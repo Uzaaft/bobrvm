@@ -1,0 +1,520 @@
+//! Metal bindings for GPU rendering.
+//!
+//! Provides Zig wrappers around Metal Objective-C API using
+//! direct message passing. This allows command buffer encoding
+//! without external dependencies.
+//!
+//! Pattern follows Ghostty's renderer/metal implementation.
+
+const std = @import("std");
+const assert = @import("../quirks.zig").inlineAssert;
+
+// =============================================================================
+// Objective-C Runtime Bindings
+// =============================================================================
+
+pub const id = *anyopaque;
+pub const SEL = *anyopaque;
+pub const Class = *anyopaque;
+pub const BOOL = bool;
+pub const NSUInteger = usize;
+pub const NSInteger = isize;
+
+extern "objc" fn objc_msgSend() callconv(.c) void;
+extern "objc" fn objc_getClass(name: [*:0]const u8) callconv(.c) ?Class;
+extern "objc" fn sel_registerName(name: [*:0]const u8) callconv(.c) SEL;
+extern "objc" fn objc_autoreleasePoolPush() callconv(.c) ?*anyopaque;
+extern "objc" fn objc_autoreleasePoolPop(pool: ?*anyopaque) callconv(.c) void;
+
+/// Send a message with no return value.
+pub fn msgSendVoid(target: id, selector: SEL) void {
+    const func: *const fn (id, SEL) callconv(.c) void = @ptrCast(&objc_msgSend);
+    func(target, selector);
+}
+
+/// Send a message returning an object.
+pub fn msgSendId(target: id, selector: SEL) ?id {
+    const func: *const fn (id, SEL) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+    return func(target, selector);
+}
+
+/// Send a message with one argument returning an object.
+pub fn msgSendId1(target: id, selector: SEL, arg: anytype) ?id {
+    const ArgType = @TypeOf(arg);
+    const func: *const fn (id, SEL, ArgType) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+    return func(target, selector, arg);
+}
+
+/// Get a selector.
+pub fn sel(name: [*:0]const u8) SEL {
+    return sel_registerName(name);
+}
+
+/// Get a class.
+pub fn cls(name: [*:0]const u8) ?Class {
+    return objc_getClass(name);
+}
+
+// =============================================================================
+// Metal Types
+// =============================================================================
+
+/// Metal pixel format.
+pub const MTLPixelFormat = enum(NSUInteger) {
+    invalid = 0,
+    bgra8Unorm = 80,
+    bgra8Unorm_sRGB = 81,
+    rgba8Unorm = 70,
+    rgba8Unorm_sRGB = 71,
+    rgba16Float = 115,
+    r8Unorm = 10,
+    rg8Unorm = 30,
+    _,
+};
+
+/// Metal load action.
+pub const MTLLoadAction = enum(NSUInteger) {
+    dontCare = 0,
+    load = 1,
+    clear = 2,
+};
+
+/// Metal store action.
+pub const MTLStoreAction = enum(NSUInteger) {
+    dontCare = 0,
+    store = 1,
+    multisampleResolve = 2,
+    storeAndMultisampleResolve = 3,
+};
+
+/// Metal primitive type.
+pub const MTLPrimitiveType = enum(NSUInteger) {
+    point = 0,
+    line = 1,
+    lineStrip = 2,
+    triangle = 3,
+    triangleStrip = 4,
+};
+
+/// Metal index type.
+pub const MTLIndexType = enum(NSUInteger) {
+    uint16 = 0,
+    uint32 = 1,
+};
+
+/// Metal command buffer status.
+pub const MTLCommandBufferStatus = enum(NSUInteger) {
+    notEnqueued = 0,
+    enqueued = 1,
+    committed = 2,
+    scheduled = 3,
+    completed = 4,
+    @"error" = 5,
+};
+
+/// Clear color.
+pub const MTLClearColor = extern struct {
+    red: f64 = 0.0,
+    green: f64 = 0.0,
+    blue: f64 = 0.0,
+    alpha: f64 = 1.0,
+};
+
+/// Viewport.
+pub const MTLViewport = extern struct {
+    originX: f64 = 0.0,
+    originY: f64 = 0.0,
+    width: f64,
+    height: f64,
+    znear: f64 = 0.0,
+    zfar: f64 = 1.0,
+};
+
+/// Scissor rect.
+pub const MTLScissorRect = extern struct {
+    x: NSUInteger = 0,
+    y: NSUInteger = 0,
+    width: NSUInteger,
+    height: NSUInteger,
+};
+
+// =============================================================================
+// Metal Wrapper Types
+// =============================================================================
+
+/// MTLDevice wrapper.
+pub const Device = struct {
+    ptr: id,
+
+    /// Create a command queue.
+    pub fn newCommandQueue(self: Device) ?CommandQueue {
+        const result = msgSendId(self.ptr, sel("newCommandQueue"));
+        return if (result) |p| CommandQueue{ .ptr = p } else null;
+    }
+
+    /// Create a buffer.
+    pub fn newBufferWithLength(self: Device, length: NSUInteger) ?Buffer {
+        const s = sel("newBufferWithLength:options:");
+        const func: *const fn (id, SEL, NSUInteger, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const result = func(self.ptr, s, length, 0); // MTLResourceStorageModeShared = 0
+        return if (result) |p| Buffer{ .ptr = p } else null;
+    }
+
+    /// Create from opaque pointer.
+    pub fn fromPtr(ptr: *anyopaque) Device {
+        return .{ .ptr = ptr };
+    }
+};
+
+/// MTLCommandQueue wrapper.
+pub const CommandQueue = struct {
+    ptr: id,
+
+    /// Create a command buffer.
+    pub fn commandBuffer(self: CommandQueue) ?CommandBuffer {
+        const result = msgSendId(self.ptr, sel("commandBuffer"));
+        return if (result) |p| CommandBuffer{ .ptr = p } else null;
+    }
+
+    pub fn fromPtr(ptr: *anyopaque) CommandQueue {
+        return .{ .ptr = ptr };
+    }
+};
+
+/// MTLCommandBuffer wrapper.
+pub const CommandBuffer = struct {
+    ptr: id,
+
+    /// Create a render command encoder.
+    pub fn renderCommandEncoderWithDescriptor(self: CommandBuffer, desc: RenderPassDescriptor) ?RenderCommandEncoder {
+        const result = msgSendId1(self.ptr, sel("renderCommandEncoderWithDescriptor:"), desc.ptr);
+        return if (result) |p| RenderCommandEncoder{ .ptr = p } else null;
+    }
+
+    /// Present a drawable.
+    pub fn presentDrawable(self: CommandBuffer, drawable: Drawable) void {
+        const s = sel("presentDrawable:");
+        const func: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, drawable.ptr);
+    }
+
+    /// Commit the command buffer.
+    pub fn commit(self: CommandBuffer) void {
+        msgSendVoid(self.ptr, sel("commit"));
+    }
+
+    /// Wait until completed.
+    pub fn waitUntilCompleted(self: CommandBuffer) void {
+        msgSendVoid(self.ptr, sel("waitUntilCompleted"));
+    }
+
+    /// Get status.
+    pub fn status(self: CommandBuffer) MTLCommandBufferStatus {
+        const s = sel("status");
+        const func: *const fn (id, SEL) callconv(.c) NSUInteger = @ptrCast(&objc_msgSend);
+        return @enumFromInt(func(self.ptr, s));
+    }
+};
+
+/// MTLRenderPassDescriptor wrapper.
+pub const RenderPassDescriptor = struct {
+    ptr: id,
+
+    /// Create a new render pass descriptor.
+    pub fn create() ?RenderPassDescriptor {
+        const class = cls("MTLRenderPassDescriptor") orelse return null;
+        const result = msgSendId(class, sel("renderPassDescriptor"));
+        return if (result) |p| RenderPassDescriptor{ .ptr = p } else null;
+    }
+
+    /// Get color attachments.
+    pub fn colorAttachments(self: RenderPassDescriptor) ?ColorAttachmentArray {
+        const result = msgSendId(self.ptr, sel("colorAttachments"));
+        return if (result) |p| ColorAttachmentArray{ .ptr = p } else null;
+    }
+};
+
+/// Color attachment array.
+pub const ColorAttachmentArray = struct {
+    ptr: id,
+
+    /// Get attachment at index.
+    pub fn objectAtIndex(self: ColorAttachmentArray, index: NSUInteger) ?ColorAttachment {
+        const s = sel("objectAtIndexedSubscript:");
+        const func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const result = func(self.ptr, s, index);
+        return if (result) |p| ColorAttachment{ .ptr = p } else null;
+    }
+};
+
+/// Color attachment.
+pub const ColorAttachment = struct {
+    ptr: id,
+
+    /// Set texture.
+    pub fn setTexture(self: ColorAttachment, texture: ?id) void {
+        const s = sel("setTexture:");
+        const func: *const fn (id, SEL, ?id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, texture);
+    }
+
+    /// Set load action.
+    pub fn setLoadAction(self: ColorAttachment, action: MTLLoadAction) void {
+        const s = sel("setLoadAction:");
+        const func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(action));
+    }
+
+    /// Set store action.
+    pub fn setStoreAction(self: ColorAttachment, action: MTLStoreAction) void {
+        const s = sel("setStoreAction:");
+        const func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(action));
+    }
+
+    /// Set clear color.
+    pub fn setClearColor(self: ColorAttachment, color: MTLClearColor) void {
+        const s = sel("setClearColor:");
+        const func: *const fn (id, SEL, MTLClearColor) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, color);
+    }
+};
+
+/// MTLRenderCommandEncoder wrapper.
+pub const RenderCommandEncoder = struct {
+    ptr: id,
+
+    /// Set viewport.
+    pub fn setViewport(self: RenderCommandEncoder, viewport: MTLViewport) void {
+        const s = sel("setViewport:");
+        const func: *const fn (id, SEL, MTLViewport) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, viewport);
+    }
+
+    /// Set scissor rect.
+    pub fn setScissorRect(self: RenderCommandEncoder, rect: MTLScissorRect) void {
+        const s = sel("setScissorRect:");
+        const func: *const fn (id, SEL, MTLScissorRect) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, rect);
+    }
+
+    /// Set render pipeline state.
+    pub fn setRenderPipelineState(self: RenderCommandEncoder, pipeline: id) void {
+        const s = sel("setRenderPipelineState:");
+        const func: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, pipeline);
+    }
+
+    /// Set vertex buffer.
+    pub fn setVertexBuffer(self: RenderCommandEncoder, buffer: ?Buffer, offset: NSUInteger, index: NSUInteger) void {
+        const s = sel("setVertexBuffer:offset:atIndex:");
+        const func: *const fn (id, SEL, ?id, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, if (buffer) |b| b.ptr else null, offset, index);
+    }
+
+    /// Set fragment buffer.
+    pub fn setFragmentBuffer(self: RenderCommandEncoder, buffer: ?Buffer, offset: NSUInteger, index: NSUInteger) void {
+        const s = sel("setFragmentBuffer:offset:atIndex:");
+        const func: *const fn (id, SEL, ?id, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, if (buffer) |b| b.ptr else null, offset, index);
+    }
+
+    /// Set fragment texture.
+    pub fn setFragmentTexture(self: RenderCommandEncoder, texture: ?id, index: NSUInteger) void {
+        const s = sel("setFragmentTexture:atIndex:");
+        const func: *const fn (id, SEL, ?id, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, texture, index);
+    }
+
+    /// Draw primitives.
+    pub fn drawPrimitives(self: RenderCommandEncoder, ptype: MTLPrimitiveType, start: NSUInteger, count: NSUInteger) void {
+        const s = sel("drawPrimitives:vertexStart:vertexCount:");
+        const func: *const fn (id, SEL, NSUInteger, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(ptype), start, count);
+    }
+
+    /// Draw indexed primitives.
+    pub fn drawIndexedPrimitives(
+        self: RenderCommandEncoder,
+        ptype: MTLPrimitiveType,
+        count: NSUInteger,
+        indexType: MTLIndexType,
+        indexBuffer: Buffer,
+        indexOffset: NSUInteger,
+    ) void {
+        const s = sel("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:");
+        const func: *const fn (id, SEL, NSUInteger, NSUInteger, NSUInteger, id, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(ptype), count, @intFromEnum(indexType), indexBuffer.ptr, indexOffset);
+    }
+
+    /// End encoding.
+    pub fn endEncoding(self: RenderCommandEncoder) void {
+        msgSendVoid(self.ptr, sel("endEncoding"));
+    }
+};
+
+/// MTLBuffer wrapper.
+pub const Buffer = struct {
+    ptr: id,
+
+    /// Get buffer contents.
+    pub fn contents(self: Buffer) ?[*]u8 {
+        const result = msgSendId(self.ptr, sel("contents"));
+        return @ptrCast(result);
+    }
+
+    /// Get buffer length.
+    pub fn length(self: Buffer) NSUInteger {
+        const s = sel("length");
+        const func: *const fn (id, SEL) callconv(.c) NSUInteger = @ptrCast(&objc_msgSend);
+        return func(self.ptr, s);
+    }
+};
+
+/// CAMetalDrawable wrapper.
+pub const Drawable = struct {
+    ptr: id,
+
+    /// Get the texture.
+    pub fn texture(self: Drawable) ?id {
+        return msgSendId(self.ptr, sel("texture"));
+    }
+};
+
+/// CAMetalLayer wrapper.
+pub const MetalLayer = struct {
+    ptr: id,
+
+    /// Get next drawable.
+    pub fn nextDrawable(self: MetalLayer) ?Drawable {
+        const result = msgSendId(self.ptr, sel("nextDrawable"));
+        return if (result) |p| Drawable{ .ptr = p } else null;
+    }
+
+    /// Set device.
+    pub fn setDevice(self: MetalLayer, device: Device) void {
+        const s = sel("setDevice:");
+        const func: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, device.ptr);
+    }
+
+    /// Set pixel format.
+    pub fn setPixelFormat(self: MetalLayer, format: MTLPixelFormat) void {
+        const s = sel("setPixelFormat:");
+        const func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(format));
+    }
+
+    /// Set drawable size.
+    pub fn setDrawableSize(self: MetalLayer, width: f64, height: f64) void {
+        const Size = extern struct { width: f64, height: f64 };
+        const s = sel("setDrawableSize:");
+        const func: *const fn (id, SEL, Size) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, .{ .width = width, .height = height });
+    }
+
+    pub fn fromPtr(ptr: *anyopaque) MetalLayer {
+        return .{ .ptr = ptr };
+    }
+};
+
+// =============================================================================
+// Frame Renderer
+// =============================================================================
+
+/// Frame renderer for encoding Metal commands.
+pub const FrameRenderer = struct {
+    device: Device,
+    queue: CommandQueue,
+    layer: MetalLayer,
+
+    /// Initialize with opaque pointers from Swift.
+    pub fn init(
+        mtl_device: *anyopaque,
+        mtl_layer: *anyopaque,
+        mtl_queue: *anyopaque,
+    ) FrameRenderer {
+        return .{
+            .device = Device.fromPtr(mtl_device),
+            .queue = CommandQueue.fromPtr(mtl_queue),
+            .layer = MetalLayer.fromPtr(mtl_layer),
+        };
+    }
+
+    /// Render a frame with the given clear color.
+    /// Returns true if frame was successfully rendered.
+    pub fn renderFrame(self: *FrameRenderer, clear_color: MTLClearColor) bool {
+        // Autorelease pool to prevent Metal object leaks
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        // Get next drawable
+        const drawable = self.layer.nextDrawable() orelse return false;
+        const texture = drawable.texture() orelse return false;
+
+        // Create command buffer
+        const cmd_buffer = self.queue.commandBuffer() orelse return false;
+
+        // Create render pass descriptor
+        const pass_desc = RenderPassDescriptor.create() orelse return false;
+        const color_attachments = pass_desc.colorAttachments() orelse return false;
+        const attachment = color_attachments.objectAtIndex(0) orelse return false;
+
+        attachment.setTexture(texture);
+        attachment.setLoadAction(.clear);
+        attachment.setStoreAction(.store);
+        attachment.setClearColor(clear_color);
+
+        // Create render encoder
+        const encoder = cmd_buffer.renderCommandEncoderWithDescriptor(pass_desc) orelse return false;
+
+        // TODO: Encode actual draw commands from GPU context
+        // For now, just clear the screen
+
+        encoder.endEncoding();
+
+        // Present and commit
+        cmd_buffer.presentDrawable(drawable);
+        cmd_buffer.commit();
+
+        return true;
+    }
+
+    /// Render a frame with framebuffer data (2D mode).
+    pub fn renderFramebuffer(
+        self: *FrameRenderer,
+        data: []const u8,
+        width: u32,
+        height: u32,
+    ) bool {
+        _ = data;
+        _ = width;
+        _ = height;
+
+        // TODO: Upload framebuffer data to texture and blit
+        return self.renderFrame(.{
+            .red = 0.0,
+            .green = 0.0,
+            .blue = 0.2,
+            .alpha = 1.0,
+        });
+    }
+};
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "MTLClearColor default" {
+    const color = MTLClearColor{};
+    try std.testing.expectEqual(@as(f64, 0.0), color.red);
+    try std.testing.expectEqual(@as(f64, 1.0), color.alpha);
+}
+
+test "MTLViewport size" {
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(MTLViewport));
+}
+
+test "MTLPixelFormat values" {
+    try std.testing.expectEqual(@as(NSUInteger, 80), @intFromEnum(MTLPixelFormat.bgra8Unorm));
+}

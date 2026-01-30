@@ -1,0 +1,364 @@
+--- xcodebuild: WARNING: Using the first of multiple matching destinations:
+{ platform:macOS, arch:arm64, id:00006034-000451123644001C, name:My Mac }
+{ platform:macOS, arch:x86_64, id:00006034-000451123644001C, name:My Mac }
+{ platform:macOS, name:Any Mac }
+debug: (apprt) creating app instance
+info: (apprt) app created successfully
+[VMStorage] storedFirmware=/Users/uzaaft/Library/Developer/Xcode/DerivedData/Bobrvm-cymhtdqcpqatwlhklnvcnclzorrr/Build/Products/Debug/Bobrvm.app/Contents/Resources/QEMU_EFI.fd, bundledFirmware=/Users/uzaaft/Library/Developer/Xcode/DerivedData/Bobrvm-cymhtdqcpqatwlhklnvcnclzorrr/Build/Products/Debug/Bobrvm.app/Contents/Resources/QEMU_EFI.fd, Bundle.main=/Users/uzaaft/Library/Developer/Xcode/DerivedData/Bobrvm-cymhtdqcpqatwlhklnvcnclzorrr/Build/Products/Debug/Bobrvm.app
+debug: (apprt) creating VM: 4096MB RAM, 2 vCPUs
+info: (apprt) VM created (total: 1)
+[sentry] INFO using database path "/Users/uzaaft/Library/Caches/com.mitchellh.ghostty/sentry"
+[sentry] WARN the provided DSN "" is not valid
+[sentry] DEBUG starting backend
+[sentry] DEBUG processing and pruning old runs
+[sentry] DEBUG sending envelope
+info: (apprt) creating hardware machine
+info: (apprt) firmware_path from config: /Users/uzaaft/Library/Developer/Xcode/DerivedData/Bobrvm-cymhtdqcpqatwlhklnvcnclzorrr/Build/Products/Debug/Bobrvm.app/Contents/Resources/QEMU_EFI.fd
+info: (machine) initializing machine: 4096MB RAM, 2 vCPUs
+info: (machine) starting machine
+debug: (machine) mapped pflash CODE: 0x0 - 0x4000000
+debug: (machine) mapped pflash VARS: 0x4000000 - 0x8000000
+info: (machine) loading firmware: /Users/uzaaft/Library/Developer/Xcode/DerivedData/Bobrvm-cymhtdqcpqatwlhklnvcnclzorrr/Build/Products/Debug/Bobrvm.app/Contents/Resources/QEMU_EFI.fd
+info: (machine) loaded firmware: 2097152 bytes at 0x0
+info: (machine) UEFI vars file not found, will be created on shutdown: /Users/uzaaft/Library/Application Support/Bobrvm/New_VM_vars.fd
+debug: (machine) mapped RAM: 0x40000000 - 0x140000000
+debug: (dtb) generated DTB: 1768 bytes
+info: (machine) loaded DTB: 1768 bytes at 0x13fe00000
+info: (gic) initialized GICv3: 2 CPUs, 128 SPIs
+debug: (machine) initialized GIC at 0x8000000
+debug: (machine) initialized ICC handler
+debug: (machine) initialized UART at 0x9000000
+debug: (machine) initialized virtio-console at 0xa000000
+debug: (machine) initialized virtio-blk at 0xa000200 with disk: /Users/uzaaft/Library/Application Support/Bobrvm/New_VM.raw
+debug: (machine) attaching disk2: /Users/uzaaft/Downloads/nixos-minimal-25.11.4506.078d69f03934-aarch64-linux.iso (len=79)
+debug: (machine) initialized virtio-blk2 at 0xa000400 with disk: /Users/uzaaft/Downloads/nixos-minimal-25.11.4506.078d69f03934-aarch64-linux.iso (read-only: true)
+info: (machine) machine started
+info: (apprt) VM started
+debug: vcpu 0: created on thread
+debug: (machine) vCPU 0: firmware boot PC=0x0
+info: vcpu 0: first hv_vcpu_run starting
+debug: vcpu 1: created on thread
+debug: (machine) vCPU 1: secondary state at 0x40001000 (waiting for PSCI CPU_ON)
+info: vcpu 1: first hv_vcpu_run starting
+info: vcpu 1: exit #1 ec=0x1 addr=0x0 pc=0x40001000 lr=0x0 (run=0ms)
+info: vcpu 0: exit #1 ec=0x24 addr=0x3c000000 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #2 ec=0x24 addr=0x3c000040 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #3 ec=0x24 addr=0x3c000080 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #4 ec=0x24 addr=0x3c0000c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #5 ec=0x24 addr=0x3c000100 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #6 ec=0x24 addr=0x3c000140 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #7 ec=0x24 addr=0x3c000180 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #8 ec=0x24 addr=0x3c0001c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #9 ec=0x24 addr=0x3c000200 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #10 ec=0x24 addr=0x3c000240 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #100000 ec=0x24 addr=0x3c61a7c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #200000 ec=0x24 addr=0x3cc34fc0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #300000 ec=0x24 addr=0x3d24f7c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: (renderer) starting renderer thread (target 60fps)
+debug: (renderer) renderer thread started
+info: vcpu 0: exit #400000 ec=0x24 addr=0x3d869fc0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #500000 ec=0x24 addr=0x3de847c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #600000 ec=0x24 addr=0x3e49efc0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #700000 ec=0x24 addr=0x3eab97c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #800000 ec=0x24 addr=0x3f0d3fc0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #900000 ec=0x24 addr=0x3f6ee7c0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 0: exit #1000000 ec=0x24 addr=0x3fd08fc0 pc=0x13428 lr=0x143cc (run=0ms)
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0
+info: vcpu 1: exits=1 mmio=0 gic=0 uart=0 pci=0 vtimer=0 wfi=1 sysreg=0

@@ -1,0 +1,456 @@
+const std = @import("std");
+const fs = std.fs;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const XCFrameworkStep = @import("src/build/XCFrameworkStep.zig");
+const XcodebuildStep = @import("src/build/XcodebuildStep.zig");
+
+const GhosttyXCFrameworkTarget = enum { native, universal };
+
+const GhosttySteps = struct {
+    install_root_step: *std.Build.Step,
+};
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const is_nix_build = b.graph.env_map.get("NIX_BUILD_TOP") != null;
+
+    // Build options
+    const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
+    const emit_macos_app = b.option(bool, "emit-macos-app", "Build macOS app via xcodebuild") orelse false;
+
+    // Create the root module
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/main_c.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // Link system frameworks on macOS
+    if (target.result.os.tag == .macos) {
+        // Add framework search path from SDKROOT if available
+        if (b.graph.env_map.get("SDKROOT")) |sdk| {
+            const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+            const include_path = b.fmt("{s}/usr/include", .{sdk});
+            const library_path = b.fmt("{s}/usr/lib", .{sdk});
+            root_module.addFrameworkPath(.{ .cwd_relative = framework_path });
+            root_module.addSystemIncludePath(.{ .cwd_relative = include_path });
+            root_module.addLibraryPath(.{ .cwd_relative = library_path });
+        }
+
+        root_module.linkFramework("Hypervisor", .{});
+        root_module.linkFramework("Metal", .{});
+        root_module.linkFramework("MetalKit", .{});
+        root_module.linkFramework("QuartzCore", .{});
+        root_module.linkFramework("IOSurface", .{});
+        root_module.linkSystemLibrary("objc", .{});
+
+        // Add C source for os_log wrapper
+        root_module.addCSourceFile(.{
+            .file = b.path("src/os/log.c"),
+            .flags = &.{"-std=c11"},
+        });
+    }
+
+    // Create the main library
+    const lib = b.addLibrary(.{
+        .name = "bobrvm",
+        .root_module = root_module,
+        .linkage = .static,
+    });
+
+    b.installArtifact(lib);
+
+    // Install headers
+    b.installDirectory(.{
+        .source_dir = b.path("include"),
+        .install_dir = .header,
+        .install_subdir = "",
+    });
+
+    // CLI executable module
+    const cli_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // Link system frameworks for CLI on macOS
+    if (target.result.os.tag == .macos) {
+        if (b.graph.env_map.get("SDKROOT")) |sdk| {
+            const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+            const include_path = b.fmt("{s}/usr/include", .{sdk});
+            const library_path = b.fmt("{s}/usr/lib", .{sdk});
+            cli_module.addFrameworkPath(.{ .cwd_relative = framework_path });
+            cli_module.addSystemIncludePath(.{ .cwd_relative = include_path });
+            cli_module.addLibraryPath(.{ .cwd_relative = library_path });
+        }
+
+        cli_module.linkFramework("Hypervisor", .{});
+        cli_module.linkFramework("Metal", .{});
+        cli_module.linkFramework("QuartzCore", .{});
+        cli_module.linkFramework("IOSurface", .{});
+        cli_module.linkSystemLibrary("objc", .{});
+
+        cli_module.addCSourceFile(.{
+            .file = b.path("src/os/log.c"),
+            .flags = &.{"-std=c11"},
+        });
+    }
+
+    // CLI executable
+    const cli_exe = b.addExecutable(.{
+        .name = "bobrvm",
+        .root_module = cli_module,
+    });
+
+    const install_cli = b.addInstallArtifact(cli_exe, .{});
+    b.getInstallStep().dependOn(&install_cli.step);
+
+    // Code-sign the installed CLI with hypervisor entitlement (macOS only)
+    if (target.result.os.tag == .macos and !is_nix_build) {
+        const codesign = b.addSystemCommand(&.{
+            "codesign",
+            "--sign",
+            "-",
+            "--entitlements",
+            "cli.entitlements",
+            "--force",
+            "zig-out/bin/bobrvm",
+        });
+        codesign.step.dependOn(&install_cli.step);
+        b.getInstallStep().dependOn(&codesign.step);
+    }
+
+    // CLI run step
+    const cli_run = b.addRunArtifact(cli_exe);
+    cli_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        cli_run.addArgs(args);
+    }
+
+    const cli_step = b.step("cli", "Run the headless CLI");
+    cli_step.dependOn(&cli_run.step);
+
+    // Test module
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Link frameworks for tests on macOS
+    if (target.result.os.tag == .macos) {
+        if (b.graph.env_map.get("SDKROOT")) |sdk| {
+            const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+            test_module.addFrameworkPath(.{ .cwd_relative = framework_path });
+        }
+        test_module.linkFramework("Hypervisor", .{});
+    }
+
+    // Test step
+    const main_tests = b.addTest(.{
+        .root_module = test_module,
+    });
+
+    const run_tests = b.addRunArtifact(main_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+
+    // ==========================================================================
+    // Integration test: bare-metal ARM64 test binary (pure assembly)
+    // ==========================================================================
+    const bare_metal_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+
+    const bare_metal_module = b.createModule(.{
+        .target = bare_metal_target,
+        .optimize = .ReleaseSmall,
+    });
+
+    // Pure assembly test
+    bare_metal_module.addAssemblyFile(b.path("tests/integration/bare_metal/test.S"));
+
+    const bare_metal_test = b.addExecutable(.{
+        .name = "bare_metal_test",
+        .root_module = bare_metal_module,
+    });
+    bare_metal_test.setLinkerScript(b.path("tests/integration/bare_metal/link.ld"));
+
+    // Extract raw binary from ELF
+    const bare_metal_bin = bare_metal_test.addObjCopy(.{
+        .format = .bin,
+    });
+
+    // Install the binary
+    const install_bare_metal = b.addInstallFile(bare_metal_bin.getOutput(), "test/bare_metal_test.bin");
+
+    const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
+    bare_metal_step.dependOn(&install_bare_metal.step);
+
+    // XCFramework step (macOS only)
+    if (target.result.os.tag == .macos) {
+        const ghostty_steps = addGhosttySteps(b, optimize);
+        const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
+        ghostty_step.dependOn(ghostty_steps.install_root_step);
+
+        const xcframework = XCFrameworkStep.create(b, lib);
+        const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
+        xcframework_step.dependOn(&xcframework.step);
+
+        if (emit_xcframework) {
+            b.default_step.dependOn(&xcframework.step);
+        }
+
+        // macOS app step
+        if (emit_macos_app) {
+            const xcodebuild = XcodebuildStep.create(b, xcframework, optimize);
+            xcodebuild.step.dependOn(ghostty_steps.install_root_step);
+            b.default_step.dependOn(&xcodebuild.step);
+        }
+
+        // Run step - build and run app with logging to terminal
+        const run_step = b.step("run", "Build and run the macOS app (with terminal logging)");
+        const xcodebuild_for_run = XcodebuildStep.create(b, xcframework, optimize);
+        xcodebuild_for_run.step.dependOn(ghostty_steps.install_root_step);
+        run_step.dependOn(&xcodebuild_for_run.step);
+
+        // Run app directly (not via open) so stderr shows in terminal
+        // Set BOBRVM_LOG=true for dev mode logging
+        const xcodeproj_path = b.pathFromRoot("macos/Bobrvm.xcodeproj");
+        const run_script = b.fmt(
+            \\BUILT_PRODUCTS_DIR=$(xcodebuild -project "{s}" -scheme Bobrvm -showBuildSettings 2>/dev/null | grep ' BUILT_PRODUCTS_DIR' | head -1 | awk '{{print $3}}')
+            \\BOBRVM_LOG=true exec "$BUILT_PRODUCTS_DIR/Bobrvm.app/Contents/MacOS/Bobrvm"
+        , .{xcodeproj_path});
+        var run_cmd = b.addSystemCommand(&.{"sh"});
+        run_cmd.addArgs(&.{ "-c", run_script });
+        run_cmd.step.dependOn(&xcodebuild_for_run.step);
+        run_step.dependOn(&run_cmd.step);
+    }
+}
+
+fn addGhosttySteps(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+) GhosttySteps {
+    const ghostty_xcframework_target = b.option(
+        GhosttyXCFrameworkTarget,
+        "ghostty-xcframework-target",
+        "Ghostty xcframework target (native or universal).",
+    ) orelse .native;
+
+    const ghostty_dep = b.dependency("ghostty", .{ .@"version-string" = "0.0.0" });
+    const ghostty_target_arg = @tagName(ghostty_xcframework_target);
+
+    const ghostty_cmd = b.addSystemCommand(&.{
+        "zig",
+        "build",
+        "-Dapp-runtime=none",
+        "-Dversion-string=0.0.0",
+        "-Demit-macos-app=false",
+        "-Demit-xcframework=true",
+        "-Di18n=false",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
+        b.fmt("-Dxcframework-target={s}", .{ghostty_target_arg}),
+    });
+    ghostty_cmd.setCwd(ghostty_dep.path("."));
+    ghostty_cmd.expectExitCode(0);
+    ghostty_cmd.addFileInput(ghostty_dep.path("build.zig"));
+    ghostty_cmd.addFileInput(ghostty_dep.path("build.zig.zon"));
+    ghostty_cmd.addFileInput(ghostty_dep.path("include/ghostty.h"));
+    addRunFileInputsForDir(b, ghostty_cmd, ghostty_dep.path("src").getPath(b), &.{});
+    addRunFileInputsForDir(b, ghostty_cmd, ghostty_dep.path("include").getPath(b), &.{});
+
+    const ghostty_install = b.addInstallDirectory(.{
+        .source_dir = ghostty_dep.path("macos/GhosttyKit.xcframework"),
+        .install_dir = .prefix,
+        .install_subdir = "GhosttyKit.xcframework",
+    });
+    ghostty_install.step.dependOn(&ghostty_cmd.step);
+
+    const install_prefix = b.getInstallPath(.prefix, "");
+    const install_prefix_abs = if (fs.path.isAbsolute(install_prefix))
+        install_prefix
+    else
+        b.pathFromRoot(install_prefix);
+    const zig_out_abs = b.pathFromRoot("zig-out");
+    const ghostty_xcframework_src = b.fmt("{s}/GhosttyKit.xcframework", .{install_prefix_abs});
+    const ghostty_xcframework_dest = b.pathFromRoot("zig-out/GhosttyKit.xcframework");
+
+    const ghostty_install_root_step: *std.Build.Step = if (mem.eql(u8, install_prefix_abs, zig_out_abs))
+        &ghostty_install.step
+    else blk: {
+        const copy_step = CopyDirStep.create(
+            b,
+            .{ .cwd_relative = ghostty_xcframework_src },
+            .{ .cwd_relative = ghostty_xcframework_dest },
+        );
+        copy_step.step.dependOn(&ghostty_install.step);
+        break :blk &copy_step.step;
+    };
+
+    return .{ .install_root_step = ghostty_install_root_step };
+}
+
+fn addRunFileInputsForDir(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    root_path: []const u8,
+    extensions: []const []const u8,
+) void {
+    const dir = if (fs.path.isAbsolute(root_path))
+        fs.openDirAbsolute(root_path, .{ .iterate = true })
+    else
+        fs.cwd().openDir(root_path, .{ .iterate = true });
+    var handle = dir catch @panic("unable to open directory");
+    defer handle.close();
+
+    var walker = handle.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+
+    while (true) {
+        const entry = walker.next() catch @panic("unable to walk directory") orelse break;
+        if (entry.kind != .file) continue;
+        if (extensions.len != 0 and !hasExtension(entry.path, extensions)) continue;
+
+        const full_path = b.pathJoin(&.{ root_path, entry.path });
+        run.addFileInput(.{ .cwd_relative = full_path });
+    }
+}
+
+fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
+    for (extensions) |ext| {
+        if (mem.endsWith(u8, path, ext)) return true;
+    }
+    return false;
+}
+
+const CopyDirStep = struct {
+    step: std.Build.Step,
+    source_dir: std.Build.LazyPath,
+    dest_dir: std.Build.LazyPath,
+
+    pub fn create(
+        b: *std.Build,
+        source_dir: std.Build.LazyPath,
+        dest_dir: std.Build.LazyPath,
+    ) *CopyDirStep {
+        const step = b.allocator.create(CopyDirStep) catch @panic("OOM");
+        step.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "copy GhosttyKit.xcframework",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .source_dir = source_dir.dupe(b),
+            .dest_dir = dest_dir.dupe(b),
+        };
+        source_dir.addStepDependencies(&step.step);
+        return step;
+    }
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
+        _ = options;
+        const b = step.owner;
+        const self: *CopyDirStep = @fieldParentPtr("step", step);
+        step.clearWatchInputs();
+
+        const src_path = self.source_dir.getPath3(b, step);
+        const dest_path = self.dest_dir.getPath3(b, step);
+
+        const src = try src_path.toString(b.allocator);
+        defer b.allocator.free(src);
+        const dest = try dest_path.toString(b.allocator);
+        defer b.allocator.free(dest);
+
+        try copyDirTree(b.allocator, src, dest);
+    }
+};
+
+fn copyDirTree(allocator: Allocator, source_path: []const u8, dest_path: []const u8) !void {
+    try deleteTreePath(dest_path);
+    if (fs.path.isAbsolute(dest_path)) {
+        try ensureDirAbsolute(dest_path);
+    } else {
+        try fs.cwd().makePath(dest_path);
+    }
+
+    var source_dir = try openDirPath(source_path, true);
+    defer source_dir.close();
+    var dest_dir = try openDirPath(dest_path, false);
+    defer dest_dir.close();
+
+    try copyDirContents(allocator, source_dir, dest_dir);
+}
+
+fn copyDirContents(allocator: Allocator, source_dir: fs.Dir, dest_dir: fs.Dir) !void {
+    var walker = try source_dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                try dest_dir.makePath(entry.path);
+            },
+            .file => {
+                try ensureParentDir(dest_dir, entry.path);
+                try source_dir.copyFile(entry.path, dest_dir, entry.path, .{});
+            },
+            .sym_link => {
+                try ensureParentDir(dest_dir, entry.path);
+                var buf: [fs.max_path_bytes]u8 = undefined;
+                const target = try source_dir.readLink(entry.path, &buf);
+                dest_dir.symLink(target, entry.path, .{}) catch |err| {
+                    if (err != error.PathAlreadyExists) return err;
+                };
+            },
+            else => {},
+        }
+    }
+}
+
+fn ensureParentDir(dir: fs.Dir, path: []const u8) !void {
+    const parent = fs.path.dirname(path) orelse return;
+    try dir.makePath(parent);
+}
+
+fn ensureDirAbsolute(path: []const u8) !void {
+    if (!fs.path.isAbsolute(path)) return error.BadPathName;
+    fs.makeDirAbsolute(path) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        error.FileNotFound => {
+            const parent = fs.path.dirname(path) orelse return err;
+            try ensureDirAbsolute(parent);
+            try fs.makeDirAbsolute(path);
+        },
+        else => return err,
+    };
+}
+
+fn openDirPath(path: []const u8, iterate: bool) !fs.Dir {
+    const opts: fs.Dir.OpenOptions = .{ .iterate = iterate };
+    return if (fs.path.isAbsolute(path))
+        fs.openDirAbsolute(path, opts)
+    else
+        fs.cwd().openDir(path, opts);
+}
+
+fn deleteTreePath(path: []const u8) !void {
+    if (fs.path.isAbsolute(path)) {
+        fs.deleteTreeAbsolute(path) catch |err| {
+            if (err != error.FileNotFound) return err;
+        };
+        return;
+    }
+
+    fs.cwd().deleteTree(path) catch |err| {
+        if (err != error.FileNotFound) return err;
+    };
+}

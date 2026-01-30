@@ -1,0 +1,22 @@
+.{
+    .name = .bobrvm,
+    .version = "0.1.0",
+    .fingerprint = 0x63a0af4de3f13c99,
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/250877eff69ee1f00168a1f5ce9ab5490e29b0dc.zip",
+            .hash = "ghostty-1.3.0-dev-5UdBC_PYRQTHglz7xxFCn7LOMMntdWNlkbZMVAKmvl3F",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "include",
+        "AGENTS.md",
+        "README.md",
+    },
+}

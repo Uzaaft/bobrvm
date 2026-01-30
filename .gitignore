@@ -1,0 +1,32 @@
+# Zig
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Nix
+result
+result-*
+
+# macOS
+.DS_Store
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# XCFramework (generated)
+macos/BobrvmKit.xcframework/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.so
+tests/integration/alpine/out/initramfs-minimal
