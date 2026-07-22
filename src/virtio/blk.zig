@@ -393,6 +393,9 @@ pub const Block = struct {
         const req_type: RequestType = @enumFromInt(header.type);
         switch (req_type) {
             .in => {
+                // Per-descriptor reads: preadAll loops internally, so it is
+                // robust to the short readv/preadv behavior macOS exhibits
+                // for multi-iovec vectored reads (which corrupts blocks).
                 const file = self.file orelse return .io_err;
                 var offset = header.sector * SECTOR_SIZE;
                 for (data) |desc| {
@@ -400,7 +403,7 @@ pub const Block = struct {
                     const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
                     if (offset + buf.len > self.capacity_bytes) return .io_err;
                     const n = file.preadAll(buf, offset) catch return .io_err;
-                    // Short read within capacity: zero-fill (sparse image tail).
+                    // Short read within capacity: zero-fill (sparse tail).
                     @memset(buf[n..], 0);
                     offset += buf.len;
                     data_written.* += @intCast(buf.len);
