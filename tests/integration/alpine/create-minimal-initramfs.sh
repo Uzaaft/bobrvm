@@ -25,9 +25,14 @@ mkdir -p "$MINI_DIR"/{bin,dev,proc,sys,etc,lib}
 # Copy busybox
 cp "$WORK_DIR/bin/busybox" "$MINI_DIR/bin/"
 
-# Copy necessary libraries (busybox is dynamically linked to musl)
+# Copy necessary libraries (busybox is dynamically linked to musl;
+# kmod's modprobe needs libzstd/liblzma from usr/lib)
 if [ -d "$WORK_DIR/lib" ]; then
     cp -a "$WORK_DIR/lib/"* "$MINI_DIR/lib/" 2>/dev/null || true
+fi
+if [ -d "$WORK_DIR/usr/lib" ]; then
+    mkdir -p "$MINI_DIR/usr/lib"
+    cp -a "$WORK_DIR/usr/lib/"* "$MINI_DIR/usr/lib/" 2>/dev/null || true
 fi
 
 # Copy sbin/modprobe if available
@@ -42,18 +47,12 @@ if [ ! -f "$MINI_DIR/sbin/modprobe" ]; then
     ln -sf ../bin/busybox "$MINI_DIR/sbin/modprobe"
 fi
 
-# Copy virtio modules (virtio_mmio for the transport, virtio_blk for disks)
+# Copy the full module tree so modprobe can resolve dependencies
+# (virtio_mmio/virtio_blk plus virtio_gpu with its DRM stack).
 KERN_VERSION=$(ls "$WORK_DIR/lib/modules" | head -1)
 if [ -n "$KERN_VERSION" ]; then
-    mkdir -p "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/virtio"
-    mkdir -p "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/block"
-    cp "$WORK_DIR/lib/modules/$KERN_VERSION/kernel/drivers/virtio/virtio_mmio.ko" \
-       "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/virtio/" 2>/dev/null || true
-    cp "$WORK_DIR/lib/modules/$KERN_VERSION/kernel/drivers/block/virtio_blk.ko" \
-       "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/block/" 2>/dev/null || true
-
-    # Copy modules metadata
-    cp "$WORK_DIR/lib/modules/$KERN_VERSION/modules."* "$MINI_DIR/lib/modules/$KERN_VERSION/" 2>/dev/null || true
+    mkdir -p "$MINI_DIR/lib/modules"
+    cp -a "$WORK_DIR/lib/modules/$KERN_VERSION" "$MINI_DIR/lib/modules/" 2>/dev/null || true
 fi
 
 # Create symlinks for basic commands
@@ -85,14 +84,13 @@ echo "Loading virtio modules..." >/dev/ttyAMA0 2>&1
 KVER=$(uname -r)
 echo "Kernel: $KVER" >/dev/ttyAMA0 2>&1
 if [ -f "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" ]; then
-    echo "Loading virtio_mmio.ko..." >/dev/ttyAMA0 2>&1
-    /bin/insmod "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" 2>/dev/ttyAMA0
-    RET=$?
-    echo "insmod returned: $RET" >/dev/ttyAMA0 2>&1
-    if [ -f "/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko" ]; then
-        /bin/insmod "/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko" 2>/dev/ttyAMA0
-        echo "virtio_blk insmod returned: $?" >/dev/ttyAMA0 2>&1
-    fi
+    echo "Loading virtio modules..." >/dev/ttyAMA0 2>&1
+    modprobe virtio_mmio 2>/dev/ttyAMA0
+    echo "virtio_mmio: $?" >/dev/ttyAMA0 2>&1
+    modprobe virtio_blk 2>/dev/ttyAMA0
+    echo "virtio_blk: $?" >/dev/ttyAMA0 2>&1
+    modprobe virtio-gpu 2>/dev/ttyAMA0
+    echo "virtio_gpu: $?" >/dev/ttyAMA0 2>&1
     sleep 1
 else
     echo "virtio_mmio.ko not found for $KVER" >/dev/ttyAMA0 2>&1

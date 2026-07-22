@@ -125,6 +125,13 @@ pub const MachineConfig = struct {
     /// Whether the secondary disk is read-only (typically true for ISO).
     disk2_read_only: bool = true,
 
+    /// Enable the virtio-gpu display device.
+    enable_gpu: bool = false,
+
+    /// Display size for the virtio-gpu scanout.
+    display_width: u32 = 1280,
+    display_height: u32 = 800,
+
     /// Count how many block devices are configured.
     pub fn blockDeviceCount(self: MachineConfig) u8 {
         var count: u8 = 0;
@@ -143,6 +150,9 @@ pub const MachineConfig = struct {
 };
 
 /// Virtual Machine instance.
+/// Number of addressable virtio-mmio slots (console, 2 disks, gpu, spare).
+const VIRTIO_SLOT_COUNT: u64 = 8;
+
 pub const Machine = struct {
     alloc: Allocator,
     config: MachineConfig,
@@ -174,6 +184,10 @@ pub const Machine = struct {
     /// Virtio block device (secondary, slot 2, typically ISO).
     block2: ?*virtio.Block = null,
 
+    /// Virtio GPU device (assigned the slot after the block devices).
+    gpu: ?*virtio.Gpu = null,
+    gpu_slot: u8 = 0,
+
     /// UART device (PL011 for earlycon).
     uart: ?*virtio.Uart = null,
 
@@ -192,6 +206,10 @@ pub const Machine = struct {
     /// Console output callback.
     console_output: ?*const fn ([]const u8, ?*anyopaque) void = null,
     console_userdata: ?*anyopaque = null,
+
+    /// Frame ready callback (applied to the GPU at device init).
+    frame_callback: ?*const fn (?*anyopaque) void = null,
+    frame_userdata: ?*anyopaque = null,
 
     /// Initrd tracking (for DTB generation).
     initrd_start: u64 = 0,
@@ -246,6 +264,11 @@ pub const Machine = struct {
             block2.deinit();
         }
 
+        if (self.gpu) |gpu_dev| {
+            gpu_dev.deinit();
+            self.gpu = null;
+        }
+
         if (self.uart) |uart| {
             self.alloc.destroy(uart);
             self.uart = null;
@@ -280,6 +303,16 @@ pub const Machine = struct {
         self.vcpus.deinit(self.alloc);
 
         self.alloc.destroy(self);
+    }
+
+    /// Set frame ready callback (must be called before start).
+    pub fn setFrameCallback(
+        self: *Machine,
+        callback: *const fn (?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        self.frame_callback = callback;
+        self.frame_userdata = userdata;
     }
 
     /// Inject host input into the guest consoles. Thread-safe: buffers
@@ -648,43 +681,36 @@ pub const Machine = struct {
             return;
         }
 
-        // Virtio console
-        if (addr >= MemoryLayout.virtioBase(0) and addr < MemoryLayout.virtioBase(0) + MemoryLayout.VIRTIO_SIZE) {
-            if (self.console) |console| {
-                const offset: u12 = @truncate(addr - MemoryLayout.virtioBase(0));
-                if (is_write) {
-                    const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                    console.write(offset, @truncate(value));
-                } else {
-                    const value = console.read(offset);
-                    if (srt != 31) {
-                        try vcpu.setReg(@enumFromInt(srt), value);
-                    }
-                }
+        // Virtio MMIO devices (console/blk/gpu, slot-addressed)
+        const virtio_end = MemoryLayout.VIRTIO_BASE + MemoryLayout.VIRTIO_SIZE * VIRTIO_SLOT_COUNT;
+        if (addr >= MemoryLayout.VIRTIO_BASE and addr < virtio_end) {
+            const slot: u8 = @intCast((addr - MemoryLayout.VIRTIO_BASE) / MemoryLayout.VIRTIO_SIZE);
+            const offset: u12 = @truncate(addr - MemoryLayout.virtioBase(slot));
+            const value: u32 = if (is_write)
+                @truncate(if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt)))
+            else
+                0;
+            var result: u32 = 0;
+
+            if (self.gpu != null and slot == self.gpu_slot) {
+                const gpu_dev = self.gpu.?;
+                if (is_write) gpu_dev.write(offset, value) else result = gpu_dev.read(offset);
+            } else if (slot == 0 and self.console != null) {
+                const console = self.console.?;
+                if (is_write) console.write(offset, value) else result = console.read(offset);
+            } else if (slot == 1 and self.block != null) {
+                const blk = self.block.?;
+                if (is_write) blk.write(offset, value) else result = blk.read(offset);
+            } else if (slot == 2 and self.block2 != null) {
+                const blk = self.block2.?;
+                if (is_write) blk.write(offset, value) else result = blk.read(offset);
+            }
+
+            if (!is_write and srt != 31) {
+                try vcpu.setReg(@enumFromInt(srt), result);
             }
             try vcpu.advancePC(info);
             return;
-        }
-
-        // Virtio block devices (slots 1 and 2)
-        inline for (.{ .{ 1, "block" }, .{ 2, "block2" } }) |slot| {
-            const base = MemoryLayout.virtioBase(slot[0]);
-            if (addr >= base and addr < base + MemoryLayout.VIRTIO_SIZE) {
-                if (@field(self, slot[1])) |blk| {
-                    const offset: u12 = @truncate(addr - base);
-                    if (is_write) {
-                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                        blk.write(offset, @truncate(value));
-                    } else {
-                        const value = blk.read(offset);
-                        if (srt != 31) {
-                            try vcpu.setReg(@enumFromInt(srt), value);
-                        }
-                    }
-                }
-                try vcpu.advancePC(info);
-                return;
-            }
         }
 
         // PCIe ECAM (configuration space)
@@ -987,8 +1013,9 @@ pub const Machine = struct {
         var builder = dtb.DtbBuilder.init(self.alloc);
         defer builder.deinit();
 
-        // Count virtio devices: console (slot 0) + block devices (slots 1, 2)
-        const virtio_count: u8 = 1 + self.config.blockDeviceCount();
+        // Count virtio devices: console (slot 0) + block devices + gpu
+        const virtio_count: u8 = 1 + self.config.blockDeviceCount() +
+            @intFromBool(self.config.enable_gpu);
 
         const config = dtb.DtbConfig{
             .ram_base = MemoryLayout.RAM_BASE,
@@ -1086,6 +1113,24 @@ pub const Machine = struct {
                 MemoryLayout.virtioBase(2),
                 disk2_path,
                 self.config.disk2_read_only,
+            });
+        }
+
+        // Initialize GPU (slot after the block devices) if enabled
+        if (self.config.enable_gpu) {
+            self.gpu_slot = 1 + self.config.blockDeviceCount();
+            self.gpu = try virtio.Gpu.init(self.alloc);
+            self.gpu.?.setGuestMemory(getGuestMemoryWrapper);
+            self.gpu.?.setDisplaySize(self.config.display_width, self.config.display_height);
+            self.gpu.?.transport.setIrqCallback(gpuIrqCallback, self);
+            if (self.frame_callback) |cb| {
+                self.gpu.?.setFrameCallback(cb, self.frame_userdata);
+            }
+            log.debug("initialized virtio-gpu at 0x{x} (slot {}, {}x{})", .{
+                MemoryLayout.virtioBase(self.gpu_slot),
+                self.gpu_slot,
+                self.config.display_width,
+                self.config.display_height,
             });
         }
 
@@ -1493,6 +1538,14 @@ pub const Machine = struct {
         // DTB declares virtio slot 2 as GIC_SPI 34 → intid 32 + 34 = 66.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(66, level);
+        }
+    }
+
+    fn gpuIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        // Virtio slot N is GIC_SPI 32+N → intid 64 + N.
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.gpu_slot), level);
         }
     }
 

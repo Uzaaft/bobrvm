@@ -66,8 +66,16 @@ pub const Reg = enum(u12) {
     queue_driver_high = 0x094,
     queue_device_low = 0x0a0,
     queue_device_high = 0x0a4,
+    shm_sel = 0x0ac,
+    shm_len_low = 0x0b0,
+    shm_len_high = 0x0b4,
+    shm_base_low = 0x0b8,
+    shm_base_high = 0x0bc,
     config_generation = 0x0fc,
     config = 0x100,
+    // Non-exhaustive: guests may touch registers we don't model;
+    // reads return 0, writes are ignored.
+    _,
 };
 
 /// Queue configuration.
@@ -210,6 +218,9 @@ pub const Transport = struct {
                 (@as(u32, @intFromBool(self.status.device_needs_reset)) << 4) |
                 (@as(u32, @intFromBool(self.status.failed)) << 5),
             .config_generation => self.config_generation,
+            // No shared-memory regions: length reads must be all-ones
+            // (the spec's "region does not exist" marker).
+            .shm_len_low, .shm_len_high => 0xFFFF_FFFF,
             else => 0, // Write-only registers return 0
         };
     }

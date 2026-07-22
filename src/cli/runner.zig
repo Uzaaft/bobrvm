@@ -26,6 +26,9 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .disk_read_only = config.disk_read_only,
         .disk2_path = config.disk2_path,
         .disk2_read_only = config.disk2_read_only,
+        .enable_gpu = config.enable_gpu,
+        .display_width = config.display_width,
+        .display_height = config.display_height,
     };
 
     log.info("creating VM: {}MB RAM, {} vCPUs", .{
@@ -52,6 +55,15 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     defer unregisterMachineForCleanup();
 
     hw.setConsoleOutput(consoleOutput, null);
+
+    // Debug: dump scanout frames when BOBRVM_DUMP_FRAMES=<dir> is set.
+    if (config.enable_gpu) {
+        if (std.posix.getenv("BOBRVM_DUMP_FRAMES")) |dir| {
+            frame_dump_dir = dir;
+            frame_machine = hw;
+            hw.setFrameCallback(frameDump, null);
+        }
+    }
 
     // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
     // the guest. Ctrl-] detaches and shuts down, like telnet.
@@ -89,6 +101,30 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
 }
 
 var saved_termios: ?std.posix.termios = null;
+var frame_dump_dir: ?[]const u8 = null;
+var frame_machine: ?*machine.Machine = null;
+var frame_count: u32 = 0;
+
+/// Dump selected scanout frames as raw BGRA for debugging.
+fn frameDump(_: ?*anyopaque) void {
+    const dir = frame_dump_dir orelse return;
+    const hw = frame_machine orelse return;
+    const gpu = hw.gpu orelse return;
+    const scan = gpu.scanout() orelse return;
+
+    frame_count += 1;
+    // First frames and every 120th thereafter.
+    if (frame_count > 3 and frame_count % 120 != 0) return;
+
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/frame-{d}-{d}x{d}.bgra", .{
+        dir, frame_count, scan.width, scan.height,
+    }) catch return;
+    const file = std.fs.cwd().createFile(path, .{}) catch return;
+    defer file.close();
+    file.writeAll(scan.data) catch {};
+    log.info("dumped frame {} ({}x{})", .{ frame_count, scan.width, scan.height });
+}
 
 fn restoreTermios() void {
     if (saved_termios) |t| {

@@ -22,6 +22,9 @@ disk2_read_only: bool = true,
 kernel_path: ?[]const u8 = null,
 initrd_path: ?[]const u8 = null,
 cmdline: []const u8 = "console=hvc0 earlycon=pl011,0x09000000",
+enable_gpu: bool = false,
+display_width: u32 = 1280,
+display_height: u32 = 800,
 
 pub const ParseError = error{
     InvalidArgument,
@@ -92,6 +95,25 @@ pub fn parseArgs(args: *std.process.ArgIterator) (Allocator.Error || ParseError)
         } else if (std.mem.eql(u8, arg, "--cmdline")) {
             config.cmdline = args.next() orelse {
                 log.err("--cmdline requires a value", .{});
+                return ParseError.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "--gpu")) {
+            config.enable_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--display")) {
+            const val = args.next() orelse {
+                log.err("--display requires a value (e.g. 1280x800)", .{});
+                return ParseError.InvalidArgument;
+            };
+            const sep = std.mem.indexOfScalar(u8, val, 'x') orelse {
+                log.err("--display format is WIDTHxHEIGHT", .{});
+                return ParseError.InvalidArgument;
+            };
+            config.display_width = std.fmt.parseInt(u32, val[0..sep], 10) catch {
+                log.err("invalid display width", .{});
+                return ParseError.InvalidArgument;
+            };
+            config.display_height = std.fmt.parseInt(u32, val[sep + 1 ..], 10) catch {
+                log.err("invalid display height", .{});
                 return ParseError.InvalidArgument;
             };
         } else {

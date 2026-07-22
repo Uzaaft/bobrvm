@@ -1,32 +1,29 @@
-//! Virtio GPU Device.
+//! Virtio GPU Device (2D scanout).
 //!
-//! Implements virtio-gpu per virtio 1.2 spec section 5.7.
-//! Provides 2D framebuffer and 3D (virgl) acceleration.
+//! Implements virtio-gpu per virtio 1.2 spec section 5.7, processing
+//! descriptor chains directly from guest memory. 2D only for now: the
+//! guest DRM driver renders into resources backed by guest pages,
+//! transfers them to a host copy, and flushes; the host presents the
+//! scanout resource. 3D (virgl) arrives with the Metal backend.
 //!
 //! Queues:
 //!   0: controlq (commands and responses)
 //!   1: cursorq (cursor updates)
-//!
-//! Supports both 2D (simple framebuffer) and 3D (virgl/venus) modes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const mmio = @import("mmio.zig");
-const Queue = @import("queue.zig");
-const gpu_module = @import("../gpu/main.zig");
+const ring = @import("ring.zig");
+
+const log = std.log.scoped(.virtio_gpu);
 
 /// GPU feature bits.
 pub const Features = struct {
-    /// 3D (virgl) support.
     pub const VIRGL: u64 = 1 << 0;
-    /// EDID support.
     pub const EDID: u64 = 1 << 1;
-    /// Resource UUID support.
     pub const RESOURCE_UUID: u64 = 1 << 2;
-    /// Resource blob support.
     pub const RESOURCE_BLOB: u64 = 1 << 3;
-    /// Context init support.
     pub const CONTEXT_INIT: u64 = 1 << 4;
 };
 
@@ -45,18 +42,6 @@ pub const CmdType = enum(u32) {
     get_capset = 0x0109,
     get_edid = 0x010a,
 
-    // 3D commands
-    ctx_create = 0x0200,
-    ctx_destroy = 0x0201,
-    ctx_attach_resource = 0x0202,
-    ctx_detach_resource = 0x0203,
-    resource_create_3d = 0x0204,
-    transfer_to_host_3d = 0x0205,
-    transfer_from_host_3d = 0x0206,
-    submit_3d = 0x0207,
-    resource_map_blob = 0x0208,
-    resource_unmap_blob = 0x0209,
-
     // Cursor commands
     update_cursor = 0x0300,
     move_cursor = 0x0301,
@@ -67,8 +52,6 @@ pub const CmdType = enum(u32) {
     resp_ok_capset_info = 0x1102,
     resp_ok_capset = 0x1103,
     resp_ok_edid = 0x1104,
-    resp_ok_resource_uuid = 0x1105,
-    resp_ok_map_info = 0x1106,
 
     // Response types (error)
     resp_err_unspec = 0x1200,
@@ -91,12 +74,9 @@ pub const CtrlHeader = extern struct {
     _padding: [3]u8 = .{ 0, 0, 0 },
 };
 
-/// Display info (per scanout).
-pub const DisplayOne = extern struct {
-    r: Rect = .{},
-    enabled: u32 = 0,
-    flags: u32 = 0,
-};
+/// FLAG_FENCE: the driver requests a fence; the response must carry
+/// the fence_id back with FLAG_FENCE set.
+pub const FLAG_FENCE: u32 = 1 << 0;
 
 /// Rectangle.
 pub const Rect = extern struct {
@@ -106,7 +86,19 @@ pub const Rect = extern struct {
     height: u32 = 0,
 };
 
-/// Resource create 2D.
+/// Display info (per scanout).
+pub const DisplayOne = extern struct {
+    r: Rect = .{},
+    enabled: u32 = 0,
+    flags: u32 = 0,
+};
+
+/// Display info response.
+pub const DisplayInfoResp = extern struct {
+    header: CtrlHeader,
+    pmodes: [16]DisplayOne = [_]DisplayOne{.{}} ** 16,
+};
+
 pub const ResourceCreate2D = extern struct {
     header: CtrlHeader,
     resource_id: u32,
@@ -115,14 +107,12 @@ pub const ResourceCreate2D = extern struct {
     height: u32,
 };
 
-/// Resource unref.
 pub const ResourceUnref = extern struct {
     header: CtrlHeader,
     resource_id: u32,
     _padding: u32 = 0,
 };
 
-/// Set scanout.
 pub const SetScanout = extern struct {
     header: CtrlHeader,
     r: Rect,
@@ -130,7 +120,6 @@ pub const SetScanout = extern struct {
     resource_id: u32,
 };
 
-/// Resource flush.
 pub const ResourceFlush = extern struct {
     header: CtrlHeader,
     r: Rect,
@@ -138,7 +127,6 @@ pub const ResourceFlush = extern struct {
     _padding: u32 = 0,
 };
 
-/// Transfer to host 2D.
 pub const TransferToHost2D = extern struct {
     header: CtrlHeader,
     r: Rect,
@@ -154,41 +142,16 @@ pub const MemEntry = extern struct {
     _padding: u32 = 0,
 };
 
-/// Resource attach backing.
 pub const ResourceAttachBacking = extern struct {
     header: CtrlHeader,
     resource_id: u32,
     nr_entries: u32,
 };
 
-/// Context create.
-pub const CtxCreate = extern struct {
+pub const ResourceDetachBacking = extern struct {
     header: CtrlHeader,
-    nlen: u32,
-    context_init: u32,
-    debug_name: [64]u8 = .{0} ** 64,
-};
-
-/// Submit 3D.
-pub const Submit3D = extern struct {
-    header: CtrlHeader,
-    size: u32,
+    resource_id: u32,
     _padding: u32 = 0,
-};
-
-/// Capset info response.
-pub const CapsetInfoResp = extern struct {
-    header: CtrlHeader,
-    capset_id: u32,
-    capset_max_version: u32,
-    capset_max_size: u32,
-    _padding: u32 = 0,
-};
-
-/// Display info response.
-pub const DisplayInfoResp = extern struct {
-    header: CtrlHeader,
-    pmodes: [16]DisplayOne = .{.{}} ** 16,
 };
 
 /// GPU config space.
@@ -196,16 +159,25 @@ pub const Config = extern struct {
     events_read: u32 = 0,
     events_clear: u32 = 0,
     num_scanouts: u32 = 1,
-    num_capsets: u32 = 1, // virgl
+    num_capsets: u32 = 0,
 };
 
-/// 2D resource.
+/// A 2D resource: host pixel copy + guest backing pages.
 pub const Resource2D = struct {
     id: u32,
     format: u32,
     width: u32,
     height: u32,
-    backing: ?[]u8,
+    /// Host copy of the pixels (width * height * 4).
+    host_data: []u8,
+    /// Guest backing pages (scatter-gather).
+    entries: std.ArrayListUnmanaged(MemEntry),
+
+    pub const BYTES_PER_PIXEL: u32 = 4;
+
+    pub fn stride(self: *const Resource2D) u32 {
+        return self.width * BYTES_PER_PIXEL;
+    }
 };
 
 /// GPU device.
@@ -214,49 +186,38 @@ pub const Gpu = struct {
     transport: *mmio.Transport,
     config: Config,
 
-    /// Control queue.
-    control_queue: Queue.VirtQueue,
-    /// Cursor queue.
-    cursor_queue: Queue.VirtQueue,
+    /// Shadow avail-ring cursors for the two queues.
+    ctrl_last_avail: u16,
+    cursor_last_avail: u16,
 
     /// 2D resources.
     resources: std.AutoHashMap(u32, Resource2D),
 
-    /// 3D GPU device (virgl contexts).
-    gpu_device: gpu_module.GpuDevice,
-
     /// Current scanout.
     scanout_resource_id: u32,
-    scanout_rect: Rect,
 
     /// Display dimensions.
     display_width: u32,
     display_height: u32,
 
     /// Guest memory accessor.
-    guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
+    guest_memory: ?ring.GetMemFn,
 
-    /// Frame ready callback.
+    /// Frame ready callback (scanout resource was flushed).
     frame_callback: ?*const fn (userdata: ?*anyopaque) void,
     frame_userdata: ?*anyopaque,
 
-    /// Interrupt callback.
-    interrupt_callback: ?*const fn (userdata: ?*anyopaque) void,
-    interrupt_userdata: ?*anyopaque,
-
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
+    pub const MAX_RESOURCE_DIM: u32 = 8192;
+    pub const MAX_BACKING_ENTRIES: u32 = 16384;
 
     pub fn init(alloc: Allocator) Error!*Gpu {
-        const features = Features.VIRGL;
+        // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
+        const virtio_version_1: u64 = 1 << 32;
+        const features = virtio_version_1;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
         errdefer transport.deinit();
-
-        var control_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer control_queue.deinit();
-
-        var cursor_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer cursor_queue.deinit();
 
         const gpu = try alloc.create(Gpu);
         errdefer alloc.destroy(gpu);
@@ -265,19 +226,15 @@ pub const Gpu = struct {
             .alloc = alloc,
             .transport = transport,
             .config = .{},
-            .control_queue = control_queue,
-            .cursor_queue = cursor_queue,
+            .ctrl_last_avail = 0,
+            .cursor_last_avail = 0,
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
-            .gpu_device = gpu_module.GpuDevice.init(alloc),
             .scanout_resource_id = 0,
-            .scanout_rect = .{},
-            .display_width = 1920,
-            .display_height = 1080,
+            .display_width = 1280,
+            .display_height = 800,
             .guest_memory = null,
             .frame_callback = null,
             .frame_userdata = null,
-            .interrupt_callback = null,
-            .interrupt_userdata = null,
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -290,27 +247,24 @@ pub const Gpu = struct {
     pub fn deinit(self: *Gpu) void {
         var iter = self.resources.valueIterator();
         while (iter.next()) |res| {
-            if (res.backing) |b| self.alloc.free(b);
+            self.alloc.free(res.host_data);
+            res.entries.deinit(self.alloc);
         }
         self.resources.deinit();
-        self.gpu_device.deinit();
-        self.cursor_queue.deinit();
-        self.control_queue.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
     }
 
-    /// Set display dimensions.
+    /// Set display dimensions (before guest probes).
     pub fn setDisplaySize(self: *Gpu, width: u32, height: u32) void {
+        assert(width > 0 and height > 0);
+        assert(width <= MAX_RESOURCE_DIM and height <= MAX_RESOURCE_DIM);
         self.display_width = width;
         self.display_height = height;
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(
-        self: *Gpu,
-        accessor: *const fn (u64, usize) ?[]u8,
-    ) void {
+    pub fn setGuestMemory(self: *Gpu, accessor: ring.GetMemFn) void {
         self.guest_memory = accessor;
     }
 
@@ -324,14 +278,11 @@ pub const Gpu = struct {
         self.frame_userdata = userdata;
     }
 
-    /// Set interrupt callback.
-    pub fn setInterruptCallback(
-        self: *Gpu,
-        callback: *const fn (?*anyopaque) void,
-        userdata: ?*anyopaque,
-    ) void {
-        self.interrupt_callback = callback;
-        self.interrupt_userdata = userdata;
+    /// Current scanout pixels (BGRA/XRGB 4 bytes per pixel), or null.
+    pub fn scanout(self: *Gpu) ?struct { data: []const u8, width: u32, height: u32 } {
+        if (self.scanout_resource_id == 0) return null;
+        const res = self.resources.get(self.scanout_resource_id) orelse return null;
+        return .{ .data = res.host_data, .width = res.width, .height = res.height };
     }
 
     // =========================================================================
@@ -370,9 +321,17 @@ pub const Gpu = struct {
 
     fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
         const self: *Gpu = @ptrCast(@alignCast(userdata));
-        if (queue_idx == 0) {
-            self.processControlQueue();
+        switch (queue_idx) {
+            0 => self.processControlQueue(),
+            1 => self.processCursorQueue(),
+            else => {},
         }
+    }
+
+    /// Poll both queues. Called from the vCPU loop.
+    pub fn poll(self: *Gpu) void {
+        self.processControlQueue();
+        self.processCursorQueue();
     }
 
     // =========================================================================
@@ -380,230 +339,315 @@ pub const Gpu = struct {
     // =========================================================================
 
     fn processControlQueue(self: *Gpu) void {
-        const queue = &self.control_queue;
+        const qc = self.transport.queues[0];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
 
-        while (queue.pop()) |head| {
-            self.processCommand(head);
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var processed: u32 = 0;
+
+        while (self.ctrl_last_avail != avail_idx) : (processed += 1) {
+            const head = ring.availEntry(qc, self.ctrl_last_avail, get_mem) orelse break;
+            const written = self.processCommand(qc, head, get_mem);
+            ring.pushUsed(qc, head, written, get_mem);
+            self.ctrl_last_avail +%= 1;
         }
 
-        if (self.interrupt_callback) |cb| {
-            cb(self.interrupt_userdata);
+        if (processed > 0) {
+            self.transport.signalUsedBuffer();
         }
     }
 
-    fn processCommand(self: *Gpu, head: u16) void {
-        const queue = &self.control_queue;
-        const desc = &queue.desc[head];
+    fn processCursorQueue(self: *Gpu) void {
+        const qc = self.transport.queues[1];
+        if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
 
-        if (desc.len < @sizeOf(CtrlHeader)) return;
-        const header_mem = get_mem(desc.addr, @sizeOf(CtrlHeader)) orelse return;
-        const header = std.mem.bytesToValue(CtrlHeader, header_mem[0..@sizeOf(CtrlHeader)]);
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var processed: u32 = 0;
 
+        // Cursor commands have no response; just consume them.
+        while (self.cursor_last_avail != avail_idx) : (processed += 1) {
+            const head = ring.availEntry(qc, self.cursor_last_avail, get_mem) orelse break;
+            ring.pushUsed(qc, head, 0, get_mem);
+            self.cursor_last_avail +%= 1;
+        }
+
+        if (processed > 0) {
+            self.transport.signalUsedBuffer();
+        }
+    }
+
+    /// Execute one command chain; returns bytes written to the response.
+    fn processCommand(self: *Gpu, qc: mmio.QueueConfig, head: u16, get_mem: ring.GetMemFn) u32 {
+        const chain = ring.Chain.collect(qc, head, get_mem);
+        const req = chain.request(get_mem) orelse return 0;
+        const resp = chain.response(get_mem) orelse return 0;
+        if (req.len < @sizeOf(CtrlHeader) or resp.len < @sizeOf(CtrlHeader)) return 0;
+
+        const header = std.mem.bytesToValue(CtrlHeader, req[0..@sizeOf(CtrlHeader)]);
         const cmd_type: CmdType = @enumFromInt(header.type);
+
         var resp_type: CmdType = .resp_ok_nodata;
+        var resp_len: u32 = @sizeOf(CtrlHeader);
 
         switch (cmd_type) {
             .get_display_info => {
-                resp_type = self.cmdGetDisplayInfo(head, desc);
+                resp_type = self.cmdGetDisplayInfo(resp, &resp_len);
             },
             .resource_create_2d => {
-                self.cmdResourceCreate2D(desc, get_mem) catch {
-                    resp_type = .resp_err_out_of_memory;
-                };
+                resp_type = self.cmdResourceCreate2D(req);
             },
             .resource_unref => {
-                self.cmdResourceUnref(desc, get_mem);
+                resp_type = self.cmdResourceUnref(req);
             },
             .set_scanout => {
-                self.cmdSetScanout(desc, get_mem);
+                resp_type = self.cmdSetScanout(req);
             },
             .resource_flush => {
-                self.cmdResourceFlush(desc, get_mem);
+                resp_type = self.cmdResourceFlush(req);
             },
             .transfer_to_host_2d => {
-                self.cmdTransferToHost2D(desc, get_mem);
+                resp_type = self.cmdTransferToHost2D(req, get_mem);
             },
             .resource_attach_backing => {
-                self.cmdResourceAttachBacking(desc, get_mem) catch {
-                    resp_type = .resp_err_out_of_memory;
-                };
+                resp_type = self.cmdResourceAttachBacking(req, &chain, get_mem);
             },
-            .get_capset_info => {
-                resp_type = self.cmdGetCapsetInfo(head, desc, header);
-            },
-            .ctx_create => {
-                self.gpu_device.processCommand(.ctx_create, &.{}) catch {};
-            },
-            .ctx_destroy => {
-                const data_mem = get_mem(desc.addr, desc.len) orelse return;
-                self.gpu_device.processCommand(.ctx_destroy, data_mem[@sizeOf(CtrlHeader)..]) catch {};
-            },
-            .submit_3d => {
-                self.cmdSubmit3D(desc, get_mem, header) catch {};
+            .resource_detach_backing => {
+                resp_type = self.cmdResourceDetachBacking(req);
             },
             else => {
+                log.warn("unhandled GPU command: 0x{x}", .{header.type});
                 resp_type = .resp_err_unspec;
             },
         }
 
-        // Write response
-        self.writeResponse(head, resp_type);
+        // Write the response header (payload responses already wrote
+        // theirs and set resp_len).
+        var resp_header = CtrlHeader{ .type = @intFromEnum(resp_type) };
+        if ((header.flags & FLAG_FENCE) != 0) {
+            resp_header.flags = FLAG_FENCE;
+            resp_header.fence_id = header.fence_id;
+        }
+        @memcpy(resp[0..@sizeOf(CtrlHeader)], std.mem.asBytes(&resp_header));
+
+        return @min(resp_len, @as(u32, @intCast(resp.len)));
     }
 
-    fn cmdGetDisplayInfo(self: *Gpu, head: u16, desc: *const Queue.Desc) CmdType {
-        _ = head;
-        _ = desc;
+    fn cmdGetDisplayInfo(self: *Gpu, resp: []u8, resp_len: *u32) CmdType {
+        if (resp.len < @sizeOf(DisplayInfoResp)) return .resp_err_unspec;
 
-        // Response is written in next descriptor
-        // For now, just return success
-        _ = self;
+        var info = DisplayInfoResp{
+            .header = .{ .type = @intFromEnum(CmdType.resp_ok_display_info) },
+        };
+        info.pmodes[0] = .{
+            .r = .{ .width = self.display_width, .height = self.display_height },
+            .enabled = 1,
+        };
+        @memcpy(resp[0..@sizeOf(DisplayInfoResp)], std.mem.asBytes(&info));
+        resp_len.* = @sizeOf(DisplayInfoResp);
         return .resp_ok_display_info;
     }
 
-    fn cmdResourceCreate2D(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype) !void {
-        if (desc.len < @sizeOf(ResourceCreate2D)) return;
-        const mem = get_mem(desc.addr, @sizeOf(ResourceCreate2D)) orelse return;
-        const cmd = std.mem.bytesToValue(ResourceCreate2D, mem[0..@sizeOf(ResourceCreate2D)]);
+    fn cmdResourceCreate2D(self: *Gpu, req: []const u8) CmdType {
+        if (req.len < @sizeOf(ResourceCreate2D)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(ResourceCreate2D, req[0..@sizeOf(ResourceCreate2D)]);
 
-        try self.resources.put(cmd.resource_id, .{
+        if (cmd.resource_id == 0) return .resp_err_invalid_resource_id;
+        if (cmd.width == 0 or cmd.height == 0) return .resp_err_invalid_parameter;
+        if (cmd.width > MAX_RESOURCE_DIM or cmd.height > MAX_RESOURCE_DIM) {
+            return .resp_err_invalid_parameter;
+        }
+
+        const size = @as(usize, cmd.width) * cmd.height * Resource2D.BYTES_PER_PIXEL;
+        const host_data = self.alloc.alloc(u8, size) catch return .resp_err_out_of_memory;
+        @memset(host_data, 0);
+
+        // Replace any existing resource with this id.
+        if (self.resources.fetchRemove(cmd.resource_id)) |old| {
+            self.alloc.free(old.value.host_data);
+            var entries = old.value.entries;
+            entries.deinit(self.alloc);
+        }
+
+        self.resources.put(cmd.resource_id, .{
             .id = cmd.resource_id,
             .format = cmd.format,
             .width = cmd.width,
             .height = cmd.height,
-            .backing = null,
-        });
+            .host_data = host_data,
+            .entries = .{},
+        }) catch {
+            self.alloc.free(host_data);
+            return .resp_err_out_of_memory;
+        };
+
+        return .resp_ok_nodata;
     }
 
-    fn cmdResourceUnref(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype) void {
-        if (desc.len < @sizeOf(ResourceUnref)) return;
-        const mem = get_mem(desc.addr, @sizeOf(ResourceUnref)) orelse return;
-        const cmd = std.mem.bytesToValue(ResourceUnref, mem[0..@sizeOf(ResourceUnref)]);
+    fn cmdResourceUnref(self: *Gpu, req: []const u8) CmdType {
+        if (req.len < @sizeOf(ResourceUnref)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(ResourceUnref, req[0..@sizeOf(ResourceUnref)]);
 
         if (self.resources.fetchRemove(cmd.resource_id)) |entry| {
-            if (entry.value.backing) |b| self.alloc.free(b);
+            self.alloc.free(entry.value.host_data);
+            var entries = entry.value.entries;
+            entries.deinit(self.alloc);
+            if (self.scanout_resource_id == cmd.resource_id) {
+                self.scanout_resource_id = 0;
+            }
+            return .resp_ok_nodata;
         }
+        return .resp_err_invalid_resource_id;
     }
 
-    fn cmdSetScanout(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype) void {
-        if (desc.len < @sizeOf(SetScanout)) return;
-        const mem = get_mem(desc.addr, @sizeOf(SetScanout)) orelse return;
-        const cmd = std.mem.bytesToValue(SetScanout, mem[0..@sizeOf(SetScanout)]);
+    fn cmdSetScanout(self: *Gpu, req: []const u8) CmdType {
+        if (req.len < @sizeOf(SetScanout)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(SetScanout, req[0..@sizeOf(SetScanout)]);
 
+        if (cmd.scanout_id != 0) return .resp_err_invalid_scanout_id;
+        // resource_id 0 disables the scanout.
+        if (cmd.resource_id != 0 and !self.resources.contains(cmd.resource_id)) {
+            return .resp_err_invalid_resource_id;
+        }
         self.scanout_resource_id = cmd.resource_id;
-        self.scanout_rect = cmd.r;
+        return .resp_ok_nodata;
     }
 
-    fn cmdResourceFlush(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype) void {
-        if (desc.len < @sizeOf(ResourceFlush)) return;
-        const mem = get_mem(desc.addr, @sizeOf(ResourceFlush)) orelse return;
-        const cmd = std.mem.bytesToValue(ResourceFlush, mem[0..@sizeOf(ResourceFlush)]);
+    fn cmdResourceFlush(self: *Gpu, req: []const u8) CmdType {
+        if (req.len < @sizeOf(ResourceFlush)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(ResourceFlush, req[0..@sizeOf(ResourceFlush)]);
 
-        // If flushing the scanout resource, signal frame ready
-        if (cmd.resource_id == self.scanout_resource_id) {
+        if (cmd.resource_id == self.scanout_resource_id and self.scanout_resource_id != 0) {
             if (self.frame_callback) |cb| {
                 cb(self.frame_userdata);
             }
         }
+        return .resp_ok_nodata;
     }
 
-    fn cmdTransferToHost2D(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype) void {
-        if (desc.len < @sizeOf(TransferToHost2D)) return;
-        const mem = get_mem(desc.addr, @sizeOf(TransferToHost2D)) orelse return;
-        const cmd = std.mem.bytesToValue(TransferToHost2D, mem[0..@sizeOf(TransferToHost2D)]);
+    fn cmdTransferToHost2D(self: *Gpu, req: []const u8, get_mem: ring.GetMemFn) CmdType {
+        if (req.len < @sizeOf(TransferToHost2D)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(TransferToHost2D, req[0..@sizeOf(TransferToHost2D)]);
 
-        // Get the resource backing and copy pixel data
-        const res = self.resources.getPtr(cmd.resource_id) orelse return;
-        _ = res;
-        // TODO: Implement actual transfer from guest memory to backing
+        const res = self.resources.getPtr(cmd.resource_id) orelse
+            return .resp_err_invalid_resource_id;
+        if (res.entries.items.len == 0) return .resp_err_unspec;
+
+        const r = cmd.r;
+        if (r.x + r.width > res.width or r.y + r.height > res.height) {
+            return .resp_err_invalid_parameter;
+        }
+
+        // Guest backing uses the resource's linear layout: copy the
+        // rect row by row from the scattered guest pages.
+        const stride = res.stride();
+        const row_bytes = @as(usize, r.width) * Resource2D.BYTES_PER_PIXEL;
+        var row: u32 = 0;
+        while (row < r.height) : (row += 1) {
+            const line_off = @as(u64, r.y + row) * stride + @as(u64, r.x) * Resource2D.BYTES_PER_PIXEL;
+            // Per spec the source offset is cmd.offset plus the rect's
+            // position within the resource for the transferred region.
+            const src_off = cmd.offset + @as(u64, row) * stride;
+            const dst = res.host_data[@intCast(line_off)..][0..row_bytes];
+            if (!copyFromBacking(res.entries.items, src_off, dst, get_mem)) {
+                return .resp_err_unspec;
+            }
+        }
+
+        return .resp_ok_nodata;
     }
 
-    fn cmdResourceAttachBacking(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype) !void {
-        if (desc.len < @sizeOf(ResourceAttachBacking)) return;
-        const mem = get_mem(desc.addr, desc.len) orelse return;
-        const cmd = std.mem.bytesToValue(ResourceAttachBacking, mem[0..@sizeOf(ResourceAttachBacking)]);
+    /// Copy `dst.len` bytes starting at linear `offset` out of the
+    /// scattered guest backing into `dst`.
+    fn copyFromBacking(
+        entries: []const MemEntry,
+        offset: u64,
+        dst: []u8,
+        get_mem: ring.GetMemFn,
+    ) bool {
+        var remaining = dst;
+        var skip = offset;
+        for (entries) |entry| {
+            if (remaining.len == 0) return true;
+            if (skip >= entry.length) {
+                skip -= entry.length;
+                continue;
+            }
+            const avail = entry.length - @as(u32, @intCast(skip));
+            const n: usize = @min(remaining.len, avail);
+            const src = get_mem(entry.addr + skip, n) orelse return false;
+            @memcpy(remaining[0..n], src[0..n]);
+            remaining = remaining[n..];
+            skip = 0;
+        }
+        return remaining.len == 0;
+    }
 
-        const res = self.resources.getPtr(cmd.resource_id) orelse return;
+    fn cmdResourceAttachBacking(
+        self: *Gpu,
+        req: []const u8,
+        chain: *const ring.Chain,
+        get_mem: ring.GetMemFn,
+    ) CmdType {
+        if (req.len < @sizeOf(ResourceAttachBacking)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(
+            ResourceAttachBacking,
+            req[0..@sizeOf(ResourceAttachBacking)],
+        );
 
-        // Calculate total size from entries
-        var total_size: usize = 0;
-        const entries_start = @sizeOf(ResourceAttachBacking);
+        const res = self.resources.getPtr(cmd.resource_id) orelse
+            return .resp_err_invalid_resource_id;
+        if (cmd.nr_entries == 0 or cmd.nr_entries > MAX_BACKING_ENTRIES) {
+            return .resp_err_invalid_parameter;
+        }
+
+        // The entry array either follows the command in the same buffer
+        // or arrives as a second device-readable descriptor (Linux).
+        const entries_bytes = @as(usize, cmd.nr_entries) * @sizeOf(MemEntry);
+        const inline_entries = req[@sizeOf(ResourceAttachBacking)..];
+        const entries_mem: []const u8 = if (inline_entries.len >= entries_bytes)
+            inline_entries
+        else blk: {
+            var readable_idx: u32 = 0;
+            for (chain.slice()) |d| {
+                if (d.isWrite()) continue;
+                readable_idx += 1;
+                if (readable_idx == 2) {
+                    const mem = get_mem(d.addr, d.len) orelse
+                        return .resp_err_invalid_parameter;
+                    break :blk mem;
+                }
+            }
+            return .resp_err_invalid_parameter;
+        };
+        if (entries_mem.len < entries_bytes) return .resp_err_invalid_parameter;
+
+        res.entries.clearRetainingCapacity();
+        res.entries.ensureTotalCapacity(self.alloc, cmd.nr_entries) catch
+            return .resp_err_out_of_memory;
+
         var i: u32 = 0;
-        while (i < cmd.nr_entries and entries_start + (i + 1) * @sizeOf(MemEntry) <= desc.len) : (i += 1) {
-            const entry_offset = entries_start + i * @sizeOf(MemEntry);
-            const entry = std.mem.bytesToValue(MemEntry, mem[entry_offset..][0..@sizeOf(MemEntry)]);
-            total_size += entry.length;
+        while (i < cmd.nr_entries) : (i += 1) {
+            const off = i * @sizeOf(MemEntry);
+            const entry = std.mem.bytesToValue(MemEntry, entries_mem[off..][0..@sizeOf(MemEntry)]);
+            res.entries.appendAssumeCapacity(entry);
         }
 
-        // Allocate backing store
-        if (total_size > 0) {
-            if (res.backing) |old| self.alloc.free(old);
-            res.backing = try self.alloc.alloc(u8, total_size);
-        }
+        return .resp_ok_nodata;
     }
 
-    fn cmdGetCapsetInfo(self: *Gpu, head: u16, desc: *const Queue.Desc, header: CtrlHeader) CmdType {
-        _ = head;
-        _ = desc;
-        _ = header;
-        _ = self;
-        // Return virgl capset info
-        return .resp_ok_capset_info;
-    }
+    fn cmdResourceDetachBacking(self: *Gpu, req: []const u8) CmdType {
+        if (req.len < @sizeOf(ResourceDetachBacking)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(
+            ResourceDetachBacking,
+            req[0..@sizeOf(ResourceDetachBacking)],
+        );
 
-    fn cmdSubmit3D(self: *Gpu, desc: *const Queue.Desc, get_mem: anytype, header: CtrlHeader) !void {
-        if (desc.len < @sizeOf(Submit3D)) return;
-        const mem = get_mem(desc.addr, desc.len) orelse return;
-
-        const cmd_data = mem[@sizeOf(Submit3D)..];
-        var data_with_ctx: [8 + 4096]u8 = undefined;
-
-        // Prepend ctx_id
-        std.mem.writeInt(u32, data_with_ctx[0..4], header.ctx_id, .little);
-        const copy_len = @min(cmd_data.len, data_with_ctx.len - 8);
-        @memcpy(data_with_ctx[8..][0..copy_len], cmd_data[0..copy_len]);
-
-        try self.gpu_device.processCommand(.submit_3d, data_with_ctx[0 .. 8 + copy_len]);
-    }
-
-    fn writeResponse(self: *Gpu, head: u16, resp_type: CmdType) void {
-        // Find response descriptor (next in chain)
-        const queue = &self.control_queue;
-        const desc = &queue.desc[head];
-
-        if (!desc.flags.next) {
-            queue.pushUsed(head, @sizeOf(CtrlHeader));
-            return;
-        }
-
-        const resp_idx = desc.next;
-        const resp_desc = &queue.desc[resp_idx];
-
-        if (resp_desc.flags.write and resp_desc.len >= @sizeOf(CtrlHeader)) {
-            const get_mem = self.guest_memory orelse {
-                queue.pushUsed(head, 0);
-                return;
-            };
-            const mem = get_mem(resp_desc.addr, @sizeOf(CtrlHeader)) orelse {
-                queue.pushUsed(head, 0);
-                return;
-            };
-
-            const resp = CtrlHeader{
-                .type = @intFromEnum(resp_type),
-            };
-            @memcpy(mem[0..@sizeOf(CtrlHeader)], std.mem.asBytes(&resp));
-        }
-
-        queue.pushUsed(head, @sizeOf(CtrlHeader));
-        self.transport.signalUsedBuffer();
-    }
-
-    /// Get current framebuffer data (for rendering).
-    pub fn getFramebuffer(self: *Gpu) ?[]const u8 {
-        if (self.scanout_resource_id == 0) return null;
-        const res = self.resources.get(self.scanout_resource_id) orelse return null;
-        return res.backing;
+        const res = self.resources.getPtr(cmd.resource_id) orelse
+            return .resp_err_invalid_resource_id;
+        res.entries.clearAndFree(self.alloc);
+        return .resp_ok_nodata;
     }
 
     pub fn mmioSize() usize {
@@ -615,29 +659,69 @@ pub const Gpu = struct {
 // Tests
 // =============================================================================
 
+const testing = std.testing;
+
 test "Gpu init" {
-    const gpu = try Gpu.init(std.testing.allocator);
+    const gpu = try Gpu.init(testing.allocator);
     defer gpu.deinit();
 
     const magic = gpu.read(@intFromEnum(mmio.Reg.magic));
-    try std.testing.expectEqual(mmio.MAGIC, magic);
+    try testing.expectEqual(mmio.MAGIC, magic);
 
     const device_id = gpu.read(@intFromEnum(mmio.Reg.device_id));
-    try std.testing.expectEqual(@as(u32, 16), device_id);
+    try testing.expectEqual(@as(u32, 16), device_id);
 }
 
 test "Gpu config read" {
-    const gpu = try Gpu.init(std.testing.allocator);
+    const gpu = try Gpu.init(testing.allocator);
     defer gpu.deinit();
 
     const num_scanouts = gpu.read(@intFromEnum(mmio.Reg.config) + 8);
-    try std.testing.expectEqual(@as(u32, 1), num_scanouts);
+    try testing.expectEqual(@as(u32, 1), num_scanouts);
 }
 
 test "CtrlHeader size" {
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(CtrlHeader));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(CtrlHeader));
 }
 
 test "ResourceCreate2D size" {
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(ResourceCreate2D));
+    try testing.expectEqual(@as(usize, 40), @sizeOf(ResourceCreate2D));
+}
+
+test "Gpu resource lifecycle via direct command calls" {
+    const gpu = try Gpu.init(testing.allocator);
+    defer gpu.deinit();
+
+    // Create a 4x2 resource
+    const create = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 1,
+        .format = 2, // XRGB8888
+        .width = 4,
+        .height = 2,
+    };
+    var resp = gpu.cmdResourceCreate2D(std.mem.asBytes(&create));
+    try testing.expectEqual(CmdType.resp_ok_nodata, resp);
+    try testing.expect(gpu.resources.contains(1));
+    try testing.expectEqual(@as(usize, 32), gpu.resources.get(1).?.host_data.len);
+
+    // Scanout it
+    const scan = SetScanout{
+        .header = .{ .type = @intFromEnum(CmdType.set_scanout) },
+        .r = .{ .width = 4, .height = 2 },
+        .scanout_id = 0,
+        .resource_id = 1,
+    };
+    resp = gpu.cmdSetScanout(std.mem.asBytes(&scan));
+    try testing.expectEqual(CmdType.resp_ok_nodata, resp);
+    try testing.expect(gpu.scanout() != null);
+
+    // Unref clears scanout
+    const unref = ResourceUnref{
+        .header = .{ .type = @intFromEnum(CmdType.resource_unref) },
+        .resource_id = 1,
+    };
+    resp = gpu.cmdResourceUnref(std.mem.asBytes(&unref));
+    try testing.expectEqual(CmdType.resp_ok_nodata, resp);
+    try testing.expect(gpu.scanout() == null);
 }
