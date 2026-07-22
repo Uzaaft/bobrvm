@@ -70,6 +70,18 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             const t = std.Thread.spawn(.{}, testKeyLoop, .{hw}) catch null;
             if (t) |thread| thread.detach();
         }
+
+        // Debug: type BOBRVM_TEST_TYPE on the virtio keyboard after
+        // BOBRVM_TEST_TYPE_DELAY seconds (default 120), for verifying
+        // the GUI shell path (VT keyboard -> tty1 getty) headlessly.
+        if (std.posix.getenv("BOBRVM_TEST_TYPE")) |text| {
+            const delay_s: u64 = if (std.posix.getenv("BOBRVM_TEST_TYPE_DELAY")) |d|
+                std.fmt.parseInt(u64, d, 10) catch 120
+            else
+                120;
+            const t = std.Thread.spawn(.{}, testTypeLoop, .{ hw, text, delay_s }) catch null;
+            if (t) |thread| thread.detach();
+        }
     }
 
     // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
@@ -121,6 +133,71 @@ fn testKeyLoop(hw: *machine.Machine) void {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         hw.injectKey(30, false);
         std.Thread.sleep(1 * std.time.ns_per_s);
+    }
+}
+
+/// Map an ASCII character to an evdev keycode (unshifted keys only).
+fn asciiToEvdev(char: u8) u16 {
+    return switch (char) {
+        'a' => 30,
+        'b' => 48,
+        'c' => 46,
+        'd' => 32,
+        'e' => 18,
+        'f' => 33,
+        'g' => 34,
+        'h' => 35,
+        'i' => 23,
+        'j' => 36,
+        'k' => 37,
+        'l' => 38,
+        'm' => 50,
+        'n' => 49,
+        'o' => 24,
+        'p' => 25,
+        'q' => 16,
+        'r' => 19,
+        's' => 31,
+        't' => 20,
+        'u' => 22,
+        'v' => 47,
+        'w' => 17,
+        'x' => 45,
+        'y' => 21,
+        'z' => 44,
+        '1' => 2,
+        '2' => 3,
+        '3' => 4,
+        '4' => 5,
+        '5' => 6,
+        '6' => 7,
+        '7' => 8,
+        '8' => 9,
+        '9' => 10,
+        '0' => 11,
+        ' ' => 57,
+        '\n' => 28,
+        '-' => 12,
+        '=' => 13,
+        '/' => 53,
+        '.' => 52,
+        ',' => 51,
+        ';' => 39,
+        else => 0,
+    };
+}
+
+/// Type a string on the virtio keyboard (BOBRVM_TEST_TYPE debug hook).
+fn testTypeLoop(hw: *machine.Machine, text: []const u8, delay_s: u64) void {
+    std.Thread.sleep(delay_s * std.time.ns_per_s);
+    log.info("typing test string on virtio keyboard", .{});
+    for (text) |char| {
+        const code = asciiToEvdev(char);
+        if (code == 0) continue;
+        hw.injectKey(code, true);
+        std.Thread.sleep(40 * std.time.ns_per_ms);
+        hw.injectKey(code, false);
+        std.Thread.sleep(80 * std.time.ns_per_ms);
     }
 }
 
