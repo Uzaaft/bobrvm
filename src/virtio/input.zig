@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const mmio = @import("mmio.zig");
 const Queue = @import("queue.zig");
+const ring = @import("ring.zig");
 
 /// Input device subtype.
 pub const Subtype = enum(u8) {
@@ -203,8 +204,14 @@ pub const Input = struct {
     /// Status queue (guest → host, for LEDs).
     status_queue: Queue.VirtQueue,
 
-    /// Pending events to deliver.
+    /// Pending events to deliver. Guarded by events_mutex: the host
+    /// UI thread appends, the vCPU thread drains via pollEvents.
     pending_events: std.ArrayListUnmanaged(InputEvent),
+    events_mutex: std.Thread.Mutex,
+
+    /// Shadow avail-ring cursors.
+    event_last_avail: u16,
+    status_last_avail: u16,
 
     /// Device name.
     name: []const u8,
@@ -226,7 +233,9 @@ pub const Input = struct {
     pub const QUEUE_SIZE: u16 = 64;
 
     pub fn init(alloc: Allocator, subtype: Subtype) Error!*Input {
-        const transport = try mmio.Transport.init(alloc, 18, 0, 2); // 18 = input device ID
+        // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
+        const virtio_version_1: u64 = 1 << 32;
+        const transport = try mmio.Transport.init(alloc, 18, virtio_version_1, 2); // 18 = input device ID
         errdefer transport.deinit();
 
         var event_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
@@ -244,6 +253,9 @@ pub const Input = struct {
             .event_queue = event_queue,
             .status_queue = status_queue,
             .pending_events = .{},
+            .events_mutex = .{},
+            .event_last_avail = 0,
+            .status_last_avail = 0,
             .name = switch (subtype) {
                 .keyboard => "bobrvm-keyboard",
                 .mouse => "bobrvm-mouse",
@@ -374,7 +386,13 @@ pub const Input = struct {
         }
     }
 
+    pub const PENDING_EVENTS_MAX: usize = 1024;
+
     fn queueEvent(self: *Input, event: InputEvent) !void {
+        self.events_mutex.lock();
+        defer self.events_mutex.unlock();
+        // Bound the queue so a wedged guest can't grow it forever.
+        if (self.pending_events.items.len >= PENDING_EVENTS_MAX) return;
         try self.pending_events.append(self.alloc, event);
     }
 
@@ -384,7 +402,6 @@ pub const Input = struct {
             .code = 0,
             .value = 0,
         });
-        self.deliverEvents();
     }
 
     // =========================================================================
@@ -469,24 +486,53 @@ pub const Input = struct {
         }
     }
 
+    /// Fill config.data with the code bitmap for the queried event type
+    /// (select=EV_BITS, subsel=<EV_*>); returns the bitmap size in bytes.
+    /// A size of 0 means the event type is unsupported.
     fn getEvBits(self: *Input) u8 {
+        const subsel: EventType = @enumFromInt(self.config.subsel);
         switch (self.subtype) {
-            .keyboard => {
-                // EV_KEY
-                self.config.data[0] = 1 << @intFromEnum(EventType.key);
-                return 1;
+            .keyboard => switch (subsel) {
+                .key => {
+                    // Keys 1..127 (standard keyboard range incl. modifiers)
+                    var code: u16 = 1;
+                    while (code < 128) : (code += 1) {
+                        self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
+                    }
+                    return 16;
+                },
+                .rep => return 1, // autorepeat handled by the guest
+                else => return 0,
             },
-            .mouse => {
-                // EV_KEY | EV_REL
-                self.config.data[0] = (1 << @intFromEnum(EventType.key)) |
-                    (1 << @intFromEnum(EventType.rel));
-                return 1;
+            .mouse => switch (subsel) {
+                .key => {
+                    // BTN_LEFT (0x110), BTN_RIGHT (0x111), BTN_MIDDLE (0x112)
+                    inline for ([_]u16{ 0x110, 0x111, 0x112 }) |code| {
+                        self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
+                    }
+                    return 0x113 / 8 + 1;
+                },
+                .rel => {
+                    // REL_X, REL_Y, REL_HWHEEL, REL_WHEEL
+                    inline for ([_]u16{ 0x00, 0x01, 0x06, 0x08 }) |code| {
+                        self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
+                    }
+                    return 2;
+                },
+                else => return 0,
             },
-            .tablet => {
-                // EV_KEY | EV_ABS
-                self.config.data[0] = (1 << @intFromEnum(EventType.key)) |
-                    (1 << @intFromEnum(EventType.abs));
-                return 1;
+            .tablet => switch (subsel) {
+                .key => {
+                    const code: u16 = 0x110; // BTN_LEFT
+                    self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
+                    return 0x110 / 8 + 1;
+                },
+                .abs => {
+                    // ABS_X, ABS_Y
+                    self.config.data[0] = 0x3;
+                    return 1;
+                },
+                else => return 0,
             },
         }
     }
@@ -497,36 +543,76 @@ pub const Input = struct {
 
     fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
         const self: *Input = @ptrCast(@alignCast(userdata));
-        if (queue_idx == 0) {
-            // Guest made buffers available - deliver pending events
-            self.deliverEvents();
+        switch (queue_idx) {
+            0 => self.deliverEvents(),
+            1 => self.processStatusQueue(),
+            else => {},
         }
     }
 
+    /// Poll for deliverable events. Called from the vCPU loop so all
+    /// guest-memory access stays on one thread.
+    pub fn pollEvents(self: *Input) void {
+        self.deliverEvents();
+        self.processStatusQueue();
+    }
+
     fn deliverEvents(self: *Input) void {
-        const queue = &self.event_queue;
+        const qc = self.transport.queues[0];
+        if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
 
-        while (self.pending_events.items.len > 0) {
-            const head = queue.pop() orelse break;
-            const desc = &queue.desc[head];
+        self.events_mutex.lock();
+        defer self.events_mutex.unlock();
+        if (self.pending_events.items.len == 0) return;
 
-            if (desc.flags.write and desc.len >= @sizeOf(InputEvent)) {
-                const event = self.pending_events.orderedRemove(0);
-                const mem = get_mem(desc.addr, @sizeOf(InputEvent)) orelse continue;
-                const event_bytes = std.mem.asBytes(&event);
-                @memcpy(mem[0..@sizeOf(InputEvent)], event_bytes);
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var last_avail = self.event_last_avail;
+        var delivered: usize = 0;
 
-                queue.pushUsed(head, @sizeOf(InputEvent));
+        while (last_avail != avail_idx and delivered < self.pending_events.items.len) {
+            const head = ring.availEntry(qc, last_avail, get_mem) orelse break;
+            const desc = ring.readDesc(qc, head, get_mem) orelse break;
+            if (!desc.isWrite() or desc.len < @sizeOf(InputEvent)) {
+                // Unusable buffer: consume it with zero length.
+                ring.pushUsed(qc, head, 0, get_mem);
+                last_avail +%= 1;
+                continue;
             }
+
+            const mem = get_mem(desc.addr, @sizeOf(InputEvent)) orelse break;
+            const event = self.pending_events.items[delivered];
+            @memcpy(mem[0..@sizeOf(InputEvent)], std.mem.asBytes(&event));
+            ring.pushUsed(qc, head, @sizeOf(InputEvent), get_mem);
+
+            delivered += 1;
+            last_avail +%= 1;
         }
 
-        // Signal interrupt if events delivered
-        if (queue.used_idx > 0) {
+        self.event_last_avail = last_avail;
+        if (delivered > 0) {
+            self.pending_events.replaceRangeAssumeCapacity(0, delivered, &.{});
             self.transport.signalUsedBuffer();
-            if (self.interrupt_callback) |cb| {
-                cb(self.interrupt_userdata);
-            }
+        }
+    }
+
+    fn processStatusQueue(self: *Input) void {
+        const qc = self.transport.queues[1];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
+
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var processed: u32 = 0;
+
+        // LED/status updates: consume and ignore.
+        while (self.status_last_avail != avail_idx) : (processed += 1) {
+            const head = ring.availEntry(qc, self.status_last_avail, get_mem) orelse break;
+            ring.pushUsed(qc, head, 0, get_mem);
+            self.status_last_avail +%= 1;
+        }
+
+        if (processed > 0) {
+            self.transport.signalUsedBuffer();
         }
     }
 
@@ -574,4 +660,51 @@ test "Input inject key" {
 test "KeyCode values" {
     try std.testing.expectEqual(@as(u16, 30), @intFromEnum(KeyCode.a));
     try std.testing.expectEqual(@as(u16, 0x110), @intFromEnum(KeyCode.btn_left));
+}
+
+var test_guest_mem: [8192]u8 = undefined;
+
+fn testGetMem(addr: u64, len: usize) ?[]u8 {
+    if (addr < 0x1000) return null;
+    const off = addr - 0x1000;
+    if (off + len > test_guest_mem.len) return null;
+    return test_guest_mem[off..][0..len];
+}
+
+test "Input delivers events into a guest ring" {
+    const input = try Input.init(std.testing.allocator, .keyboard);
+    defer input.deinit();
+
+    @memset(&test_guest_mem, 0);
+    input.setGuestMemory(testGetMem);
+
+    // Layout in fake guest memory (base 0x1000):
+    //   desc table @0x1000, avail @0x1400, used @0x1600, buffers @0x1800
+    // One writable 8-byte buffer in desc 0, avail_idx = 1.
+    std.mem.writeInt(u64, test_guest_mem[0..8], 0x1800, .little); // desc0.addr
+    std.mem.writeInt(u32, test_guest_mem[8..12], 8, .little); // desc0.len
+    std.mem.writeInt(u16, test_guest_mem[12..14], 2, .little); // desc0.flags = WRITE
+    std.mem.writeInt(u16, test_guest_mem[0x402..0x404], 1, .little); // avail.idx = 1
+    std.mem.writeInt(u16, test_guest_mem[0x404..0x406], 0, .little); // avail.ring[0] = 0
+
+    // Configure the transport's queue 0 via MMIO like a driver would.
+    input.write(@intFromEnum(mmio.Reg.queue_sel), 0);
+    input.write(@intFromEnum(mmio.Reg.queue_num), 64);
+    input.write(@intFromEnum(mmio.Reg.queue_desc_low), 0x1000);
+    input.write(@intFromEnum(mmio.Reg.queue_driver_low), 0x1400);
+    input.write(@intFromEnum(mmio.Reg.queue_device_low), 0x1600);
+    input.write(@intFromEnum(mmio.Reg.queue_ready), 1);
+
+    try input.injectKey(30, true); // KEY_A press (+ SYN)
+    input.pollEvents();
+
+    // used.idx must have advanced and the buffer must hold the event.
+    const used_idx = std.mem.readInt(u16, test_guest_mem[0x602..0x604], .little);
+    try std.testing.expectEqual(@as(u16, 1), used_idx);
+    const ev_type = std.mem.readInt(u16, test_guest_mem[0x800..0x802], .little);
+    const ev_code = std.mem.readInt(u16, test_guest_mem[0x802..0x804], .little);
+    const ev_value = std.mem.readInt(u32, test_guest_mem[0x804..0x808], .little);
+    try std.testing.expectEqual(@as(u16, 1), ev_type); // EV_KEY
+    try std.testing.expectEqual(@as(u16, 30), ev_code); // KEY_A
+    try std.testing.expectEqual(@as(u32, 1), ev_value); // pressed
 }

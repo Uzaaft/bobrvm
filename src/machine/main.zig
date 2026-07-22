@@ -188,6 +188,12 @@ pub const Machine = struct {
     gpu: ?*virtio.Gpu = null,
     gpu_slot: u8 = 0,
 
+    /// Virtio input devices (slots after the GPU, present with it).
+    keyboard: ?*virtio.Input = null,
+    keyboard_slot: u8 = 0,
+    mouse: ?*virtio.Input = null,
+    mouse_slot: u8 = 0,
+
     /// UART device (PL011 for earlycon).
     uart: ?*virtio.Uart = null,
 
@@ -269,6 +275,16 @@ pub const Machine = struct {
             self.gpu = null;
         }
 
+        if (self.keyboard) |kbd| {
+            kbd.deinit();
+            self.keyboard = null;
+        }
+
+        if (self.mouse) |mouse| {
+            mouse.deinit();
+            self.mouse = null;
+        }
+
         if (self.uart) |uart| {
             self.alloc.destroy(uart);
             self.uart = null;
@@ -320,6 +336,34 @@ pub const Machine = struct {
     pub fn injectConsoleInput(self: *Machine, data: []const u8) void {
         if (self.uart) |uart| uart.queueInput(data);
         if (self.console) |console| console.queueInput(data) catch {};
+        self.pending_irq.store(true, .release);
+    }
+
+    /// Inject a keyboard event (evdev keycode). Thread-safe.
+    pub fn injectKey(self: *Machine, keycode: u16, pressed: bool) void {
+        const kbd = self.keyboard orelse return;
+        kbd.injectKey(keycode, pressed) catch {};
+        self.pending_irq.store(true, .release);
+    }
+
+    /// Inject a mouse button event (evdev BTN_*). Thread-safe.
+    pub fn injectMouseButton(self: *Machine, button: u16, pressed: bool) void {
+        const mouse = self.mouse orelse return;
+        mouse.injectButton(button, pressed) catch {};
+        self.pending_irq.store(true, .release);
+    }
+
+    /// Inject relative mouse motion. Thread-safe.
+    pub fn injectMouseMove(self: *Machine, dx: i32, dy: i32) void {
+        const mouse = self.mouse orelse return;
+        mouse.injectRelative(dx, dy) catch {};
+        self.pending_irq.store(true, .release);
+    }
+
+    /// Inject scroll wheel motion. Thread-safe.
+    pub fn injectScroll(self: *Machine, dx: i32, dy: i32) void {
+        const mouse = self.mouse orelse return;
+        mouse.injectScroll(dx, dy) catch {};
         self.pending_irq.store(true, .release);
     }
 
@@ -551,6 +595,8 @@ pub const Machine = struct {
                 console.pollTransmit();
                 console.pollReceive();
             }
+            if (self.keyboard) |kbd| kbd.pollEvents();
+            if (self.mouse) |mouse| mouse.pollEvents();
 
             const exit_info = try vcpu.run();
             exit_count += 1;
@@ -567,11 +613,13 @@ pub const Machine = struct {
                             try self.handleMmio(vcpu, exit_info);
                         },
                         .wf_trapped => {
-                            // Poll console queues while halted
+                            // Poll console/input queues while halted
                             if (self.console) |console| {
                                 console.pollTransmit();
                                 console.pollReceive();
                             }
+                            if (self.keyboard) |kbd| kbd.pollEvents();
+                            if (self.mouse) |mouse| mouse.pollEvents();
                             try vcpu.advancePC(exit_info);
                             std.Thread.sleep(1_000_000); // 1ms
                         },
@@ -695,6 +743,12 @@ pub const Machine = struct {
             if (self.gpu != null and slot == self.gpu_slot) {
                 const gpu_dev = self.gpu.?;
                 if (is_write) gpu_dev.write(offset, value) else result = gpu_dev.read(offset);
+            } else if (self.keyboard != null and slot == self.keyboard_slot) {
+                const kbd = self.keyboard.?;
+                if (is_write) kbd.write(offset, value) else result = kbd.read(offset);
+            } else if (self.mouse != null and slot == self.mouse_slot) {
+                const mouse = self.mouse.?;
+                if (is_write) mouse.write(offset, value) else result = mouse.read(offset);
             } else if (slot == 0 and self.console != null) {
                 const console = self.console.?;
                 if (is_write) console.write(offset, value) else result = console.read(offset);
@@ -1014,8 +1068,9 @@ pub const Machine = struct {
         defer builder.deinit();
 
         // Count virtio devices: console (slot 0) + block devices + gpu
+        // + keyboard + mouse (input accompanies the display)
         const virtio_count: u8 = 1 + self.config.blockDeviceCount() +
-            @intFromBool(self.config.enable_gpu);
+            if (self.config.enable_gpu) @as(u8, 3) else 0;
 
         const config = dtb.DtbConfig{
             .ram_base = MemoryLayout.RAM_BASE,
@@ -1131,6 +1186,22 @@ pub const Machine = struct {
                 self.gpu_slot,
                 self.config.display_width,
                 self.config.display_height,
+            });
+
+            // Input devices accompany the display.
+            self.keyboard_slot = self.gpu_slot + 1;
+            self.keyboard = try virtio.Input.init(self.alloc, .keyboard);
+            self.keyboard.?.setGuestMemory(getGuestMemoryWrapper);
+            self.keyboard.?.transport.setIrqCallback(keyboardIrqCallback, self);
+
+            self.mouse_slot = self.gpu_slot + 2;
+            self.mouse = try virtio.Input.init(self.alloc, .mouse);
+            self.mouse.?.setGuestMemory(getGuestMemoryWrapper);
+            self.mouse.?.transport.setIrqCallback(mouseIrqCallback, self);
+
+            log.debug("initialized virtio-input at slots {} (kbd), {} (mouse)", .{
+                self.keyboard_slot,
+                self.mouse_slot,
             });
         }
 
@@ -1546,6 +1617,20 @@ pub const Machine = struct {
         // Virtio slot N is GIC_SPI 32+N → intid 64 + N.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.gpu_slot), level);
+        }
+    }
+
+    fn keyboardIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.keyboard_slot), level);
+        }
+    }
+
+    fn mouseIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.mouse_slot), level);
         }
     }
 

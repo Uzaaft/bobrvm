@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
 const machine = @import("../machine/main.zig");
+const keymap = @import("keymap.zig");
 const renderer = @import("../renderer/main.zig");
 
 const log = std.log.scoped(.apprt);
@@ -517,6 +518,8 @@ pub const Surface = struct {
     focused: bool,
     render: renderer.Renderer,
     render_started: bool,
+    last_mouse_x: f64 = 0,
+    last_mouse_y: f64 = 0,
 
     pub const CreateError = Allocator.Error || std.Thread.SpawnError;
 
@@ -631,30 +634,37 @@ pub const Surface = struct {
     // -------------------------------------------------------------------------
 
     pub fn handleKey(self: *Surface, event: KeyEvent) void {
-        _ = self;
-        _ = event;
-        // TODO: Route to virtio-input
+        const hw = self.vm.hw_machine orelse return;
+        const evdev_code = keymap.macosToEvdev(event.keycode);
+        if (evdev_code == keymap.UNMAPPED) return;
+        hw.injectKey(evdev_code, event.pressed);
     }
 
     pub fn handleMouseButton(self: *Surface, button: MouseButton, pressed: bool) void {
-        _ = self;
-        _ = button;
-        _ = pressed;
-        // TODO: Route to virtio-input
+        const hw = self.vm.hw_machine orelse return;
+        const evdev_button: u16 = switch (button) {
+            .left => 0x110, // BTN_LEFT
+            .right => 0x111, // BTN_RIGHT
+            .middle => 0x112, // BTN_MIDDLE
+        };
+        hw.injectMouseButton(evdev_button, pressed);
     }
 
     pub fn handleMousePos(self: *Surface, x: f64, y: f64) void {
-        _ = self;
-        _ = x;
-        _ = y;
-        // TODO: Route to virtio-input
+        const hw = self.vm.hw_machine orelse return;
+        // Relative device: convert absolute view coords to deltas.
+        const dx: i32 = @intFromFloat(x - self.last_mouse_x);
+        const dy: i32 = @intFromFloat(y - self.last_mouse_y);
+        self.last_mouse_x = x;
+        self.last_mouse_y = y;
+        if (dx != 0 or dy != 0) {
+            hw.injectMouseMove(dx, dy);
+        }
     }
 
     pub fn handleMouseScroll(self: *Surface, dx: f64, dy: f64) void {
-        _ = self;
-        _ = dx;
-        _ = dy;
-        // TODO: Route to virtio-input
+        const hw = self.vm.hw_machine orelse return;
+        hw.injectScroll(@intFromFloat(dx), @intFromFloat(dy));
     }
 };
 

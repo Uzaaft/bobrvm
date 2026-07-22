@@ -63,6 +63,13 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             frame_machine = hw;
             hw.setFrameCallback(frameDump, null);
         }
+
+        // Debug: periodically inject synthetic key presses so guest-side
+        // virtio-input delivery can be verified headlessly.
+        if (std.posix.getenv("BOBRVM_TEST_KEYS") != null) {
+            const t = std.Thread.spawn(.{}, testKeyLoop, .{hw}) catch null;
+            if (t) |thread| thread.detach();
+        }
     }
 
     // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
@@ -104,6 +111,18 @@ var saved_termios: ?std.posix.termios = null;
 var frame_dump_dir: ?[]const u8 = null;
 var frame_machine: ?*machine.Machine = null;
 var frame_count: u32 = 0;
+
+/// Inject 'a' key presses every second (BOBRVM_TEST_KEYS debug hook).
+fn testKeyLoop(hw: *machine.Machine) void {
+    std.Thread.sleep(15 * std.time.ns_per_s);
+    var i: u32 = 0;
+    while (i < 600) : (i += 1) {
+        hw.injectKey(30, true); // KEY_A
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        hw.injectKey(30, false);
+        std.Thread.sleep(1 * std.time.ns_per_s);
+    }
+}
 
 /// Dump selected scanout frames as raw BGRA for debugging.
 fn frameDump(_: ?*anyopaque) void {

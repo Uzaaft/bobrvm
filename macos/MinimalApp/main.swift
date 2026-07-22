@@ -15,6 +15,8 @@ import QuartzCore
 
 final class MetalView: NSView {
     let metalLayer = CAMetalLayer()
+    var surface: bobrvm_surface_t?
+    var lastFlags = NSEvent.ModifierFlags()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -24,6 +26,70 @@ final class MetalView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    private func sendKey(_ event: NSEvent, pressed: Bool) {
+        guard let surface else { return }
+        var key = bobrvm_key_event_s()
+        key.keycode = UInt32(event.keyCode)
+        key.modifiers = UInt32(event.modifierFlags.rawValue & 0xFFFF_FFFF)
+        key.pressed = pressed
+        bobrvm_surface_key(surface, key)
+    }
+
+    override func keyDown(with event: NSEvent) { sendKey(event, pressed: true) }
+    override func keyUp(with event: NSEvent) { sendKey(event, pressed: false) }
+
+    override func flagsChanged(with event: NSEvent) {
+        // Modifier keys: derive press/release from the flag transition.
+        let flagFor: [UInt16: NSEvent.ModifierFlags] = [
+            0x37: .command, 0x36: .command,
+            0x38: .shift, 0x3C: .shift,
+            0x3A: .option, 0x3D: .option,
+            0x3B: .control, 0x3E: .control,
+            0x39: .capsLock,
+        ]
+        if let flag = flagFor[event.keyCode] {
+            sendKey(event, pressed: event.modifierFlags.contains(flag))
+        }
+        lastFlags = event.modifierFlags
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let surface else { return }
+        bobrvm_surface_mouse_button(surface, BOBRVM_MOUSE_LEFT, true)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let surface else { return }
+        bobrvm_surface_mouse_button(surface, BOBRVM_MOUSE_LEFT, false)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard let surface else { return }
+        bobrvm_surface_mouse_button(surface, BOBRVM_MOUSE_RIGHT, true)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let surface else { return }
+        bobrvm_surface_mouse_button(surface, BOBRVM_MOUSE_RIGHT, false)
+    }
+
+    private func sendMousePos(_ event: NSEvent) {
+        guard let surface else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        // Flip to top-left origin to match the guest's coordinate space.
+        bobrvm_surface_mouse_pos(surface, p.x, bounds.height - p.y)
+    }
+
+    override func mouseMoved(with event: NSEvent) { sendMousePos(event) }
+    override func mouseDragged(with event: NSEvent) { sendMousePos(event) }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let surface else { return }
+        bobrvm_surface_mouse_scroll(surface, event.scrollingDeltaX, event.scrollingDeltaY)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -129,6 +195,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         guard surface != nil else { fatalError("bobrvm_surface_new failed") }
         bobrvm_surface_set_size(surface, UInt32(width), UInt32(height))
+
+        // Route input events from the view to the guest.
+        view.surface = surface
+        window.makeFirstResponder(view)
+        window.acceptsMouseMovedEvents = true
 
         // Drive frames at 60 Hz. (CVDisplayLink integration comes with
         // the full app; a timer is enough to verify the pipeline.)
