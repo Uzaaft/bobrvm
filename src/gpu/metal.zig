@@ -257,6 +257,53 @@ pub const Device = struct {
     }
 };
 
+/// MTLVertexFormat (subset used for guest vertex attributes).
+pub const MTLVertexFormat = enum(NSUInteger) {
+    invalid = 0,
+    float = 28,
+    float2 = 29,
+    float3 = 30,
+    float4 = 31,
+    uchar4_normalized = 8,
+    _,
+};
+
+/// MTLVertexDescriptor wrapper: describes how vertex attributes are pulled
+/// from bound vertex buffers (built from the guest's vertex_elements).
+pub const VertexDescriptor = struct {
+    ptr: id,
+
+    pub fn create() ?VertexDescriptor {
+        const class = cls("MTLVertexDescriptor") orelse return null;
+        const p = msgSendId(class, sel("vertexDescriptor")) orelse return null;
+        return .{ .ptr = p };
+    }
+
+    pub fn setAttribute(
+        self: VertexDescriptor,
+        index: NSUInteger,
+        format: MTLVertexFormat,
+        offset: NSUInteger,
+        buffer_index: NSUInteger,
+    ) void {
+        const attrs = msgSendId(self.ptr, sel("attributes")) orelse return;
+        const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const att = idx_func(attrs, sel("objectAtIndexedSubscript:"), index) orelse return;
+        const set_n: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_n(att, sel("setFormat:"), @intFromEnum(format));
+        set_n(att, sel("setOffset:"), offset);
+        set_n(att, sel("setBufferIndex:"), buffer_index);
+    }
+
+    pub fn setLayoutStride(self: VertexDescriptor, index: NSUInteger, stride: NSUInteger) void {
+        const layouts = msgSendId(self.ptr, sel("layouts")) orelse return;
+        const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const layout = idx_func(layouts, sel("objectAtIndexedSubscript:"), index) orelse return;
+        const set_n: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_n(layout, sel("setStride:"), stride);
+    }
+};
+
 /// MTLLibrary wrapper.
 pub const Library = struct {
     ptr: id,
@@ -312,6 +359,11 @@ pub const RenderPipelineDescriptor = struct {
         const s = sel("setFragmentFunction:");
         const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
         f(self.ptr, s, func.ptr);
+    }
+
+    pub fn setVertexDescriptor(self: RenderPipelineDescriptor, vd: VertexDescriptor) void {
+        const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setVertexDescriptor:"), vd.ptr);
     }
 
     /// Set the pixel format of color attachment 0.

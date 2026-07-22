@@ -341,6 +341,86 @@ pub const Renderer = struct {
         cmd.waitUntilCompleted();
     }
 
+    /// One vertex attribute pulled from a bound vertex buffer (built from
+    /// the guest's vertex_elements).
+    pub const VertexAttr = struct {
+        format: metal.MTLVertexFormat,
+        offset: u32,
+        buffer_index: u32 = 0,
+    };
+
+    /// Build a real render pipeline from TGSI-translated MSL sources and a
+    /// vertex layout. The returned PSO is owned by the caller (release()).
+    /// This is what replaces the passthrough pipeline once guest shaders are
+    /// available.
+    pub fn buildPipeline(
+        self: *Renderer,
+        vs_msl: [:0]const u8,
+        vs_entry: [*:0]const u8,
+        fs_msl: [:0]const u8,
+        fs_entry: [*:0]const u8,
+        attrs: []const VertexAttr,
+        stride: u32,
+        format: metal.MTLPixelFormat,
+    ) Error!metal.RenderPipelineState {
+        const vlib = self.device.newLibraryWithSource(vs_msl) orelse return Error.ShaderCompileFailed;
+        defer vlib.release();
+        const flib = self.device.newLibraryWithSource(fs_msl) orelse return Error.ShaderCompileFailed;
+        defer flib.release();
+        const vfn = vlib.newFunction(vs_entry) orelse return Error.ShaderCompileFailed;
+        defer vfn.release();
+        const ffn = flib.newFunction(fs_entry) orelse return Error.ShaderCompileFailed;
+        defer ffn.release();
+
+        const desc = metal.RenderPipelineDescriptor.create() orelse return Error.PipelineCreateFailed;
+        defer desc.release();
+        desc.setVertexFunction(vfn);
+        desc.setFragmentFunction(ffn);
+        desc.setColorFormat0(format);
+
+        if (attrs.len > 0) {
+            const vd = metal.VertexDescriptor.create() orelse return Error.PipelineCreateFailed;
+            for (attrs, 0..) |a, i| vd.setAttribute(i, a.format, a.offset, a.buffer_index);
+            vd.setLayoutStride(0, stride);
+            desc.setVertexDescriptor(vd);
+        }
+
+        return self.device.newRenderPipelineState(desc) orelse return Error.PipelineCreateFailed;
+    }
+
+    /// Clear a target then draw from a vertex buffer using a caller-supplied
+    /// pipeline (e.g. one built from translated guest shaders).
+    pub fn clearDrawPipeline(
+        self: *Renderer,
+        target_handle: ResourceHandle,
+        clear_color: [4]f32,
+        pso: metal.RenderPipelineState,
+        vbuf_handle: ResourceHandle,
+        vbuf_offset: u32,
+        vertex_count: u32,
+        prim: metal.MTLPrimitiveType,
+    ) Error!void {
+        const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
+        const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
+        const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.clear);
+        att.setStoreAction(.store);
+        att.setClearColor(.{ .red = clear_color[0], .green = clear_color[1], .blue = clear_color[2], .alpha = clear_color[3] });
+
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        enc.setRenderPipelineState(pso.ptr);
+        enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        enc.drawPrimitives(prim, 0, vertex_count);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
     /// Map a Gallium primitive type to Metal's. Metal has no loop/fan/quad
     /// primitives; those fall back to the closest supported topology (a
     /// proper impl expands them index-side — deferred).
@@ -593,4 +673,62 @@ test "TGSI→MSL output compiles on a real Metal device" {
     defer alib.release();
     const afn = alib.newFunction("vs_main") orelse return error.TestUnexpectedResult;
     defer afn.release();
+}
+
+test "translated shaders build a real pipeline and draw a triangle" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch |err| {
+        if (err == Error.NoMetalDevice) return error.SkipZigTest;
+        return err;
+    };
+    defer r.deinit();
+
+    // VS: position passthrough (attribute 0). FS: solid white via IMM.
+    const vs_src =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL OUT[0], POSITION
+        \\  0: MOV OUT[0], IN[0]
+        \\  1: END
+    ;
+    const fs_src =
+        \\FRAG
+        \\DCL OUT[0], COLOR
+        \\IMM[0] FLT32 { 1.0000, 1.0000, 1.0000, 1.0000}
+        \\  0: MOV OUT[0], IMM[0]
+        \\  1: END
+    ;
+    const vprog = try tgsi.parse(vs_src);
+    var vmsl = try tgsi.emit(alloc, &vprog);
+    defer vmsl.deinit(alloc);
+    const fprog = try tgsi.parse(fs_src);
+    var fmsl = try tgsi.emit(alloc, &fprog);
+    defer fmsl.deinit(alloc);
+
+    const vz = try alloc.dupeZ(u8, vmsl.source);
+    defer alloc.free(vz);
+    const fz = try alloc.dupeZ(u8, fmsl.source);
+    defer alloc.free(fz);
+
+    // Vertex layout: attribute 0 = float2 at offset 0, stride 8. Metal
+    // expands the float2 to (x,y,0,1) for the float4 shader input.
+    const attrs = [_]Renderer.VertexAttr{.{ .format = .float2, .offset = 0, .buffer_index = 0 }};
+    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm);
+    defer pso.release();
+
+    const w: u32 = 64;
+    const h: u32 = 64;
+    try r.createRenderTarget(1, .b8g8r8a8_unorm, w, h);
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    try r.createBuffer(2, @sizeOf(@TypeOf(verts)));
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try r.uploadBuffer(2, 0, vb[0..@sizeOf(@TypeOf(verts))]);
+
+    try r.clearDrawPipeline(1, .{ 0.0, 0.0, 0.0, 1.0 }, pso, 2, 0, 3, .triangle);
+
+    var buf: [64 * 64 * 4]u8 = undefined;
+    try r.readback(1, &buf);
+    const center = ((h / 2) * w + (w / 2)) * 4;
+    try std.testing.expect(buf[center + 0] > 200 and buf[center + 1] > 200 and buf[center + 2] > 200);
+    try std.testing.expect(buf[0] < 40 and buf[1] < 40 and buf[2] < 40);
 }

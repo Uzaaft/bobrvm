@@ -503,11 +503,14 @@ pub fn emit(alloc: Allocator, prog: *const Program) Error!Msl {
 }
 
 fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program) !void {
-    try app(w, alloc, "struct VSIn {{\n", .{});
-    for (prog.in_decls[0..prog.n_in]) |d| {
-        try app(w, alloc, "    float4 a{d} [[attribute({d})]];\n", .{ d.index, d.index });
+    const has_in = prog.n_in > 0;
+    if (has_in) {
+        try app(w, alloc, "struct VSIn {{\n", .{});
+        for (prog.in_decls[0..prog.n_in]) |d| {
+            try app(w, alloc, "    float4 a{d} [[attribute({d})]];\n", .{ d.index, d.index });
+        }
+        try app(w, alloc, "}};\n", .{});
     }
-    try app(w, alloc, "}};\n", .{});
 
     try app(w, alloc, "struct VSOut {{\n", .{});
     var has_position = false;
@@ -522,11 +525,17 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
     if (!has_position) try app(w, alloc, "    float4 position [[position]];\n", .{});
     try app(w, alloc, "}};\n", .{});
 
-    if (prog.uses_const) {
-        try app(w, alloc, "vertex VSOut vs_main(VSIn in [[stage_in]], constant float4* c [[buffer(1)]]) {{\n    VSOut out;\n", .{});
-    } else {
-        try app(w, alloc, "vertex VSOut vs_main(VSIn in [[stage_in]]) {{\n    VSOut out;\n", .{});
+    try app(w, alloc, "vertex VSOut vs_main(", .{});
+    var need_comma = false;
+    if (has_in) {
+        try app(w, alloc, "VSIn in [[stage_in]]", .{});
+        need_comma = true;
     }
+    if (prog.uses_const) {
+        if (need_comma) try app(w, alloc, ", ", .{});
+        try app(w, alloc, "constant float4* c [[buffer(1)]]", .{});
+    }
+    try app(w, alloc, ") {{\n    VSOut out;\n", .{});
     if (!has_position) try app(w, alloc, "    out.position = float4(0.0,0.0,0.0,1.0);\n", .{});
     try emitLocals(w, alloc, prog);
     try emitBody(w, alloc, prog);
@@ -534,17 +543,27 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
 }
 
 fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program) !void {
-    try app(w, alloc, "struct FSIn {{\n", .{});
-    for (prog.in_decls[0..prog.n_in]) |d| {
-        try app(w, alloc, "    float4 a{d} [[user(locn{d})]];\n", .{ d.index, d.index });
+    const has_in = prog.n_in > 0;
+    if (has_in) {
+        try app(w, alloc, "struct FSIn {{\n", .{});
+        for (prog.in_decls[0..prog.n_in]) |d| {
+            try app(w, alloc, "    float4 a{d} [[user(locn{d})]];\n", .{ d.index, d.index });
+        }
+        try app(w, alloc, "}};\n", .{});
     }
-    try app(w, alloc, "}};\n", .{});
 
-    if (prog.uses_const) {
-        try app(w, alloc, "fragment float4 fs_main(FSIn in [[stage_in]], constant float4* c [[buffer(1)]]) {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
-    } else {
-        try app(w, alloc, "fragment float4 fs_main(FSIn in [[stage_in]]) {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
+    // Build the parameter list (omit an empty [[stage_in]] — invalid MSL).
+    try app(w, alloc, "fragment float4 fs_main(", .{});
+    var need_comma = false;
+    if (has_in) {
+        try app(w, alloc, "FSIn in [[stage_in]]", .{});
+        need_comma = true;
     }
+    if (prog.uses_const) {
+        if (need_comma) try app(w, alloc, ", ", .{});
+        try app(w, alloc, "constant float4* c [[buffer(1)]]", .{});
+    }
+    try app(w, alloc, ") {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
     try emitLocals(w, alloc, prog);
     try emitBody(w, alloc, prog);
     try app(w, alloc, "    return out0;\n}}\n", .{});
