@@ -180,9 +180,41 @@ pub const GpuDevice = struct {
         }
     }
 
-    /// Record a 3D resource created by the guest.
+    /// Record a 3D resource created by the guest, and back it on the GPU.
+    /// This is the path the virtio-gpu device actually uses.
     pub fn createResourceRecord(self: *GpuDevice, res: Resource) Error!void {
         try self.resources.put(res.handle, res);
+        self.backResource(res);
+    }
+
+    /// Give a recorded resource its GPU backing: buffers → MTLBuffer (sized
+    /// by width, which holds the byte size for buffer resources), render
+    /// targets → MTLTexture. No-op when there is no Metal device.
+    fn backResource(self: *GpuDevice, res: Resource) void {
+        const r = self.ensureRenderer() orelse return;
+        if (res.target == .buffer) {
+            r.createBuffer(res.handle, res.width) catch {};
+        } else if (res.bind & PipeBind.render_target != 0) {
+            r.createRenderTarget(res.handle, res.format, res.width, if (res.height == 0) 1 else res.height) catch {};
+        }
+    }
+
+    /// Upload guest data into a buffer resource's MTLBuffer at `offset`.
+    /// Returns false if there is no GPU-backed buffer for the handle.
+    pub fn uploadToBuffer(self: *GpuDevice, handle: ResourceHandle, offset: u32, data: []const u8) bool {
+        const r = if (self.renderer) |*rr| rr else return false;
+        r.uploadBuffer(handle, offset, data) catch return false;
+        return true;
+    }
+
+    /// The CPU-visible contents of a buffer resource's MTLBuffer, for
+    /// zero-copy fills (e.g. transfer_to_host_3d copying guest backing pages
+    /// straight into GPU-visible memory). Null if not buffer-backed.
+    pub fn bufferContents(self: *GpuDevice, handle: ResourceHandle) ?[]u8 {
+        const r = if (self.renderer) |*rr| rr else return null;
+        const buf = r.getBuffer(handle) orelse return null;
+        const ptr = buf.contents() orelse return null;
+        return ptr[0..buf.length()];
     }
 
     /// Execute a virgl command buffer for a context.
@@ -229,16 +261,8 @@ pub const GpuDevice = struct {
             .bind = bind,
         });
 
-        // Back the resource on the GPU. Buffers (target == buffer) become
-        // MTLBuffers sized by width (buffers encode byte size in width);
-        // render-target textures become MTLTextures.
-        if (self.ensureRenderer()) |r| {
-            if (target == .buffer) {
-                r.createBuffer(handle, width) catch {};
-            } else if (bind & PipeBind.render_target != 0) {
-                r.createRenderTarget(handle, format, width, if (height == 0) 1 else height) catch {};
-            }
-        }
+        // Back the resource on the GPU (buffer → MTLBuffer, RT → MTLTexture).
+        self.backResource(self.resources.get(handle).?);
     }
 
     /// Read a rendered resource's pixels back to host memory (for scanout
@@ -383,6 +407,37 @@ test "GpuDevice init and context creation" {
 
     try gpu.processCommand(.ctx_create, &.{});
     try std.testing.expectEqual(@as(usize, 1), gpu.contexts.count());
+}
+
+test "createResourceRecord backs a buffer on the GPU and round-trips upload" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    // The real virtio path: cmdResourceCreate3D → createResourceRecord.
+    try gpu.createResourceRecord(.{
+        .handle = 5,
+        .target = .buffer,
+        .format = .none,
+        .width = 256, // buffers encode byte size in width
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
+    });
+
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    // Upload guest bytes and read them straight back out of GPU memory.
+    const data = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    try std.testing.expect(gpu.uploadToBuffer(5, 16, &data));
+
+    const contents = gpu.bufferContents(5) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(contents.len >= 256);
+    try std.testing.expectEqualSlices(u8, &data, contents[16 .. 16 + data.len]);
 }
 
 test "GpuDevice routes a guest clear command stream to Metal" {
