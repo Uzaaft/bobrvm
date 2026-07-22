@@ -89,12 +89,29 @@ pub const Resource = struct {
 };
 
 /// GPU device managing contexts and resources.
+/// Gallium PIPE_BIND_* flags relevant to resource classification (subset).
+pub const PipeBind = struct {
+    pub const depth_stencil: u32 = 1 << 0;
+    pub const render_target: u32 = 1 << 1;
+    pub const sampler_view: u32 = 1 << 3;
+    pub const vertex_buffer: u32 = 1 << 4;
+    pub const index_buffer: u32 = 1 << 5;
+    pub const constant_buffer: u32 = 1 << 6;
+};
+
 pub const GpuDevice = struct {
     alloc: Allocator,
     contexts: std.AutoHashMap(ContextId, *Context),
     resources: std.AutoHashMap(ResourceHandle, Resource),
     next_ctx_id: ContextId,
     next_resource_id: ResourceHandle,
+    /// Metal execution backend. Created lazily on the first 3D resource so
+    /// GpuDevice construction never depends on a Metal device being present
+    /// (headless CI without a GPU falls back to decode-only, as before).
+    renderer: ?virgl.Renderer = null,
+    /// Set once we've tried (and possibly failed) to create the renderer,
+    /// so we don't retry device creation on every resource.
+    renderer_tried: bool = false,
 
     pub const Error = Allocator.Error || virgl.decoder.DecodeError;
 
@@ -105,6 +122,8 @@ pub const GpuDevice = struct {
             .resources = std.AutoHashMap(ResourceHandle, Resource).init(alloc),
             .next_ctx_id = 1,
             .next_resource_id = 1,
+            .renderer = null,
+            .renderer_tried = false,
         };
     }
 
@@ -115,6 +134,17 @@ pub const GpuDevice = struct {
         }
         self.contexts.deinit();
         self.resources.deinit();
+        if (self.renderer) |*r| r.deinit();
+    }
+
+    /// Lazily create the Metal renderer. Returns null if no Metal device is
+    /// available; callers then behave as decode-only (no execution).
+    fn ensureRenderer(self: *GpuDevice) ?*virgl.Renderer {
+        if (self.renderer) |*r| return r;
+        if (self.renderer_tried) return null;
+        self.renderer_tried = true;
+        self.renderer = virgl.Renderer.init(self.alloc) catch return null;
+        return if (self.renderer) |*r| r else null;
     }
 
     /// Process a virtio-gpu control command.
@@ -198,6 +228,25 @@ pub const GpuDevice = struct {
             .flags = flags,
             .bind = bind,
         });
+
+        // Back the resource on the GPU. Buffers (target == buffer) become
+        // MTLBuffers sized by width (buffers encode byte size in width);
+        // render-target textures become MTLTextures.
+        if (self.ensureRenderer()) |r| {
+            if (target == .buffer) {
+                r.createBuffer(handle, width) catch {};
+            } else if (bind & PipeBind.render_target != 0) {
+                r.createRenderTarget(handle, format, width, if (height == 0) 1 else height) catch {};
+            }
+        }
+    }
+
+    /// Read a rendered resource's pixels back to host memory (for scanout
+    /// or verification). Returns false if there is no GPU-backed texture.
+    pub fn readbackResource(self: *GpuDevice, handle: ResourceHandle, out: []u8) bool {
+        const r = if (self.renderer) |*rr| rr else return false;
+        r.readback(handle, out) catch return false;
+        return true;
     }
 
     fn destroyResource(self: *GpuDevice, data: []const u8) Error!void {
@@ -219,7 +268,6 @@ pub const GpuDevice = struct {
 
     /// Process a virgl command buffer.
     fn processCommandBuffer(self: *GpuDevice, ctx: *Context, data: []const u8) Error!void {
-        _ = self;
         var dec = Decoder.init(data);
 
         while (dec.hasMore()) {
@@ -239,6 +287,14 @@ pub const GpuDevice = struct {
                         .sampler_state => try ctx.createSamplerState(handle, payload),
                         .vertex_elements => try ctx.createVertexElements(handle, payload),
                         .shader => try ctx.createShader(handle, .vertex, payload),
+                        .surface => {
+                            // Surface create payload: [res_handle, format, ...].
+                            if (payload.len >= 2) {
+                                const res_handle = payload[0];
+                                const fmt: virgl.protocol.Format = @enumFromInt(payload[1]);
+                                try ctx.createSurface(handle, res_handle, fmt);
+                            }
+                        },
                         else => dec.skip(header.length - 1),
                     }
                 },
@@ -275,6 +331,14 @@ pub const GpuDevice = struct {
                 .clear => {
                     const clear_cmd = try dec.decodeClear(header.length);
                     ctx.clear(clear_cmd);
+                    // Execute the clear against the bound framebuffer's first
+                    // color target: framebuffer cbuf[0] → surface → resource →
+                    // MTLTexture. Only color clears are handled for now.
+                    if (self.ensureRenderer()) |r| {
+                        if (self.resolveColorTarget(ctx, 0)) |res_handle| {
+                            r.clearTarget(res_handle, clear_cmd.color) catch {};
+                        }
+                    }
                 },
 
                 .draw_vbo => {
@@ -285,6 +349,17 @@ pub const GpuDevice = struct {
                 else => dec.skip(header.length),
             }
         }
+    }
+
+    /// Resolve color attachment `index` of the context's bound framebuffer
+    /// to the underlying resource handle: framebuffer cbuf → surface object →
+    /// surface.resource_handle. Returns null if unbound.
+    fn resolveColorTarget(self: *GpuDevice, ctx: *Context, index: usize) ?ResourceHandle {
+        _ = self;
+        if (index >= ctx.framebuffer.cbufs.len) return null;
+        const surf_handle = ctx.framebuffer.cbufs[index] orelse return null;
+        const surface = ctx.surfaces.get(surf_handle) orelse return null;
+        return surface.resource_handle;
     }
 
     /// Get a context by ID.
@@ -308,6 +383,86 @@ test "GpuDevice init and context creation" {
 
     try gpu.processCommand(.ctx_create, &.{});
     try std.testing.expectEqual(@as(usize, 1), gpu.contexts.count());
+}
+
+test "GpuDevice routes a guest clear command stream to Metal" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt_handle: u32 = 10;
+    const surf_handle: u32 = 20;
+
+    // resource_create_3d for a 32x32 BGRA render target (44-byte payload).
+    var res: [44]u8 = .{0} ** 44;
+    std.mem.writeInt(u32, res[0..4], rt_handle, .little);
+    res[4] = @intFromEnum(virgl.context.ResourceTarget.texture_2d);
+    std.mem.writeInt(u32, res[8..12], @intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm), .little);
+    std.mem.writeInt(u32, res[12..16], PipeBind.render_target, .little);
+    std.mem.writeInt(u32, res[16..20], 32, .little); // width
+    std.mem.writeInt(u32, res[20..24], 32, .little); // height
+    std.mem.writeInt(u32, res[24..28], 1, .little); // depth
+    std.mem.writeInt(u32, res[28..32], 1, .little); // array_size
+    try gpu.processCommand(.resource_create_3d, &res);
+
+    // No Metal device available (headless CI) → nothing to execute.
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    try gpu.createContextId(1);
+
+    // Build a virgl command buffer: create SURFACE → set_framebuffer → clear.
+    var w: [17]u32 = undefined;
+    var i: usize = 0;
+    // create_object(1), object_type surface(8), length 3 (handle + 2 payload)
+    w[i] = 1 | (8 << 8) | (3 << 16);
+    i += 1;
+    w[i] = surf_handle;
+    i += 1;
+    w[i] = rt_handle;
+    i += 1;
+    w[i] = @intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm);
+    i += 1;
+    // set_framebuffer_state(5), length 3
+    w[i] = 5 | (3 << 16);
+    i += 1;
+    w[i] = 1; // nr_cbufs
+    i += 1;
+    w[i] = 0; // zsurf
+    i += 1;
+    w[i] = surf_handle; // cbuf[0]
+    i += 1;
+    // clear(7), length 8
+    w[i] = 7 | (8 << 16);
+    i += 1;
+    w[i] = 0x4; // flags (ignored by executor)
+    i += 1;
+    w[i] = @bitCast(@as(f32, 1.0)); // r
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.5)); // g
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.25)); // b
+    i += 1;
+    w[i] = @bitCast(@as(f32, 1.0)); // a
+    i += 1;
+    w[i] = 0; // depth lo
+    i += 1;
+    w[i] = 0; // depth hi
+    i += 1;
+    w[i] = 0; // stencil
+    i += 1;
+    try std.testing.expectEqual(@as(usize, 17), i);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(w[0..]));
+
+    // Read the render target back and confirm the guest clear landed.
+    var buf: [32 * 32 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt_handle, &buf));
+
+    const center = ((16 * 32) + 16) * 4;
+    try std.testing.expect(buf[center + 2] > 250); // R ~255
+    try std.testing.expectApproxEqAbs(@as(f32, 128), @as(f32, @floatFromInt(buf[center + 1])), 2.0); // G ~0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 64), @as(f32, @floatFromInt(buf[center + 0])), 2.0); // B ~0.25
+    try std.testing.expectEqual(@as(u8, 255), buf[center + 3]); // A
 }
 
 test {
