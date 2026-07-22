@@ -68,58 +68,79 @@ pub const DecodeError = error{
 
 /// Command decoder state machine.
 pub const Decoder = struct {
-    data: []const u32,
+    /// Raw guest bytes (arbitrary alignment: the command buffer comes
+    /// straight from a guest descriptor, which need not be 4-aligned).
+    bytes: []const u8,
+    /// Length in whole u32 words.
+    word_len: usize,
+    /// Current position, in words.
     pos: usize,
+    /// Bounded scratch for payload() (virgl commands are small; the wire
+    /// header length is a u16 but practical payloads are far smaller).
+    scratch: [4096]u32 = undefined,
 
     pub fn init(data: []const u8) Decoder {
-        // Reinterpret bytes as u32 slice (must handle alignment)
-        const ptr: [*]const u32 = @ptrCast(@alignCast(data.ptr));
-        const len = data.len / @sizeOf(u32);
         return .{
-            .data = ptr[0..len],
+            .bytes = data,
+            .word_len = data.len / @sizeOf(u32),
             .pos = 0,
         };
     }
 
+    /// Read word `i` with no alignment requirement.
+    fn wordAt(self: *const Decoder, i: usize) u32 {
+        return std.mem.readInt(u32, self.bytes[i * 4 ..][0..4], .little);
+    }
+
+    /// Payload-only decoders read from a scratch slice; keep them working
+    /// by materializing words on demand. `data` exposes the word count.
+    pub fn data_len(self: *const Decoder) usize {
+        return self.word_len;
+    }
+
     /// Check if more commands are available.
     pub fn hasMore(self: *const Decoder) bool {
-        return self.pos < self.data.len;
+        return self.pos < self.word_len;
     }
 
     /// Read the next command header.
     pub fn nextHeader(self: *Decoder) DecodeError!proto.CommandHeader {
-        if (self.pos >= self.data.len) return DecodeError.UnexpectedEnd;
+        if (self.pos >= self.word_len) return DecodeError.UnexpectedEnd;
 
-        const header = proto.CommandHeader.parse(self.data[self.pos]);
+        const header = proto.CommandHeader.parse(self.wordAt(self.pos));
         self.pos += 1;
 
-        // Validate length
-        if (self.pos + header.length > self.data.len) {
+        // Validate length (guest-controlled: guard against overflow and
+        // running past the buffer).
+        if (@as(usize, self.pos) + header.length > self.word_len) {
             return DecodeError.InvalidLength;
         }
 
         return header;
     }
 
-    /// Get payload slice for current command.
+    /// Get payload slice for current command. Returns owned words copied
+    /// into a bounded scratch buffer so callers get a []const u32 without
+    /// any alignment assumption on the guest bytes.
     pub fn payload(self: *Decoder, length: u16) DecodeError![]const u32 {
-        if (self.pos + length > self.data.len) {
+        if (self.pos + length > self.word_len) {
             return DecodeError.UnexpectedEnd;
         }
-        const result = self.data[self.pos .. self.pos + length];
+        if (length > self.scratch.len) return DecodeError.InvalidLength;
+        for (0..length) |i| self.scratch[i] = self.wordAt(self.pos + i);
         self.pos += length;
-        return result;
+        return self.scratch[0..length];
     }
 
-    /// Skip current command payload.
+    /// Skip current command payload (bounded to the buffer).
     pub fn skip(self: *Decoder, length: u16) void {
-        self.pos += length;
+        self.pos = @min(self.pos + length, self.word_len);
     }
 
     /// Read a single u32.
     pub fn readU32(self: *Decoder) DecodeError!u32 {
-        if (self.pos >= self.data.len) return DecodeError.UnexpectedEnd;
-        const val = self.data[self.pos];
+        if (self.pos >= self.word_len) return DecodeError.UnexpectedEnd;
+        const val = self.wordAt(self.pos);
         self.pos += 1;
         return val;
     }
@@ -318,4 +339,52 @@ test "Decoder clear command" {
     try std.testing.expect(clear.flags.color0);
     try std.testing.expect(clear.flags.depth);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), clear.color[0], 0.001);
+}
+
+test "Decoder tolerates an unaligned guest buffer" {
+    // A guest command buffer at an odd offset must not trip @alignCast.
+    var raw: [12]u8 = undefined;
+    // header word at offset 1: opcode=nop(0), len=1
+    const hdr = (proto.CommandHeader{ .opcode = .nop, .object_type = .null, .length = 1 }).encode();
+    std.mem.writeInt(u32, raw[1..5], hdr, .little);
+    std.mem.writeInt(u32, raw[5..9], 0xDEADBEEF, .little);
+
+    var dec = Decoder.init(raw[1..9]); // 2 words, misaligned base
+    const h = try dec.nextHeader();
+    try std.testing.expectEqual(proto.Command.nop, h.opcode);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), try dec.readU32());
+    try std.testing.expect(!dec.hasMore());
+}
+
+test "Decoder rejects a header claiming more payload than present" {
+    var raw: [4]u8 = undefined;
+    // opcode=clear(7), length=100 but only 0 payload words follow
+    const hdr = (proto.CommandHeader{ .opcode = .clear, .object_type = .null, .length = 100 }).encode();
+    std.mem.writeInt(u32, raw[0..4], hdr, .little);
+
+    var dec = Decoder.init(&raw);
+    try std.testing.expectError(DecodeError.InvalidLength, dec.nextHeader());
+}
+
+test "Decoder skip is bounded and readU32 stops at end" {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u32, raw[0..4], 1, .little);
+    std.mem.writeInt(u32, raw[4..8], 2, .little);
+
+    var dec = Decoder.init(&raw);
+    dec.skip(1000); // over-long skip must not run past the buffer
+    try std.testing.expect(!dec.hasMore());
+    try std.testing.expectError(DecodeError.UnexpectedEnd, dec.readU32());
+}
+
+test "Decoder payload copies words without alignment assumptions" {
+    var raw: [13]u8 = undefined;
+    std.mem.writeInt(u32, raw[1..5], 0x11111111, .little);
+    std.mem.writeInt(u32, raw[5..9], 0x22222222, .little);
+    std.mem.writeInt(u32, raw[9..13], 0x33333333, .little);
+
+    var dec = Decoder.init(raw[1..13]); // misaligned, 3 words
+    const p = try dec.payload(3);
+    try std.testing.expectEqual(@as(u32, 0x11111111), p[0]);
+    try std.testing.expectEqual(@as(u32, 0x33333333), p[2]);
 }
