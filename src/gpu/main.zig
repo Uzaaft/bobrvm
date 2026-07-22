@@ -99,6 +99,14 @@ pub const PipeBind = struct {
     pub const constant_buffer: u32 = 1 << 6;
 };
 
+/// Identifies a translated-shader pipeline for caching.
+pub const PipelineKey = struct {
+    vs: u32,
+    fs: u32,
+    ve: u32,
+    fmt: u32,
+};
+
 pub const GpuDevice = struct {
     alloc: Allocator,
     contexts: std.AutoHashMap(ContextId, *Context),
@@ -112,6 +120,9 @@ pub const GpuDevice = struct {
     /// Set once we've tried (and possibly failed) to create the renderer,
     /// so we don't retry device creation on every resource.
     renderer_tried: bool = false,
+    /// Cache of pipelines built from translated guest shaders, keyed by the
+    /// bound shader/vertex-layout/target-format combination.
+    pipelines: std.AutoHashMap(PipelineKey, metal.RenderPipelineState) = undefined,
 
     pub const Error = Allocator.Error || virgl.decoder.DecodeError;
 
@@ -124,6 +135,7 @@ pub const GpuDevice = struct {
             .next_resource_id = 1,
             .renderer = null,
             .renderer_tried = false,
+            .pipelines = std.AutoHashMap(PipelineKey, metal.RenderPipelineState).init(alloc),
         };
     }
 
@@ -134,6 +146,9 @@ pub const GpuDevice = struct {
         }
         self.contexts.deinit();
         self.resources.deinit();
+        var pit = self.pipelines.valueIterator();
+        while (pit.next()) |p| p.release();
+        self.pipelines.deinit();
         if (self.renderer) |*r| r.deinit();
     }
 
@@ -407,14 +422,20 @@ pub const GpuDevice = struct {
                             const vbo_handle = ctx.vbo_handles[0];
                             if (vbo_handle != 0 and draw_cmd.count > 0) {
                                 const prim = virgl.Renderer.mapPrimitive(draw_cmd.mode);
-                                r.drawTargetFromBuffer(
-                                    target,
-                                    vbo_handle,
-                                    ctx.vbo_offsets[0],
-                                    draw_cmd.count,
-                                    prim,
-                                    .{ 1.0, 1.0, 1.0, 1.0 },
-                                ) catch {};
+                                if (self.getOrBuildPipeline(ctx, r, target)) |pso| {
+                                    // Real translated guest shaders.
+                                    r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim) catch {};
+                                } else {
+                                    // Passthrough fallback (no bound shaders yet).
+                                    r.drawTargetFromBuffer(
+                                        target,
+                                        vbo_handle,
+                                        ctx.vbo_offsets[0],
+                                        draw_cmd.count,
+                                        prim,
+                                        .{ 1.0, 1.0, 1.0, 1.0 },
+                                    ) catch {};
+                                }
                             }
                         }
                     }
@@ -434,6 +455,74 @@ pub const GpuDevice = struct {
         const surf_handle = ctx.framebuffer.cbufs[index] orelse return null;
         const surface = ctx.surfaces.get(surf_handle) orelse return null;
         return surface.resource_handle;
+    }
+
+    /// Build (or fetch from cache) a real Metal pipeline from the context's
+    /// currently bound vertex/fragment shaders and vertex_elements, targeting
+    /// `target_handle`'s format. Returns null if anything needed is missing or
+    /// translation fails, in which case the caller uses the passthrough.
+    fn getOrBuildPipeline(
+        self: *GpuDevice,
+        ctx: *Context,
+        r: *virgl.Renderer,
+        target_handle: ResourceHandle,
+    ) ?metal.RenderPipelineState {
+        const vs_h = ctx.bound.vs orelse return null;
+        const fs_h = ctx.bound.fs orelse return null;
+        const ve_h = ctx.bound.vertex_elements orelse return null;
+        const target = r.getTarget(target_handle) orelse return null;
+
+        const key = PipelineKey{ .vs = vs_h, .fs = fs_h, .ve = ve_h, .fmt = @intCast(@intFromEnum(target.format)) };
+        if (self.pipelines.get(key)) |pso| return pso;
+
+        const vs = ctx.shaders.get(vs_h) orelse return null;
+        const fs = ctx.shaders.get(fs_h) orelse return null;
+        const vs_text = vs.tgsi_text orelse return null;
+        const fs_text = fs.tgsi_text orelse return null;
+        const ve = ctx.vertex_elements.get(ve_h) orelse return null;
+
+        const pso = self.buildTranslatedPipeline(r, vs_text, fs_text, ve, ctx, target.format) catch return null;
+        self.pipelines.put(key, pso) catch {
+            pso.release();
+            return null;
+        };
+        return pso;
+    }
+
+    fn buildTranslatedPipeline(
+        self: *GpuDevice,
+        r: *virgl.Renderer,
+        vs_text: []const u8,
+        fs_text: []const u8,
+        ve: virgl.state.VertexElementsState,
+        ctx: *Context,
+        format: metal.MTLPixelFormat,
+    ) !metal.RenderPipelineState {
+        const tgsi = virgl.tgsi;
+        const vprog = try tgsi.parse(vs_text);
+        var vmsl = try tgsi.emit(self.alloc, &vprog);
+        defer vmsl.deinit(self.alloc);
+        const fprog = try tgsi.parse(fs_text);
+        var fmsl = try tgsi.emit(self.alloc, &fprog);
+        defer fmsl.deinit(self.alloc);
+
+        const vz = try self.alloc.dupeZ(u8, vmsl.source);
+        defer self.alloc.free(vz);
+        const fz = try self.alloc.dupeZ(u8, fmsl.source);
+        defer self.alloc.free(fz);
+
+        // Vertex layout from vertex_elements (single vertex buffer, index 0).
+        var attrs: [16]virgl.Renderer.VertexAttr = undefined;
+        const n = @min(ve.count, 16);
+        for (0..n) |i| {
+            attrs[i] = .{
+                .format = virgl.Renderer.mapVertexFormat(ve.elements[i].src_format),
+                .offset = ve.elements[i].src_offset,
+                .buffer_index = 0,
+            };
+        }
+        const stride = ctx.vbo_strides[0];
+        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], stride, format);
     }
 
     /// Get a context by ID.
@@ -488,6 +577,135 @@ test "createResourceRecord backs a buffer on the GPU and round-trips upload" {
     const contents = gpu.bufferContents(5) orelse return error.TestUnexpectedResult;
     try std.testing.expect(contents.len >= 256);
     try std.testing.expectEqualSlices(u8, &data, contents[16 .. 16 + data.len]);
+}
+
+test "GpuDevice renders with translated guest shaders end to end" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const buf: u32 = 30;
+
+    try gpu.createResourceRecord(.{
+        .handle = rt,       .target = .texture_2d, .format = .b8g8r8a8_unorm,
+        .width = 64,        .height = 64,          .depth = 1,
+        .array_size = 1,    .last_level = 0,       .nr_samples = 0,
+        .flags = 0,         .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = buf,      .target = .buffer,     .format = .none,
+        .width = 24,        .height = 0,           .depth = 1,
+        .array_size = 1,    .last_level = 0,       .nr_samples = 0,
+        .flags = 0,         .bind = PipeBind.vertex_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(buf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    // Fragment shader outputs solid RED — distinguishes real shading from the
+    // passthrough (which is white).
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}\n0: MOV OUT[0], IMM[0]\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    // vertex_elements: 1 element {src_offset 0, buffer 0, format r32g32_float}
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
+    b.w(0);
+    // bind_shader vs, fs
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    // bind_object vertex_elements
+    b.cmd(2, 5, 1);
+    b.w(52);
+    // create surface
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    // set_framebuffer
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    // set_vertex_buffers [stride, offset, handle]
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(buf);
+    // clear black
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    // draw_vbo triangles,3
+    b.cmd(8, 0, 12);
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    for (0..9) |_| b.w(0);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const center = ((32 * 64) + 32) * 4;
+    // RED (BGRA): B<40, G<40, R>200 — passthrough would be white (all >200).
+    try std.testing.expect(px[center + 2] > 200); // R
+    try std.testing.expect(px[center + 1] < 40); // G
+    try std.testing.expect(px[center + 0] < 40); // B
+    try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
 }
 
 test "GpuDevice captures shader TGSI text and binds by stage" {

@@ -421,6 +421,49 @@ pub const Renderer = struct {
         cmd.waitUntilCompleted();
     }
 
+    /// Map a Gallium vertex attribute format to Metal's vertex format.
+    pub fn mapVertexFormat(fmt: proto.Format) metal.MTLVertexFormat {
+        return switch (fmt) {
+            .r32_float => .float,
+            .r32g32_float => .float2,
+            .r32g32b32_float => .float3,
+            .r32g32b32a32_float => .float4,
+            else => .float4,
+        };
+    }
+
+    /// Draw a vertex buffer with a caller-supplied pipeline into a target
+    /// WITHOUT clearing it (loadAction=load), so it composes after a prior
+    /// clear/draw. This is the real-shader draw_vbo path.
+    pub fn drawWithPipeline(
+        self: *Renderer,
+        target_handle: ResourceHandle,
+        pso: metal.RenderPipelineState,
+        vbuf_handle: ResourceHandle,
+        vbuf_offset: u32,
+        vertex_count: u32,
+        prim: metal.MTLPrimitiveType,
+    ) Error!void {
+        const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
+        const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
+        const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.load);
+        att.setStoreAction(.store);
+
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        enc.setRenderPipelineState(pso.ptr);
+        enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        enc.drawPrimitives(prim, 0, vertex_count);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
     /// Map a Gallium primitive type to Metal's. Metal has no loop/fan/quad
     /// primitives; those fall back to the closest supported topology (a
     /// proper impl expands them index-side — deferred).
