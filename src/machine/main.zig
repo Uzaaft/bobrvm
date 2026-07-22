@@ -1416,6 +1416,7 @@ pub const Machine = struct {
             self.net.?.setGuestMemory(getGuestMemoryWrapper);
             self.net.?.transport.setIrqCallback(netIrqCallback, self);
             self.nat = mininat.MiniNat.init(self.alloc, natReplyCallback, self);
+            self.nat.setRxReady(natRxReadyCallback, self);
             try self.nat.start();
             self.net.?.setTxCallback(netTxCallback, self);
             log.debug("initialized virtio-net at slot {} (built-in NAT)", .{self.net_slot});
@@ -1870,6 +1871,13 @@ pub const Machine = struct {
     fn natReplyCallback(frame: []const u8, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
         if (self.net) |net| net.queueRxFrame(frame);
+    }
+
+    /// NAT back-pressure: true while the guest RX queue has headroom.
+    fn natRxReadyCallback(userdata: ?*anyopaque) bool {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.net) |net| return net.rxReady();
+        return true;
     }
 
     fn uartIrqCallback(level: bool, userdata: ?*anyopaque) void {

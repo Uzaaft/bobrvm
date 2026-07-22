@@ -71,6 +71,15 @@ pub const MiniNat = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
 
+    /// Back-pressure: returns true while the guest RX side has headroom.
+    /// The pump stops pulling from host sockets when this is false, so a
+    /// bulk download can't overrun the guest queue and drop segments
+    /// (which, with no retransmit, would stall the connection). Data
+    /// waits in the host socket buffer; the host kernel's TCP window then
+    /// throttles the real sender.
+    rx_ready: ?*const fn (?*anyopaque) bool = null,
+    rx_ready_userdata: ?*anyopaque = null,
+
     pub const UDP_FLOW_MAX: usize = 256;
     pub const UDP_IDLE_TIMEOUT_S: i64 = 60;
     pub const TCP_FLOW_MAX: usize = 256;
@@ -86,6 +95,12 @@ pub const MiniNat = struct {
             .udp_flows = std.AutoHashMap(UdpKey, UdpFlow).init(alloc),
             .tcp_flows = std.AutoHashMap(TcpKey, TcpFlow).init(alloc),
         };
+    }
+
+    /// Set the RX back-pressure predicate (see rx_ready).
+    pub fn setRxReady(self: *MiniNat, cb: *const fn (?*anyopaque) bool, userdata: ?*anyopaque) void {
+        self.rx_ready = cb;
+        self.rx_ready_userdata = userdata;
     }
 
     /// Start the reply-poll thread (forwards socket replies to the guest).
@@ -300,6 +315,11 @@ pub const MiniNat = struct {
         const now = std.time.timestamp();
         var remove_key: ?TcpKey = null;
 
+        // Back-pressure: if the guest RX queue is backed up, don't pull
+        // more host data this pass (connect completion and close still
+        // proceed). Leaves data in the host socket → real sender throttles.
+        const rx_ok = if (self.rx_ready) |rr| rr(self.rx_ready_userdata) else true;
+
         var iter = self.tcp_flows.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
@@ -335,7 +355,9 @@ pub const MiniNat = struct {
                 continue;
             }
 
-            // Relay available host data to the guest.
+            // Relay available host data to the guest — unless the guest RX
+            // side is backed up, in which case defer (no drop).
+            if (!rx_ok) continue;
             const n = std.posix.recv(flow.socket, buf[0..TCP_MSS], 0) catch |e| {
                 if (e == error.WouldBlock) continue;
                 self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_RST | TCP_ACK, &.{});

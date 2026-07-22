@@ -73,7 +73,12 @@ pub const Net = struct {
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
     pub const MAX_FRAME: usize = 65550;
-    pub const MAX_RX_QUEUED: usize = 256;
+    pub const MAX_RX_QUEUED: usize = 1024;
+    /// Back-pressure threshold: a frame source (e.g. the NAT TCP relay)
+    /// should stop producing while the queue is at/above this, so it never
+    /// overflows and drops — dropping a TCP segment in a proxy with no
+    /// retransmit stalls the connection permanently.
+    pub const RX_BACKPRESSURE: usize = 768;
 
     /// Default guest MAC (locally administered).
     pub const GUEST_MAC = [6]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
@@ -137,6 +142,15 @@ pub const Net = struct {
         self.rx_frames.append(self.alloc, copy) catch {
             self.alloc.free(copy);
         };
+    }
+
+    /// True while the RX queue has headroom. Frame producers should stop
+    /// (leaving data in their own buffers) when this is false, so the
+    /// queue never overflows. Thread-safe.
+    pub fn rxReady(self: *Net) bool {
+        self.rx_mutex.lock();
+        defer self.rx_mutex.unlock();
+        return self.rx_frames.items.len < RX_BACKPRESSURE;
     }
 
     // =========================================================================
