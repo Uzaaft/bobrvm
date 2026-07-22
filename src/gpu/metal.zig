@@ -553,6 +553,10 @@ pub const Buffer = struct {
         const func: *const fn (id, SEL) callconv(.c) NSUInteger = @ptrCast(&objc_msgSend);
         return func(self.ptr, s);
     }
+
+    pub fn release(self: Buffer) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
 };
 
 /// CAMetalDrawable wrapper.

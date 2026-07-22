@@ -92,6 +92,10 @@ pub const Renderer = struct {
     /// PSO's color format must match the render target it draws into).
     passthrough: std.AutoHashMap(NSUInteger, metal.RenderPipelineState),
     passthrough_lib: ?metal.Library,
+    /// Guest buffer resources (vertex/index/constant) backed by MTLBuffers
+    /// in shared storage, so guest uploads are a plain memcpy (no copy on
+    /// the GPU side — the buffer is read in place by the vertex stage).
+    buffers: std.AutoHashMap(ResourceHandle, metal.Buffer),
 
     /// Create a renderer with the system default Metal device. Works
     /// headlessly (no window), which is exactly what tests and the
@@ -107,6 +111,7 @@ pub const Renderer = struct {
             .targets = std.AutoHashMap(ResourceHandle, Target).init(alloc),
             .passthrough = std.AutoHashMap(NSUInteger, metal.RenderPipelineState).init(alloc),
             .passthrough_lib = null,
+            .buffers = std.AutoHashMap(ResourceHandle, metal.Buffer).init(alloc),
         };
     }
 
@@ -122,6 +127,7 @@ pub const Renderer = struct {
             .targets = std.AutoHashMap(ResourceHandle, Target).init(alloc),
             .passthrough = std.AutoHashMap(NSUInteger, metal.RenderPipelineState).init(alloc),
             .passthrough_lib = null,
+            .buffers = std.AutoHashMap(ResourceHandle, metal.Buffer).init(alloc),
         };
     }
 
@@ -133,6 +139,9 @@ pub const Renderer = struct {
         while (pit.next()) |p| p.release();
         self.passthrough.deinit();
         if (self.passthrough_lib) |lib| lib.release();
+        var bit = self.buffers.valueIterator();
+        while (bit.next()) |b| b.release();
+        self.buffers.deinit();
     }
 
     /// Back a guest render-target resource with an MTLTexture. Idempotent
@@ -261,6 +270,76 @@ pub const Renderer = struct {
         cmd.waitUntilCompleted();
     }
 
+    // =========================================================================
+    // Buffer resources (vertex / index / constant)
+    // =========================================================================
+
+    /// Back a guest buffer resource with an MTLBuffer of `size` bytes.
+    /// Idempotent per handle (re-create releases the old buffer).
+    pub fn createBuffer(self: *Renderer, handle: ResourceHandle, size: u32) Error!void {
+        if (size == 0) return Error.TextureCreateFailed;
+        const buf = self.device.newBufferWithLength(size) orelse return Error.TextureCreateFailed;
+        if (self.buffers.fetchRemove(handle)) |old| old.value.release();
+        try self.buffers.put(handle, buf);
+    }
+
+    pub fn getBuffer(self: *Renderer, handle: ResourceHandle) ?metal.Buffer {
+        return self.buffers.get(handle);
+    }
+
+    /// Upload guest data into a buffer resource at `offset`. This is the
+    /// transfer_to_host_3d data movement for buffers: shared storage means
+    /// it is a direct memcpy into GPU-visible memory (no staging copy).
+    pub fn uploadBuffer(self: *Renderer, handle: ResourceHandle, offset: u32, data: []const u8) Error!void {
+        const buf = self.buffers.get(handle) orelse return Error.UnknownTarget;
+        const cap = buf.length();
+        if (@as(usize, offset) + data.len > cap) return Error.TextureCreateFailed;
+        const dst = buf.contents() orelse return Error.TextureCreateFailed;
+        @memcpy(dst[offset .. offset + data.len], data);
+    }
+
+    /// Clear a target and draw solid-colored triangles whose clip-space
+    /// float2 vertices come from a buffer resource (bound at vertex
+    /// buffer index 0, starting at `vbuf_offset`). This is the form the
+    /// decoded draw_vbo feeds: geometry lives in a guest-uploaded MTLBuffer.
+    pub fn clearAndDrawBuffer(
+        self: *Renderer,
+        handle: ResourceHandle,
+        clear_color: [4]f32,
+        vbuf_handle: ResourceHandle,
+        vbuf_offset: u32,
+        vertex_count: u32,
+        tri_color: [4]f32,
+    ) Error!void {
+        const target = self.targets.get(handle) orelse return Error.UnknownTarget;
+        const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+        const pso = try self.passthroughPipeline(target.format);
+
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
+        const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.clear);
+        att.setStoreAction(.store);
+        att.setClearColor(.{
+            .red = clear_color[0],
+            .green = clear_color[1],
+            .blue = clear_color[2],
+            .alpha = clear_color[3],
+        });
+
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        enc.setRenderPipelineState(pso.ptr);
+        enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        var color = tri_color;
+        enc.setFragmentBytes(@ptrCast(&color), @sizeOf([4]f32), 0);
+        enc.drawPrimitives(.triangle, 0, vertex_count);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
     /// Read a render target's pixels back into a host buffer (tight rows).
     /// `out` must be at least width*height*bytesPerPixel.
     pub fn readback(self: *Renderer, handle: ResourceHandle, out: []u8) Error!void {
@@ -353,4 +432,42 @@ test "draw triangle renders geometry through a Metal pipeline" {
     try std.testing.expect(buf[2] < 40); // R at pixel 0
     try std.testing.expect(buf[1] < 40); // G
     try std.testing.expect(buf[0] < 40); // B
+}
+
+test "draw triangle from an uploaded vertex buffer" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch |err| {
+        if (err == Error.NoMetalDevice) return error.SkipZigTest;
+        return err;
+    };
+    defer r.deinit();
+
+    const w: u32 = 64;
+    const h: u32 = 64;
+    try r.createRenderTarget(1, .b8g8r8a8_unorm, w, h);
+
+    // Guest uploads triangle vertices into a buffer resource (handle 2),
+    // exactly the transfer_to_host_3d → draw_vbo data path.
+    const verts = [_][2]f32{
+        .{ -0.9, -0.9 },
+        .{ 0.9, -0.9 },
+        .{ 0.0, 0.9 },
+    };
+    try r.createBuffer(2, @sizeOf(@TypeOf(verts)));
+    const bytes: [*]const u8 = @ptrCast(&verts);
+    try r.uploadBuffer(2, 0, bytes[0..@sizeOf(@TypeOf(verts))]);
+
+    // Green triangle this time (RGBA (0,1,0,1)).
+    try r.clearAndDrawBuffer(1, .{ 0.0, 0.0, 0.0, 1.0 }, 2, 0, 3, .{ 0.0, 1.0, 0.0, 1.0 });
+
+    var buf: [64 * 64 * 4]u8 = undefined;
+    try r.readback(1, &buf);
+
+    const center = ((h / 2) * w + (w / 2)) * 4;
+    try std.testing.expect(buf[center + 1] > 200); // G
+    try std.testing.expect(buf[center + 2] < 40); // R
+    try std.testing.expect(buf[center + 0] < 40); // B
+
+    // Corner still black.
+    try std.testing.expect(buf[1] < 40);
 }
