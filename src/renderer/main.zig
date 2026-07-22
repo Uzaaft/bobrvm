@@ -90,6 +90,16 @@ pub const Renderer = struct {
         self.send(.{ .commands_ready = batch });
     }
 
+    /// Set the guest scanout source. Must be set before start().
+    pub fn setScanoutSource(
+        self: *Renderer,
+        lock_fn: *const fn (?*anyopaque) ?Thread.Scanout,
+        unlock_fn: *const fn (?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        self.render_thread.setScanoutSource(lock_fn, unlock_fn, userdata);
+    }
+
     /// Set presentation callback.
     pub fn setPresentCallback(
         self: *Renderer,

@@ -54,6 +54,13 @@ pub const Size = struct {
 };
 
 /// Content scale for HiDPI.
+/// A guest framebuffer view (BGRA, 4 bytes per pixel).
+pub const Scanout = struct {
+    data: []const u8,
+    width: u32,
+    height: u32,
+};
+
 pub const ContentScale = struct {
     x: f64 = 1.0,
     y: f64 = 1.0,
@@ -277,6 +284,12 @@ pub const RenderThread = struct {
     present_callback: ?*const fn (?*anyopaque) callconv(.c) void = null,
     present_userdata: ?*anyopaque = null,
 
+    // Scanout source (guest framebuffer). lock returns a view valid
+    // until unlock is called; null when no scanout exists yet.
+    scanout_lock: ?*const fn (?*anyopaque) ?Scanout = null,
+    scanout_unlock: ?*const fn (?*anyopaque) void = null,
+    scanout_userdata: ?*anyopaque = null,
+
     pub const InitError = Allocator.Error || std.Thread.SpawnError;
 
     pub fn init(
@@ -298,6 +311,18 @@ pub const RenderThread = struct {
     }
 
     /// Set presentation callback (called from Swift).
+    /// Set the guest scanout source. Must be set before start().
+    pub fn setScanoutSource(
+        self: *RenderThread,
+        lock_fn: *const fn (?*anyopaque) ?Scanout,
+        unlock_fn: *const fn (?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        self.scanout_lock = lock_fn;
+        self.scanout_unlock = unlock_fn;
+        self.scanout_userdata = userdata;
+    }
+
     pub fn setPresentCallback(
         self: *RenderThread,
         callback: ?*const fn (?*anyopaque) callconv(.c) void,
@@ -431,7 +456,24 @@ pub const RenderThread = struct {
         if (!self.visible) return;
         if (self.size.width == 0 or self.size.height == 0) return;
 
-        // Use clear color from pending batch if available
+        // Present the guest scanout when one exists.
+        if (self.scanout_lock) |lock_fn| {
+            if (lock_fn(self.scanout_userdata)) |scan| {
+                const ok = self.frame_renderer.renderFramebuffer(
+                    scan.data,
+                    scan.width,
+                    scan.height,
+                );
+                if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
+                self.pending_batch = null;
+                if (ok) {
+                    if (self.present_callback) |cb| cb(self.present_userdata);
+                }
+                return;
+            }
+        }
+
+        // No scanout yet: clear (color from pending batch if available).
         var clear_color = self.clear_color;
         if (self.pending_batch) |batch| {
             clear_color = .{

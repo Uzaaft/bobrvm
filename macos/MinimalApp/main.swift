@@ -1,0 +1,166 @@
+// Minimal bobrvm display app.
+//
+// Scaffolding for verifying the guest scanout pipeline end-to-end while
+// the full SwiftUI app comes together: one window, one CAMetalLayer,
+// frames drawn by the Zig renderer thread (Swift owns the window and
+// Metal context only, per the ghostty pattern).
+//
+// Build: ./macos/MinimalApp/build.sh
+// Run:   BobrvmDisplay --kernel Image --initrd initrd [--disk d.img] \
+//            [--cmdline '...'] [--memory-mb 2048]
+
+import AppKit
+import Metal
+import QuartzCore
+
+final class MetalView: NSView {
+    let metalLayer = CAMetalLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer = metalLayer
+        metalLayer.contentsGravity = .resize
+    }
+
+    required init?(coder: NSCoder) { fatalError("unsupported") }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var window: NSWindow!
+    var view: MetalView!
+    var timer: Timer?
+
+    var bobrApp: bobrvm_app_t?
+    var vm: bobrvm_vm_t?
+    var surface: bobrvm_surface_t?
+
+    // Retained for the app's lifetime: Zig holds raw pointers to these.
+    var device: MTLDevice!
+    var queue: MTLCommandQueue!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let width = 1280.0
+        let height = 800.0
+
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "bobrvm"
+        window.center()
+
+        view = MetalView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        window.contentView = view
+        window.makeKeyAndOrderFront(nil)
+
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let cq = dev.makeCommandQueue()
+        else {
+            fatalError("no Metal device")
+        }
+        device = dev
+        queue = cq
+        view.metalLayer.device = device
+        view.metalLayer.pixelFormat = .bgra8Unorm
+        // The Zig renderer blits into the drawable texture.
+        view.metalLayer.framebufferOnly = false
+
+        bobrvm_init()
+
+        var runtimeCfg = bobrvm_runtime_config_s()
+        bobrApp = bobrvm_app_new(&runtimeCfg)
+        guard bobrApp != nil else { fatalError("bobrvm_app_new failed") }
+
+        // Parse CLI arguments into the VM config.
+        var kernel: String? = nil
+        var initrd: String? = nil
+        var disk: String? = nil
+        var cmdline = "console=hvc0 earlycon=pl011,0x09000000"
+        var memoryMB: UInt64 = 2048
+
+        var args = CommandLine.arguments.dropFirst().makeIterator()
+        while let arg = args.next() {
+            switch arg {
+            case "--kernel": kernel = args.next()
+            case "--initrd": initrd = args.next()
+            case "--disk": disk = args.next()
+            case "--cmdline": cmdline = args.next() ?? cmdline
+            case "--memory-mb": memoryMB = UInt64(args.next() ?? "") ?? memoryMB
+            default: print("unknown argument: \(arg)")
+            }
+        }
+        guard let kernelPath = kernel else {
+            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img]")
+            NSApp.terminate(nil)
+            return
+        }
+
+        // Keep C strings alive for the duration of bobrvm_vm_new (it copies).
+        kernelPath.withCString { kernelC in
+            withOptionalCString(initrd) { initrdC in
+                withOptionalCString(disk) { diskC in
+                    cmdline.withCString { cmdlineC in
+                        var cfg = bobrvm_vm_config_s()
+                        cfg.memory_bytes = memoryMB * 1024 * 1024
+                        cfg.vcpu_count = 1
+                        cfg.kernel_path = kernelC
+                        cfg.initrd_path = initrdC
+                        cfg.disk_path = diskC
+                        cfg.disk_read_only = diskC != nil && (disk?.hasSuffix(".iso") ?? false)
+                        cfg.cmdline = cmdlineC
+                        vm = bobrvm_vm_new(bobrApp, &cfg)
+                    }
+                }
+            }
+        }
+        guard vm != nil else { fatalError("bobrvm_vm_new failed") }
+
+        let rc = bobrvm_vm_start(vm)
+        guard rc == BOBRVM_OK else { fatalError("bobrvm_vm_start failed: \(rc)") }
+
+        surface = bobrvm_surface_new(
+            vm,
+            Unmanaged.passUnretained(device).toOpaque(),
+            Unmanaged.passUnretained(view.metalLayer).toOpaque(),
+            Unmanaged.passUnretained(queue).toOpaque()
+        )
+        guard surface != nil else { fatalError("bobrvm_surface_new failed") }
+        bobrvm_surface_set_size(surface, UInt32(width), UInt32(height))
+
+        // Drive frames at 60 Hz. (CVDisplayLink integration comes with
+        // the full app; a timer is enough to verify the pipeline.)
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self, let surface = self.surface else { return }
+            bobrvm_surface_draw(surface)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        if let surface { bobrvm_surface_destroy(surface) }
+        if let vm { bobrvm_vm_destroy(vm) }
+        if let bobrApp { bobrvm_app_destroy(bobrApp) }
+        bobrvm_deinit()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
+
+func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    if let s {
+        return s.withCString { body($0) }
+    }
+    return body(nil)
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+let delegate = AppDelegate()
+app.delegate = delegate
+app.activate(ignoringOtherApps: true)
+app.run()

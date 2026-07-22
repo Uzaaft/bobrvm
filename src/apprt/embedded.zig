@@ -294,6 +294,9 @@ pub const VM = struct {
     /// The actual machine (hypervisor + devices).
     hw_machine: ?*machine.Machine = null,
 
+    /// Thread running the synchronous vCPU loop.
+    vcpu_thread: ?std.Thread = null,
+
     pub const State = enum {
         stopped,
         running,
@@ -331,16 +334,15 @@ pub const VM = struct {
         // Pre-condition: reasonable surface count
         assert(self.surfaces.items.len <= 16);
 
-        // Stop and destroy machine first
-        if (self.hw_machine) |hw| {
-            hw.deinit();
-            self.hw_machine = null;
-        }
-
-        for (self.surfaces.items) |surface| {
-            surface.destroy();
+        // Destroy surfaces first: their renderer threads read the GPU
+        // scanout owned by the machine.
+        while (self.surfaces.items.len > 0) {
+            self.surfaces.items[self.surfaces.items.len - 1].destroy();
         }
         self.surfaces.deinit(self.alloc);
+
+        // Then stop and destroy the machine (joins the vCPU thread)
+        self.stop();
 
         // Free owned config strings
         self.config.deinit(self.alloc);
@@ -385,6 +387,8 @@ pub const VM = struct {
                 .disk2_path = self.config.disk2_path,
                 .disk2_read_only = self.config.disk2_read_only,
                 .cmdline = self.config.cmdline orelse "console=hvc0 earlycon=pl011,0x09000000",
+                // GUI VMs always get a display device.
+                .enable_gpu = true,
             };
 
             self.hw_machine = machine.Machine.init(self.alloc, machine_config) catch |err| {
@@ -396,9 +400,10 @@ pub const VM = struct {
             self.hw_machine.?.setConsoleOutput(consoleOutputCallback, self);
         }
 
-        // Start the machine
-        self.hw_machine.?.start() catch |err| {
-            log.warn("failed to start machine: {}", .{err});
+        // Run the synchronous vCPU loop on a dedicated thread (the same
+        // proven loop the CLI uses; the async VMRunner path is legacy).
+        self.vcpu_thread = std.Thread.spawn(.{}, vcpuThreadMain, .{self.hw_machine.?}) catch |err| {
+            log.warn("failed to spawn vCPU thread: {}", .{err});
             return error.MachineStartFailed;
         };
 
@@ -409,10 +414,21 @@ pub const VM = struct {
         log.info("VM started", .{});
     }
 
+    fn vcpuThreadMain(hw: *machine.Machine) void {
+        hw.startSync() catch |err| {
+            log.warn("vCPU loop failed: {}", .{err});
+        };
+    }
+
     pub fn stop(self: *VM) void {
         log.info("stopping VM", .{});
 
         if (self.hw_machine) |hw| {
+            hw.stop();
+            if (self.vcpu_thread) |thread| {
+                thread.join();
+                self.vcpu_thread = null;
+            }
             // Must fully deinit to release hypervisor (only one VM per process)
             hw.deinit();
             self.hw_machine = null;
@@ -426,24 +442,16 @@ pub const VM = struct {
 
     pub fn pause(self: *VM) void {
         if (self.state == .running) {
-            if (self.hw_machine) |hw| {
-                // Must fully deinit to release hypervisor (only one VM per process)
-                hw.deinit();
-                self.hw_machine = null;
-            }
+            self.stop();
             self.state = .paused;
         }
     }
 
     pub fn unpause(self: *VM) void {
         if (self.state == .paused) {
-            if (self.hw_machine) |hw| {
-                hw.start() catch {
-                    log.err("failed to unpause machine", .{});
-                    return;
-                };
-            }
-            self.state = .running;
+            self.start() catch {
+                log.err("failed to unpause machine", .{});
+            };
         }
     }
 
@@ -535,7 +543,25 @@ pub const Surface = struct {
             .render_started = false,
         };
 
+        // Feed the renderer from the VM's virtio-gpu scanout.
+        surface.render.setScanoutSource(scanoutLock, scanoutUnlock, vm);
+
         return surface;
+    }
+
+    fn scanoutLock(userdata: ?*anyopaque) ?renderer.Thread.Scanout {
+        const vm: *VM = @ptrCast(@alignCast(userdata orelse return null));
+        const hw = vm.hw_machine orelse return null;
+        const gpu = hw.gpu orelse return null;
+        const view = gpu.lockScanout() orelse return null;
+        return .{ .data = view.data, .width = view.width, .height = view.height };
+    }
+
+    fn scanoutUnlock(userdata: ?*anyopaque) void {
+        const vm: *VM = @ptrCast(@alignCast(userdata orelse return));
+        const hw = vm.hw_machine orelse return;
+        const gpu = hw.gpu orelse return;
+        gpu.unlockScanout();
     }
 
     pub fn destroy(self: *Surface) void {

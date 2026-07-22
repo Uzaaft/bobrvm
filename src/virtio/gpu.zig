@@ -193,6 +193,10 @@ pub const Gpu = struct {
     /// 2D resources.
     resources: std.AutoHashMap(u32, Resource2D),
 
+    /// Guards resource host_data lifetime + scanout id: the vCPU thread
+    /// mutates while the renderer thread reads via lockScanout.
+    scanout_mutex: std.Thread.Mutex,
+
     /// Current scanout.
     scanout_resource_id: u32,
 
@@ -229,6 +233,7 @@ pub const Gpu = struct {
             .ctrl_last_avail = 0,
             .cursor_last_avail = 0,
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
+            .scanout_mutex = .{},
             .scanout_resource_id = 0,
             .display_width = 1280,
             .display_height = 800,
@@ -278,11 +283,34 @@ pub const Gpu = struct {
         self.frame_userdata = userdata;
     }
 
+    pub const ScanoutView = struct {
+        data: []const u8,
+        width: u32,
+        height: u32,
+    };
+
     /// Current scanout pixels (BGRA/XRGB 4 bytes per pixel), or null.
-    pub fn scanout(self: *Gpu) ?struct { data: []const u8, width: u32, height: u32 } {
+    /// Caller must be on the vCPU thread (unsynchronized).
+    pub fn scanout(self: *Gpu) ?ScanoutView {
         if (self.scanout_resource_id == 0) return null;
         const res = self.resources.get(self.scanout_resource_id) orelse return null;
         return .{ .data = res.host_data, .width = res.width, .height = res.height };
+    }
+
+    /// Acquire the scanout for reading from another thread (renderer).
+    /// Must be paired with unlockScanout; the view is only valid while
+    /// the lock is held.
+    pub fn lockScanout(self: *Gpu) ?ScanoutView {
+        self.scanout_mutex.lock();
+        const view = self.scanout() orelse {
+            self.scanout_mutex.unlock();
+            return null;
+        };
+        return view;
+    }
+
+    pub fn unlockScanout(self: *Gpu) void {
+        self.scanout_mutex.unlock();
     }
 
     // =========================================================================
@@ -390,6 +418,10 @@ pub const Gpu = struct {
 
         var resp_type: CmdType = .resp_ok_nodata;
         var resp_len: u32 = @sizeOf(CtrlHeader);
+
+        // Serialize against the renderer thread reading the scanout.
+        self.scanout_mutex.lock();
+        defer self.scanout_mutex.unlock();
 
         switch (cmd_type) {
             .get_display_info => {

@@ -191,6 +191,12 @@ pub const CommandBuffer = struct {
         return if (result) |p| RenderCommandEncoder{ .ptr = p } else null;
     }
 
+    /// Create a blit command encoder.
+    pub fn blitCommandEncoder(self: CommandBuffer) ?BlitCommandEncoder {
+        const result = msgSendId(self.ptr, sel("blitCommandEncoder"));
+        return if (result) |p| BlitCommandEncoder{ .ptr = p } else null;
+    }
+
     /// Present a drawable.
     pub fn presentDrawable(self: CommandBuffer, drawable: Drawable) void {
         const s = sel("presentDrawable:");
@@ -419,6 +425,111 @@ pub const MetalLayer = struct {
 };
 
 // =============================================================================
+// Textures & Blit
+// =============================================================================
+
+pub const MTLOrigin = extern struct {
+    x: NSUInteger = 0,
+    y: NSUInteger = 0,
+    z: NSUInteger = 0,
+};
+
+pub const MTLSize = extern struct {
+    width: NSUInteger,
+    height: NSUInteger,
+    depth: NSUInteger = 1,
+};
+
+pub const MTLRegion = extern struct {
+    origin: MTLOrigin = .{},
+    size: MTLSize,
+};
+
+/// MTLTexture wrapper.
+pub const Texture = struct {
+    ptr: id,
+
+    /// Upload pixel data into the texture.
+    pub fn replaceRegion(
+        self: Texture,
+        region: MTLRegion,
+        mipmap_level: NSUInteger,
+        bytes: [*]const u8,
+        bytes_per_row: NSUInteger,
+    ) void {
+        const s = sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:");
+        const func: *const fn (
+            id,
+            SEL,
+            MTLRegion,
+            NSUInteger,
+            [*]const u8,
+            NSUInteger,
+        ) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, region, mipmap_level, bytes, bytes_per_row);
+    }
+
+    pub fn release(self: Texture) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
+};
+
+/// Create a 2D texture on the device.
+pub fn createTexture2D(device: Device, format: MTLPixelFormat, width: u32, height: u32) ?Texture {
+    const desc_class = cls("MTLTextureDescriptor") orelse return null;
+    const s = sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:");
+    const func: *const fn (
+        Class,
+        SEL,
+        NSUInteger,
+        NSUInteger,
+        NSUInteger,
+        BOOL,
+    ) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+    const desc = func(desc_class, s, @intFromEnum(format), width, height, false) orelse
+        return null;
+
+    const tex = msgSendId1(device.ptr, sel("newTextureWithDescriptor:"), desc) orelse
+        return null;
+    return .{ .ptr = tex };
+}
+
+/// MTLBlitCommandEncoder wrapper.
+pub const BlitCommandEncoder = struct {
+    ptr: id,
+
+    pub fn copyTexture(
+        self: BlitCommandEncoder,
+        src: id,
+        src_origin: MTLOrigin,
+        src_size: MTLSize,
+        dst: id,
+        dst_origin: MTLOrigin,
+    ) void {
+        const s = sel("copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:" ++
+            "toTexture:destinationSlice:destinationLevel:destinationOrigin:");
+        const func: *const fn (
+            id,
+            SEL,
+            id,
+            NSUInteger,
+            NSUInteger,
+            MTLOrigin,
+            MTLSize,
+            id,
+            NSUInteger,
+            NSUInteger,
+            MTLOrigin,
+        ) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, src, 0, 0, src_origin, src_size, dst, 0, 0, dst_origin);
+    }
+
+    pub fn endEncoding(self: BlitCommandEncoder) void {
+        msgSendVoid(self.ptr, sel("endEncoding"));
+    }
+};
+
+// =============================================================================
 // Frame Renderer
 // =============================================================================
 
@@ -427,6 +538,11 @@ pub const FrameRenderer = struct {
     device: Device,
     queue: CommandQueue,
     layer: MetalLayer,
+
+    /// Cached staging texture for framebuffer uploads.
+    fb_texture: ?Texture = null,
+    fb_width: u32 = 0,
+    fb_height: u32 = 0,
 
     /// Initialize with opaque pointers from Swift.
     pub fn init(
@@ -439,6 +555,11 @@ pub const FrameRenderer = struct {
             .queue = CommandQueue.fromPtr(mtl_queue),
             .layer = MetalLayer.fromPtr(mtl_layer),
         };
+    }
+
+    pub fn deinit(self: *FrameRenderer) void {
+        if (self.fb_texture) |tex| tex.release();
+        self.fb_texture = null;
     }
 
     /// Render a frame with the given clear color.
@@ -480,24 +601,60 @@ pub const FrameRenderer = struct {
         return true;
     }
 
-    /// Render a frame with framebuffer data (2D mode).
+    /// Render a frame with framebuffer data (2D scanout).
+    /// Uploads the BGRA pixels to a staging texture and blits it to the
+    /// drawable. The layer's drawable size is pinned to the framebuffer
+    /// size; CoreAnimation scales it to the view.
     pub fn renderFramebuffer(
         self: *FrameRenderer,
         data: []const u8,
         width: u32,
         height: u32,
     ) bool {
-        _ = data;
-        _ = width;
-        _ = height;
+        assert(width > 0 and height > 0);
+        assert(data.len >= @as(usize, width) * height * 4);
 
-        // TODO: Upload framebuffer data to texture and blit
-        return self.renderFrame(.{
-            .red = 0.0,
-            .green = 0.0,
-            .blue = 0.2,
-            .alpha = 1.0,
-        });
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        // (Re)create the staging texture on size change.
+        if (self.fb_texture == null or self.fb_width != width or self.fb_height != height) {
+            if (self.fb_texture) |tex| tex.release();
+            self.fb_texture = createTexture2D(self.device, .bgra8Unorm, width, height) orelse
+                return false;
+            self.fb_width = width;
+            self.fb_height = height;
+            self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
+        }
+        const fb_tex = self.fb_texture.?;
+
+        // Upload pixels.
+        fb_tex.replaceRegion(
+            .{ .size = .{ .width = width, .height = height } },
+            0,
+            data.ptr,
+            @as(NSUInteger, width) * 4,
+        );
+
+        // Blit to the drawable.
+        const drawable = self.layer.nextDrawable() orelse return false;
+        const dst_texture = drawable.texture() orelse return false;
+        const cmd_buffer = self.queue.commandBuffer() orelse return false;
+        const blit = cmd_buffer.blitCommandEncoder() orelse return false;
+
+        blit.copyTexture(
+            fb_tex.ptr,
+            .{},
+            .{ .width = width, .height = height },
+            dst_texture,
+            .{},
+        );
+        blit.endEncoding();
+
+        cmd_buffer.presentDrawable(drawable);
+        cmd_buffer.commit();
+
+        return true;
     }
 };
 
