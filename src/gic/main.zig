@@ -287,6 +287,23 @@ pub const Gic = struct {
         }
     }
 
+    /// True when any interrupt is pending+enabled+inactive for this CPU
+    /// (the state of the CPU's IRQ line). No side effects.
+    pub fn hasDeliverableIrq(self: *const Gic, cpu_id: u8) bool {
+        if (cpu_id >= self.num_cpus) return false;
+        if ((self.ctlr & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS)) == 0) return false;
+
+        for (self.redists[cpu_id].sgi_ppi) |irq| {
+            if (irq.pending and irq.enabled and !irq.active) return true;
+        }
+        for (self.spis) |spi| {
+            if (spi.pending and spi.enabled and !spi.active and spi.target_cpu == cpu_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Get highest priority pending interrupt for a CPU (for IAR read).
     pub fn ackInterrupt(self: *Gic, cpu_id: u8) u32 {
         if (cpu_id >= self.num_cpus) return 1023; // Spurious

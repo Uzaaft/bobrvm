@@ -25,7 +25,9 @@ const enable_debug_logs = builtin.mode == .Debug;
 
 /// Thread-local machine pointer for guest memory access.
 /// Set before vCPU threads start, used by getGuestMemoryWrapper.
-threadlocal var current_machine: ?*Machine = null;
+// Single VM per process (a Hypervisor.framework restriction), shared by
+// all vCPU threads for guest memory access.
+var current_machine: ?*Machine = null;
 
 /// Memory layout for ARM64 Linux VM.
 /// Based on QEMU virt machine layout for UEFI compatibility.
@@ -153,6 +155,17 @@ pub const MachineConfig = struct {
 /// Number of addressable virtio-mmio slots (console, 2 disks, gpu, spare).
 const VIRTIO_SLOT_COUNT: u64 = 8;
 
+/// Per-vCPU run state for the synchronous multi-threaded loop.
+const VcpuRunState = struct {
+    pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    vtimer_unmask: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    entry_point: u64 = 0,
+    context_id: u64 = 0,
+    thread: ?std.Thread = null,
+    vcpu: ?*hypervisor.Vcpu = null,
+};
+
 pub const Machine = struct {
     alloc: Allocator,
     config: MachineConfig,
@@ -225,11 +238,12 @@ pub const Machine = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Pending IRQ flag (set by GIC when interrupt should be injected).
-    pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Per-CPU run state (allocated for vcpu_count at init).
+    cpu_states: []VcpuRunState = &.{},
 
-    /// Set when the guest EOIs the vtimer PPI; the vCPU loop unmasks HVF's
-    /// vtimer so it can fire again.
-    vtimer_unmask: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Machine-wide lock ("big machine lock"): serializes device and GIC
+    /// state across vCPU threads and host input threads.
+    machine_lock: std.Thread.Mutex = .{},
 
     pub const Error = hypervisor.Error || Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.WriteError || std.Thread.SpawnError || error{
         KernelTooLarge,
@@ -251,6 +265,8 @@ pub const Machine = struct {
             .config = config,
             .vcpus = .{},
         };
+        machine.cpu_states = try alloc.alloc(VcpuRunState, config.vcpu_count);
+        for (machine.cpu_states) |*state| state.* = .{};
 
         return machine;
     }
@@ -317,6 +333,10 @@ pub const Machine = struct {
         // Clean up hypervisor (vCPUs then VM)
         self.cleanupHypervisor();
         self.vcpus.deinit(self.alloc);
+        if (self.cpu_states.len > 0) {
+            self.alloc.free(self.cpu_states);
+            self.cpu_states = &.{};
+        }
 
         self.alloc.destroy(self);
     }
@@ -334,37 +354,39 @@ pub const Machine = struct {
     /// Inject host input into the guest consoles. Thread-safe: buffers
     /// are drained on the vCPU thread.
     pub fn injectConsoleInput(self: *Machine, data: []const u8) void {
+        self.machine_lock.lock();
         if (self.uart) |uart| uart.queueInput(data);
+        self.machine_lock.unlock();
         if (self.console) |console| console.queueInput(data) catch {};
-        self.pending_irq.store(true, .release);
+        self.kickCpu(0);
     }
 
     /// Inject a keyboard event (evdev keycode). Thread-safe.
     pub fn injectKey(self: *Machine, keycode: u16, pressed: bool) void {
         const kbd = self.keyboard orelse return;
         kbd.injectKey(keycode, pressed) catch {};
-        self.pending_irq.store(true, .release);
+        self.kickCpu(0);
     }
 
     /// Inject a mouse button event (evdev BTN_*). Thread-safe.
     pub fn injectMouseButton(self: *Machine, button: u16, pressed: bool) void {
         const mouse = self.mouse orelse return;
         mouse.injectButton(button, pressed) catch {};
-        self.pending_irq.store(true, .release);
+        self.kickCpu(0);
     }
 
     /// Inject relative mouse motion. Thread-safe.
     pub fn injectMouseMove(self: *Machine, dx: i32, dy: i32) void {
         const mouse = self.mouse orelse return;
         mouse.injectRelative(dx, dy) catch {};
-        self.pending_irq.store(true, .release);
+        self.kickCpu(0);
     }
 
     /// Inject scroll wheel motion. Thread-safe.
     pub fn injectScroll(self: *Machine, dx: i32, dy: i32) void {
         const mouse = self.mouse orelse return;
         mouse.injectScroll(dx, dy) catch {};
-        self.pending_irq.store(true, .release);
+        self.kickCpu(0);
     }
 
     /// Set console output callback.
@@ -479,11 +501,15 @@ pub const Machine = struct {
             runner.stop();
         }
 
-        // Clear current machine pointer
-        current_machine = null;
-
         self.running.store(false, .release);
-        log.info("machine stopped", .{});
+
+        // Kick every sync-loop vCPU out of hv_vcpu_run so they observe
+        // running=false promptly.
+        for (self.cpu_states) |*state| {
+            if (state.vcpu) |v| v.forceExit() catch {};
+        }
+
+        log.info("machine stop requested", .{});
     }
 
     /// Kick a specific vCPU to wake it from WFI/sleep.
@@ -561,73 +587,98 @@ pub const Machine = struct {
 
         // Set up initial vCPU state (as vCPU 0 - the boot CPU)
         try self.setupVcpuState(vcpu, 0);
+        self.cpu_states[0].vcpu = vcpu;
+        self.cpu_states[0].started.store(true, .release);
 
         self.running.store(true, .release);
         log.info("machine started, running vCPU loop", .{});
 
         // Run vCPU loop on this thread
-        self.runVcpuLoop(vcpu) catch |err| {
+        self.runVcpuLoop(vcpu, 0) catch |err| {
             log.err("vCPU loop error: {}", .{err});
         };
 
         self.running.store(false, .release);
+        self.joinSecondaryVcpus();
         current_machine = null;
         log.info("machine stopped", .{});
     }
 
-    fn runVcpuLoop(self: *Machine, vcpu: *hypervisor.Vcpu) !void {
+    fn runVcpuLoop(self: *Machine, vcpu: *hypervisor.Vcpu, cpu_id: u8) !void {
         var exit_count: u64 = 0;
+        const state = &self.cpu_states[cpu_id];
 
         while (self.running.load(.acquire)) {
             // Check for pending IRQ before running
-            if (self.pending_irq.swap(false, .acq_rel)) {
-                try vcpu.setPendingInterrupt(.irq, true);
-            }
+            // Drive the IRQ line from GIC state on every iteration: HVF
+            // clears the pending interrupt at each hv_vcpu_run entry, so a
+            // one-shot assert loses interrupts the guest had masked.
+            _ = state.pending_irq.swap(false, .acq_rel);
+            self.machine_lock.lock();
+            const irq_line = if (self.gic_device) |g| g.hasDeliverableIrq(cpu_id) else false;
+            self.machine_lock.unlock();
+            try vcpu.setPendingInterrupt(.irq, irq_line);
 
             // Unmask the HVF vtimer once the guest has EOI'd PPI 27.
-            if (self.vtimer_unmask.swap(false, .acq_rel)) {
+            if (state.vtimer_unmask.swap(false, .acq_rel)) {
                 try vcpu.setVTimerMask(false);
             }
 
-            // Poll virtio console queues on every exit (guest may use
-            // notification suppression; host input arrives asynchronously).
-            if (self.console) |console| {
-                console.pollTransmit();
-                console.pollReceive();
+            // Poll host-input-fed queues (vCPU 0 only; MMIO kicks from any
+            // CPU are processed inline under the machine lock).
+            if (cpu_id == 0) {
+                self.machine_lock.lock();
+                if (self.console) |console| {
+                    console.pollTransmit();
+                    console.pollReceive();
+                }
+                if (self.keyboard) |kbd| kbd.pollEvents();
+                if (self.mouse) |mouse| mouse.pollEvents();
+                self.machine_lock.unlock();
             }
-            if (self.keyboard) |kbd| kbd.pollEvents();
-            if (self.mouse) |mouse| mouse.pollEvents();
 
             const exit_info = try vcpu.run();
             exit_count += 1;
 
             switch (exit_info.reason) {
                 .canceled => {
-                    log.info("vCPU canceled", .{});
-                    break;
+                    // hv_vcpus_exit kick: either a cross-thread IRQ kick
+                    // (handled by the flag checks at the top of the loop)
+                    // or shutdown (running=false ends the loop).
+                    continue;
                 },
                 .exception => {
                     const ec = exit_info.exceptionClass();
                     switch (ec) {
                         .data_abort_lower, .data_abort_same => {
+                            self.machine_lock.lock();
+                            defer self.machine_lock.unlock();
                             try self.handleMmio(vcpu, exit_info);
                         },
                         .wf_trapped => {
                             // Poll console/input queues while halted
-                            if (self.console) |console| {
-                                console.pollTransmit();
-                                console.pollReceive();
+                            if (cpu_id == 0) {
+                                self.machine_lock.lock();
+                                if (self.console) |console| {
+                                    console.pollTransmit();
+                                    console.pollReceive();
+                                }
+                                if (self.keyboard) |kbd| kbd.pollEvents();
+                                if (self.mouse) |mouse| mouse.pollEvents();
+                                self.machine_lock.unlock();
                             }
-                            if (self.keyboard) |kbd| kbd.pollEvents();
-                            if (self.mouse) |mouse| mouse.pollEvents();
                             try vcpu.advancePC(exit_info);
                             std.Thread.sleep(1_000_000); // 1ms
                         },
                         .hvc_aarch64, .smc_aarch64 => {
+                            self.machine_lock.lock();
+                            defer self.machine_lock.unlock();
                             try self.handlePsci(vcpu, exit_info);
                         },
                         .msr_mrs_system => {
-                            try self.handleSysReg(vcpu, exit_info);
+                            self.machine_lock.lock();
+                            defer self.machine_lock.unlock();
+                            try self.handleSysReg(vcpu, cpu_id, exit_info);
                         },
                         else => {
                             log.warn("unhandled exception class: 0x{x}", .{@intFromEnum(ec)});
@@ -643,9 +694,11 @@ pub const Machine = struct {
                 .vtimer_activated => {
                     // Pend the virtual timer PPI (intid 27). HVF masks the
                     // vtimer on this exit; we unmask when the guest EOIs.
+                    self.machine_lock.lock();
                     if (self.gic_device) |gic_dev| {
-                        gic_dev.setPpiPending(0, 27, true);
+                        gic_dev.setPpiPending(cpu_id, 27, true);
                     }
+                    self.machine_lock.unlock();
                     try vcpu.setPendingInterrupt(.irq, true);
                 },
                 .unknown => {
@@ -879,9 +932,33 @@ pub const Machine = struct {
             0x8400000A => blk: {
                 const feature = try vcpu.getReg(.x1);
                 break :blk switch (feature) {
-                    0x84000000, 0x84000008, 0x84000009, 0x8400000A => 0,
+                    0x84000000,
+                    0x84000008,
+                    0x84000009,
+                    0x8400000A,
+                    0x84000003,
+                    0xC4000003,
+                    0x84000004,
+                    0xC4000004,
+                    => 0,
                     else => 0xFFFFFFFF,
                 };
+            },
+
+            // PSCI_CPU_ON (32- and 64-bit calling conventions)
+            0x84000003, 0xC4000003 => blk: {
+                const target_mpidr = try vcpu.getReg(.x1);
+                const entry_point = try vcpu.getReg(.x2);
+                const context_id = try vcpu.getReg(.x3);
+                break :blk self.psciCpuOn(target_mpidr, entry_point, context_id);
+            },
+
+            // PSCI_AFFINITY_INFO
+            0x84000004, 0xC4000004 => blk: {
+                const target_mpidr = try vcpu.getReg(.x1);
+                const cpu_id = target_mpidr & 0xFF;
+                if (cpu_id >= self.cpu_states.len) break :blk PSCI_INVALID_PARAMETERS;
+                break :blk if (self.cpu_states[cpu_id].started.load(.acquire)) 0 else 1;
             },
 
             // PSCI_SYSTEM_OFF
@@ -908,14 +985,97 @@ pub const Machine = struct {
         // NOTE: Do NOT advance PC - for HVC/SMC, PC already points past the instruction
     }
 
-    fn handleSysReg(self: *Machine, vcpu: *hypervisor.Vcpu, info: hypervisor.ExitInfo) !void {
+    const PSCI_INVALID_PARAMETERS: u64 = @bitCast(@as(i64, -2));
+    const PSCI_ALREADY_ON: u64 = @bitCast(@as(i64, -4));
+    const PSCI_INTERNAL_FAILURE: u64 = @bitCast(@as(i64, -6));
+
+    /// PSCI CPU_ON: bring a secondary vCPU online on its own thread.
+    fn psciCpuOn(self: *Machine, target_mpidr: u64, entry_point: u64, context_id: u64) u64 {
+        const cpu_id = target_mpidr & 0xFF;
+        if (cpu_id == 0 or cpu_id >= self.cpu_states.len) return PSCI_INVALID_PARAMETERS;
+
+        const state = &self.cpu_states[cpu_id];
+        if (state.started.load(.acquire)) return PSCI_ALREADY_ON;
+
+        state.entry_point = entry_point;
+        state.context_id = context_id;
+        state.started.store(true, .release);
+
+        state.thread = std.Thread.spawn(.{}, secondaryVcpuMain, .{ self, @as(u8, @intCast(cpu_id)) }) catch {
+            state.started.store(false, .release);
+            return PSCI_INTERNAL_FAILURE;
+        };
+
+        log.info("PSCI CPU_ON: cpu {} entry=0x{x}", .{ cpu_id, entry_point });
+        return 0;
+    }
+
+    /// Entry point for secondary vCPU threads (HVF requires create+run
+    /// on the same thread).
+    fn secondaryVcpuMain(self: *Machine, cpu_id: u8) void {
+        const state = &self.cpu_states[cpu_id];
+        const vm = self.hv_vm orelse return;
+
+        const vcpu = vm.createVcpu() catch |err| {
+            log.err("cpu {}: vCPU creation failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+
+        self.setupSecondaryState(vcpu, cpu_id, state.entry_point, state.context_id) catch |err| {
+            log.err("cpu {}: state setup failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        state.vcpu = vcpu;
+
+        self.runVcpuLoop(vcpu, cpu_id) catch |err| {
+            log.warn("cpu {}: vCPU loop failed: {}", .{ cpu_id, err });
+        };
+        state.started.store(false, .release);
+    }
+
+    /// EL1 boot state for a CPU_ON'd secondary: like the primary but with
+    /// the PSCI-provided entry point and context id.
+    fn setupSecondaryState(
+        self: *Machine,
+        vcpu: *hypervisor.Vcpu,
+        cpu_id: u8,
+        entry_point: u64,
+        context_id: u64,
+    ) !void {
+        _ = self;
+        try vcpu.setSysReg(.cpacr_el1, 3 << 20);
+        try vcpu.setSysReg(.vbar_el1, MemoryLayout.RAM_BASE);
+        try vcpu.setSysReg(.sctlr_el1, 0);
+        // Best-effort: HVF may treat MPIDR as read-only (its default is
+        // the vCPU creation index, which matches our numbering).
+        vcpu.setSysReg(.mpidr_el1, @as(u64, cpu_id)) catch |err| {
+            log.warn("cpu {}: MPIDR not settable: {}", .{ cpu_id, err });
+        };
+        try vcpu.setReg(.cpsr, 0x3c4);
+        try vcpu.setPC(entry_point);
+        try vcpu.setReg(.x0, context_id);
+    }
+
+    /// Join all secondary vCPU threads (after running=false).
+    fn joinSecondaryVcpus(self: *Machine) void {
+        for (self.cpu_states, 0..) |*state, i| {
+            if (i == 0) continue;
+            if (state.vcpu) |v| v.forceExit() catch {};
+            if (state.thread) |thread| {
+                thread.join();
+                state.thread = null;
+            }
+        }
+    }
+
+    fn handleSysReg(self: *Machine, vcpu: *hypervisor.Vcpu, cpu_id: u8, info: hypervisor.ExitInfo) !void {
         const iss = info.iss();
         const decoded = icc.IccHandler.decodeIss(iss);
 
         // Check if this is an ICC register
         if (self.icc_handler) |handler| {
-            const cpu_id: u8 = 0; // TODO: get from vcpu
-
             if (decoded.is_read) {
                 const value = handler.read(cpu_id, decoded.reg);
                 if (decoded.rt != 31) {
@@ -1279,7 +1439,6 @@ pub const Machine = struct {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(80, true);
         }
-        self.pending_irq.store(true, .release);
     }
 
     fn registerMmioHandlers(self: *Machine) !void {
@@ -1583,7 +1742,10 @@ pub const Machine = struct {
         // Check if address is within RAM region
         if (addr < MemoryLayout.RAM_BASE) return null;
         const ram_offset = addr - MemoryLayout.RAM_BASE;
-        if (ram_offset + len > ram.len) return null;
+        if (ram_offset + len > ram.len) {
+            log.warn("get_mem: OOB addr=0x{x} len={} ram_len=0x{x}", .{ addr, len, ram.len });
+            return null;
+        }
 
         return ram[ram_offset..][0..len];
     }
@@ -1651,16 +1813,24 @@ pub const Machine = struct {
             if (self.gic_device) |gic_dev| {
                 gic_dev.setPpiPending(cpu_id, 27, false);
             }
-            self.vtimer_unmask.store(true, .release);
+            if (cpu_id < self.cpu_states.len) {
+                self.cpu_states[cpu_id].vtimer_unmask.store(true, .release);
+            }
         }
     }
 
     fn gicInjectIrqCallback(cpu_id: u8, userdata: ?*anyopaque) void {
-        _ = cpu_id;
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        // For sync mode, we need to set a pending IRQ flag
-        // The vCPU loop will check this and inject the IRQ
-        self.pending_irq.store(true, .release);
+        self.kickCpu(cpu_id);
+    }
+
+    /// Mark an IRQ pending for a vCPU and force it out of hv_vcpu_run so
+    /// cross-CPU interrupts (SGIs, device IRQs) are delivered promptly.
+    fn kickCpu(self: *Machine, cpu_id: u8) void {
+        if (cpu_id >= self.cpu_states.len) return;
+        const state = &self.cpu_states[cpu_id];
+        state.pending_irq.store(true, .release);
+        if (state.vcpu) |v| v.forceExit() catch {};
     }
 };
 
