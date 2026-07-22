@@ -14,6 +14,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const metal = @import("../metal.zig");
 const proto = @import("protocol.zig");
+const tgsi = @import("tgsi.zig");
 
 const NSUInteger = metal.NSUInteger;
 
@@ -520,4 +521,55 @@ test "draw triangle from an uploaded vertex buffer" {
 
     // Corner still black.
     try std.testing.expect(buf[1] < 40);
+}
+
+test "TGSI→MSL output compiles on a real Metal device" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch |err| {
+        if (err == Error.NoMetalDevice) return error.SkipZigTest;
+        return err;
+    };
+    defer r.deinit();
+
+    // Passthrough VS and FS in TGSI text, as mesa's virgl driver would dump.
+    const vs_src =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL IN[1]
+        \\DCL OUT[0], POSITION
+        \\DCL OUT[1], GENERIC[0]
+        \\  0: MOV OUT[0], IN[0]
+        \\  1: MOV OUT[1], IN[1]
+        \\  2: END
+    ;
+    const fs_src =
+        \\FRAG
+        \\DCL IN[0], GENERIC[0]
+        \\DCL OUT[0], COLOR
+        \\  0: MOV OUT[0], IN[0]
+        \\  1: END
+    ;
+
+    const vprog = try tgsi.parse(vs_src);
+    var vmsl = try tgsi.emit(alloc, &vprog);
+    defer vmsl.deinit(alloc);
+    const fprog = try tgsi.parse(fs_src);
+    var fmsl = try tgsi.emit(alloc, &fprog);
+    defer fmsl.deinit(alloc);
+
+    // Both translated shaders must compile as MSL on the GPU.
+    const vsrcz = try alloc.dupeZ(u8, vmsl.source);
+    defer alloc.free(vsrcz);
+    const fsrcz = try alloc.dupeZ(u8, fmsl.source);
+    defer alloc.free(fsrcz);
+
+    const vlib = r.device.newLibraryWithSource(vsrcz) orelse return error.TestUnexpectedResult;
+    defer vlib.release();
+    const flib = r.device.newLibraryWithSource(fsrcz) orelse return error.TestUnexpectedResult;
+    defer flib.release();
+
+    const vfn = vlib.newFunction("vs_main") orelse return error.TestUnexpectedResult;
+    defer vfn.release();
+    const ffn = flib.newFunction("fs_main") orelse return error.TestUnexpectedResult;
+    defer ffn.release();
 }

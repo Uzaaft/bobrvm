@@ -18,6 +18,7 @@ pub const context = @import("context.zig");
 pub const caps = @import("caps.zig");
 pub const renderer = @import("renderer.zig");
 pub const Renderer = renderer.Renderer;
+pub const tgsi = @import("tgsi.zig");
 
 // Re-export commonly used types
 pub const Command = protocol.Command;
@@ -33,4 +34,5 @@ test {
     _ = context;
     _ = caps;
     _ = renderer;
+    _ = tgsi;
 }
