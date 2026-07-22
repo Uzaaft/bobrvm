@@ -14,11 +14,15 @@ const GhosttySteps = struct {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const is_nix_build = b.graph.env_map.get("NIX_BUILD_TOP") != null;
+    // A sandboxed `nix build` sets NIX_BUILD_TOP but not IN_NIX_SHELL;
+    // `nix develop` sets both. Codesigning must run in the dev shell (the
+    // CLI needs the hypervisor entitlement) but can't run in the sandbox.
+    const in_nix_shell = b.graph.env_map.get("IN_NIX_SHELL") != null;
+    const is_nix_build = b.graph.env_map.get("NIX_BUILD_TOP") != null and !in_nix_shell;
     // Swift/Xcode/Ghostty steps never run under nix (nix builds the Zig core
     // only); resolving the ghostty dependency inside a nix shell also fails
     // because ghostty's apple-sdk detection can't see the real Darwin SDK.
-    const in_nix = is_nix_build or b.graph.env_map.get("IN_NIX_SHELL") != null;
+    const in_nix = is_nix_build or in_nix_shell;
 
     // Build options
     const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
