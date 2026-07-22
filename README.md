@@ -1,25 +1,33 @@
-Fuck you broadcom
-
-
-
-
 # bobrvm
 
-Linux virtualization for macOS with OpenGL 4.3 and Vulkan support.
+Native Linux virtualization for macOS. The entire VM core — hypervisor,
+virtio devices, interrupt controller, GPU translation, networking — is
+Zig; only the window/Metal-context host is Swift (the ghostty split).
 
-## Features
+Boots NixOS to a shell in two modes: a **GUI** window (VMware-Fusion
+style) and a **headless** drop-into-a-shell console.
 
-- **OpenGL 4.3** via virgl → Metal translation
-- **Vulkan 1.3** via Venus → Metal translation  
-- **Apple Silicon native** using Hypervisor.framework
-- **Zero-copy GPU** via IOSurface sharing
-- **Fast file sharing** via virtiofs + DAX
+## Status
+
+Working and verified against a NixOS 25.05 aarch64 guest:
+
+| Area | State |
+|------|-------|
+| Boot (Apple Hypervisor.framework, arm64) | ✅ NixOS to login, ~15s (1 vCPU) |
+| Serial console (virtio-console + PL011) | ✅ interactive shell |
+| SMP (PSCI CPU_ON) | ✅ 4 vCPUs online |
+| virtio-blk | ✅ read/write, durable across restarts |
+| virtio-gpu 2D → Metal | ✅ fbcon renders in the app window |
+| virtio-input (keyboard/mouse) | ✅ evdev in guest |
+| virtio-net + built-in NAT | ✅ DHCP, DNS, TCP/UDP internet (no root) |
+| OpenGL 4.3 (virgl) | ⚠️ capset advertised (glsl 430); Metal execution WIP |
+| Vulkan (Venus) | ⏳ planned |
 
 ## Requirements
 
 - macOS 13+ (Ventura or later)
-- Apple Silicon (M1/M2/M3/M4) or Intel Mac
-- Nix package manager
+- Apple Silicon (M1/M2/M3/M4)
+- Nix (for the Zig core); Xcode/Swift toolchain (for the app)
 
 ## Building
 
@@ -48,6 +56,44 @@ zig build -Demit-macos-app
 
 # Build and run with terminal logging (dev mode)
 zig build run
+```
+
+## Usage
+
+Two ways to run a guest, sharing the same Zig VM core.
+
+### Headless (drop into a shell)
+
+`bobrvm run` boots directly into the guest's console — no window:
+
+```bash
+# Sign the CLI once per build (Hypervisor.framework entitlement).
+# `nix develop -c zig build` does this automatically.
+
+# Direct kernel boot, interactive serial console (Ctrl-] to quit):
+./zig-out/bin/bobrvm run \
+    --kernel Image --initrd initrd \
+    --memory 4096 --cpus 4 \
+    --disk root.raw --disk2 scratch.raw --disk2-writable \
+    --net \
+    --cmdline 'console=hvc0 root=LABEL=... init=/nix/store/...-init'
+```
+
+Key flags: `--net` (built-in NAT: DHCP + real internet, no root),
+`--gpu`/`--virgl` (add a display device), `--display WxH`,
+`--disk2 <img> --disk2-writable` (a persistent second disk, `/dev/vdb`).
+
+### GUI (window)
+
+The Swift app (`macos/MinimalApp`) owns the window and Metal context;
+the Zig renderer thread blits the guest scanout into a `CAMetalLayer`
+and routes keyboard/mouse back to virtio-input.
+
+```bash
+nix develop -c zig build            # build libbobrvm.a
+./macos/MinimalApp/build.sh         # link + codesign the app
+./zig-out/bin/BobrvmDisplay --kernel Image --initrd initrd \
+    --cmdline 'console=tty0 console=hvc0 ...'
 ```
 
 ## Logging
@@ -111,16 +157,23 @@ log stream --level debug --predicate 'subsystem=="com.bobrvm.lib"'
 
 ```
 bobrvm/
-├── flake.nix           # Nix build
+├── flake.nix           # Nix build (Zig core only)
 ├── build.zig           # Zig build
-├── include/bobrvm.h    # C API
+├── include/bobrvm.h    # C API (Swift FFI)
 ├── src/
-│   ├── apprt/          # Application runtime
-│   ├── hypervisor/     # Hypervisor.framework
-│   ├── virtio/         # Virtio devices
-│   ├── gpu/            # GPU translation
-│   └── renderer/       # Metal rendering
-└── macos/              # Swift UI (future)
+│   ├── cli/            # `bobrvm run` headless entry
+│   ├── apprt/          # C API + embedded runtime (keymap, surfaces)
+│   ├── hypervisor/     # Hypervisor.framework bindings, vCPU
+│   ├── machine/        # Machine model, MMIO dispatch, PSCI/SMP, DTB
+│   ├── gic/            # GICv3 interrupt controller
+│   ├── virtio/         # console, blk, gpu, input, net, mmio, ring
+│   ├── net/            # built-in NAT (ARP/DHCP/ICMP/UDP/TCP)
+│   ├── gpu/            # virgl decode + Metal backend
+│   └── renderer/       # Metal render thread
+├── macos/
+│   ├── MinimalApp/     # Swift display app (swiftc, outside nix)
+│   └── Bobrvm.xcodeproj/
+└── tests/integration/  # alpine, persistence, bare-metal harnesses
 ```
 
 ## License
