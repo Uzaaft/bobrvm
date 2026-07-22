@@ -206,13 +206,10 @@ pub const IccHandler = struct {
     }
 
     fn handleSgi(self: *IccHandler, source_cpu: u8, value: u64) void {
-        _ = self;
         const intid: u32 = @truncate((value >> 24) & 0xF);
         const target_list: u16 = @truncate(value);
         const irm = (value >> 40) & 1; // Interrupt Routing Mode
 
-        log.debug("CPU{}: SGI {} target_list=0x{x} irm={}", .{ source_cpu, intid, target_list, irm });
-
-        // TODO: Send SGI to target CPUs
+        self.gic.sendSgi(source_cpu, intid, target_list, irm == 1);
     }
 };

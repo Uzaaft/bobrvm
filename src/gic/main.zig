@@ -163,15 +163,13 @@ pub const Gic = struct {
         }
 
         // Initialize redistributor state
-        for (gic.redists, 0..) |*redist, i| {
+        for (gic.redists) |*redist| {
             redist.* = .{};
-            // Initialize PPI priorities
-            for (&redist.sgi_ppi) |*irq| {
+            for (&redist.sgi_ppi, 0..) |*irq, intid| {
                 irq.priority = 0xA0; // Default priority
-                // PPI 16-31 are typically level-triggered
-                if (i >= 16) {
-                    irq.config = 0;
-                }
+                // SGIs (0-15) are always edge-triggered; PPIs (16-31)
+                // are level-triggered.
+                irq.config = if (intid < 16) 1 else 0;
             }
         }
 
@@ -220,6 +218,30 @@ pub const Gic = struct {
         // If newly pending and enabled, signal the target CPU
         if (pending and !was_pending and spi.enabled) {
             self.checkPendingIrq(spi.target_cpu);
+        }
+    }
+
+    /// Deliver a Software Generated Interrupt (ICC_SGI1R write).
+    /// With all_but_self, targets every CPU except the source; otherwise
+    /// targets the CPUs in target_list (affinity 0 bitmap).
+    pub fn sendSgi(
+        self: *Gic,
+        source_cpu: u8,
+        intid: u32,
+        target_list: u16,
+        all_but_self: bool,
+    ) void {
+        assert(intid < 16);
+        assert(source_cpu < self.num_cpus);
+
+        var cpu: u8 = 0;
+        while (cpu < self.num_cpus) : (cpu += 1) {
+            if (all_but_self) {
+                if (cpu == source_cpu) continue;
+            } else {
+                if (cpu >= 16 or (target_list >> @intCast(cpu)) & 1 == 0) continue;
+            }
+            self.setPpiPending(cpu, intid, true);
         }
     }
 
