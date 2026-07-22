@@ -314,6 +314,7 @@ pub const Machine = struct {
         }
 
         if (self.net) |net| {
+            self.nat.stop();
             net.deinit();
             self.net = null;
         }
@@ -1394,7 +1395,8 @@ pub const Machine = struct {
             self.net = try virtio.Net.init(self.alloc);
             self.net.?.setGuestMemory(getGuestMemoryWrapper);
             self.net.?.transport.setIrqCallback(netIrqCallback, self);
-            self.nat = mininat.MiniNat.init(natReplyCallback, self);
+            self.nat = mininat.MiniNat.init(self.alloc, natReplyCallback, self);
+            try self.nat.start();
             self.net.?.setTxCallback(netTxCallback, self);
             log.debug("initialized virtio-net at slot {} (built-in NAT)", .{self.net_slot});
         }

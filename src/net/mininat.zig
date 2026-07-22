@@ -6,7 +6,9 @@
 //!
 //!   guest:   10.0.2.15
 //!   gateway: 10.0.2.2 (this responder)
-//!   dns:     10.0.2.3 (advertised, not yet answering)
+//!
+//! UDP datagrams to external addresses are forwarded through host
+//! sockets (so DNS to real resolvers works); TCP forwarding is next.
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
@@ -15,7 +17,7 @@ const log = std.log.scoped(.mininat);
 
 pub const GUEST_IP = [4]u8{ 10, 0, 2, 15 };
 pub const GATEWAY_IP = [4]u8{ 10, 0, 2, 2 };
-pub const DNS_IP = [4]u8{ 10, 0, 2, 3 };
+pub const DNS_IP = [4]u8{ 1, 1, 1, 1 };
 pub const NETMASK = [4]u8{ 255, 255, 255, 0 };
 pub const GATEWAY_MAC = [6]u8{ 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
@@ -26,12 +28,54 @@ const ETHERTYPE_ARP: u16 = 0x0806;
 /// Reply sink: frames the responder wants delivered to the guest.
 pub const ReplyFn = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
 
+const UdpKey = struct {
+    guest_port: u16,
+    remote_ip: [4]u8,
+    remote_port: u16,
+};
+
+const UdpFlow = struct {
+    socket: std.posix.socket_t,
+    last_used: i64,
+};
+
 pub const MiniNat = struct {
     reply: ReplyFn,
     reply_userdata: ?*anyopaque,
 
-    pub fn init(reply: ReplyFn, userdata: ?*anyopaque) MiniNat {
-        return .{ .reply = reply, .reply_userdata = userdata };
+    alloc: std.mem.Allocator,
+    udp_flows: std.AutoHashMap(UdpKey, UdpFlow),
+    flows_mutex: std.Thread.Mutex = .{},
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    poll_thread: ?std.Thread = null,
+
+    pub const UDP_FLOW_MAX: usize = 256;
+    pub const UDP_IDLE_TIMEOUT_S: i64 = 60;
+
+    pub fn init(alloc: std.mem.Allocator, reply: ReplyFn, userdata: ?*anyopaque) MiniNat {
+        return .{
+            .reply = reply,
+            .reply_userdata = userdata,
+            .alloc = alloc,
+            .udp_flows = std.AutoHashMap(UdpKey, UdpFlow).init(alloc),
+        };
+    }
+
+    /// Start the reply-poll thread (forwards socket replies to the guest).
+    pub fn start(self: *MiniNat) !void {
+        self.running.store(true, .release);
+        self.poll_thread = try std.Thread.spawn(.{}, pollLoop, .{self});
+    }
+
+    pub fn stop(self: *MiniNat) void {
+        self.running.store(false, .release);
+        if (self.poll_thread) |thread| {
+            thread.join();
+            self.poll_thread = null;
+        }
+        var iter = self.udp_flows.valueIterator();
+        while (iter.next()) |flow| std.posix.close(flow.socket);
+        self.udp_flows.deinit();
     }
 
     /// Handle one guest → host Ethernet frame.
@@ -109,7 +153,142 @@ pub const MiniNat = struct {
         // DHCP client → server
         if (dst_port == 67) {
             self.handleDhcp(frame, frame[udp_off + 8 ..]);
+            return;
         }
+
+        // Forward datagrams for non-local destinations via host sockets.
+        const ip = frame[ETH_HDR..];
+        const dst_ip = ip[16..20];
+        if (std.mem.eql(u8, dst_ip[0..3], GATEWAY_IP[0..3])) return; // local net
+        if (dst_ip[0] == 255) return; // broadcast
+
+        const src_port = std.mem.readInt(u16, udp[0..2], .big);
+        const udp_len = std.mem.readInt(u16, udp[4..6], .big);
+        if (udp_len < 8 or udp_off + udp_len > frame.len) return;
+        const payload = frame[udp_off + 8 .. udp_off + udp_len];
+
+        self.forwardUdp(src_port, dst_ip[0..4].*, dst_port, payload);
+    }
+
+    fn forwardUdp(
+        self: *MiniNat,
+        guest_port: u16,
+        remote_ip: [4]u8,
+        remote_port: u16,
+        payload: []const u8,
+    ) void {
+        const key = UdpKey{
+            .guest_port = guest_port,
+            .remote_ip = remote_ip,
+            .remote_port = remote_port,
+        };
+
+        self.flows_mutex.lock();
+        defer self.flows_mutex.unlock();
+
+        const gop = self.udp_flows.getOrPut(key) catch return;
+        if (!gop.found_existing) {
+            if (self.udp_flows.count() > UDP_FLOW_MAX) {
+                _ = self.udp_flows.remove(key);
+                return;
+            }
+            const sock = std.posix.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
+                0,
+            ) catch {
+                _ = self.udp_flows.remove(key);
+                return;
+            };
+            gop.value_ptr.* = .{ .socket = sock, .last_used = std.time.timestamp() };
+        }
+        gop.value_ptr.last_used = std.time.timestamp();
+
+        var addr = std.posix.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, remote_port),
+            .addr = @bitCast(remote_ip),
+        };
+        _ = std.posix.sendto(
+            gop.value_ptr.socket,
+            payload,
+            0,
+            @ptrCast(&addr),
+            @sizeOf(std.posix.sockaddr.in),
+        ) catch {};
+    }
+
+    /// Poll host sockets for replies and frame them back to the guest.
+    fn pollLoop(self: *MiniNat) void {
+        var buf: [2048]u8 = undefined;
+        while (self.running.load(.acquire)) {
+            var delivered = false;
+
+            self.flows_mutex.lock();
+            const now = std.time.timestamp();
+            var expired: ?UdpKey = null;
+            var iter = self.udp_flows.iterator();
+            while (iter.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const flow = entry.value_ptr;
+
+                if (now - flow.last_used > UDP_IDLE_TIMEOUT_S) {
+                    expired = key; // one per pass keeps the iterator valid
+                    continue;
+                }
+
+                const n = std.posix.recvfrom(flow.socket, &buf, 0, null, null) catch |err| {
+                    if (err != error.WouldBlock) expired = key;
+                    continue;
+                };
+                if (n == 0) continue;
+                flow.last_used = now;
+                self.replyUdp(key, buf[0..n]);
+                delivered = true;
+            }
+            if (expired) |key| {
+                if (self.udp_flows.fetchRemove(key)) |entry| {
+                    std.posix.close(entry.value.socket);
+                }
+            }
+            self.flows_mutex.unlock();
+
+            if (!delivered) {
+                std.Thread.sleep(2 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    /// Build remote → guest UDP frame.
+    fn replyUdp(self: *MiniNat, key: UdpKey, payload: []const u8) void {
+        var out: [2048 + 42]u8 = undefined;
+        const total = ETH_HDR + 20 + 8 + payload.len;
+        if (total > out.len) return;
+
+        // Ethernet: to guest
+        @memcpy(out[0..6], &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
+        @memcpy(out[6..12], &GATEWAY_MAC);
+        std.mem.writeInt(u16, out[12..14], ETHERTYPE_IP, .big);
+
+        const ip = out[ETH_HDR..];
+        @memset(ip[0..20], 0);
+        ip[0] = 0x45;
+        std.mem.writeInt(u16, ip[2..4], @intCast(20 + 8 + payload.len), .big);
+        ip[8] = 64;
+        ip[9] = 17;
+        @memcpy(ip[12..16], &key.remote_ip);
+        @memcpy(ip[16..20], &GUEST_IP);
+        const ip_csum = checksum(ip[0..20]);
+        std.mem.writeInt(u16, ip[10..12], ip_csum, .big);
+
+        const udp = out[ETH_HDR + 20 ..];
+        std.mem.writeInt(u16, udp[0..2], key.remote_port, .big);
+        std.mem.writeInt(u16, udp[2..4], key.guest_port, .big);
+        std.mem.writeInt(u16, udp[4..6], @intCast(8 + payload.len), .big);
+        std.mem.writeInt(u16, udp[6..8], 0, .big); // checksum disabled
+
+        @memcpy(out[ETH_HDR + 28 ..][0..payload.len], payload);
+
+        self.reply(out[0..total], self.reply_userdata);
     }
 
     fn handleIcmp(self: *MiniNat, frame: []const u8, ihl: usize) void {
@@ -282,7 +461,8 @@ fn clearReplies() void {
 test "mininat: ARP request for gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testReply, null);
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    defer nat.udp_flows.deinit();
 
     var req: [42]u8 = undefined;
     @memset(&req, 0);
@@ -309,7 +489,8 @@ test "mininat: ARP request for gateway gets a reply" {
 test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testReply, null);
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    defer nat.udp_flows.deinit();
 
     var req: [ETH_HDR + 20 + 8 + 244]u8 = undefined;
     @memset(&req, 0);
@@ -342,7 +523,8 @@ test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
 test "mininat: ICMP echo to gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testReply, null);
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    defer nat.udp_flows.deinit();
 
     var req: [ETH_HDR + 20 + 12]u8 = undefined;
     @memset(&req, 0);
