@@ -42,13 +42,16 @@ if [ ! -f "$MINI_DIR/sbin/modprobe" ]; then
     ln -sf ../bin/busybox "$MINI_DIR/sbin/modprobe"
 fi
 
-# Copy virtio_mmio module (needed for virtio-console over MMIO)
+# Copy virtio modules (virtio_mmio for the transport, virtio_blk for disks)
 KERN_VERSION=$(ls "$WORK_DIR/lib/modules" | head -1)
 if [ -n "$KERN_VERSION" ]; then
     mkdir -p "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/virtio"
+    mkdir -p "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/block"
     cp "$WORK_DIR/lib/modules/$KERN_VERSION/kernel/drivers/virtio/virtio_mmio.ko" \
        "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/virtio/" 2>/dev/null || true
-    
+    cp "$WORK_DIR/lib/modules/$KERN_VERSION/kernel/drivers/block/virtio_blk.ko" \
+       "$MINI_DIR/lib/modules/$KERN_VERSION/kernel/drivers/block/" 2>/dev/null || true
+
     # Copy modules metadata
     cp "$WORK_DIR/lib/modules/$KERN_VERSION/modules."* "$MINI_DIR/lib/modules/$KERN_VERSION/" 2>/dev/null || true
 fi
@@ -62,6 +65,9 @@ done
 # Create minimal init script
 cat > "$MINI_DIR/init" << 'EOF'
 #!/bin/ash
+
+# Install all busybox applet symlinks (dd, head, mount, ...)
+/bin/busybox --install -s /bin
 
 # Mount virtual filesystems
 mount -t proc proc /proc
@@ -83,6 +89,10 @@ if [ -f "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" ]; then
     /bin/insmod "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" 2>/dev/ttyAMA0
     RET=$?
     echo "insmod returned: $RET" >/dev/ttyAMA0 2>&1
+    if [ -f "/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko" ]; then
+        /bin/insmod "/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko" 2>/dev/ttyAMA0
+        echo "virtio_blk insmod returned: $?" >/dev/ttyAMA0 2>&1
+    fi
     sleep 1
 else
     echo "virtio_mmio.ko not found for $KVER" >/dev/ttyAMA0 2>&1

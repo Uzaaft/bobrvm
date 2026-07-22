@@ -116,8 +116,9 @@ pub const Transport = struct {
     notify_callback: ?*const fn (queue_idx: u32, userdata: ?*anyopaque) void,
     notify_userdata: ?*anyopaque,
 
-    /// Callback for interrupt injection.
-    irq_callback: ?*const fn (userdata: ?*anyopaque) void,
+    /// Callback for the interrupt line (level-triggered): true while
+    /// InterruptStatus is non-zero, false once the driver ACKs it all.
+    irq_callback: ?*const fn (level: bool, userdata: ?*anyopaque) void,
     irq_userdata: ?*anyopaque,
 
     pub const Error = Allocator.Error;
@@ -181,10 +182,10 @@ pub const Transport = struct {
         self.notify_userdata = userdata;
     }
 
-    /// Set IRQ callback (for injecting interrupts to guest).
+    /// Set IRQ line callback (for injecting interrupts to guest).
     pub fn setIrqCallback(
         self: *Transport,
-        callback: *const fn (?*anyopaque) void,
+        callback: *const fn (bool, ?*anyopaque) void,
         userdata: ?*anyopaque,
     ) void {
         self.irq_callback = callback;
@@ -235,7 +236,15 @@ pub const Transport = struct {
                 }
             },
             .queue_notify => self.handleNotify(value),
-            .interrupt_ack => self.interrupt_status = @bitCast(@as(u32, @bitCast(self.interrupt_status)) & ~value),
+            .interrupt_ack => {
+                self.interrupt_status = @bitCast(@as(u32, @bitCast(self.interrupt_status)) & ~value);
+                // Deassert the (level) interrupt line once fully ACKed
+                if (@as(u32, @bitCast(self.interrupt_status)) == 0) {
+                    if (self.irq_callback) |cb| {
+                        cb(false, self.irq_userdata);
+                    }
+                }
+            },
             .status => self.handleStatusWrite(@truncate(value)),
             .queue_desc_low => {
                 if (self.currentQueue()) |q| {
@@ -330,9 +339,9 @@ pub const Transport = struct {
     /// Signal used buffer interrupt.
     pub fn signalUsedBuffer(self: *Transport) void {
         self.interrupt_status.used_buffer = true;
-        // Trigger IRQ callback to inject interrupt to guest
+        // Assert the (level) interrupt line
         if (self.irq_callback) |cb| {
-            cb(self.irq_userdata);
+            cb(true, self.irq_userdata);
         }
     }
 

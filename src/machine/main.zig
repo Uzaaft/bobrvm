@@ -666,6 +666,27 @@ pub const Machine = struct {
             return;
         }
 
+        // Virtio block devices (slots 1 and 2)
+        inline for (.{ .{ 1, "block" }, .{ 2, "block2" } }) |slot| {
+            const base = MemoryLayout.virtioBase(slot[0]);
+            if (addr >= base and addr < base + MemoryLayout.VIRTIO_SIZE) {
+                if (@field(self, slot[1])) |blk| {
+                    const offset: u12 = @truncate(addr - base);
+                    if (is_write) {
+                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                        blk.write(offset, @truncate(value));
+                    } else {
+                        const value = blk.read(offset);
+                        if (srt != 31) {
+                            try vcpu.setReg(@enumFromInt(srt), value);
+                        }
+                    }
+                }
+                try vcpu.advancePC(info);
+                return;
+            }
+        }
+
         // PCIe ECAM (configuration space)
         if (addr >= MemoryLayout.ECAM_BASE and addr < MemoryLayout.ECAM_BASE + MemoryLayout.ECAM_SIZE) {
             const ecam_addr = pci.EcamAddr.decode(addr);
@@ -1044,6 +1065,7 @@ pub const Machine = struct {
             self.block = try virtio.Block.init(self.alloc);
             try self.block.?.attachDisk(disk_path, self.config.disk_read_only);
             self.block.?.setGuestMemory(getGuestMemoryWrapper);
+            self.block.?.transport.setIrqCallback(blk1IrqCallback, self);
             log.debug("initialized virtio-blk at 0x{x} with disk: {s}", .{
                 MemoryLayout.virtioBase(1),
                 disk_path,
@@ -1059,6 +1081,7 @@ pub const Machine = struct {
                 return err;
             };
             self.block2.?.setGuestMemory(getGuestMemoryWrapper);
+            self.block2.?.transport.setIrqCallback(blk2IrqCallback, self);
             log.debug("initialized virtio-blk2 at 0x{x} with disk: {s} (read-only: {})", .{
                 MemoryLayout.virtioBase(2),
                 disk2_path,
@@ -1449,11 +1472,27 @@ pub const Machine = struct {
         return ram[ram_offset..][0..len];
     }
 
-    fn consoleIrqCallback(userdata: ?*anyopaque) void {
+    fn consoleIrqCallback(level: bool, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
         // DTB declares virtio slot 0 as GIC_SPI 32 → intid 32 + 32 = 64.
         if (self.gic_device) |gic_dev| {
-            gic_dev.setSpiPending(64, true);
+            gic_dev.setSpiPending(64, level);
+        }
+    }
+
+    fn blk1IrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        // DTB declares virtio slot 1 as GIC_SPI 33 → intid 32 + 33 = 65.
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(65, level);
+        }
+    }
+
+    fn blk2IrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        // DTB declares virtio slot 2 as GIC_SPI 34 → intid 32 + 34 = 66.
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(66, level);
         }
     }
 

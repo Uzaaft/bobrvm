@@ -142,7 +142,10 @@ pub const Block = struct {
     pub const SECTOR_SIZE: u64 = 512;
 
     pub fn init(alloc: Allocator) Error!*Block {
-        const features = Features.SIZE_MAX | Features.SEG_MAX | Features.BLK_SIZE | Features.FLUSH;
+        // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
+        const virtio_version_1: u64 = 1 << 32;
+        const features = Features.SIZE_MAX | Features.SEG_MAX | Features.BLK_SIZE |
+            Features.FLUSH | virtio_version_1;
         const transport = try mmio.Transport.init(alloc, 2, features, 1); // 2 = block device ID
         errdefer transport.deinit();
 
@@ -264,167 +267,181 @@ pub const Block = struct {
         }
     }
 
-    fn processRequestQueue(self: *Block) void {
-        const queue = &self.request_queue;
+    /// Poll the request queue. Can be called from the vCPU loop.
+    pub fn pollRequests(self: *Block) void {
+        self.processRequestQueue();
+    }
 
-        while (queue.pop()) |head| {
-            self.processRequest(head);
+    /// A descriptor read out of guest memory.
+    const GuestDesc = struct {
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+
+        const F_NEXT: u16 = 1;
+        const F_WRITE: u16 = 2;
+    };
+
+    /// Longest descriptor chain we accept: header + seg_max data + status.
+    const MAX_CHAIN: usize = 130;
+
+    fn readDesc(
+        qc: mmio.QueueConfig,
+        idx: u16,
+        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+    ) ?GuestDesc {
+        const mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
+        return .{
+            .addr = std.mem.readInt(u64, mem[0..8], .little),
+            .len = std.mem.readInt(u32, mem[8..12], .little),
+            .flags = std.mem.readInt(u16, mem[12..14], .little),
+            .next = std.mem.readInt(u16, mem[14..16], .little),
+        };
+    }
+
+    fn processRequestQueue(self: *Block) void {
+        const qc = self.transport.queues[0];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
+
+        const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
+        const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
+
+        var last_avail_idx = self.request_queue.last_avail_idx;
+        var processed: u32 = 0;
+
+        while (last_avail_idx != avail_idx) : (processed += 1) {
+            const ring_idx = last_avail_idx % qc.num;
+            const ring_entry = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse break;
+            const desc_idx = std.mem.readInt(u16, ring_entry[0..2], .little);
+
+            const written = self.processRequestGuest(qc, desc_idx, get_mem);
+
+            const used_ring = get_mem(qc.device_addr, 6) orelse break;
+            var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
+            const used_ring_idx = used_idx % qc.num;
+            const used_entry = get_mem(qc.device_addr + 4 + @as(u64, used_ring_idx) * 8, 8) orelse break;
+            std.mem.writeInt(u32, used_entry[0..4], desc_idx, .little);
+            std.mem.writeInt(u32, used_entry[4..8], written, .little);
+            used_idx +%= 1;
+            std.mem.writeInt(u16, @ptrCast(used_ring[2..4]), used_idx, .little);
+
+            last_avail_idx +%= 1;
         }
 
-        // Signal interrupt if requests completed
-        if (self.interrupt_callback) |cb| {
-            cb(self.interrupt_userdata);
+        self.request_queue.last_avail_idx = last_avail_idx;
+        if (processed > 0) {
+            self.transport.signalUsedBuffer();
         }
     }
 
-    fn processRequest(self: *Block, head: u16) void {
-        const queue = &self.request_queue;
+    /// Execute one request chain. Returns the number of bytes written to
+    /// device-writable buffers (data for reads, plus the status byte).
+    fn processRequestGuest(
+        self: *Block,
+        qc: mmio.QueueConfig,
+        head: u16,
+        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+    ) u32 {
+        // Collect the descriptor chain.
+        var descs: [MAX_CHAIN]GuestDesc = undefined;
+        var count: usize = 0;
         var idx = head;
-        var status: Status = .ok;
-        var total_len: u32 = 0;
-
-        // First descriptor: request header
-        const header_desc = &queue.desc[idx];
-        const header = self.readHeader(header_desc) orelse {
-            self.completeRequest(head, 0, .io_err);
-            return;
-        };
-
-        // Advance to data descriptors
-        if (!header_desc.flags.next) {
-            self.completeRequest(head, 0, .io_err);
-            return;
+        while (count < MAX_CHAIN) {
+            const desc = readDesc(qc, idx, get_mem) orelse break;
+            descs[count] = desc;
+            count += 1;
+            if ((desc.flags & GuestDesc.F_NEXT) == 0) break;
+            idx = desc.next;
         }
-        idx = header_desc.next;
 
-        // Process based on request type
+        // Minimum viable request: header + status.
+        if (count < 2) return 0;
+        const header_desc = descs[0];
+        const status_desc = descs[count - 1];
+        if (status_desc.len < 1 or (status_desc.flags & GuestDesc.F_WRITE) == 0) return 0;
+
+        var status: Status = .ok;
+        var data_written: u32 = 0;
+
+        if (header_desc.len < @sizeOf(RequestHeader)) {
+            status = .io_err;
+        } else if (get_mem(header_desc.addr, @sizeOf(RequestHeader))) |hdr_mem| {
+            const header = std.mem.bytesToValue(RequestHeader, hdr_mem[0..@sizeOf(RequestHeader)]);
+            const data = descs[1 .. count - 1];
+            status = self.executeRequest(header, data, get_mem, &data_written);
+        } else {
+            status = .io_err;
+        }
+
+        // Status byte is always written.
+        if (get_mem(status_desc.addr, 1)) |status_mem| {
+            status_mem[0] = @intFromEnum(status);
+        }
+
+        return data_written + 1;
+    }
+
+    fn executeRequest(
+        self: *Block,
+        header: RequestHeader,
+        data: []const GuestDesc,
+        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        data_written: *u32,
+    ) Status {
         const req_type: RequestType = @enumFromInt(header.type);
         switch (req_type) {
             .in => {
-                // Read from disk to guest memory
-                status = self.handleRead(queue, &idx, header.sector, &total_len);
+                const file = self.file orelse return .io_err;
+                var offset = header.sector * SECTOR_SIZE;
+                for (data) |desc| {
+                    if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
+                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
+                    if (offset + buf.len > self.capacity_bytes) return .io_err;
+                    const n = file.preadAll(buf, offset) catch return .io_err;
+                    // Short read within capacity: zero-fill (sparse image tail).
+                    @memset(buf[n..], 0);
+                    offset += buf.len;
+                    data_written.* += @intCast(buf.len);
+                }
+                return .ok;
             },
             .out => {
-                // Write from guest memory to disk
-                status = self.handleWrite(queue, &idx, header.sector, &total_len);
+                if (self.read_only) return .io_err;
+                const file = self.file orelse return .io_err;
+                var offset = header.sector * SECTOR_SIZE;
+                for (data) |desc| {
+                    if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
+                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
+                    if (offset + buf.len > self.capacity_bytes) return .io_err;
+                    file.pwriteAll(buf, offset) catch return .io_err;
+                    offset += buf.len;
+                }
+                return .ok;
             },
             .flush => {
                 if (self.file) |f| {
-                    f.sync() catch {
-                        status = .io_err;
-                    };
+                    f.sync() catch return .io_err;
                 }
+                return .ok;
             },
             .get_id => {
-                // Return device ID (not implemented)
-                status = .unsupp;
+                // Serial ID: write into the first writable data buffer.
+                for (data) |desc| {
+                    if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
+                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
+                    const id = "bobrvm";
+                    const n = @min(buf.len, id.len);
+                    @memcpy(buf[0..n], id[0..n]);
+                    @memset(buf[n..], 0);
+                    data_written.* += @intCast(buf.len);
+                    return .ok;
+                }
+                return .io_err;
             },
-            else => {
-                status = .unsupp;
-            },
+            else => return .unsupp,
         }
-
-        // Write status to last descriptor
-        self.writeStatus(queue, idx, status);
-        self.completeRequest(head, total_len, status);
-    }
-
-    fn readHeader(self: *Block, desc: *const Queue.Desc) ?RequestHeader {
-        if (desc.len < @sizeOf(RequestHeader)) return null;
-
-        const get_mem = self.guest_memory orelse return null;
-        const mem = get_mem(desc.addr, @sizeOf(RequestHeader)) orelse return null;
-
-        return std.mem.bytesToValue(RequestHeader, mem[0..@sizeOf(RequestHeader)]);
-    }
-
-    fn handleRead(
-        self: *Block,
-        queue: *Queue.VirtQueue,
-        idx: *u16,
-        sector: u64,
-        total_len: *u32,
-    ) Status {
-        const file = self.file orelse return .io_err;
-        const get_mem = self.guest_memory orelse return .io_err;
-
-        var offset = sector * SECTOR_SIZE;
-
-        // Process data descriptors
-        while (true) {
-            const desc = &queue.desc[idx.*];
-
-            if (desc.flags.write) {
-                // This is a device-writable buffer (for read data)
-                const mem = get_mem(desc.addr, desc.len) orelse return .io_err;
-
-                file.seekTo(offset) catch return .io_err;
-                const bytes_read = file.read(mem) catch return .io_err;
-
-                total_len.* += @intCast(bytes_read);
-                offset += bytes_read;
-            }
-
-            if (!desc.flags.next) break;
-            idx.* = desc.next;
-            if (idx.* >= queue.size) break;
-        }
-
-        return .ok;
-    }
-
-    fn handleWrite(
-        self: *Block,
-        queue: *Queue.VirtQueue,
-        idx: *u16,
-        sector: u64,
-        total_len: *u32,
-    ) Status {
-        if (self.read_only) return .io_err;
-
-        const file = self.file orelse return .io_err;
-        const get_mem = self.guest_memory orelse return .io_err;
-
-        var offset = sector * SECTOR_SIZE;
-
-        // Process data descriptors
-        while (true) {
-            const desc = &queue.desc[idx.*];
-
-            if (!desc.flags.write) {
-                // Device-readable buffer (write data from guest)
-                const mem = get_mem(desc.addr, desc.len) orelse return .io_err;
-
-                file.seekTo(offset) catch return .io_err;
-                const bytes_written = file.write(mem) catch return .io_err;
-
-                total_len.* += @intCast(bytes_written);
-                offset += bytes_written;
-            }
-
-            if (!desc.flags.next) break;
-            idx.* = desc.next;
-            if (idx.* >= queue.size) break;
-        }
-
-        return .ok;
-    }
-
-    fn writeStatus(self: *Block, queue: *Queue.VirtQueue, idx: u16, status: Status) void {
-        const desc = &queue.desc[idx];
-        const get_mem = self.guest_memory orelse return;
-
-        // Last descriptor should be status (1 byte, device-writable)
-        if (desc.flags.write and desc.len >= 1) {
-            const mem = get_mem(desc.addr, 1) orelse return;
-            mem[0] = @intFromEnum(status);
-        }
-    }
-
-    fn completeRequest(self: *Block, head: u16, len: u32, status: Status) void {
-        _ = status;
-        self.request_queue.pushUsed(head, len);
-        self.transport.signalUsedBuffer();
     }
 
     /// Get MMIO region size.
