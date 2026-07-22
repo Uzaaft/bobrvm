@@ -1,14 +1,16 @@
 //! Built-in NAT responder (slirp-style addressing, no root required).
 //!
-//! Answers the guest's ARP, DHCP, and ICMP-echo traffic so `ip addr`
-//! shows a lease and `ping 10.0.2.2` works out of the box. TCP/UDP
-//! forwarding and the vmnet.framework backend come later.
+//! Answers the guest's ARP, DHCP, and ICMP-echo traffic and forwards
+//! UDP/TCP to real hosts through host sockets — so `ip addr` shows a
+//! lease, `ping 10.0.2.2` works, DNS resolves, and `curl` reaches the
+//! internet, all without root. The vmnet.framework backend comes later.
 //!
 //!   guest:   10.0.2.15
 //!   gateway: 10.0.2.2 (this responder)
+//!   dns:     1.1.1.1 (advertised; UDP forwarded to the real resolver)
 //!
-//! UDP datagrams to external addresses are forwarded through host
-//! sockets (so DNS to real resolvers works); TCP forwarding is next.
+//! TCP is a minimal user-mode proxy: guest SYN opens a host socket, we
+//! track sequence numbers and relay bytes both ways with proper ACKs.
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
@@ -39,18 +41,42 @@ const UdpFlow = struct {
     last_used: i64,
 };
 
+const TcpKey = struct {
+    guest_port: u16,
+    remote_ip: [4]u8,
+    remote_port: u16,
+};
+
+const TcpState = enum { connecting, established, fin_wait, closed };
+
+/// A forwarded TCP connection (guest ↔ host socket).
+const TcpFlow = struct {
+    socket: std.posix.socket_t,
+    state: TcpState,
+    /// Our (gateway-side) sequence number = bytes we've sent to the guest.
+    snd_nxt: u32,
+    /// Next sequence we expect from the guest = bytes acked to it.
+    rcv_nxt: u32,
+    last_used: i64,
+};
+
 pub const MiniNat = struct {
     reply: ReplyFn,
     reply_userdata: ?*anyopaque,
 
     alloc: std.mem.Allocator,
     udp_flows: std.AutoHashMap(UdpKey, UdpFlow),
+    tcp_flows: std.AutoHashMap(TcpKey, TcpFlow),
     flows_mutex: std.Thread.Mutex = .{},
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
 
     pub const UDP_FLOW_MAX: usize = 256;
     pub const UDP_IDLE_TIMEOUT_S: i64 = 60;
+    pub const TCP_FLOW_MAX: usize = 256;
+    pub const TCP_IDLE_TIMEOUT_S: i64 = 300;
+    /// Our advertised window / max relayed segment payload.
+    pub const TCP_MSS: usize = 1400;
 
     pub fn init(alloc: std.mem.Allocator, reply: ReplyFn, userdata: ?*anyopaque) MiniNat {
         return .{
@@ -58,6 +84,7 @@ pub const MiniNat = struct {
             .reply_userdata = userdata,
             .alloc = alloc,
             .udp_flows = std.AutoHashMap(UdpKey, UdpFlow).init(alloc),
+            .tcp_flows = std.AutoHashMap(TcpKey, TcpFlow).init(alloc),
         };
     }
 
@@ -76,6 +103,9 @@ pub const MiniNat = struct {
         var iter = self.udp_flows.valueIterator();
         while (iter.next()) |flow| std.posix.close(flow.socket);
         self.udp_flows.deinit();
+        var titer = self.tcp_flows.valueIterator();
+        while (titer.next()) |flow| std.posix.close(flow.socket);
+        self.tcp_flows.deinit();
     }
 
     /// Handle one guest → host Ethernet frame.
@@ -139,6 +169,7 @@ pub const MiniNat = struct {
 
         switch (proto) {
             17 => self.handleUdp(frame, ihl),
+            6 => self.handleTcp(frame, ihl),
             1 => self.handleIcmp(frame, ihl),
             else => {},
         }
@@ -250,12 +281,86 @@ pub const MiniNat = struct {
                     std.posix.close(entry.value.socket);
                 }
             }
+
+            if (self.pumpTcp(&buf)) delivered = true;
             self.flows_mutex.unlock();
 
             if (!delivered) {
                 std.Thread.sleep(2 * std.time.ns_per_ms);
             }
         }
+    }
+
+    /// Service TCP flows: complete connects (SYN-ACK), relay host data to
+    /// the guest, propagate close. Caller holds flows_mutex. Returns true
+    /// if any work happened. One expiry/removal per pass keeps the
+    /// iterator valid.
+    fn pumpTcp(self: *MiniNat, buf: []u8) bool {
+        var work = false;
+        const now = std.time.timestamp();
+        var remove_key: ?TcpKey = null;
+
+        var iter = self.tcp_flows.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const flow = entry.value_ptr;
+
+            if (now - flow.last_used > TCP_IDLE_TIMEOUT_S or flow.state == .closed) {
+                remove_key = key;
+                continue;
+            }
+
+            if (flow.state == .connecting) {
+                // A nonblocking connect completes when the socket becomes
+                // writable; only then is SO_ERROR meaningful.
+                var pfd = [_]std.posix.pollfd{.{
+                    .fd = flow.socket,
+                    .events = std.posix.POLL.OUT,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&pfd, 0) catch 0;
+                if (ready == 0 or (pfd[0].revents & std.posix.POLL.OUT) == 0) continue;
+
+                std.posix.getsockoptError(flow.socket) catch {
+                    self.tcpSendRst(key, flow.rcv_nxt);
+                    remove_key = key;
+                    continue;
+                };
+                // Connected: SYN-ACK, then our seq advances past the SYN.
+                self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_SYN | TCP_ACK, &.{});
+                flow.snd_nxt +%= 1;
+                flow.state = .established;
+                flow.last_used = now;
+                work = true;
+                continue;
+            }
+
+            // Relay available host data to the guest.
+            const n = std.posix.recv(flow.socket, buf[0..TCP_MSS], 0) catch |e| {
+                if (e == error.WouldBlock) continue;
+                self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_RST | TCP_ACK, &.{});
+                remove_key = key;
+                continue;
+            };
+            if (n == 0) {
+                // Host closed: send FIN.
+                self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_FIN | TCP_ACK, &.{});
+                flow.snd_nxt +%= 1;
+                remove_key = key;
+                continue;
+            }
+            self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_PSH | TCP_ACK, buf[0..n]);
+            flow.snd_nxt +%= @intCast(n);
+            flow.last_used = now;
+            work = true;
+        }
+
+        if (remove_key) |key| {
+            if (self.tcp_flows.fetchRemove(key)) |entry| {
+                std.posix.close(entry.value.socket);
+            }
+        }
+        return work;
     }
 
     /// Build remote → guest UDP frame.
@@ -289,6 +394,201 @@ pub const MiniNat = struct {
         @memcpy(out[ETH_HDR + 28 ..][0..payload.len], payload);
 
         self.reply(out[0..total], self.reply_userdata);
+    }
+
+    // =========================================================================
+    // TCP (user-mode proxy)
+    // =========================================================================
+
+    const TCP_FIN: u8 = 0x01;
+    const TCP_SYN: u8 = 0x02;
+    const TCP_RST: u8 = 0x04;
+    const TCP_PSH: u8 = 0x08;
+    const TCP_ACK: u8 = 0x10;
+
+    fn handleTcp(self: *MiniNat, frame: []const u8, ihl: usize) void {
+        const tcp_off = ETH_HDR + ihl;
+        if (frame.len < tcp_off + 20) return;
+        const ip = frame[ETH_HDR..];
+        const dst_ip = ip[16..20];
+        // Only forward off-net destinations.
+        if (std.mem.eql(u8, dst_ip[0..3], GATEWAY_IP[0..3])) return;
+
+        const tcp = frame[tcp_off..];
+        const src_port = std.mem.readInt(u16, tcp[0..2], .big);
+        const dst_port = std.mem.readInt(u16, tcp[2..4], .big);
+        const seq = std.mem.readInt(u32, tcp[4..8], .big);
+        const data_off: usize = @as(usize, (tcp[12] >> 4)) * 4;
+        const flags = tcp[13];
+        if (tcp_off + data_off > frame.len) return;
+        const payload = frame[tcp_off + data_off ..];
+
+        const key = TcpKey{
+            .guest_port = src_port,
+            .remote_ip = dst_ip[0..4].*,
+            .remote_port = dst_port,
+        };
+
+        self.flows_mutex.lock();
+        defer self.flows_mutex.unlock();
+
+        if (flags & TCP_SYN != 0 and flags & TCP_ACK == 0) {
+            self.tcpOpen(key, seq);
+            return;
+        }
+
+        const flow = self.tcp_flows.getPtr(key) orelse {
+            // Unknown connection: RST it so the guest gives up quickly.
+            if (flags & TCP_RST == 0) self.tcpSendRst(key, seq + @as(u32, @intCast(payload.len)));
+            return;
+        };
+        flow.last_used = std.time.timestamp();
+
+        if (flags & TCP_RST != 0) {
+            std.posix.close(flow.socket);
+            _ = self.tcp_flows.remove(key);
+            return;
+        }
+
+        // Relay any guest payload to the host socket (only new bytes,
+        // and only once the host side is connected).
+        if (payload.len > 0 and seq == flow.rcv_nxt and flow.state == .established) {
+            sendAll(flow.socket, payload);
+            flow.rcv_nxt +%= @intCast(payload.len);
+            self.tcpSendAck(key, flow);
+        }
+
+        if (flags & TCP_FIN != 0) {
+            flow.rcv_nxt +%= 1; // FIN consumes a sequence number
+            std.posix.shutdown(flow.socket, .send) catch {};
+            self.tcpSendAck(key, flow);
+            flow.state = .fin_wait;
+        }
+    }
+
+    /// Best-effort send of the whole buffer to a nonblocking socket via
+    /// the raw syscall: std.posix.send maps ENOTCONN/EPIPE to
+    /// unreachable, which a NAT proxy must tolerate (races with connect
+    /// completion and peer close). Guest payloads are small; brief spins
+    /// on EAGAIN are acceptable.
+    fn sendAll(socket: std.posix.socket_t, data: []const u8) void {
+        var off: usize = 0;
+        var spins: u32 = 0;
+        while (off < data.len and spins < 1000) {
+            const rc = std.posix.system.send(socket, data.ptr + off, data.len - off, 0);
+            const signed: isize = @bitCast(rc);
+            if (signed >= 0) {
+                off += @intCast(signed);
+                continue;
+            }
+            const e = std.posix.errno(rc);
+            if (e == .AGAIN) {
+                spins += 1;
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            }
+            return; // ENOTCONN/EPIPE/ECONNRESET: drop
+        }
+    }
+
+    fn tcpOpen(self: *MiniNat, key: TcpKey, guest_seq: u32) void {
+        if (self.tcp_flows.count() >= TCP_FLOW_MAX) return;
+
+        const sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
+            0,
+        ) catch return;
+
+        var addr = std.posix.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, key.remote_port),
+            .addr = @bitCast(key.remote_ip),
+        };
+        std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch |err| {
+            // EINPROGRESS is expected for a nonblocking connect.
+            if (err != error.WouldBlock and err != error.ConnectionPending) {
+                std.posix.close(sock);
+                return;
+            }
+        };
+
+        // Our ISN is arbitrary; use a fixed base plus the guest seq for
+        // variety (determinism is fine for a single-host proxy).
+        const flow = TcpFlow{
+            .socket = sock,
+            .state = .connecting,
+            .snd_nxt = 0x1000,
+            .rcv_nxt = guest_seq +% 1, // SYN consumes a sequence number
+            .last_used = std.time.timestamp(),
+        };
+        self.tcp_flows.put(key, flow) catch {
+            std.posix.close(sock);
+            return;
+        };
+        // SYN-ACK is sent once the host connect completes (pollLoop).
+    }
+
+    /// Send a bare ACK for the current rcv_nxt/snd_nxt.
+    fn tcpSendAck(self: *MiniNat, key: TcpKey, flow: *TcpFlow) void {
+        self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_ACK, &.{});
+    }
+
+    fn tcpSendRst(self: *MiniNat, key: TcpKey, ack: u32) void {
+        self.tcpSend(key, 0, ack, TCP_RST | TCP_ACK, &.{});
+    }
+
+    /// Build and deliver one remote → guest TCP segment.
+    fn tcpSend(self: *MiniNat, key: TcpKey, seq: u32, ack: u32, flags: u8, payload: []const u8) void {
+        var out: [ETH_HDR + 20 + 20 + TCP_MSS]u8 = undefined;
+        if (payload.len > TCP_MSS) return;
+        const total = ETH_HDR + 20 + 20 + payload.len;
+
+        @memcpy(out[0..6], &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
+        @memcpy(out[6..12], &GATEWAY_MAC);
+        std.mem.writeInt(u16, out[12..14], ETHERTYPE_IP, .big);
+
+        const ip = out[ETH_HDR..];
+        @memset(ip[0..20], 0);
+        ip[0] = 0x45;
+        std.mem.writeInt(u16, ip[2..4], @intCast(20 + 20 + payload.len), .big);
+        ip[8] = 64;
+        ip[9] = 6; // TCP
+        @memcpy(ip[12..16], &key.remote_ip);
+        @memcpy(ip[16..20], &GUEST_IP);
+        std.mem.writeInt(u16, ip[10..12], checksum(ip[0..20]), .big);
+
+        const tcp = out[ETH_HDR + 20 ..];
+        @memset(tcp[0..20], 0);
+        std.mem.writeInt(u16, tcp[0..2], key.remote_port, .big);
+        std.mem.writeInt(u16, tcp[2..4], key.guest_port, .big);
+        std.mem.writeInt(u32, tcp[4..8], seq, .big);
+        std.mem.writeInt(u32, tcp[8..12], ack, .big);
+        tcp[12] = 5 << 4; // data offset = 5 words
+        tcp[13] = flags;
+        std.mem.writeInt(u16, tcp[14..16], 0xFFFF, .big); // window
+        @memcpy(tcp[20..][0..payload.len], payload);
+        std.mem.writeInt(u16, tcp[16..18], tcpChecksum(key.remote_ip, GUEST_IP, tcp[0 .. 20 + payload.len]), .big);
+
+        self.reply(out[0..total], self.reply_userdata);
+    }
+
+    /// TCP checksum over the pseudo-header + segment.
+    fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, segment: []const u8) u16 {
+        var sum: u32 = 0;
+        sum += (@as(u32, src_ip[0]) << 8) | src_ip[1];
+        sum += (@as(u32, src_ip[2]) << 8) | src_ip[3];
+        sum += (@as(u32, dst_ip[0]) << 8) | dst_ip[1];
+        sum += (@as(u32, dst_ip[2]) << 8) | dst_ip[3];
+        sum += 6; // protocol
+        sum += @intCast(segment.len);
+
+        var i: usize = 0;
+        while (i + 1 < segment.len) : (i += 2) {
+            sum += (@as(u32, segment[i]) << 8) | segment[i + 1];
+        }
+        if (i < segment.len) sum += @as(u32, segment[i]) << 8;
+        while (sum >> 16 != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+        return @truncate(~sum);
     }
 
     fn handleIcmp(self: *MiniNat, frame: []const u8, ihl: usize) void {
@@ -462,7 +762,10 @@ test "mininat: ARP request for gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
-    defer nat.udp_flows.deinit();
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+    }
 
     var req: [42]u8 = undefined;
     @memset(&req, 0);
@@ -490,7 +793,10 @@ test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
-    defer nat.udp_flows.deinit();
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+    }
 
     var req: [ETH_HDR + 20 + 8 + 244]u8 = undefined;
     @memset(&req, 0);
@@ -524,7 +830,10 @@ test "mininat: ICMP echo to gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
-    defer nat.udp_flows.deinit();
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+    }
 
     var req: [ETH_HDR + 20 + 12]u8 = undefined;
     @memset(&req, 0);
