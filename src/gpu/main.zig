@@ -365,9 +365,42 @@ pub const GpuDevice = struct {
                     }
                 },
 
+                .set_vertex_buffers => {
+                    // N triples of [stride, offset, handle].
+                    const n: u16 = header.length / 3;
+                    var idx: u8 = 0;
+                    while (idx < n) : (idx += 1) {
+                        const stride = try dec.readU32();
+                        const offset = try dec.readU32();
+                        const vhandle = try dec.readU32();
+                        ctx.setVertexBuffer(idx, vhandle, stride, offset);
+                    }
+                    const consumed: u16 = n * 3;
+                    if (header.length > consumed) dec.skip(header.length - consumed);
+                },
+
                 .draw_vbo => {
                     const draw_cmd = try dec.decodeDrawVbo(header.length);
                     ctx.draw(draw_cmd);
+                    // Route the draw: rasterize the bound vertex buffer into the
+                    // bound framebuffer color target. Shading is the passthrough
+                    // stand-in (solid white) until TGSI→MSL lands.
+                    if (self.ensureRenderer()) |r| {
+                        if (self.resolveColorTarget(ctx, 0)) |target| {
+                            const vbo_handle = ctx.vbo_handles[0];
+                            if (vbo_handle != 0 and draw_cmd.count > 0) {
+                                const prim = virgl.Renderer.mapPrimitive(draw_cmd.mode);
+                                r.drawTargetFromBuffer(
+                                    target,
+                                    vbo_handle,
+                                    ctx.vbo_offsets[0],
+                                    draw_cmd.count,
+                                    prim,
+                                    .{ 1.0, 1.0, 1.0, 1.0 },
+                                ) catch {};
+                            }
+                        }
+                    }
                 },
 
                 else => dec.skip(header.length),
@@ -438,6 +471,130 @@ test "createResourceRecord backs a buffer on the GPU and round-trips upload" {
     const contents = gpu.bufferContents(5) orelse return error.TestUnexpectedResult;
     try std.testing.expect(contents.len >= 256);
     try std.testing.expectEqualSlices(u8, &data, contents[16 .. 16 + data.len]);
+}
+
+test "GpuDevice routes a guest draw_vbo command stream to Metal" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt_handle: u32 = 10;
+    const surf_handle: u32 = 20;
+    const buf_handle: u32 = 30;
+
+    // Render target + vertex buffer via the real record path.
+    try gpu.createResourceRecord(.{
+        .handle = rt_handle,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = buf_handle,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
+    });
+
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    // Upload triangle vertices (clip-space float2) into the buffer.
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vbytes: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(buf_handle, 0, vbytes[0..@sizeOf(@TypeOf(verts))]));
+
+    try gpu.createContextId(1);
+
+    var w: [34]u32 = undefined;
+    var i: usize = 0;
+    // create SURFACE
+    w[i] = 1 | (8 << 8) | (3 << 16);
+    i += 1;
+    w[i] = surf_handle;
+    i += 1;
+    w[i] = rt_handle;
+    i += 1;
+    w[i] = @intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm);
+    i += 1;
+    // set_framebuffer_state
+    w[i] = 5 | (3 << 16);
+    i += 1;
+    w[i] = 1;
+    i += 1; // nr_cbufs
+    w[i] = 0;
+    i += 1; // zsurf
+    w[i] = surf_handle;
+    i += 1;
+    // clear to black
+    w[i] = 7 | (8 << 16);
+    i += 1;
+    w[i] = 0x4;
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.0));
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.0));
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.0));
+    i += 1;
+    w[i] = @bitCast(@as(f32, 1.0));
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    // set_vertex_buffers: 1 triple [stride, offset, handle]
+    w[i] = 6 | (3 << 16);
+    i += 1;
+    w[i] = 8; // stride (float2)
+    i += 1;
+    w[i] = 0; // offset
+    i += 1;
+    w[i] = buf_handle;
+    i += 1;
+    // draw_vbo (length 12): start,count,mode,indexed,inst,bias,start_inst,prim_restart,restart,min,max,cso
+    w[i] = 8 | (12 << 16);
+    i += 1;
+    w[i] = 0; // start
+    i += 1;
+    w[i] = 3; // count
+    i += 1;
+    w[i] = @intFromEnum(virgl.protocol.PrimitiveType.triangles);
+    i += 1;
+    // remaining draw_vbo payload words: indexed, instance_count, index_bias,
+    // start_instance, primitive_restart, restart_index, min_index, max_index, cso
+    for (0..9) |_| {
+        w[i] = 0;
+        i += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 34), i);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(w[0..]));
+
+    var buf: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt_handle, &buf));
+
+    // Center: covered by the (white) triangle. Corner: cleared black.
+    const center = ((32 * 64) + 32) * 4;
+    try std.testing.expect(buf[center + 0] > 200); // B
+    try std.testing.expect(buf[center + 1] > 200); // G
+    try std.testing.expect(buf[center + 2] > 200); // R
+    try std.testing.expect(buf[0] < 40 and buf[1] < 40 and buf[2] < 40); // corner black
 }
 
 test "GpuDevice routes a guest clear command stream to Metal" {

@@ -340,6 +340,56 @@ pub const Renderer = struct {
         cmd.waitUntilCompleted();
     }
 
+    /// Map a Gallium primitive type to Metal's. Metal has no loop/fan/quad
+    /// primitives; those fall back to the closest supported topology (a
+    /// proper impl expands them index-side — deferred).
+    pub fn mapPrimitive(mode: proto.PrimitiveType) metal.MTLPrimitiveType {
+        return switch (mode) {
+            .points => .point,
+            .lines, .line_loop => .line,
+            .line_strip => .lineStrip,
+            .triangles, .quads, .polygon => .triangle,
+            .triangle_strip, .quad_strip => .triangleStrip,
+            else => .triangle,
+        };
+    }
+
+    /// Draw into an already-established render target WITHOUT clearing it
+    /// (loadAction=load), so it composes after a prior clear/draw. This is
+    /// the routing target for a decoded draw_vbo: geometry from a bound
+    /// vertex buffer is rasterized into the bound framebuffer color target.
+    pub fn drawTargetFromBuffer(
+        self: *Renderer,
+        target_handle: ResourceHandle,
+        vbuf_handle: ResourceHandle,
+        vbuf_offset: u32,
+        vertex_count: u32,
+        prim: metal.MTLPrimitiveType,
+        color: [4]f32,
+    ) Error!void {
+        const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
+        const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+        const pso = try self.passthroughPipeline(target.format);
+
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
+        const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.load); // preserve prior contents
+        att.setStoreAction(.store);
+
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        enc.setRenderPipelineState(pso.ptr);
+        enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        var c = color;
+        enc.setFragmentBytes(@ptrCast(&c), @sizeOf([4]f32), 0);
+        enc.drawPrimitives(prim, 0, vertex_count);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
     /// Read a render target's pixels back into a host buffer (tight rows).
     /// `out` must be at least width*height*bytesPerPixel.
     pub fn readback(self: *Renderer, handle: ResourceHandle, out: []u8) Error!void {
