@@ -30,3 +30,6 @@ macos/BobrvmKit.xcframework/
 *.dylib
 *.so
 tests/integration/alpine/out/initramfs-minimal
+
+# Zig package mirror (local cache)
+zig-pkg/

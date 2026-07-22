@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_nix_build = b.graph.env_map.get("NIX_BUILD_TOP") != null;
+    // Swift/Xcode/Ghostty steps never run under nix (nix builds the Zig core
+    // only); resolving the ghostty dependency inside a nix shell also fails
+    // because ghostty's apple-sdk detection can't see the real Darwin SDK.
+    const in_nix = is_nix_build or b.graph.env_map.get("IN_NIX_SHELL") != null;
 
     // Build options
     const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
@@ -194,8 +198,8 @@ pub fn build(b: *std.Build) void {
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // XCFramework step (macOS only)
-    if (target.result.os.tag == .macos) {
+    // XCFramework + app steps (macOS only, never under nix)
+    if (target.result.os.tag == .macos and !in_nix) {
         const ghostty_steps = addGhosttySteps(b, optimize);
         const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
         ghostty_step.dependOn(ghostty_steps.install_root_step);
