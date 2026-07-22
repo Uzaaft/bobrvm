@@ -450,15 +450,25 @@ pub const MiniNat = struct {
             return;
         }
 
-        // Relay any guest payload to the host socket (only new bytes,
-        // and only once the host side is connected).
+        // Relay any guest payload to the host socket (only new bytes, and
+        // only once the host side is connected). One non-blocking send;
+        // ACK only what actually went through and let the guest retransmit
+        // the rest. Never spin here — this runs on the vCPU thread under
+        // the machine lock, so a blocking send would freeze the guest.
         if (payload.len > 0 and seq == flow.rcv_nxt and flow.state == .established) {
-            sendAll(flow.socket, payload);
-            flow.rcv_nxt +%= @intCast(payload.len);
-            self.tcpSendAck(key, flow);
+            const sent = trySend(flow.socket, payload);
+            if (sent > 0) {
+                flow.rcv_nxt +%= @intCast(sent);
+                self.tcpSendAck(key, flow);
+            }
+            // If sent < payload.len, we simply don't ACK the tail; the
+            // guest's retransmit timer resends it.
         }
 
-        if (flags & TCP_FIN != 0) {
+        // A FIN is only valid (and consumes its sequence number) once we
+        // have acked all preceding data — i.e. the guest didn't retransmit
+        // past our rcv_nxt.
+        if (flags & TCP_FIN != 0 and seq +% @as(u32, @intCast(payload.len)) == flow.rcv_nxt) {
             flow.rcv_nxt +%= 1; // FIN consumes a sequence number
             std.posix.shutdown(flow.socket, .send) catch {};
             self.tcpSendAck(key, flow);
@@ -466,29 +476,17 @@ pub const MiniNat = struct {
         }
     }
 
-    /// Best-effort send of the whole buffer to a nonblocking socket via
-    /// the raw syscall: std.posix.send maps ENOTCONN/EPIPE to
-    /// unreachable, which a NAT proxy must tolerate (races with connect
-    /// completion and peer close). Guest payloads are small; brief spins
-    /// on EAGAIN are acceptable.
-    fn sendAll(socket: std.posix.socket_t, data: []const u8) void {
-        var off: usize = 0;
-        var spins: u32 = 0;
-        while (off < data.len and spins < 1000) {
-            const rc = std.posix.system.send(socket, data.ptr + off, data.len - off, 0);
-            const signed: isize = @bitCast(rc);
-            if (signed >= 0) {
-                off += @intCast(signed);
-                continue;
-            }
-            const e = std.posix.errno(rc);
-            if (e == .AGAIN) {
-                spins += 1;
-                std.Thread.sleep(std.time.ns_per_ms);
-                continue;
-            }
-            return; // ENOTCONN/EPIPE/ECONNRESET: drop
-        }
+    /// One non-blocking send; returns bytes accepted by the socket (0 on
+    /// EAGAIN or a dead peer). Uses the raw syscall because std.posix.send
+    /// maps ENOTCONN/EPIPE to unreachable, which a NAT proxy must tolerate
+    /// (races with connect completion and peer close). Must never block:
+    /// the caller runs on the vCPU thread under the machine lock, and the
+    /// TCP proxy relies on the guest to retransmit anything not acked.
+    fn trySend(socket: std.posix.socket_t, data: []const u8) usize {
+        const rc = std.posix.system.send(socket, data.ptr, data.len, 0);
+        const signed: isize = @bitCast(rc);
+        if (signed >= 0) return @intCast(signed);
+        return 0; // EAGAIN / ENOTCONN / EPIPE / ECONNRESET
     }
 
     fn tcpOpen(self: *MiniNat, key: TcpKey, guest_seq: u32) void {
