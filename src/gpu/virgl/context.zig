@@ -49,8 +49,22 @@ pub const ResourceTarget = enum(u8) {
 pub const Shader = struct {
     handle: ObjectHandle,
     shader_type: proto.ShaderType,
-    // TODO: TGSI tokens, compiled Metal shader
+    /// Owned TGSI text (as dumped by the guest mesa driver), translated to
+    /// MSL when a pipeline is built. Null if not captured.
+    tgsi_text: ?[]u8 = null,
 };
+
+/// Detect a shader stage from the leading TGSI header token.
+fn detectStage(text: []const u8) proto.ShaderType {
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const first = it.next() orelse return .vertex;
+    if (std.mem.eql(u8, first, "FRAG")) return .fragment;
+    if (std.mem.eql(u8, first, "GEOM")) return .geometry;
+    if (std.mem.eql(u8, first, "TESS_CTRL")) return .tess_ctrl;
+    if (std.mem.eql(u8, first, "TESS_EVAL")) return .tess_eval;
+    if (std.mem.eql(u8, first, "COMP")) return .compute;
+    return .vertex;
+}
 
 /// Surface object (render target view).
 pub const Surface = struct {
@@ -195,6 +209,10 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        var sh_it = self.shaders.valueIterator();
+        while (sh_it.next()) |sh| {
+            if (sh.tgsi_text) |t| self.alloc.free(t);
+        }
         self.blend_states.deinit();
         self.rasterizer_states.deinit();
         self.dsa_states.deinit();
@@ -235,11 +253,25 @@ pub const Context = struct {
         try self.vertex_elements.put(handle, ve);
     }
 
-    pub fn createShader(self: *Context, handle: ObjectHandle, shader_type: proto.ShaderType, _: []const u32) Error!void {
-        // TODO: Parse TGSI tokens and compile to Metal
+    /// Capture a shader from its packed TGSI text words (4 chars/word,
+    /// little-endian, nul-terminated). The stage is derived from the TGSI
+    /// header token so we don't depend on the wire type encoding.
+    pub fn createShader(self: *Context, handle: ObjectHandle, words: []const u32) Error!void {
+        const raw = try self.alloc.alloc(u8, words.len * 4);
+        defer self.alloc.free(raw);
+        for (0..words.len) |i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], words[i], .little);
+        const end = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
+        const text = try self.alloc.dupe(u8, raw[0..end]);
+        errdefer self.alloc.free(text);
+
+        const stage = detectStage(text);
+        if (self.shaders.fetchRemove(handle)) |old| {
+            if (old.value.tgsi_text) |t| self.alloc.free(t);
+        }
         try self.shaders.put(handle, .{
             .handle = handle,
-            .shader_type = shader_type,
+            .shader_type = stage,
+            .tgsi_text = text,
         });
     }
 
@@ -298,7 +330,11 @@ pub const Context = struct {
             .dsa => _ = self.dsa_states.remove(handle),
             .sampler_state => _ = self.sampler_states.remove(handle),
             .vertex_elements => _ = self.vertex_elements.remove(handle),
-            .shader => _ = self.shaders.remove(handle),
+            .shader => {
+                if (self.shaders.fetchRemove(handle)) |old| {
+                    if (old.value.tgsi_text) |t| self.alloc.free(t);
+                }
+            },
             .surface => _ = self.surfaces.remove(handle),
             .sampler_view => _ = self.sampler_views.remove(handle),
             else => {},

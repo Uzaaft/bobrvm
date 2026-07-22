@@ -310,7 +310,14 @@ pub const GpuDevice = struct {
                         .dsa => try ctx.createDsaState(handle, payload),
                         .sampler_state => try ctx.createSamplerState(handle, payload),
                         .vertex_elements => try ctx.createVertexElements(handle, payload),
-                        .shader => try ctx.createShader(handle, .vertex, payload),
+                        .shader => {
+                            // SHADER payload: [type, offset, num_tokens,
+                            // so_num_outputs, <packed TGSI text words...>].
+                            // Single-part shaders without stream-out only.
+                            if (payload.len > 4 and payload[3] == 0) {
+                                try ctx.createShader(handle, payload[4..]);
+                            }
+                        },
                         .surface => {
                             // Surface create payload: [res_handle, format, ...].
                             if (payload.len >= 2) {
@@ -331,6 +338,16 @@ pub const GpuDevice = struct {
                         .dsa => ctx.bindDsaState(handle),
                         .vertex_elements => ctx.bindVertexElements(handle),
                         else => {},
+                    }
+                },
+
+                .bind_shader => {
+                    // Payload: [handle, type]. Route by the shader's captured
+                    // stage rather than trusting the wire type encoding.
+                    const shandle = try dec.readU32();
+                    if (header.length >= 2) _ = try dec.readU32();
+                    if (ctx.shaders.get(shandle)) |sh| {
+                        ctx.bindShader(sh.shader_type, shandle);
                     }
                 },
 
@@ -471,6 +488,59 @@ test "createResourceRecord backs a buffer on the GPU and round-trips upload" {
     const contents = gpu.bufferContents(5) orelse return error.TestUnexpectedResult;
     try std.testing.expect(contents.len >= 256);
     try std.testing.expectEqualSlices(u8, &data, contents[16 .. 16 + data.len]);
+}
+
+test "GpuDevice captures shader TGSI text and binds by stage" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    // Pack the text (nul-terminated) into TGSI words (4 chars/word, little).
+    const nwords: usize = (vs_text.len + 1 + 3) / 4;
+    var words: [64]u32 = .{0} ** 64;
+    for (vs_text, 0..) |ch, i| {
+        words[i / 4] |= @as(u32, ch) << @intCast((i % 4) * 8);
+    }
+
+    const shader_handle: u32 = 50;
+    var stream: [128]u32 = undefined;
+    var i: usize = 0;
+    // create_object(1), object_type shader(4), length = handle + 4 hdr + text
+    stream[i] = 1 | (4 << 8) | (@as(u32, @intCast(1 + 4 + nwords)) << 16);
+    i += 1;
+    stream[i] = shader_handle;
+    i += 1;
+    stream[i] = 0; // type (ignored; stage from text)
+    i += 1;
+    stream[i] = 0; // offset
+    i += 1;
+    stream[i] = 0; // num_tokens
+    i += 1;
+    stream[i] = 0; // so_num_outputs
+    i += 1;
+    for (0..nwords) |k| {
+        stream[i] = words[k];
+        i += 1;
+    }
+    // bind_shader(31), length 2 [handle, type]
+    stream[i] = 31 | (2 << 16);
+    i += 1;
+    stream[i] = shader_handle;
+    i += 1;
+    stream[i] = 0;
+    i += 1;
+
+    try gpu.submit(1, std.mem.sliceAsBytes(stream[0..i]));
+
+    const ctx = gpu.getContext(1).?;
+    const sh = ctx.shaders.get(shader_handle) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(sh.tgsi_text != null);
+    try std.testing.expect(std.mem.indexOf(u8, sh.tgsi_text.?, "MOV OUT[0], IN[0]") != null);
+    try std.testing.expectEqual(virgl.protocol.ShaderType.vertex, sh.shader_type);
+    // bind_shader routed to the vertex slot.
+    try std.testing.expectEqual(@as(?u32, shader_handle), ctx.bound.vs);
 }
 
 test "GpuDevice routes a guest draw_vbo command stream to Metal" {
