@@ -132,11 +132,33 @@ pub const GpuDevice = struct {
     fn createContext(self: *GpuDevice) Error!void {
         const id = self.next_ctx_id;
         self.next_ctx_id += 1;
+        try self.createContextId(id);
+    }
 
+    /// Create a context with a guest-chosen id (virtio-gpu ctx_id).
+    pub fn createContextId(self: *GpuDevice, id: ContextId) Error!void {
+        if (self.contexts.contains(id)) return;
         const ctx = try Context.init(self.alloc, id);
         errdefer ctx.deinit();
-
         try self.contexts.put(id, ctx);
+    }
+
+    /// Destroy a context by guest id.
+    pub fn destroyContextId(self: *GpuDevice, id: ContextId) void {
+        if (self.contexts.fetchRemove(id)) |entry| {
+            entry.value.deinit();
+        }
+    }
+
+    /// Record a 3D resource created by the guest.
+    pub fn createResourceRecord(self: *GpuDevice, res: Resource) Error!void {
+        try self.resources.put(res.handle, res);
+    }
+
+    /// Execute a virgl command buffer for a context.
+    pub fn submit(self: *GpuDevice, ctx_id: ContextId, cmd_data: []const u8) Error!void {
+        const ctx = self.contexts.get(ctx_id) orelse return;
+        try self.processCommandBuffer(ctx, cmd_data);
     }
 
     fn destroyContext(self: *GpuDevice, data: []const u8) Error!void {

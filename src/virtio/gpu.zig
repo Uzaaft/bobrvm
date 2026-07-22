@@ -15,6 +15,8 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
+const virgl = @import("../gpu/virgl/main.zig");
+const gpu_module = @import("../gpu/main.zig");
 
 const log = std.log.scoped(.virtio_gpu);
 
@@ -41,6 +43,16 @@ pub const CmdType = enum(u32) {
     get_capset_info = 0x0108,
     get_capset = 0x0109,
     get_edid = 0x010a,
+
+    // 3D commands
+    ctx_create = 0x0200,
+    ctx_destroy = 0x0201,
+    ctx_attach_resource = 0x0202,
+    ctx_detach_resource = 0x0203,
+    resource_create_3d = 0x0204,
+    transfer_to_host_3d = 0x0205,
+    transfer_from_host_3d = 0x0206,
+    submit_3d = 0x0207,
 
     // Cursor commands
     update_cursor = 0x0300,
@@ -154,6 +166,71 @@ pub const ResourceDetachBacking = extern struct {
     _padding: u32 = 0,
 };
 
+pub const CtxCreate = extern struct {
+    header: CtrlHeader,
+    nlen: u32,
+    context_init: u32,
+    debug_name: [64]u8 = [_]u8{0} ** 64,
+};
+
+pub const CtxResource = extern struct {
+    header: CtrlHeader,
+    resource_id: u32,
+    _padding: u32 = 0,
+};
+
+pub const ResourceCreate3D = extern struct {
+    header: CtrlHeader,
+    resource_id: u32,
+    target: u32,
+    format: u32,
+    bind: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    nr_samples: u32,
+    flags: u32,
+    _padding: u32 = 0,
+};
+
+pub const Submit3D = extern struct {
+    header: CtrlHeader,
+    size: u32,
+    _padding: u32 = 0,
+};
+
+pub const GetCapsetInfo = extern struct {
+    header: CtrlHeader,
+    capset_index: u32,
+    _padding: u32 = 0,
+};
+
+pub const CapsetInfoResp = extern struct {
+    header: CtrlHeader,
+    capset_id: u32,
+    capset_max_version: u32,
+    capset_max_size: u32,
+    _padding: u32 = 0,
+};
+
+pub const GetCapset = extern struct {
+    header: CtrlHeader,
+    capset_id: u32,
+    capset_version: u32,
+};
+
+/// Capset ids (VIRTIO_GPU_CAPSET_*).
+pub const CAPSET_VIRGL: u32 = 1;
+pub const CAPSET_VIRGL2: u32 = 2;
+
+/// Capset blob sizes (virgl_caps_v1/v2 from virglrenderer). The kernel
+/// transports these opaquely to mesa; sizes must be honest, contents
+/// grow as the translator does.
+pub const CAPS_V1_SIZE: u32 = 308;
+pub const CAPS_V2_SIZE: u32 = 1384;
+
 /// GPU config space.
 pub const Config = extern struct {
     events_read: u32 = 0,
@@ -211,15 +288,20 @@ pub const Gpu = struct {
     frame_callback: ?*const fn (userdata: ?*anyopaque) void,
     frame_userdata: ?*anyopaque,
 
+    /// 3D (virgl) support: guest contexts + resources + command decode.
+    virgl_enabled: bool,
+    gpu_device: gpu_module.GpuDevice,
+
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
     pub const MAX_RESOURCE_DIM: u32 = 8192;
     pub const MAX_BACKING_ENTRIES: u32 = 16384;
 
-    pub fn init(alloc: Allocator) Error!*Gpu {
+    pub fn init(alloc: Allocator, enable_virgl: bool) Error!*Gpu {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
-        const features = virtio_version_1;
+        var features = virtio_version_1;
+        if (enable_virgl) features |= Features.VIRGL;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
         errdefer transport.deinit();
 
@@ -229,7 +311,7 @@ pub const Gpu = struct {
         gpu.* = .{
             .alloc = alloc,
             .transport = transport,
-            .config = .{},
+            .config = .{ .num_capsets = if (enable_virgl) 2 else 0 },
             .ctrl_last_avail = 0,
             .cursor_last_avail = 0,
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
@@ -240,6 +322,8 @@ pub const Gpu = struct {
             .guest_memory = null,
             .frame_callback = null,
             .frame_userdata = null,
+            .virgl_enabled = enable_virgl,
+            .gpu_device = gpu_module.GpuDevice.init(alloc),
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -256,6 +340,7 @@ pub const Gpu = struct {
             res.entries.deinit(self.alloc);
         }
         self.resources.deinit();
+        self.gpu_device.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
     }
@@ -447,6 +532,37 @@ pub const Gpu = struct {
             },
             .resource_detach_backing => {
                 resp_type = self.cmdResourceDetachBacking(req);
+            },
+            .get_capset_info => {
+                resp_type = self.cmdGetCapsetInfo(req, resp, &resp_len);
+            },
+            .get_capset => {
+                resp_type = self.cmdGetCapset(req, resp, &resp_len);
+            },
+            .ctx_create => {
+                resp_type = self.cmdCtxCreate(header);
+            },
+            .ctx_destroy => {
+                if (self.virgl_enabled) {
+                    self.gpu_device.destroyContextId(header.ctx_id);
+                    resp_type = .resp_ok_nodata;
+                } else {
+                    resp_type = .resp_err_unspec;
+                }
+            },
+            .ctx_attach_resource, .ctx_detach_resource => {
+                // Resource<->context association: accepted (tracked later).
+                resp_type = if (self.virgl_enabled) .resp_ok_nodata else .resp_err_unspec;
+            },
+            .resource_create_3d => {
+                resp_type = self.cmdResourceCreate3D(req);
+            },
+            .transfer_to_host_3d, .transfer_from_host_3d => {
+                // Accepted; data movement lands with the Metal backend.
+                resp_type = if (self.virgl_enabled) .resp_ok_nodata else .resp_err_unspec;
+            },
+            .submit_3d => {
+                resp_type = self.cmdSubmit3D(header, req, &chain, get_mem);
             },
             else => {
                 log.warn("unhandled GPU command: 0x{x}", .{header.type});
@@ -669,6 +785,121 @@ pub const Gpu = struct {
         return .resp_ok_nodata;
     }
 
+    fn cmdGetCapsetInfo(self: *Gpu, req: []const u8, resp: []u8, resp_len: *u32) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (req.len < @sizeOf(GetCapsetInfo)) return .resp_err_invalid_parameter;
+        if (resp.len < @sizeOf(CapsetInfoResp)) return .resp_err_unspec;
+        const cmd = std.mem.bytesToValue(GetCapsetInfo, req[0..@sizeOf(GetCapsetInfo)]);
+
+        var info = CapsetInfoResp{
+            .header = .{ .type = @intFromEnum(CmdType.resp_ok_capset_info) },
+            .capset_id = 0,
+            .capset_max_version = 0,
+            .capset_max_size = 0,
+        };
+        switch (cmd.capset_index) {
+            0 => {
+                info.capset_id = CAPSET_VIRGL;
+                info.capset_max_version = 1;
+                info.capset_max_size = CAPS_V1_SIZE;
+            },
+            1 => {
+                info.capset_id = CAPSET_VIRGL2;
+                info.capset_max_version = 2;
+                info.capset_max_size = CAPS_V2_SIZE;
+            },
+            else => return .resp_err_invalid_parameter,
+        }
+        @memcpy(resp[0..@sizeOf(CapsetInfoResp)], std.mem.asBytes(&info));
+        resp_len.* = @sizeOf(CapsetInfoResp);
+        return .resp_ok_capset_info;
+    }
+
+    fn cmdGetCapset(self: *Gpu, req: []const u8, resp: []u8, resp_len: *u32) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (req.len < @sizeOf(GetCapset)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(GetCapset, req[0..@sizeOf(GetCapset)]);
+
+        const size: u32 = switch (cmd.capset_id) {
+            CAPSET_VIRGL => CAPS_V1_SIZE,
+            CAPSET_VIRGL2 => CAPS_V2_SIZE,
+            else => return .resp_err_invalid_parameter,
+        };
+        if (resp.len < @sizeOf(CtrlHeader) + size) return .resp_err_unspec;
+
+        // Zeroed caps blob for now: honest sizes, conservative contents.
+        // Real GL 4.3 capability bits land with the Metal translator.
+        @memset(resp[@sizeOf(CtrlHeader)..][0..size], 0);
+        resp_len.* = @sizeOf(CtrlHeader) + size;
+        return .resp_ok_capset;
+    }
+
+    fn cmdCtxCreate(self: *Gpu, header: CtrlHeader) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (header.ctx_id == 0) return .resp_err_invalid_context_id;
+        self.gpu_device.createContextId(header.ctx_id) catch return .resp_err_out_of_memory;
+        return .resp_ok_nodata;
+    }
+
+    fn cmdResourceCreate3D(self: *Gpu, req: []const u8) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (req.len < @sizeOf(ResourceCreate3D)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(ResourceCreate3D, req[0..@sizeOf(ResourceCreate3D)]);
+        if (cmd.resource_id == 0) return .resp_err_invalid_resource_id;
+
+        self.gpu_device.createResourceRecord(.{
+            .handle = cmd.resource_id,
+            .target = @enumFromInt(@as(u8, @truncate(cmd.target))),
+            .format = @enumFromInt(cmd.format),
+            .width = cmd.width,
+            .height = cmd.height,
+            .depth = cmd.depth,
+            .array_size = cmd.array_size,
+            .last_level = cmd.last_level,
+            .nr_samples = cmd.nr_samples,
+            .flags = cmd.flags,
+            .bind = cmd.bind,
+        }) catch return .resp_err_out_of_memory;
+        return .resp_ok_nodata;
+    }
+
+    fn cmdSubmit3D(
+        self: *Gpu,
+        header: CtrlHeader,
+        req: []const u8,
+        chain: *const ring.Chain,
+        get_mem: ring.GetMemFn,
+    ) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (req.len < @sizeOf(Submit3D)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(Submit3D, req[0..@sizeOf(Submit3D)]);
+
+        // The command stream either follows the header in the same buffer
+        // or arrives as a second device-readable descriptor (Linux).
+        const inline_data = req[@sizeOf(Submit3D)..];
+        const cmd_data: []const u8 = if (inline_data.len >= cmd.size)
+            inline_data[0..cmd.size]
+        else blk: {
+            var readable_idx: u32 = 0;
+            for (chain.slice()) |d| {
+                if (d.isWrite()) continue;
+                readable_idx += 1;
+                if (readable_idx == 2) {
+                    const mem = get_mem(d.addr, d.len) orelse
+                        return .resp_err_invalid_parameter;
+                    if (mem.len < cmd.size) return .resp_err_invalid_parameter;
+                    break :blk mem[0..cmd.size];
+                }
+            }
+            return .resp_err_invalid_parameter;
+        };
+
+        self.gpu_device.submit(header.ctx_id, cmd_data) catch {
+            return .resp_err_unspec;
+        };
+        return .resp_ok_nodata;
+    }
+
     fn cmdResourceDetachBacking(self: *Gpu, req: []const u8) CmdType {
         if (req.len < @sizeOf(ResourceDetachBacking)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(
@@ -694,7 +925,7 @@ pub const Gpu = struct {
 const testing = std.testing;
 
 test "Gpu init" {
-    const gpu = try Gpu.init(testing.allocator);
+    const gpu = try Gpu.init(testing.allocator, false);
     defer gpu.deinit();
 
     const magic = gpu.read(@intFromEnum(mmio.Reg.magic));
@@ -705,7 +936,7 @@ test "Gpu init" {
 }
 
 test "Gpu config read" {
-    const gpu = try Gpu.init(testing.allocator);
+    const gpu = try Gpu.init(testing.allocator, false);
     defer gpu.deinit();
 
     const num_scanouts = gpu.read(@intFromEnum(mmio.Reg.config) + 8);
@@ -721,7 +952,7 @@ test "ResourceCreate2D size" {
 }
 
 test "Gpu resource lifecycle via direct command calls" {
-    const gpu = try Gpu.init(testing.allocator);
+    const gpu = try Gpu.init(testing.allocator, false);
     defer gpu.deinit();
 
     // Create a 4x2 resource
@@ -756,4 +987,42 @@ test "Gpu resource lifecycle via direct command calls" {
     resp = gpu.cmdResourceUnref(std.mem.asBytes(&unref));
     try testing.expectEqual(CmdType.resp_ok_nodata, resp);
     try testing.expect(gpu.scanout() == null);
+}
+
+test "virgl capset info and submit decode" {
+    const gpu = try Gpu.init(testing.allocator, true);
+    defer gpu.deinit();
+
+    // Capset info for index 1 (virgl2)
+    const info_req = GetCapsetInfo{
+        .header = .{ .type = @intFromEnum(CmdType.get_capset_info) },
+        .capset_index = 1,
+    };
+    var resp_buf: [64]u8 = undefined;
+    var resp_len: u32 = 0;
+    const rt = gpu.cmdGetCapsetInfo(std.mem.asBytes(&info_req), &resp_buf, &resp_len);
+    try testing.expectEqual(CmdType.resp_ok_capset_info, rt);
+    const info = std.mem.bytesToValue(CapsetInfoResp, resp_buf[0..@sizeOf(CapsetInfoResp)]);
+    try testing.expectEqual(CAPSET_VIRGL2, info.capset_id);
+    try testing.expectEqual(CAPS_V2_SIZE, info.capset_max_size);
+
+    // Context create via header ctx_id
+    const hdr = CtrlHeader{ .type = @intFromEnum(CmdType.ctx_create), .ctx_id = 7 };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdCtxCreate(hdr));
+    try testing.expect(gpu.gpu_device.contexts.contains(7));
+
+    // Synthetic virgl stream: NOP + SET_SCISSOR (skipped) decoded without error
+    var stream: [5]u32 = undefined;
+    stream[0] = (virgl.CommandHeader{ .opcode = .nop, .object_type = .null, .length = 0 }).encode();
+    stream[1] = (virgl.CommandHeader{ .opcode = .set_stencil_ref, .object_type = .null, .length = 1 }).encode();
+    stream[2] = 0x00010001;
+    stream[3] = (virgl.CommandHeader{ .opcode = .set_blend_color, .object_type = .null, .length = 4 }).encode();
+    stream[4] = 0; // truncated on purpose? no — keep well-formed: pad below
+    // Rebuild well-formed: nop + stencil_ref(1)
+    const bytes = std.mem.sliceAsBytes(stream[0..3]);
+    try gpu.gpu_device.submit(7, bytes);
+
+    // Destroy
+    gpu.gpu_device.destroyContextId(7);
+    try testing.expect(!gpu.gpu_device.contexts.contains(7));
 }

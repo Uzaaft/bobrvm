@@ -23,6 +23,7 @@ kernel_path: ?[]const u8 = null,
 initrd_path: ?[]const u8 = null,
 cmdline: []const u8 = "console=hvc0 earlycon=pl011,0x09000000",
 enable_gpu: bool = false,
+enable_virgl: bool = false,
 display_width: u32 = 1280,
 display_height: u32 = 800,
 
@@ -99,6 +100,9 @@ pub fn parseArgs(args: *std.process.ArgIterator) (Allocator.Error || ParseError)
             };
         } else if (std.mem.eql(u8, arg, "--gpu")) {
             config.enable_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--virgl")) {
+            config.enable_gpu = true;
+            config.enable_virgl = true;
         } else if (std.mem.eql(u8, arg, "--display")) {
             const val = args.next() orelse {
                 log.err("--display requires a value (e.g. 1280x800)", .{});

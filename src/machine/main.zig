@@ -130,6 +130,9 @@ pub const MachineConfig = struct {
     /// Enable the virtio-gpu display device.
     enable_gpu: bool = false,
 
+    /// Advertise virgl 3D acceleration (experimental translator).
+    enable_virgl: bool = false,
+
     /// Display size for the virtio-gpu scanout.
     display_width: u32 = 1280,
     display_height: u32 = 800,
@@ -1334,7 +1337,7 @@ pub const Machine = struct {
         // Initialize GPU (slot after the block devices) if enabled
         if (self.config.enable_gpu) {
             self.gpu_slot = 1 + self.config.blockDeviceCount();
-            self.gpu = try virtio.Gpu.init(self.alloc);
+            self.gpu = try virtio.Gpu.init(self.alloc, self.config.enable_virgl);
             self.gpu.?.setGuestMemory(getGuestMemoryWrapper);
             self.gpu.?.setDisplaySize(self.config.display_width, self.config.display_height);
             self.gpu.?.transport.setIrqCallback(gpuIrqCallback, self);
