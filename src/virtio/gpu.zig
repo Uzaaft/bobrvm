@@ -687,9 +687,22 @@ pub const Gpu = struct {
             return .resp_err_invalid_parameter;
         }
 
-        // Guest backing uses the resource's linear layout: copy the
-        // rect row by row from the scattered guest pages.
         const stride = res.stride();
+
+        // Fast path: a full-width rect is contiguous in both the guest
+        // backing and host_data, so the whole region is one copy instead
+        // of a per-row scatter walk (the common fbcon/scanout case).
+        if (r.x == 0 and r.width == res.width) {
+            const block_off = @as(u64, r.y) * stride;
+            const block_len = @as(usize, r.height) * stride;
+            const dst = res.host_data[@intCast(block_off)..][0..block_len];
+            if (!copyFromBacking(res.entries.items, cmd.offset, dst, get_mem)) {
+                return .resp_err_unspec;
+            }
+            return .resp_ok_nodata;
+        }
+
+        // General case: partial-width rect, copy row by row.
         const row_bytes = @as(usize, r.width) * Resource2D.BYTES_PER_PIXEL;
         var row: u32 = 0;
         while (row < r.height) : (row += 1) {
@@ -1025,4 +1038,70 @@ test "virgl capset info and submit decode" {
     // Destroy
     gpu.gpu_device.destroyContextId(7);
     try testing.expect(!gpu.gpu_device.contexts.contains(7));
+}
+
+test "transfer_to_host_2d full-width fast path matches guest backing" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    // A 64x8 XRGB resource backed by a single contiguous region in our
+    // fake guest memory at 0x1000.
+    const w: u32 = 64;
+    const h: u32 = 8;
+    const bytes = @as(usize, w) * h * 4;
+
+    const guest = try testing.allocator.alloc(u8, bytes);
+    defer testing.allocator.free(guest);
+    for (guest, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+
+    const Ctx = struct {
+        var mem: []u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    Ctx.mem = guest;
+    gpu.setGuestMemory(Ctx.get);
+
+    // create_2d
+    const create = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 1,
+        .format = 2,
+        .width = w,
+        .height = h,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdResourceCreate2D(std.mem.asBytes(&create)));
+
+    // attach a single contiguous backing entry
+    const AttachMsg = extern struct { hdr: ResourceAttachBacking, entry: MemEntry };
+    const attach = AttachMsg{
+        .hdr = .{
+            .header = .{ .type = @intFromEnum(CmdType.resource_attach_backing) },
+            .resource_id = 1,
+            .nr_entries = 1,
+        },
+        .entry = .{ .addr = 0x1000, .length = @intCast(bytes) },
+    };
+    var empty_chain = ring.Chain{};
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdResourceAttachBacking(std.mem.asBytes(&attach), &empty_chain, Ctx.get),
+    );
+
+    // full-surface transfer (hits the fast path)
+    const xfer = TransferToHost2D{
+        .header = .{ .type = @intFromEnum(CmdType.transfer_to_host_2d) },
+        .r = .{ .width = w, .height = h },
+        .offset = 0,
+        .resource_id = 1,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost2D(std.mem.asBytes(&xfer), Ctx.get));
+
+    // host copy must match the guest backing byte-for-byte
+    const res = gpu.resources.get(1).?;
+    try testing.expect(std.mem.eql(u8, res.host_data, guest));
 }
