@@ -26,6 +26,10 @@ extern "objc" fn sel_registerName(name: [*:0]const u8) callconv(.c) SEL;
 extern "objc" fn objc_autoreleasePoolPush() callconv(.c) ?*anyopaque;
 extern "objc" fn objc_autoreleasePoolPop(pool: ?*anyopaque) callconv(.c) void;
 
+/// Create the system default Metal device (C function in the Metal framework).
+/// Works headlessly — no window/display required.
+extern "c" fn MTLCreateSystemDefaultDevice() callconv(.c) ?id;
+
 /// Send a message with no return value.
 pub fn msgSendVoid(target: id, selector: SEL) void {
     const func: *const fn (id, SEL) callconv(.c) void = @ptrCast(&objc_msgSend);
@@ -70,6 +74,22 @@ pub const MTLPixelFormat = enum(NSUInteger) {
     r8Unorm = 10,
     rg8Unorm = 30,
     _,
+};
+
+/// Metal texture usage flags (bitmask).
+pub const MTLTextureUsage = struct {
+    pub const unknown: NSUInteger = 0;
+    pub const shader_read: NSUInteger = 1;
+    pub const shader_write: NSUInteger = 2;
+    pub const render_target: NSUInteger = 4;
+};
+
+/// Metal storage mode.
+pub const MTLStorageMode = enum(NSUInteger) {
+    shared = 0,
+    managed = 1,
+    private = 2,
+    memoryless = 3,
 };
 
 /// Metal load action.
@@ -163,6 +183,47 @@ pub const Device = struct {
     /// Create from opaque pointer.
     pub fn fromPtr(ptr: *anyopaque) Device {
         return .{ .ptr = ptr };
+    }
+
+    /// Create the system default device (headless-capable).
+    pub fn createSystemDefault() ?Device {
+        const p = MTLCreateSystemDefaultDevice() orelse return null;
+        return .{ .ptr = p };
+    }
+
+    /// Create a buffer initialized with the given bytes (shared storage).
+    pub fn newBufferWithBytes(self: Device, bytes: []const u8) ?Buffer {
+        const s = sel("newBufferWithBytes:length:options:");
+        const func: *const fn (id, SEL, [*]const u8, NSUInteger, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const result = func(self.ptr, s, bytes.ptr, bytes.len, 0);
+        return if (result) |p| Buffer{ .ptr = p } else null;
+    }
+
+    /// Create a 2D texture with explicit usage and storage mode.
+    /// Used for render targets that are also read back / sampled.
+    pub fn newTexture2D(
+        self: Device,
+        format: MTLPixelFormat,
+        width: u32,
+        height: u32,
+        usage: NSUInteger,
+        storage: MTLStorageMode,
+    ) ?Texture {
+        const desc_class = cls("MTLTextureDescriptor") orelse return null;
+        const s = sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:");
+        const func: *const fn (Class, SEL, NSUInteger, NSUInteger, NSUInteger, BOOL) callconv(.c) ?id =
+            @ptrCast(&objc_msgSend);
+        const desc = func(desc_class, s, @intFromEnum(format), width, height, false) orelse return null;
+
+        // desc.setUsage(usage)
+        const set_usage: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_usage(desc, sel("setUsage:"), usage);
+        // desc.setStorageMode(storage)
+        const set_storage: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_storage(desc, sel("setStorageMode:"), @intFromEnum(storage));
+
+        const tex = msgSendId1(self.ptr, sel("newTextureWithDescriptor:"), desc) orelse return null;
+        return .{ .ptr = tex };
     }
 };
 
@@ -467,6 +528,20 @@ pub const Texture = struct {
             NSUInteger,
         ) callconv(.c) void = @ptrCast(&objc_msgSend);
         func(self.ptr, s, region, mipmap_level, bytes, bytes_per_row);
+    }
+
+    /// Read pixel data out of the texture into a host buffer.
+    pub fn getBytes(
+        self: Texture,
+        out: [*]u8,
+        bytes_per_row: NSUInteger,
+        region: MTLRegion,
+        mipmap_level: NSUInteger,
+    ) void {
+        const s = sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:");
+        const func: *const fn (id, SEL, [*]u8, NSUInteger, MTLRegion, NSUInteger) callconv(.c) void =
+            @ptrCast(&objc_msgSend);
+        func(self.ptr, s, out, bytes_per_row, region, mipmap_level);
     }
 
     pub fn release(self: Texture) void {

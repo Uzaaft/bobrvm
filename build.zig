@@ -148,15 +148,26 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
-    // Link frameworks for tests on macOS
+    // Link frameworks for tests on macOS. Mirror the lib/cli modules so
+    // Metal-backed tests (virgl renderer) can create a real device: the
+    // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
         if (b.graph.env_map.get("SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+            const include_path = b.fmt("{s}/usr/include", .{sdk});
+            const library_path = b.fmt("{s}/usr/lib", .{sdk});
             test_module.addFrameworkPath(.{ .cwd_relative = framework_path });
+            test_module.addSystemIncludePath(.{ .cwd_relative = include_path });
+            test_module.addLibraryPath(.{ .cwd_relative = library_path });
         }
         test_module.linkFramework("Hypervisor", .{});
+        test_module.linkFramework("Metal", .{});
+        test_module.linkFramework("QuartzCore", .{});
+        test_module.linkFramework("IOSurface", .{});
+        test_module.linkSystemLibrary("objc", .{});
     }
 
     // Test step
