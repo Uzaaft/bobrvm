@@ -840,9 +840,14 @@ pub const Gpu = struct {
         };
         if (resp.len < @sizeOf(CtrlHeader) + size) return .resp_err_unspec;
 
-        // Zeroed caps blob for now: honest sizes, conservative contents.
-        // Real GL 4.3 capability bits land with the Metal translator.
-        @memset(resp[@sizeOf(CtrlHeader)..][0..size], 0);
+        // virgl2 gets a real GL 4.3 caps blob (glsl_level 430 + limits);
+        // v1 stays zeroed. Format masks await the Metal translator.
+        const blob = resp[@sizeOf(CtrlHeader)..][0..size];
+        if (cmd.capset_id == CAPSET_VIRGL2) {
+            virgl.caps.writeV2(blob);
+        } else {
+            @memset(blob, 0);
+        }
         resp_len.* = @sizeOf(CtrlHeader) + size;
         return .resp_ok_capset;
     }

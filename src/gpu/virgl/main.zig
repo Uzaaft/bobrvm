@@ -15,6 +15,7 @@ pub const protocol = @import("protocol.zig");
 pub const decoder = @import("decoder.zig");
 pub const state = @import("state.zig");
 pub const context = @import("context.zig");
+pub const caps = @import("caps.zig");
 
 // Re-export commonly used types
 pub const Command = protocol.Command;
@@ -28,4 +29,5 @@ test {
     _ = decoder;
     _ = state;
     _ = context;
+    _ = caps;
 }
