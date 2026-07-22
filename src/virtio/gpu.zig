@@ -321,6 +321,11 @@ pub const Gpu = struct {
     /// resource id. 3D resources live in gpu_device, not self.resources, so
     /// their backing is tracked here rather than on a Resource2D.
     backing3d: std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)),
+    /// Readback of a 3D-rendered scanout resource's MTLTexture, so the
+    /// present path (which serves BGRA host pixels) can display GPU output.
+    scanout3d_data: []u8 = &.{},
+    scanout3d_w: u32 = 0,
+    scanout3d_h: u32 = 0,
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
@@ -356,6 +361,9 @@ pub const Gpu = struct {
             .virgl_enabled = enable_virgl,
             .gpu_device = gpu_module.GpuDevice.init(alloc),
             .backing3d = std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)).init(alloc),
+            .scanout3d_data = &.{},
+            .scanout3d_w = 0,
+            .scanout3d_h = 0,
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -375,6 +383,7 @@ pub const Gpu = struct {
         var b3d = self.backing3d.valueIterator();
         while (b3d.next()) |list| list.deinit(self.alloc);
         self.backing3d.deinit();
+        if (self.scanout3d_data.len > 0) self.alloc.free(self.scanout3d_data);
         self.gpu_device.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
@@ -415,13 +424,25 @@ pub const Gpu = struct {
     /// Caller must be on the vCPU thread (unsynchronized).
     pub fn scanout(self: *Gpu) ?ScanoutView {
         if (self.scanout_resource_id == 0) return null;
-        const res = self.resources.get(self.scanout_resource_id) orelse return null;
-        return .{
-            .data = res.host_data,
-            .width = res.width,
-            .height = res.height,
-            .generation = self.frame_generation,
-        };
+        // 2D scanout: served directly from the resource's host pixels.
+        if (self.resources.get(self.scanout_resource_id)) |res| {
+            return .{
+                .data = res.host_data,
+                .width = res.width,
+                .height = res.height,
+                .generation = self.frame_generation,
+            };
+        }
+        // 3D scanout: served from the GPU-texture readback buffer.
+        if (self.scanout3d_data.len > 0 and self.scanout3d_w > 0) {
+            return .{
+                .data = self.scanout3d_data,
+                .width = self.scanout3d_w,
+                .height = self.scanout3d_h,
+                .generation = self.frame_generation,
+            };
+        }
+        return null;
     }
 
     /// Acquire the scanout for reading from another thread (renderer).
@@ -699,8 +720,12 @@ pub const Gpu = struct {
         const cmd = std.mem.bytesToValue(SetScanout, req[0..@sizeOf(SetScanout)]);
 
         if (cmd.scanout_id != 0) return .resp_err_invalid_scanout_id;
-        // resource_id 0 disables the scanout.
-        if (cmd.resource_id != 0 and !self.resources.contains(cmd.resource_id)) {
+        // resource_id 0 disables the scanout. Accept both a 2D resource and a
+        // 3D (virgl-rendered) resource.
+        if (cmd.resource_id != 0 and
+            !self.resources.contains(cmd.resource_id) and
+            self.gpu_device.getResource(cmd.resource_id) == null)
+        {
             return .resp_err_invalid_resource_id;
         }
         self.scanout_resource_id = cmd.resource_id;
@@ -713,12 +738,37 @@ pub const Gpu = struct {
         const cmd = std.mem.bytesToValue(ResourceFlush, req[0..@sizeOf(ResourceFlush)]);
 
         if (cmd.resource_id == self.scanout_resource_id and self.scanout_resource_id != 0) {
+            // If the scanout is a 3D-rendered resource, pull its pixels out of
+            // the GPU texture into the host present buffer.
+            self.refresh3dScanout();
             self.frame_generation +%= 1; // content changed: renderer should present
             if (self.frame_callback) |cb| {
                 cb(self.frame_userdata);
             }
         }
         return .resp_ok_nodata;
+    }
+
+    /// Read the current 3D scanout resource's MTLTexture into the host
+    /// present buffer. No-op for 2D scanouts (served from Resource2D) or when
+    /// there is no GPU-backed texture.
+    fn refresh3dScanout(self: *Gpu) void {
+        const id = self.scanout_resource_id;
+        if (id == 0) return;
+        if (self.resources.contains(id)) return; // 2D path
+        const res = self.gpu_device.getResource(id) orelse return;
+        if (res.width == 0 or res.height == 0) return;
+        const needed = @as(usize, res.width) * res.height * 4;
+        if (self.scanout3d_data.len != needed) {
+            const nb = if (self.scanout3d_data.len == 0)
+                self.alloc.alloc(u8, needed) catch return
+            else
+                self.alloc.realloc(self.scanout3d_data, needed) catch return;
+            self.scanout3d_data = nb;
+        }
+        if (!self.gpu_device.readbackResource(id, self.scanout3d_data)) return;
+        self.scanout3d_w = res.width;
+        self.scanout3d_h = res.height;
     }
 
     fn cmdTransferToHost2D(self: *Gpu, req: []const u8, get_mem: ring.GetMemFn) CmdType {
@@ -1274,6 +1324,81 @@ test "transfer_to_host_3d uploads guest vertex data into the resource's MTLBuffe
     // The MTLBuffer must now hold the guest vertex bytes exactly.
     const contents = gpu.gpu_device.bufferContents(1).?;
     try testing.expect(std.mem.eql(u8, contents[0..nbytes], guest));
+}
+
+test "3D scanout presents rendered GPU pixels" {
+    const gpu = try Gpu.init(testing.allocator, true);
+    defer gpu.deinit();
+
+    // A 3D render-target resource that will also be the scanout.
+    try gpu.gpu_device.createResourceRecord(.{
+        .handle = 10,    .target = .texture_2d, .format = .b8g8r8a8_unorm,
+        .width = 32,     .height = 32,          .depth = 1,
+        .array_size = 1, .last_level = 0,       .nr_samples = 0,
+        .flags = 0,      .bind = 1 << 1, // PIPE_BIND_RENDER_TARGET
+    });
+    if (gpu.gpu_device.renderer == null) return error.SkipZigTest;
+
+    const scan = SetScanout{
+        .header = .{ .type = @intFromEnum(CmdType.set_scanout) },
+        .r = .{ .width = 32, .height = 32 },
+        .scanout_id = 0,
+        .resource_id = 10,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdSetScanout(std.mem.asBytes(&scan)));
+
+    // Render RED into it via a clear command stream.
+    try gpu.gpu_device.createContextId(1);
+    var w: [17]u32 = undefined;
+    var i: usize = 0;
+    w[i] = 1 | (8 << 8) | (3 << 16); // create SURFACE
+    i += 1;
+    w[i] = 60;
+    i += 1;
+    w[i] = 10;
+    i += 1;
+    w[i] = 1; // format bgra8
+    i += 1;
+    w[i] = 5 | (3 << 16); // set_framebuffer
+    i += 1;
+    w[i] = 1;
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    w[i] = 60;
+    i += 1;
+    w[i] = 7 | (8 << 16); // clear
+    i += 1;
+    w[i] = 4;
+    i += 1;
+    w[i] = @bitCast(@as(f32, 1.0)); // r
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.0)); // g
+    i += 1;
+    w[i] = @bitCast(@as(f32, 0.0)); // b
+    i += 1;
+    w[i] = @bitCast(@as(f32, 1.0)); // a
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    w[i] = 0;
+    i += 1;
+    try gpu.gpu_device.submit(1, std.mem.sliceAsBytes(w[0..i]));
+
+    const flush = ResourceFlush{
+        .header = .{ .type = @intFromEnum(CmdType.resource_flush) },
+        .r = .{ .width = 32, .height = 32 },
+        .resource_id = 10,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdResourceFlush(std.mem.asBytes(&flush)));
+
+    const view = gpu.scanout() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 32), view.width);
+    const c = ((16 * 32) + 16) * 4;
+    // Red in BGRA host memory: B<40, G<40, R>200.
+    try testing.expect(view.data[c + 2] > 200 and view.data[c + 1] < 40 and view.data[c + 0] < 40);
 }
 
 test "scanout frame generation advances only on flush of the scanout" {
