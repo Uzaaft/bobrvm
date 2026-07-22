@@ -137,6 +137,11 @@ pub const Gic = struct {
     inject_irq: ?*const fn (cpu_id: u8, userdata: ?*anyopaque) void = null,
     inject_userdata: ?*anyopaque = null,
 
+    /// Callback invoked when the guest EOIs an interrupt (e.g. to unmask
+    /// the HVF vtimer after the guest acknowledges PPI 27).
+    eoi_callback: ?*const fn (cpu_id: u8, intid: u32, userdata: ?*anyopaque) void = null,
+    eoi_userdata: ?*anyopaque = null,
+
     pub const Error = Allocator.Error;
 
     pub fn init(alloc: Allocator, num_cpus: u8) Error!*Gic {
@@ -188,6 +193,16 @@ pub const Gic = struct {
     ) void {
         self.inject_irq = callback;
         self.inject_userdata = userdata;
+    }
+
+    /// Set callback for EOI notification.
+    pub fn setEoiCallback(
+        self: *Gic,
+        callback: *const fn (cpu_id: u8, intid: u32, userdata: ?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        self.eoi_callback = callback;
+        self.eoi_userdata = userdata;
     }
 
     /// Set an SPI pending (called by devices).
@@ -298,6 +313,10 @@ pub const Gic = struct {
             }
         } else if (intid < MAX_INTID) {
             self.spis[intid - 32].active = false;
+        }
+
+        if (self.eoi_callback) |cb| {
+            cb(cpu_id, intid, self.eoi_userdata);
         }
 
         // Check for more pending interrupts
@@ -451,6 +470,13 @@ pub const Gic = struct {
                 .active => spi.active = true,
                 else => {},
             }
+        }
+
+        // A pending interrupt may have just become deliverable
+        // (e.g. device set pending before the guest enabled the line).
+        if (field == .enabled or field == .pending) {
+            var cpu: u8 = 0;
+            while (cpu < self.num_cpus) : (cpu += 1) self.checkPendingIrq(cpu);
         }
     }
 

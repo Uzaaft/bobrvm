@@ -55,7 +55,7 @@ fi
 
 # Create symlinks for basic commands
 cd "$MINI_DIR/bin"
-for cmd in sh ash cat echo ls mount mkdir mknod sleep insmod uname; do
+for cmd in sh ash cat echo ls mount mkdir mknod sleep insmod uname setsid cttyhack poweroff; do
     ln -sf busybox "$cmd"
 done
 
@@ -92,58 +92,26 @@ fi
 # Create hvc0 device if not created by devtmpfs
 mknod -m 666 /dev/hvc0 c 229 0 2>/dev/null || true
 
-# List /dev to see what we have
-echo "Devices:" >/dev/ttyAMA0 2>&1
-ls /dev/hvc* /dev/tty* 2>/dev/null >/dev/ttyAMA0 2>&1 || echo "no hvc/tty" >/dev/ttyAMA0 2>&1
+# Attach stdio to whatever console= selected (hvc0, ttyAMA0, ...).
+exec 0</dev/console 1>/dev/console 2>/dev/console
 
-# Check if hvc0 is available
-if [ -c /dev/hvc0 ]; then
-    echo "hvc0 available, switching..." >/dev/ttyAMA0 2>&1
-    
-    # Redirect stdio to hvc0 (virtio-console)
-    exec 0</dev/hvc0 1>/dev/hvc0 2>/dev/hvc0
-    
-    echo "==============================================="
-    echo "bobrvm minimal initramfs - shell ready"
-    echo "==============================================="
-    echo ""
-    echo "Running test commands..."
-    echo ""
-    
-    # Run some test commands to verify console works
-    echo "uname: $(uname -a)"
-    echo ""
-    echo "uptime: $(cat /proc/uptime)"
-    echo ""
-    echo "memory:"
-    cat /proc/meminfo | head -5
-    echo ""
-    echo "cpuinfo:"
-    cat /proc/cpuinfo | head -10
-    echo ""
-    echo "==============================================="
-    echo "Test complete! VM is running successfully."
-    echo "==============================================="
-    
-    # Keep running - just sleep in a loop so we don't exit
-    while true; do
-        sleep 10
-    done
+echo "==============================================="
+echo "bobrvm minimal initramfs - shell ready"
+echo "uname: $(uname -a)"
+echo "==============================================="
+
+# Interactive shell on the console. cttyhack (when available) makes it
+# the controlling tty so job control works; respawn if the shell exits.
+if /bin/busybox cttyhack true 2>/dev/null; then
+    SHELL_CMD="setsid cttyhack /bin/sh"
 else
-    echo "hvc0 not available, trying ttyAMA0..." >/dev/ttyAMA0 2>&1
-    
-    # Fall back to ttyAMA0 (PL011 UART)
-    exec 0</dev/ttyAMA0 1>/dev/ttyAMA0 2>/dev/ttyAMA0
-    
-    echo "==============================================="
-    echo "bobrvm minimal initramfs - shell ready (UART)"
-    echo "==============================================="
-    echo ""
-    
-    while true; do
-        sleep 10
-    done
+    SHELL_CMD="/bin/sh"
 fi
+while true; do
+    $SHELL_CMD
+    echo "(shell exited, respawning)"
+    sleep 1
+done
 EOF
 chmod +x "$MINI_DIR/init"
 

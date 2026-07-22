@@ -1,10 +1,11 @@
-//! Simple PL011 UART emulation for earlycon.
+//! PL011 UART emulation.
 //!
-//! Minimal implementation that captures TX output and provides
-//! status registers. Used for kernel earlycon before virtio-console
-//! is initialized.
+//! TX output is forwarded to a host callback. RX input is buffered in a
+//! FIFO and delivered to the guest via the RX interrupt (level-triggered,
+//! asserted while the FIFO is non-empty and RX interrupts are unmasked).
 
 const std = @import("std");
+const assert = @import("../quirks.zig").inlineAssert;
 
 const log = std.log.scoped(.uart);
 
@@ -43,10 +44,21 @@ pub const FR = struct {
     pub const BUSY: u32 = 1 << 3; // UART busy
 };
 
+/// Interrupt bits (RIS/MIS/IMSC/ICR).
+pub const INT = struct {
+    pub const RX: u32 = 1 << 4; // Receive
+    pub const TX: u32 = 1 << 5; // Transmit
+    pub const RT: u32 = 1 << 6; // Receive timeout
+};
+
 /// Simple UART state.
 pub const Uart = struct {
     output_callback: ?*const fn (data: []const u8, userdata: ?*anyopaque) void = null,
     output_userdata: ?*anyopaque = null,
+
+    /// IRQ line callback (level-triggered).
+    irq_callback: ?*const fn (level: bool, userdata: ?*anyopaque) void = null,
+    irq_userdata: ?*anyopaque = null,
 
     // Registers
     cr: u32 = 0x0300, // Control: TX/RX enabled
@@ -55,6 +67,18 @@ pub const Uart = struct {
     fbrd: u32 = 0,
     imsc: u32 = 0,
     ifls: u32 = 0,
+
+    // RX FIFO (ring buffer). Guarded by mutex: the host input thread
+    // pushes while the vCPU thread pops.
+    rx_fifo: [RX_FIFO_SIZE]u8 = undefined,
+    rx_head: usize = 0,
+    rx_len: usize = 0,
+    rx_mutex: std.Thread.Mutex = .{},
+
+    /// Last IRQ level we reported, to avoid redundant callbacks.
+    irq_level: bool = false,
+
+    pub const RX_FIFO_SIZE: usize = 4096;
 
     pub fn init() Uart {
         return .{};
@@ -69,19 +93,82 @@ pub const Uart = struct {
         self.output_userdata = userdata;
     }
 
+    pub fn setIrqCallback(
+        self: *Uart,
+        callback: *const fn (level: bool, userdata: ?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        self.irq_callback = callback;
+        self.irq_userdata = userdata;
+    }
+
+    /// Queue host input for the guest. Drops bytes if the FIFO is full.
+    pub fn queueInput(self: *Uart, data: []const u8) void {
+        self.rx_mutex.lock();
+        for (data) |byte| {
+            if (self.rx_len >= RX_FIFO_SIZE) break;
+            const tail = (self.rx_head + self.rx_len) % RX_FIFO_SIZE;
+            self.rx_fifo[tail] = byte;
+            self.rx_len += 1;
+        }
+        self.rx_mutex.unlock();
+        self.updateIrq();
+    }
+
+    fn rxPop(self: *Uart) ?u8 {
+        self.rx_mutex.lock();
+        defer self.rx_mutex.unlock();
+        if (self.rx_len == 0) return null;
+        const byte = self.rx_fifo[self.rx_head];
+        self.rx_head = (self.rx_head + 1) % RX_FIFO_SIZE;
+        self.rx_len -= 1;
+        return byte;
+    }
+
+    fn rxEmpty(self: *Uart) bool {
+        self.rx_mutex.lock();
+        defer self.rx_mutex.unlock();
+        return self.rx_len == 0;
+    }
+
+    /// Raw interrupt status: RX (and timeout) assert while data is queued.
+    fn ris(self: *Uart) u32 {
+        var status: u32 = 0;
+        if (!self.rxEmpty()) status |= INT.RX | INT.RT;
+        return status;
+    }
+
+    /// Recompute the IRQ line and notify on level change.
+    fn updateIrq(self: *Uart) void {
+        const level = (self.ris() & self.imsc) != 0;
+        if (level == self.irq_level) return;
+        self.irq_level = level;
+        if (self.irq_callback) |cb| {
+            cb(level, self.irq_userdata);
+        }
+    }
+
     pub fn read(self: *Uart, offset: u12) u32 {
         return switch (offset) {
-            Reg.UARTDR => 0, // No input
+            Reg.UARTDR => blk: {
+                const byte = self.rxPop() orelse 0;
+                self.updateIrq();
+                break :blk byte;
+            },
             Reg.UARTRSR => 0, // No errors
-            Reg.UARTFR => FR.TXFE | FR.RXFE, // TX empty, RX empty (ready to write)
+            Reg.UARTFR => blk: {
+                var fr: u32 = FR.TXFE; // TX always ready
+                if (self.rxEmpty()) fr |= FR.RXFE;
+                break :blk fr;
+            },
             Reg.UARTCR => self.cr,
             Reg.UARTLCR_H => self.lcr_h,
             Reg.UARTIBRD => self.ibrd,
             Reg.UARTFBRD => self.fbrd,
             Reg.UARTIMSC => self.imsc,
             Reg.UARTIFLS => self.ifls,
-            Reg.UARTRIS => 0,
-            Reg.UARTMIS => 0,
+            Reg.UARTRIS => self.ris(),
+            Reg.UARTMIS => self.ris() & self.imsc,
             // PrimeCell ID registers (required for Linux driver detection)
             Reg.UARTPeriphID0 => 0x11,
             Reg.UARTPeriphID1 => 0x10,
@@ -109,9 +196,16 @@ pub const Uart = struct {
             Reg.UARTLCR_H => self.lcr_h = value,
             Reg.UARTIBRD => self.ibrd = value,
             Reg.UARTFBRD => self.fbrd = value,
-            Reg.UARTIMSC => self.imsc = value,
+            Reg.UARTIMSC => {
+                self.imsc = value;
+                self.updateIrq();
+            },
             Reg.UARTIFLS => self.ifls = value,
-            Reg.UARTICR => {}, // Clear interrupts (ignore)
+            Reg.UARTICR => {
+                // RX/RT are level interrupts tied to FIFO state; a write
+                // here only re-evaluates the line.
+                self.updateIrq();
+            },
             else => {},
         }
     }
@@ -128,4 +222,48 @@ pub fn mmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
     const uart: *Uart = @ptrCast(@alignCast(context));
     _ = size;
     uart.write(@truncate(offset), @truncate(value));
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "Uart RX fifo delivers input and tracks flags" {
+    var uart = Uart.init();
+
+    // Empty: RXFE set, no interrupt
+    try std.testing.expect(uart.read(Reg.UARTFR) & FR.RXFE != 0);
+    try std.testing.expectEqual(@as(u32, 0), uart.read(Reg.UARTRIS) & INT.RX);
+
+    uart.queueInput("hi");
+    try std.testing.expect(uart.read(Reg.UARTFR) & FR.RXFE == 0);
+    try std.testing.expect(uart.read(Reg.UARTRIS) & INT.RX != 0);
+
+    try std.testing.expectEqual(@as(u32, 'h'), uart.read(Reg.UARTDR));
+    try std.testing.expectEqual(@as(u32, 'i'), uart.read(Reg.UARTDR));
+    try std.testing.expect(uart.read(Reg.UARTFR) & FR.RXFE != 0);
+}
+
+test "Uart IRQ line follows mask" {
+    var uart = Uart.init();
+
+    const Ctx = struct {
+        var level: bool = false;
+        fn cb(l: bool, _: ?*anyopaque) void {
+            level = l;
+        }
+    };
+    uart.setIrqCallback(Ctx.cb, null);
+
+    // Input with RX masked: no IRQ
+    uart.queueInput("x");
+    try std.testing.expect(!Ctx.level);
+
+    // Unmask RX: IRQ asserts
+    uart.write(Reg.UARTIMSC, INT.RX | INT.RT);
+    try std.testing.expect(Ctx.level);
+
+    // Drain FIFO: IRQ deasserts
+    _ = uart.read(Reg.UARTDR);
+    try std.testing.expect(!Ctx.level);
 }

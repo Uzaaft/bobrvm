@@ -53,8 +53,10 @@ pub const Console = struct {
     /// Output buffer (guest → host).
     output_buffer: std.ArrayListUnmanaged(u8),
 
-    /// Input buffer (host → guest).
+    /// Input buffer (host → guest). Guarded by input_mutex: the host
+    /// input thread appends, the vCPU thread drains.
     input_buffer: std.ArrayListUnmanaged(u8),
+    input_mutex: std.Thread.Mutex,
 
     /// Callback for output data.
     output_callback: ?*const fn (data: []const u8, userdata: ?*anyopaque) void,
@@ -65,6 +67,7 @@ pub const Console = struct {
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 128;
+    pub const INPUT_BUFFER_MAX: usize = 64 * 1024;
 
     pub fn init(alloc: Allocator) Error!*Console {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
@@ -88,6 +91,7 @@ pub const Console = struct {
             .transmit_queue = transmit_queue,
             .output_buffer = .{},
             .input_buffer = .{},
+            .input_mutex = .{},
             .output_callback = null,
             .output_userdata = null,
             .guest_memory = null,
@@ -129,8 +133,13 @@ pub const Console = struct {
         self.guest_memory = accessor;
     }
 
-    /// Queue input data to send to guest.
+    /// Queue input data to send to guest. Called from the host input
+    /// thread; delivery happens on the vCPU thread via pollReceive.
     pub fn queueInput(self: *Console, data: []const u8) Error!void {
+        self.input_mutex.lock();
+        defer self.input_mutex.unlock();
+        // Bound the buffer so a wedged guest can't grow it forever.
+        if (self.input_buffer.items.len + data.len > INPUT_BUFFER_MAX) return;
         try self.input_buffer.appendSlice(self.alloc, data);
     }
 
@@ -187,17 +196,104 @@ pub const Console = struct {
     }
 
     fn processReceiveQueue(self: *Console) void {
-        // Deliver pending input to guest
+        const qc = self.transport.queues[@intFromEnum(QueueIdx.receive)];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
+
+        self.input_mutex.lock();
+        defer self.input_mutex.unlock();
         if (self.input_buffer.items.len == 0) return;
 
-        // TODO: Walk descriptor chain, copy data to guest buffers
-        // For now, just clear the input buffer
-        self.input_buffer.clearRetainingCapacity();
+        const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
+        const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
+
+        var last_avail_idx = self.receive_queue.last_avail_idx;
+        var consumed: usize = 0;
+        var delivered: u32 = 0;
+
+        while (last_avail_idx != avail_idx and consumed < self.input_buffer.items.len) {
+            const ring_idx = last_avail_idx % qc.num;
+            const ring_entry = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse break;
+            const desc_idx = std.mem.readInt(u16, ring_entry[0..2], .little);
+
+            // Fill this (device-writable) descriptor chain with input.
+            var written: u32 = 0;
+            var idx = desc_idx;
+            var iterations: u16 = 0;
+            while (iterations < qc.num and consumed < self.input_buffer.items.len) : (iterations += 1) {
+                const desc_mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse break;
+                const buf_addr = std.mem.readInt(u64, desc_mem[0..8], .little);
+                const buf_len = std.mem.readInt(u32, desc_mem[8..12], .little);
+                const flags = std.mem.readInt(u16, desc_mem[12..14], .little);
+                const next = std.mem.readInt(u16, desc_mem[14..16], .little);
+
+                // Only fill device-writable descriptors (VIRTQ_DESC_F_WRITE).
+                if ((flags & 2) != 0) {
+                    if (get_mem(buf_addr, buf_len)) |buf| {
+                        const remaining = self.input_buffer.items[consumed..];
+                        const n: usize = @min(buf.len, remaining.len);
+                        @memcpy(buf[0..n], remaining[0..n]);
+                        consumed += n;
+                        written += @intCast(n);
+                    }
+                }
+
+                if ((flags & 1) == 0) break; // No VIRTQ_DESC_F_NEXT
+                idx = next;
+            }
+
+            // Report the buffer used, even if written == 0, to keep the
+            // ring consistent with the driver's expectations.
+            const used_ring = get_mem(qc.device_addr, 6) orelse break;
+            var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
+            const used_ring_idx = used_idx % qc.num;
+            const used_entry = get_mem(qc.device_addr + 4 + @as(u64, used_ring_idx) * 8, 8) orelse break;
+            std.mem.writeInt(u32, used_entry[0..4], desc_idx, .little);
+            std.mem.writeInt(u32, used_entry[4..8], written, .little);
+            used_idx +%= 1;
+            std.mem.writeInt(u16, @ptrCast(used_ring[2..4]), used_idx, .little);
+
+            delivered += written;
+            last_avail_idx +%= 1;
+        }
+
+        self.receive_queue.last_avail_idx = last_avail_idx;
+
+        if (consumed > 0) {
+            self.input_buffer.replaceRangeAssumeCapacity(0, consumed, &.{});
+        }
+        if (delivered > 0) {
+            self.transport.signalUsedBuffer();
+        }
     }
 
     /// Poll the transmit queue. Can be called from vCPU loop.
     pub fn pollTransmit(self: *Console) void {
         self.processTransmitQueue();
+    }
+
+    /// Poll the receive queue for pending host input. Called from the
+    /// vCPU loop so all guest-memory access stays on one thread.
+    pub fn pollReceive(self: *Console) void {
+        self.processReceiveQueue();
+    }
+
+    /// Debug: dump queue state for diagnostics.
+    pub fn debugState(self: *Console) void {
+        const get_mem = self.guest_memory orelse return;
+        for ([_]QueueIdx{ .receive, .transmit }) |qi| {
+            const qc = self.transport.queues[@intFromEnum(qi)];
+            var avail_idx: u16 = 0;
+            var used_idx: u16 = 0;
+            if (qc.ready) {
+                if (get_mem(qc.driver_addr, 6)) |a| avail_idx = std.mem.readInt(u16, a[2..4], .little);
+                if (get_mem(qc.device_addr, 6)) |u| used_idx = std.mem.readInt(u16, u[2..4], .little);
+            }
+            log.debug("q{}: ready={} num={} avail_idx={} used_idx={} last_avail={} desc=0x{x}", .{
+                @intFromEnum(qi),                                                                               qc.ready,     qc.num, avail_idx, used_idx,
+                if (qi == .transmit) self.transmit_queue.last_avail_idx else self.receive_queue.last_avail_idx, qc.desc_addr,
+            });
+        }
     }
 
     /// Debug: check if TX queue has pending data.

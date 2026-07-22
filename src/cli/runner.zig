@@ -53,6 +53,32 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
 
     hw.setConsoleOutput(consoleOutput, null);
 
+    // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
+    // the guest. Ctrl-] detaches and shuts down, like telnet.
+    const stdin_fd = std.posix.STDIN_FILENO;
+    const stdin_is_tty = std.posix.isatty(stdin_fd);
+    if (stdin_is_tty) {
+        if (std.posix.tcgetattr(stdin_fd)) |t| {
+            saved_termios = t;
+            var raw = t;
+            raw.lflag.ICANON = false;
+            raw.lflag.ECHO = false;
+            raw.lflag.ISIG = false;
+            raw.lflag.IEXTEN = false;
+            raw.iflag.ICRNL = false;
+            raw.iflag.IXON = false;
+            std.posix.tcsetattr(stdin_fd, .NOW, raw) catch {};
+            log.info("console attached (Ctrl-] to quit)", .{});
+        } else |_| {}
+    }
+    defer restoreTermios();
+
+    const input_thread = std.Thread.spawn(.{}, inputLoop, .{ hw, stdin_is_tty }) catch |err| blk: {
+        log.warn("failed to start console input thread: {}", .{err});
+        break :blk null;
+    };
+    if (input_thread) |t| t.detach();
+
     log.info("starting VM...", .{});
     hw.startSync() catch |err| {
         log.err("failed to start VM: {}", .{err});
@@ -60,6 +86,37 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     };
 
     log.info("VM stopped", .{});
+}
+
+var saved_termios: ?std.posix.termios = null;
+
+fn restoreTermios() void {
+    if (saved_termios) |t| {
+        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, t) catch {};
+        saved_termios = null;
+    }
+}
+
+/// Reads host stdin and forwards it to the guest console. Runs detached;
+/// the process exits (and reaps it) when the VM stops.
+fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch break;
+        if (n == 0) break; // EOF: keep VM running, stop forwarding
+
+        if (is_tty) {
+            // Ctrl-] detaches: forward everything before it, then shut down.
+            if (std.mem.indexOfScalar(u8, buf[0..n], 0x1d)) |esc| {
+                if (esc > 0) hw.injectConsoleInput(buf[0..esc]);
+                restoreTermios();
+                std.posix.raise(std.posix.SIG.TERM) catch {};
+                return;
+            }
+        }
+
+        hw.injectConsoleInput(buf[0..n]);
+    }
 }
 
 fn consoleOutput(data: []const u8, _: ?*anyopaque) void {

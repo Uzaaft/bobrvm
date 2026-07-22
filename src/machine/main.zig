@@ -203,6 +203,10 @@ pub const Machine = struct {
     /// Pending IRQ flag (set by GIC when interrupt should be injected).
     pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Set when the guest EOIs the vtimer PPI; the vCPU loop unmasks HVF's
+    /// vtimer so it can fire again.
+    vtimer_unmask: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     pub const Error = hypervisor.Error || Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.WriteError || std.Thread.SpawnError || error{
         KernelTooLarge,
         InitrdTooLarge,
@@ -276,6 +280,14 @@ pub const Machine = struct {
         self.vcpus.deinit(self.alloc);
 
         self.alloc.destroy(self);
+    }
+
+    /// Inject host input into the guest consoles. Thread-safe: buffers
+    /// are drained on the vCPU thread.
+    pub fn injectConsoleInput(self: *Machine, data: []const u8) void {
+        if (self.uart) |uart| uart.queueInput(data);
+        if (self.console) |console| console.queueInput(data) catch {};
+        self.pending_irq.store(true, .release);
     }
 
     /// Set console output callback.
@@ -495,9 +507,16 @@ pub const Machine = struct {
                 try vcpu.setPendingInterrupt(.irq, true);
             }
 
-            // Poll virtio console TX queue on every exit (guest may use notification suppression)
+            // Unmask the HVF vtimer once the guest has EOI'd PPI 27.
+            if (self.vtimer_unmask.swap(false, .acq_rel)) {
+                try vcpu.setVTimerMask(false);
+            }
+
+            // Poll virtio console queues on every exit (guest may use
+            // notification suppression; host input arrives asynchronously).
             if (self.console) |console| {
                 console.pollTransmit();
+                console.pollReceive();
             }
 
             const exit_info = try vcpu.run();
@@ -515,9 +534,10 @@ pub const Machine = struct {
                             try self.handleMmio(vcpu, exit_info);
                         },
                         .wf_trapped => {
-                            // Poll console TX while halted
+                            // Poll console queues while halted
                             if (self.console) |console| {
                                 console.pollTransmit();
+                                console.pollReceive();
                             }
                             try vcpu.advancePC(exit_info);
                             std.Thread.sleep(1_000_000); // 1ms
@@ -540,6 +560,11 @@ pub const Machine = struct {
                     }
                 },
                 .vtimer_activated => {
+                    // Pend the virtual timer PPI (intid 27). HVF masks the
+                    // vtimer on this exit; we unmask when the guest EOIs.
+                    if (self.gic_device) |gic_dev| {
+                        gic_dev.setPpiPending(0, 27, true);
+                    }
                     try vcpu.setPendingInterrupt(.irq, true);
                 },
                 .unknown => {
@@ -986,6 +1011,7 @@ pub const Machine = struct {
         self.gic_device = try gic.Gic.init(self.alloc, self.config.vcpu_count);
         // Set up IRQ injection callback
         self.gic_device.?.setInjectCallback(gicInjectIrqCallback, self);
+        self.gic_device.?.setEoiCallback(gicEoiCallback, self);
         log.debug("initialized GIC at 0x{x}", .{MemoryLayout.GIC_DIST_BASE});
 
         // Initialize ICC handler
@@ -1000,6 +1026,7 @@ pub const Machine = struct {
         if (self.console_output) |cb| {
             self.uart.?.setOutputCallback(cb, self.console_userdata);
         }
+        self.uart.?.setIrqCallback(uartIrqCallback, self);
         log.debug("initialized UART at 0x{x}", .{MemoryLayout.UART_BASE});
 
         // Initialize console (slot 0)
@@ -1109,8 +1136,9 @@ pub const Machine = struct {
 
     fn pciBlockIrq(userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
+        // DTB routes PCI INTx to GIC_SPI 48-51 → intid 80-83.
         if (self.gic_device) |gic_dev| {
-            gic_dev.setSpiPending(48, true);
+            gic_dev.setSpiPending(80, true);
         }
         self.pending_irq.store(true, .release);
     }
@@ -1423,9 +1451,30 @@ pub const Machine = struct {
 
     fn consoleIrqCallback(userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        // virtio-console is device 0, SPI starts at 32, so intid = 32 + 0 = 32
+        // DTB declares virtio slot 0 as GIC_SPI 32 → intid 32 + 32 = 64.
         if (self.gic_device) |gic_dev| {
-            gic_dev.setSpiPending(32, true);
+            gic_dev.setSpiPending(64, true);
+        }
+    }
+
+    fn uartIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        // DTB declares the PL011 as GIC_SPI 1 → intid 32 + 1 = 33.
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(33, level);
+        }
+    }
+
+    fn gicEoiCallback(cpu_id: u8, intid: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (intid == 27) {
+            // vtimer PPI: drop the (level) pending state and unmask HVF's
+            // vtimer. If the timer condition still holds, HVF exits again
+            // with vtimer_activated and we re-pend.
+            if (self.gic_device) |gic_dev| {
+                gic_dev.setPpiPending(cpu_id, 27, false);
+            }
+            self.vtimer_unmask.store(true, .release);
         }
     }
 
