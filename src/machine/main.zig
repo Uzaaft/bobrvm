@@ -171,6 +171,12 @@ const VcpuRunState = struct {
     context_id: u64 = 0,
     thread: ?std.Thread = null,
     vcpu: ?*hypervisor.Vcpu = null,
+
+    /// WFI wait: the vCPU thread blocks here when the guest halts with no
+    /// deliverable interrupt; kickCpu signals it so device IRQs from
+    /// other threads wake it immediately instead of after the poll tick.
+    wake_mutex: std.Thread.Mutex = .{},
+    wake_cond: std.Thread.Condition = .{},
 };
 
 pub const Machine = struct {
@@ -521,9 +527,12 @@ pub const Machine = struct {
 
         self.running.store(false, .release);
 
-        // Kick every sync-loop vCPU out of hv_vcpu_run so they observe
-        // running=false promptly.
+        // Kick every sync-loop vCPU out of hv_vcpu_run and wake any that
+        // are WFI-halted on the condvar so they observe running=false.
         for (self.cpu_states) |*state| {
+            state.wake_mutex.lock();
+            state.wake_cond.signal();
+            state.wake_mutex.unlock();
             if (state.vcpu) |v| v.forceExit() catch {};
         }
 
@@ -687,7 +696,18 @@ pub const Machine = struct {
                                 self.machine_lock.unlock();
                             }
                             try vcpu.advancePC(exit_info);
-                            std.Thread.sleep(1_000_000); // 1ms
+                            // Wait for an interrupt instead of busy-spinning.
+                            // Skip the wait entirely if one is already
+                            // deliverable; otherwise block until kickCpu
+                            // signals or the 1ms timer-poll cap elapses.
+                            self.machine_lock.lock();
+                            const has_irq = if (self.gic_device) |g| g.hasDeliverableIrq(cpu_id) else false;
+                            self.machine_lock.unlock();
+                            if (!has_irq and !state.pending_irq.load(.acquire)) {
+                                state.wake_mutex.lock();
+                                state.wake_cond.timedWait(&state.wake_mutex, 1_000_000) catch {};
+                                state.wake_mutex.unlock();
+                            }
                         },
                         .hvc_aarch64, .smc_aarch64 => {
                             self.machine_lock.lock();
@@ -1886,6 +1906,11 @@ pub const Machine = struct {
         if (cpu_id >= self.cpu_states.len) return;
         const state = &self.cpu_states[cpu_id];
         state.pending_irq.store(true, .release);
+        // Wake a WFI-halted vCPU (blocked on the condvar) and force a
+        // running one out of hv_vcpu_run.
+        state.wake_mutex.lock();
+        state.wake_cond.signal();
+        state.wake_mutex.unlock();
         if (state.vcpu) |v| v.forceExit() catch {};
     }
 };
