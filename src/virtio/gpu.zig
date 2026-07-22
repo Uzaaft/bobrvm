@@ -201,6 +201,27 @@ pub const Submit3D = extern struct {
     _padding: u32 = 0,
 };
 
+/// virtio_gpu_box: a 3D region (for buffers, x/w are the byte offset/length).
+pub const Box = extern struct {
+    x: u32,
+    y: u32,
+    z: u32,
+    w: u32,
+    h: u32,
+    d: u32,
+};
+
+/// virtio_gpu_transfer_host_3d.
+pub const TransferHost3D = extern struct {
+    header: CtrlHeader,
+    box: Box,
+    offset: u64,
+    resource_id: u32,
+    level: u32,
+    stride: u32,
+    layer_stride: u32,
+};
+
 pub const GetCapsetInfo = extern struct {
     header: CtrlHeader,
     capset_index: u32,
@@ -296,6 +317,10 @@ pub const Gpu = struct {
     /// 3D (virgl) support: guest contexts + resources + command decode.
     virgl_enabled: bool,
     gpu_device: gpu_module.GpuDevice,
+    /// Guest backing pages for 3D resources (buffers/textures), keyed by
+    /// resource id. 3D resources live in gpu_device, not self.resources, so
+    /// their backing is tracked here rather than on a Resource2D.
+    backing3d: std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)),
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
@@ -330,6 +355,7 @@ pub const Gpu = struct {
             .frame_userdata = null,
             .virgl_enabled = enable_virgl,
             .gpu_device = gpu_module.GpuDevice.init(alloc),
+            .backing3d = std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)).init(alloc),
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -346,6 +372,9 @@ pub const Gpu = struct {
             res.entries.deinit(self.alloc);
         }
         self.resources.deinit();
+        var b3d = self.backing3d.valueIterator();
+        while (b3d.next()) |list| list.deinit(self.alloc);
+        self.backing3d.deinit();
         self.gpu_device.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
@@ -570,8 +599,11 @@ pub const Gpu = struct {
             .resource_create_3d => {
                 resp_type = self.cmdResourceCreate3D(req);
             },
-            .transfer_to_host_3d, .transfer_from_host_3d => {
-                // Accepted; data movement lands with the Metal backend.
+            .transfer_to_host_3d => {
+                resp_type = self.cmdTransferToHost3D(req, get_mem);
+            },
+            .transfer_from_host_3d => {
+                // Host→guest readback lands with the present/readback path.
                 resp_type = if (self.virgl_enabled) .resp_ok_nodata else .resp_err_unspec;
             },
             .submit_3d => {
@@ -734,6 +766,38 @@ pub const Gpu = struct {
         return .resp_ok_nodata;
     }
 
+    /// Transfer guest data into a 3D (virgl) resource. Only buffer resources
+    /// are handled here — vertex/index/constant uploads — which is what
+    /// draw_vbo needs. The scattered guest backing is copied straight into
+    /// the resource's shared-storage MTLBuffer (zero staging copy).
+    fn cmdTransferToHost3D(self: *Gpu, req: []const u8, get_mem: ring.GetMemFn) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (req.len < @sizeOf(TransferHost3D)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(TransferHost3D, req[0..@sizeOf(TransferHost3D)]);
+
+        const res = self.gpu_device.getResource(cmd.resource_id) orelse
+            return .resp_err_invalid_resource_id;
+        // Textures need row/layer-aware upload; defer them. Buffers first.
+        if (res.target != .buffer) return .resp_ok_nodata;
+
+        const list = self.backing3d.getPtr(cmd.resource_id) orelse return .resp_err_unspec;
+        if (list.items.len == 0) return .resp_err_unspec;
+
+        const dst_all = self.gpu_device.bufferContents(cmd.resource_id) orelse
+            return .resp_err_unspec;
+
+        // For buffers the box is 1D: x = byte offset into the resource,
+        // w = byte length.
+        const start: usize = cmd.box.x;
+        const len: usize = cmd.box.w;
+        if (start + len > dst_all.len) return .resp_err_invalid_parameter;
+
+        if (!copyFromBacking(list.items, cmd.offset, dst_all[start .. start + len], get_mem)) {
+            return .resp_err_unspec;
+        }
+        return .resp_ok_nodata;
+    }
+
     /// Copy `dst.len` bytes starting at linear `offset` out of the
     /// scattered guest backing into `dst`.
     fn copyFromBacking(
@@ -772,11 +836,23 @@ pub const Gpu = struct {
             req[0..@sizeOf(ResourceAttachBacking)],
         );
 
-        const res = self.resources.getPtr(cmd.resource_id) orelse
-            return .resp_err_invalid_resource_id;
         if (cmd.nr_entries == 0 or cmd.nr_entries > MAX_BACKING_ENTRIES) {
             return .resp_err_invalid_parameter;
         }
+
+        // Resolve where the backing entries belong: a 2D resource keeps them
+        // on its Resource2D; a 3D (virgl) resource lives in gpu_device, so its
+        // backing is tracked in backing3d.
+        const dest: *std.ArrayListUnmanaged(MemEntry) = blk: {
+            if (self.resources.getPtr(cmd.resource_id)) |res| break :blk &res.entries;
+            if (self.virgl_enabled and self.gpu_device.getResource(cmd.resource_id) != null) {
+                const gop = self.backing3d.getOrPut(cmd.resource_id) catch
+                    return .resp_err_out_of_memory;
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                break :blk gop.value_ptr;
+            }
+            return .resp_err_invalid_resource_id;
+        };
 
         // The entry array either follows the command in the same buffer
         // or arrives as a second device-readable descriptor (Linux).
@@ -799,15 +875,15 @@ pub const Gpu = struct {
         };
         if (entries_mem.len < entries_bytes) return .resp_err_invalid_parameter;
 
-        res.entries.clearRetainingCapacity();
-        res.entries.ensureTotalCapacity(self.alloc, cmd.nr_entries) catch
+        dest.clearRetainingCapacity();
+        dest.ensureTotalCapacity(self.alloc, cmd.nr_entries) catch
             return .resp_err_out_of_memory;
 
         var i: u32 = 0;
         while (i < cmd.nr_entries) : (i += 1) {
             const off = i * @sizeOf(MemEntry);
             const entry = std.mem.bytesToValue(MemEntry, entries_mem[off..][0..@sizeOf(MemEntry)]);
-            res.entries.appendAssumeCapacity(entry);
+            dest.appendAssumeCapacity(entry);
         }
 
         return .resp_ok_nodata;
@@ -1124,6 +1200,80 @@ test "transfer_to_host_2d full-width fast path matches guest backing" {
     // host copy must match the guest backing byte-for-byte
     const res = gpu.resources.get(1).?;
     try testing.expect(std.mem.eql(u8, res.host_data, guest));
+}
+
+test "transfer_to_host_3d uploads guest vertex data into the resource's MTLBuffer" {
+    const gpu = try Gpu.init(testing.allocator, true);
+    defer gpu.deinit();
+
+    const nbytes: u32 = 24; // 3 vertices * float2
+
+    const guest = try testing.allocator.alloc(u8, nbytes);
+    defer testing.allocator.free(guest);
+    for (guest, 0..) |*b, i| b.* = @truncate(i + 1);
+
+    const Ctx = struct {
+        var mem: []u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    Ctx.mem = guest;
+    gpu.setGuestMemory(Ctx.get);
+
+    // Create a 3D buffer resource (target=buffer(0), bind=vertex_buffer).
+    const create = ResourceCreate3D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_3d) },
+        .resource_id = 1,
+        .target = 0,
+        .format = 0,
+        .bind = 1 << 4, // PIPE_BIND_VERTEX_BUFFER
+        .width = nbytes, // buffers encode byte size in width
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdResourceCreate3D(std.mem.asBytes(&create)));
+
+    if (gpu.gpu_device.renderer == null) return error.SkipZigTest;
+
+    // Attach a single contiguous backing region.
+    const AttachMsg = extern struct { hdr: ResourceAttachBacking, entry: MemEntry };
+    const attach = AttachMsg{
+        .hdr = .{
+            .header = .{ .type = @intFromEnum(CmdType.resource_attach_backing) },
+            .resource_id = 1,
+            .nr_entries = 1,
+        },
+        .entry = .{ .addr = 0x1000, .length = nbytes },
+    };
+    var empty_chain = ring.Chain{};
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdResourceAttachBacking(std.mem.asBytes(&attach), &empty_chain, Ctx.get),
+    );
+
+    // Transfer the whole buffer to the host.
+    const xfer = TransferHost3D{
+        .header = .{ .type = @intFromEnum(CmdType.transfer_to_host_3d) },
+        .box = .{ .x = 0, .y = 0, .z = 0, .w = nbytes, .h = 1, .d = 1 },
+        .offset = 0,
+        .resource_id = 1,
+        .level = 0,
+        .stride = 0,
+        .layer_stride = 0,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get));
+
+    // The MTLBuffer must now hold the guest vertex bytes exactly.
+    const contents = gpu.gpu_device.bufferContents(1).?;
+    try testing.expect(std.mem.eql(u8, contents[0..nbytes], guest));
 }
 
 test "scanout frame generation advances only on flush of the scanout" {
