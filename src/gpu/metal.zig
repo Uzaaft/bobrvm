@@ -54,6 +54,14 @@ pub fn sel(name: [*:0]const u8) SEL {
     return sel_registerName(name);
 }
 
+/// Create an NSString from a null-terminated UTF-8 C string (autoreleased).
+pub fn nsString(c_str: [*:0]const u8) ?id {
+    const nsstring = objc_getClass("NSString") orelse return null;
+    const s = sel("stringWithUTF8String:");
+    const func: *const fn (Class, SEL, [*:0]const u8) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+    return func(nsstring, s, c_str);
+}
+
 /// Get a class.
 pub fn cls(name: [*:0]const u8) ?Class {
     return objc_getClass(name);
@@ -225,6 +233,101 @@ pub const Device = struct {
         const tex = msgSendId1(self.ptr, sel("newTextureWithDescriptor:"), desc) orelse return null;
         return .{ .ptr = tex };
     }
+
+    /// Compile a Metal shader library from MSL source text. Returns null on
+    /// compile failure (the NSError is discarded — callers treat null as
+    /// "shader did not compile").
+    pub fn newLibraryWithSource(self: Device, source: [*:0]const u8) ?Library {
+        const src = nsString(source) orelse return null;
+        const s = sel("newLibraryWithSource:options:error:");
+        var err: ?id = null;
+        const func: *const fn (id, SEL, id, ?id, *?id) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const lib = func(self.ptr, s, src, null, &err) orelse return null;
+        return .{ .ptr = lib };
+    }
+
+    /// Create a render pipeline state from a descriptor. Returns null on
+    /// failure.
+    pub fn newRenderPipelineState(self: Device, desc: RenderPipelineDescriptor) ?RenderPipelineState {
+        const s = sel("newRenderPipelineStateWithDescriptor:error:");
+        var err: ?id = null;
+        const func: *const fn (id, SEL, id, *?id) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const pso = func(self.ptr, s, desc.ptr, &err) orelse return null;
+        return .{ .ptr = pso };
+    }
+};
+
+/// MTLLibrary wrapper.
+pub const Library = struct {
+    ptr: id,
+
+    /// Look up a function by name.
+    pub fn newFunction(self: Library, name: [*:0]const u8) ?Function {
+        const ns = nsString(name) orelse return null;
+        const f = msgSendId1(self.ptr, sel("newFunctionWithName:"), ns) orelse return null;
+        return .{ .ptr = f };
+    }
+
+    pub fn release(self: Library) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
+};
+
+/// MTLFunction wrapper.
+pub const Function = struct {
+    ptr: id,
+
+    pub fn release(self: Function) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
+};
+
+/// MTLRenderPipelineState wrapper (opaque; bound on an encoder).
+pub const RenderPipelineState = struct {
+    ptr: id,
+
+    pub fn release(self: RenderPipelineState) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
+};
+
+/// MTLRenderPipelineDescriptor wrapper.
+pub const RenderPipelineDescriptor = struct {
+    ptr: id,
+
+    pub fn create() ?RenderPipelineDescriptor {
+        const class = cls("MTLRenderPipelineDescriptor") orelse return null;
+        const obj = msgSendId(class, sel("alloc")) orelse return null;
+        const inited = msgSendId(obj, sel("init")) orelse return null;
+        return .{ .ptr = inited };
+    }
+
+    pub fn setVertexFunction(self: RenderPipelineDescriptor, func: Function) void {
+        const s = sel("setVertexFunction:");
+        const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, s, func.ptr);
+    }
+
+    pub fn setFragmentFunction(self: RenderPipelineDescriptor, func: Function) void {
+        const s = sel("setFragmentFunction:");
+        const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, s, func.ptr);
+    }
+
+    /// Set the pixel format of color attachment 0.
+    pub fn setColorFormat0(self: RenderPipelineDescriptor, format: MTLPixelFormat) void {
+        const arr = msgSendId(self.ptr, sel("colorAttachments")) orelse return;
+        const s_idx = sel("objectAtIndexedSubscript:");
+        const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const att = idx_func(arr, s_idx, 0) orelse return;
+        const s_fmt = sel("setPixelFormat:");
+        const fmt_func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        fmt_func(att, s_fmt, @intFromEnum(format));
+    }
+
+    pub fn release(self: RenderPipelineDescriptor) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
 };
 
 /// MTLCommandQueue wrapper.
@@ -370,6 +473,20 @@ pub const RenderCommandEncoder = struct {
         const s = sel("setRenderPipelineState:");
         const func: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
         func(self.ptr, s, pipeline);
+    }
+
+    /// Set inline vertex bytes (small data, ≤4KB, no separate MTLBuffer).
+    pub fn setVertexBytes(self: RenderCommandEncoder, bytes: [*]const u8, len: NSUInteger, index: NSUInteger) void {
+        const s = sel("setVertexBytes:length:atIndex:");
+        const func: *const fn (id, SEL, [*]const u8, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, bytes, len, index);
+    }
+
+    /// Set inline fragment bytes (small uniforms, ≤4KB).
+    pub fn setFragmentBytes(self: RenderCommandEncoder, bytes: [*]const u8, len: NSUInteger, index: NSUInteger) void {
+        const s = sel("setFragmentBytes:length:atIndex:");
+        const func: *const fn (id, SEL, [*]const u8, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, bytes, len, index);
     }
 
     /// Set vertex buffer.

@@ -15,6 +15,8 @@ const Allocator = std.mem.Allocator;
 const metal = @import("../metal.zig");
 const proto = @import("protocol.zig");
 
+const NSUInteger = metal.NSUInteger;
+
 pub const ResourceHandle = u32;
 
 /// A guest render-target resource backed by an MTLTexture.
@@ -32,7 +34,28 @@ pub const Error = error{
     CommandBufferFailed,
     EncoderFailed,
     UnknownTarget,
+    ShaderCompileFailed,
+    PipelineCreateFailed,
 } || Allocator.Error;
+
+/// Passthrough shader: positions come from buffer(0) as clip-space float2,
+/// fragments are a solid color from buffer(0). This is the fixed-function
+/// stand-in used until the TGSI→MSL compiler lands — it proves the full
+/// pipeline (library → functions → PSO → draw → attachment) end to end.
+const passthrough_msl: [*:0]const u8 =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\struct VOut { float4 pos [[position]]; };
+    \\vertex VOut v_passthrough(uint vid [[vertex_id]],
+    \\                          const device float2* verts [[buffer(0)]]) {
+    \\    VOut o;
+    \\    o.pos = float4(verts[vid], 0.0, 1.0);
+    \\    return o;
+    \\}
+    \\fragment float4 f_solid(constant float4& color [[buffer(0)]]) {
+    \\    return color;
+    \\}
+;
 
 /// Map a virgl/Gallium pixel format to the closest Metal pixel format.
 /// Covers the formats a render target realistically uses; unknown formats
@@ -65,6 +88,10 @@ pub const Renderer = struct {
     /// Whether we own the device (created it) vs. borrowing it from Swift.
     owns_device: bool,
     targets: std.AutoHashMap(ResourceHandle, Target),
+    /// Cached passthrough pipeline per color-attachment pixel format (the
+    /// PSO's color format must match the render target it draws into).
+    passthrough: std.AutoHashMap(NSUInteger, metal.RenderPipelineState),
+    passthrough_lib: ?metal.Library,
 
     /// Create a renderer with the system default Metal device. Works
     /// headlessly (no window), which is exactly what tests and the
@@ -78,6 +105,8 @@ pub const Renderer = struct {
             .queue = queue,
             .owns_device = true,
             .targets = std.AutoHashMap(ResourceHandle, Target).init(alloc),
+            .passthrough = std.AutoHashMap(NSUInteger, metal.RenderPipelineState).init(alloc),
+            .passthrough_lib = null,
         };
     }
 
@@ -91,6 +120,8 @@ pub const Renderer = struct {
             .queue = queue,
             .owns_device = false,
             .targets = std.AutoHashMap(ResourceHandle, Target).init(alloc),
+            .passthrough = std.AutoHashMap(NSUInteger, metal.RenderPipelineState).init(alloc),
+            .passthrough_lib = null,
         };
     }
 
@@ -98,6 +129,10 @@ pub const Renderer = struct {
         var it = self.targets.valueIterator();
         while (it.next()) |t| t.tex.release();
         self.targets.deinit();
+        var pit = self.passthrough.valueIterator();
+        while (pit.next()) |p| p.release();
+        self.passthrough.deinit();
+        if (self.passthrough_lib) |lib| lib.release();
     }
 
     /// Back a guest render-target resource with an MTLTexture. Idempotent
@@ -159,6 +194,73 @@ pub const Renderer = struct {
         cmd.waitUntilCompleted();
     }
 
+    /// Get (compiling+caching on first use) the passthrough pipeline whose
+    /// color attachment matches `format`.
+    fn passthroughPipeline(self: *Renderer, format: metal.MTLPixelFormat) Error!metal.RenderPipelineState {
+        const key: NSUInteger = @intFromEnum(format);
+        if (self.passthrough.get(key)) |pso| return pso;
+
+        if (self.passthrough_lib == null) {
+            self.passthrough_lib = self.device.newLibraryWithSource(passthrough_msl) orelse
+                return Error.ShaderCompileFailed;
+        }
+        const lib = self.passthrough_lib.?;
+        const vfn = lib.newFunction("v_passthrough") orelse return Error.ShaderCompileFailed;
+        const ffn = lib.newFunction("f_solid") orelse return Error.ShaderCompileFailed;
+
+        const desc = metal.RenderPipelineDescriptor.create() orelse return Error.PipelineCreateFailed;
+        desc.setVertexFunction(vfn);
+        desc.setFragmentFunction(ffn);
+        desc.setColorFormat0(format);
+
+        const pso = self.device.newRenderPipelineState(desc) orelse return Error.PipelineCreateFailed;
+        try self.passthrough.put(key, pso);
+        return pso;
+    }
+
+    /// Clear a target and draw solid-colored triangles from clip-space
+    /// vertices in one render pass. This is the concrete draw path the
+    /// decoded virgl draw_vbo will feed into once vertex buffers are wired;
+    /// for now it is driven directly (host vertex data) to validate that a
+    /// real Metal pipeline renders geometry into a guest render target.
+    pub fn clearAndDraw(
+        self: *Renderer,
+        handle: ResourceHandle,
+        clear_color: [4]f32,
+        verts: []const [2]f32,
+        tri_color: [4]f32,
+    ) Error!void {
+        const target = self.targets.get(handle) orelse return Error.UnknownTarget;
+        const pso = try self.passthroughPipeline(target.format);
+
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
+        const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.clear);
+        att.setStoreAction(.store);
+        att.setClearColor(.{
+            .red = clear_color[0],
+            .green = clear_color[1],
+            .blue = clear_color[2],
+            .alpha = clear_color[3],
+        });
+
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        enc.setRenderPipelineState(pso.ptr);
+
+        const vbytes: [*]const u8 = @ptrCast(verts.ptr);
+        enc.setVertexBytes(vbytes, verts.len * @sizeOf([2]f32), 0);
+        var color = tri_color;
+        enc.setFragmentBytes(@ptrCast(&color), @sizeOf([4]f32), 0);
+        enc.drawPrimitives(.triangle, 0, verts.len);
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
     /// Read a render target's pixels back into a host buffer (tight rows).
     /// `out` must be at least width*height*bytesPerPixel.
     pub fn readback(self: *Renderer, handle: ResourceHandle, out: []u8) Error!void {
@@ -214,4 +316,41 @@ test "clear render target produces exact pixels" {
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expect_r)), @as(f32, @floatFromInt(buf[o + 2])), 1.5);
         try std.testing.expectEqual(expect_a, buf[o + 3]);
     }
+}
+
+test "draw triangle renders geometry through a Metal pipeline" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch |err| {
+        if (err == Error.NoMetalDevice) return error.SkipZigTest;
+        return err;
+    };
+    defer r.deinit();
+
+    const w: u32 = 64;
+    const h: u32 = 64;
+    try r.createRenderTarget(1, .b8g8r8a8_unorm, w, h);
+
+    // A large triangle that covers the center of the target. Clip space:
+    // x,y ∈ [-1,1]; this triangle contains (0,0).
+    const verts = [_][2]f32{
+        .{ -0.9, -0.9 },
+        .{ 0.9, -0.9 },
+        .{ 0.0, 0.9 },
+    };
+    // Clear to opaque black; draw a red triangle (RGBA).
+    try r.clearAndDraw(1, .{ 0.0, 0.0, 0.0, 1.0 }, &verts, .{ 1.0, 0.0, 0.0, 1.0 });
+
+    var buf: [64 * 64 * 4]u8 = undefined;
+    try r.readback(1, &buf);
+
+    // Center pixel should be red (BGRA memory: B=0,G=0,R=255).
+    const center = ((h / 2) * w + (w / 2)) * 4;
+    try std.testing.expect(buf[center + 2] > 200); // R
+    try std.testing.expect(buf[center + 1] < 40); // G
+    try std.testing.expect(buf[center + 0] < 40); // B
+
+    // Top-left corner (0,0) is outside the triangle → still black.
+    try std.testing.expect(buf[2] < 40); // R at pixel 0
+    try std.testing.expect(buf[1] < 40); // G
+    try std.testing.expect(buf[0] < 40); // B
 }
