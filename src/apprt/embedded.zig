@@ -557,7 +557,12 @@ pub const Surface = struct {
         const hw = vm.hw_machine orelse return null;
         const gpu = hw.gpu orelse return null;
         const view = gpu.lockScanout() orelse return null;
-        return .{ .data = view.data, .width = view.width, .height = view.height };
+        return .{
+            .data = view.data,
+            .width = view.width,
+            .height = view.height,
+            .generation = view.generation,
+        };
     }
 
     fn scanoutUnlock(userdata: ?*anyopaque) void {

@@ -277,6 +277,11 @@ pub const Gpu = struct {
     /// Current scanout.
     scanout_resource_id: u32,
 
+    /// Bumped each time the scanout content changes (flush of the scanout
+    /// resource). The renderer compares this to skip re-presenting an
+    /// unchanged frame — no upload, no blit, no drawable for idle vsyncs.
+    frame_generation: u64,
+
     /// Display dimensions.
     display_width: u32,
     display_height: u32,
@@ -317,6 +322,7 @@ pub const Gpu = struct {
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
             .scanout_mutex = .{},
             .scanout_resource_id = 0,
+            .frame_generation = 0,
             .display_width = 1280,
             .display_height = 800,
             .guest_memory = null,
@@ -372,6 +378,8 @@ pub const Gpu = struct {
         data: []const u8,
         width: u32,
         height: u32,
+        /// Content generation; unchanged means the renderer can skip.
+        generation: u64,
     };
 
     /// Current scanout pixels (BGRA/XRGB 4 bytes per pixel), or null.
@@ -379,7 +387,12 @@ pub const Gpu = struct {
     pub fn scanout(self: *Gpu) ?ScanoutView {
         if (self.scanout_resource_id == 0) return null;
         const res = self.resources.get(self.scanout_resource_id) orelse return null;
-        return .{ .data = res.host_data, .width = res.width, .height = res.height };
+        return .{
+            .data = res.host_data,
+            .width = res.width,
+            .height = res.height,
+            .generation = self.frame_generation,
+        };
     }
 
     /// Acquire the scanout for reading from another thread (renderer).
@@ -659,6 +672,7 @@ pub const Gpu = struct {
             return .resp_err_invalid_resource_id;
         }
         self.scanout_resource_id = cmd.resource_id;
+        self.frame_generation +%= 1; // new scanout target: force a present
         return .resp_ok_nodata;
     }
 
@@ -667,6 +681,7 @@ pub const Gpu = struct {
         const cmd = std.mem.bytesToValue(ResourceFlush, req[0..@sizeOf(ResourceFlush)]);
 
         if (cmd.resource_id == self.scanout_resource_id and self.scanout_resource_id != 0) {
+            self.frame_generation +%= 1; // content changed: renderer should present
             if (self.frame_callback) |cb| {
                 cb(self.frame_userdata);
             }
@@ -1109,4 +1124,61 @@ test "transfer_to_host_2d full-width fast path matches guest backing" {
     // host copy must match the guest backing byte-for-byte
     const res = gpu.resources.get(1).?;
     try testing.expect(std.mem.eql(u8, res.host_data, guest));
+}
+
+test "scanout frame generation advances only on flush of the scanout" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    const Ctx = struct {
+        var mem: [4096]u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    gpu.setGuestMemory(Ctx.get);
+
+    // 8x8 resource, scanned out.
+    const create = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 1,
+        .format = 2,
+        .width = 8,
+        .height = 8,
+    };
+    _ = gpu.cmdResourceCreate2D(std.mem.asBytes(&create));
+
+    const gen0 = gpu.scanout(); // no scanout yet
+    try testing.expect(gen0 == null);
+
+    const scan = SetScanout{
+        .header = .{ .type = @intFromEnum(CmdType.set_scanout) },
+        .r = .{ .width = 8, .height = 8 },
+        .scanout_id = 0,
+        .resource_id = 1,
+    };
+    _ = gpu.cmdSetScanout(std.mem.asBytes(&scan));
+    const g_after_scanout = gpu.scanout().?.generation;
+
+    // Flushing the scanout resource advances the generation.
+    const flush = ResourceFlush{
+        .header = .{ .type = @intFromEnum(CmdType.resource_flush) },
+        .r = .{ .width = 8, .height = 8 },
+        .resource_id = 1,
+    };
+    _ = gpu.cmdResourceFlush(std.mem.asBytes(&flush));
+    try testing.expectEqual(g_after_scanout + 1, gpu.scanout().?.generation);
+
+    // Flushing a non-scanout resource does not.
+    const g = gpu.scanout().?.generation;
+    const flush_other = ResourceFlush{
+        .header = .{ .type = @intFromEnum(CmdType.resource_flush) },
+        .r = .{ .width = 8, .height = 8 },
+        .resource_id = 999,
+    };
+    _ = gpu.cmdResourceFlush(std.mem.asBytes(&flush_other));
+    try testing.expectEqual(g, gpu.scanout().?.generation);
 }

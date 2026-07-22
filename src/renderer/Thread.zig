@@ -59,6 +59,8 @@ pub const Scanout = struct {
     data: []const u8,
     width: u32,
     height: u32,
+    /// Content generation; unchanged since last present means skip.
+    generation: u64 = 0,
 };
 
 pub const ContentScale = struct {
@@ -280,6 +282,10 @@ pub const RenderThread = struct {
     // Clear color (can be set from GPU state)
     clear_color: metal.MTLClearColor = .{ .red = 0.0, .green = 0.0, .blue = 0.1, .alpha = 1.0 },
 
+    // Last scanout generation presented; skip re-upload when unchanged.
+    // maxInt = "nothing presented yet" so the first frame always draws.
+    last_generation: u64 = std.math.maxInt(u64),
+
     // Callback to Swift for frame presentation
     present_callback: ?*const fn (?*anyopaque) callconv(.c) void = null,
     present_userdata: ?*anyopaque = null,
@@ -459,6 +465,13 @@ pub const RenderThread = struct {
         // Present the guest scanout when one exists.
         if (self.scanout_lock) |lock_fn| {
             if (lock_fn(self.scanout_userdata)) |scan| {
+                // Skip the upload+blit+present entirely when the guest
+                // hasn't drawn since our last frame (idle-screen case).
+                if (scan.generation == self.last_generation) {
+                    if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
+                    self.pending_batch = null;
+                    return;
+                }
                 const ok = self.frame_renderer.renderFramebuffer(
                     scan.data,
                     scan.width,
@@ -467,6 +480,7 @@ pub const RenderThread = struct {
                 if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
                 self.pending_batch = null;
                 if (ok) {
+                    self.last_generation = scan.generation;
                     if (self.present_callback) |cb| cb(self.present_userdata);
                 }
                 return;
