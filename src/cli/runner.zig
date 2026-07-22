@@ -269,9 +269,15 @@ fn unregisterMachineForCleanup() void {
     cleanup_machine = null;
 }
 
+/// Signal-handler cleanup. Runs in async-signal context while the vCPU
+/// and NAT threads are still live, so it must NOT free anything or take
+/// locks (the old hw.deinit() here use-after-freed device state out from
+/// under running threads → segfault under load). The process exits right
+/// after; the kernel reclaims memory and releases the HVF VM. We only
+/// request the vCPUs to stop and restore the terminal.
 fn machineCleanup() void {
+    restoreTermios();
     if (cleanup_machine) |hw| {
-        hw.deinit();
-        cleanup_machine = null;
+        hw.requestStop();
     }
 }

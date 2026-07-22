@@ -516,6 +516,17 @@ pub const Machine = struct {
     }
 
     /// Stop the machine.
+    /// Async-signal-safe stop request: only an atomic store and the
+    /// hv_vcpus_exit syscall — no locks, no allocation. Safe to call from
+    /// a signal handler; the vCPU loops observe running=false and unwind
+    /// (WFI-halted CPUs wake within their 1ms condvar timeout).
+    pub fn requestStop(self: *Machine) void {
+        self.running.store(false, .release);
+        for (self.cpu_states) |*state| {
+            if (state.vcpu) |v| v.forceExit() catch {};
+        }
+    }
+
     pub fn stop(self: *Machine) void {
         if (!self.running.load(.acquire)) return;
 
