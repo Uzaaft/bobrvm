@@ -572,4 +572,25 @@ test "TGSI→MSL output compiles on a real Metal device" {
     defer vfn.release();
     const ffn = flib.newFunction("fs_main") orelse return error.TestUnexpectedResult;
     defer ffn.release();
+
+    // An arithmetic VS (MAD/DP4/swizzle/IMM/TEMP) must also compile.
+    const arith_vs =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL OUT[0], POSITION
+        \\DCL TEMP[0]
+        \\IMM[0] FLT32 { 0.5000, 0.5000, 0.0000, 1.0000}
+        \\  0: MAD TEMP[0], IN[0], IMM[0].xxxx, IMM[0]
+        \\  1: MOV OUT[0], TEMP[0]
+        \\  2: END
+    ;
+    const aprog = try tgsi.parse(arith_vs);
+    var amsl = try tgsi.emit(alloc, &aprog);
+    defer amsl.deinit(alloc);
+    const asrcz = try alloc.dupeZ(u8, amsl.source);
+    defer alloc.free(asrcz);
+    const alib = r.device.newLibraryWithSource(asrcz) orelse return error.TestUnexpectedResult;
+    defer alib.release();
+    const afn = alib.newFunction("vs_main") orelse return error.TestUnexpectedResult;
+    defer afn.release();
 }

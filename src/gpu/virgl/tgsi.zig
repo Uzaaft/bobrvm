@@ -24,6 +24,20 @@ pub const Semantic = enum { position, color, generic, psize, fog, other };
 pub const Operand = struct {
     file: RegFile,
     index: u32,
+    /// Swizzle (src) or writemask (dst) as up to 4 component chars.
+    swz: [4]u8 = .{ 'x', 'y', 'z', 'w' },
+    swz_len: u8 = 4,
+    negate: bool = false,
+    abs_val: bool = false,
+
+    /// The swizzle padded to 4 chars (TGSI replicates the last component).
+    pub fn swz4(self: Operand) [4]u8 {
+        var out = self.swz;
+        var i: usize = self.swz_len;
+        const last = if (self.swz_len > 0) self.swz[self.swz_len - 1] else 'x';
+        while (i < 4) : (i += 1) out[i] = last;
+        return out;
+    }
 };
 
 pub const Decl = struct {
@@ -64,7 +78,17 @@ pub const Program = struct {
     n_out: usize = 0,
     instrs: [MAX_INSTRS]Instr = undefined,
     n_instr: usize = 0,
+    /// Highest TEMP index referenced (-1 = none); temps are emitted as
+    /// local float4 t0..tN.
+    max_temp: i64 = -1,
+    /// Parsed IMM immediates (declared as const float4 immK).
+    imms: [MAX_IMM][4]f32 = undefined,
+    imm_present: [MAX_IMM]bool = [_]bool{false} ** MAX_IMM,
+    /// Whether any CONST[] was referenced (needs a uniform buffer binding).
+    uses_const: bool = false,
 };
+
+pub const MAX_IMM = 64;
 
 fn parseFile(s: []const u8) RegFile {
     if (std.mem.eql(u8, s, "IN")) return .in;
@@ -85,15 +109,49 @@ fn parseSemantic(s: []const u8) Semantic {
     return .other;
 }
 
-/// Parse "FILE[idx]" (ignoring any trailing swizzle/writemask) into an
-/// Operand. Returns null if it does not look like a register reference.
-fn parseOperand(token: []const u8) ?Operand {
+/// Parse a register reference "[-|]FILE[idx][.swz][|]" into an Operand,
+/// capturing negate/abs modifiers and the swizzle/writemask. Returns null
+/// if it does not look like a register reference.
+fn parseOperand(token_in: []const u8) ?Operand {
+    var token = std.mem.trim(u8, token_in, " \t");
+    var negate = false;
+    var abs_val = false;
+    if (token.len > 0 and token[0] == '-') {
+        negate = true;
+        token = token[1..];
+    }
+    if (token.len >= 2 and token[0] == '|' and token[token.len - 1] == '|') {
+        abs_val = true;
+        token = token[1 .. token.len - 1];
+    }
+
     const lb = std.mem.indexOfScalar(u8, token, '[') orelse return null;
     const rb = std.mem.indexOfScalar(u8, token, ']') orelse return null;
     if (rb <= lb + 1) return null;
     const file = parseFile(token[0..lb]);
     const idx = std.fmt.parseInt(u32, token[lb + 1 .. rb], 10) catch return null;
-    return .{ .file = file, .index = idx };
+
+    var op = Operand{ .file = file, .index = idx, .negate = negate, .abs_val = abs_val };
+
+    // Optional ".swz" after the closing bracket.
+    if (rb + 1 < token.len and token[rb + 1] == '.') {
+        const swz = token[rb + 2 ..];
+        var n: u8 = 0;
+        for (swz) |c| {
+            const norm: u8 = switch (c) {
+                'x', 'r' => 'x',
+                'y', 'g' => 'y',
+                'z', 'b' => 'z',
+                'w', 'a' => 'w',
+                else => break,
+            };
+            if (n >= 4) break;
+            op.swz[n] = norm;
+            n += 1;
+        }
+        if (n > 0) op.swz_len = n;
+    }
+    return op;
 }
 
 /// Strip a leading "N:" instruction number and surrounding whitespace.
@@ -150,7 +208,10 @@ pub fn parse(text: []const u8) Error!Program {
             try parseDecl(&prog, line[4..]);
             continue;
         }
-        if (std.mem.startsWith(u8, line, "IMM")) continue; // not modeled yet
+        if (std.mem.startsWith(u8, line, "IMM")) {
+            parseImm(&prog, line);
+            continue;
+        }
         if (std.mem.startsWith(u8, line, "PROPERTY")) continue;
 
         try parseInstr(&prog, stripLeadingNumber(line));
@@ -191,6 +252,39 @@ fn parseDecl(prog: *Program, rest: []const u8) Error!void {
     }
 }
 
+/// Parse "IMM[k] FLT32 { a, b, c, d }" into prog.imms[k].
+fn parseImm(prog: *Program, line: []const u8) void {
+    const lb = std.mem.indexOfScalar(u8, line, '[') orelse return;
+    const rb = std.mem.indexOfScalar(u8, line, ']') orelse return;
+    if (rb <= lb + 1) return;
+    const idx = std.fmt.parseInt(usize, line[lb + 1 .. rb], 10) catch return;
+    if (idx >= MAX_IMM) return;
+
+    const ob = std.mem.indexOfScalar(u8, line, '{') orelse return;
+    const cb = std.mem.indexOfScalar(u8, line, '}') orelse return;
+    if (cb <= ob + 1) return;
+
+    var vals = [_]f32{ 0, 0, 0, 0 };
+    var it = std.mem.tokenizeAny(u8, line[ob + 1 .. cb], ", \t");
+    var i: usize = 0;
+    while (it.next()) |tok| : (i += 1) {
+        if (i >= 4) break;
+        vals[i] = std.fmt.parseFloat(f32, tok) catch 0;
+    }
+    prog.imms[idx] = vals;
+    prog.imm_present[idx] = true;
+}
+
+fn trackOperand(prog: *Program, o: Operand) void {
+    switch (o.file) {
+        .temp => if (@as(i64, o.index) > prog.max_temp) {
+            prog.max_temp = @intCast(o.index);
+        },
+        .constant => prog.uses_const = true,
+        else => {},
+    }
+}
+
 fn parseInstr(prog: *Program, body: []const u8) Error!void {
     if (prog.n_instr >= MAX_INSTRS) return Error.TooManyInstrs;
 
@@ -221,6 +315,9 @@ fn parseInstr(prog: *Program, body: []const u8) Error!void {
         }
     }
 
+    if (instr.dst) |d| trackOperand(prog, d);
+    for (instr.srcs[0..instr.nsrc]) |s| trackOperand(prog, s);
+
     prog.instrs[prog.n_instr] = instr;
     prog.n_instr += 1;
 }
@@ -247,8 +344,8 @@ fn app(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, comptime fmt: []const u
     try w.appendSlice(alloc, s);
 }
 
-/// Write the MSL name for an operand reference in the current stage.
-fn opName(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, o: Operand) !void {
+/// Write the MSL base name (no swizzle/modifiers) for an operand.
+fn appendBase(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, o: Operand) !void {
     switch (o.file) {
         .in => try app(w, alloc, "in.a{d}", .{o.index}),
         .out => {
@@ -266,7 +363,124 @@ fn opName(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program
                 }
             }
         },
+        .temp => try app(w, alloc, "t{d}", .{o.index}),
+        .immediate => try app(w, alloc, "imm{d}", .{o.index}),
+        .constant => try app(w, alloc, "c[{d}]", .{o.index}),
         else => try app(w, alloc, "float4(0.0)", .{}),
+    }
+}
+
+/// Write a source operand as a float4 expression: base.swizzle with
+/// optional abs()/negate applied.
+fn appendSrc(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, o: Operand) !void {
+    if (o.negate) try app(w, alloc, "(-", .{});
+    if (o.abs_val) try app(w, alloc, "abs(", .{});
+    try appendBase(w, alloc, prog, o);
+    const s = o.swz4();
+    try app(w, alloc, ".{c}{c}{c}{c}", .{ s[0], s[1], s[2], s[3] });
+    if (o.abs_val) try app(w, alloc, ")", .{});
+    if (o.negate) try app(w, alloc, ")", .{});
+}
+
+/// Write the dst writemask (its swz chars).
+fn appendMask(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, o: Operand) !void {
+    var i: usize = 0;
+    while (i < o.swz_len) : (i += 1) try app(w, alloc, "{c}", .{o.swz[i]});
+}
+
+fn isSupported(op: []const u8) bool {
+    const ops = [_][]const u8{
+        "MOV", "ADD", "SUB", "MUL", "MAD", "DP2", "DP3", "DP4",
+        "MAX", "MIN", "RCP", "RSQ", "FRC", "FLR", "ABS", "SQRT",
+    };
+    for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
+    return false;
+}
+
+/// Emit the float4 right-hand-side expression for a supported opcode.
+fn appendRhs(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, instr: *const Instr) !void {
+    const op = instr.opName();
+    const s = instr.srcs;
+    if (std.mem.eql(u8, op, "MOV")) {
+        try appendSrc(w, alloc, prog, s[0]);
+    } else if (std.mem.eql(u8, op, "ADD")) {
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, " + ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+    } else if (std.mem.eql(u8, op, "SUB")) {
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, " - ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+    } else if (std.mem.eql(u8, op, "MUL")) {
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, " * ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+    } else if (std.mem.eql(u8, op, "MAD")) {
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, " * ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, " + ", .{});
+        try appendSrc(w, alloc, prog, s[2]);
+    } else if (std.mem.eql(u8, op, "MAX") or std.mem.eql(u8, op, "MIN")) {
+        try app(w, alloc, "{s}(", .{if (op[1] == 'A') "max" else "min"});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ", ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "DP4")) {
+        try app(w, alloc, "float4(dot(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ", ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "DP3")) {
+        try app(w, alloc, "float4(dot((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xyz, (", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ").xyz))", .{});
+    } else if (std.mem.eql(u8, op, "DP2")) {
+        try app(w, alloc, "float4(dot((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xy, (", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ").xy))", .{});
+    } else if (std.mem.eql(u8, op, "RCP")) {
+        try app(w, alloc, "float4(1.0/(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x)", .{});
+    } else if (std.mem.eql(u8, op, "RSQ")) {
+        try app(w, alloc, "float4(rsqrt((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x))", .{});
+    } else if (std.mem.eql(u8, op, "SQRT")) {
+        try app(w, alloc, "sqrt(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "FRC")) {
+        try app(w, alloc, "fract(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "FLR")) {
+        try app(w, alloc, "floor(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "ABS")) {
+        try app(w, alloc, "abs(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    }
+}
+
+/// Emit TEMP/IMM local declarations at the top of the function body.
+fn emitLocals(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program) !void {
+    var t: i64 = 0;
+    while (t <= prog.max_temp) : (t += 1) {
+        try app(w, alloc, "    float4 t{d} = float4(0.0);\n", .{t});
+    }
+    for (prog.imms[0..], 0..) |vals, k| {
+        if (!prog.imm_present[k]) continue;
+        try app(w, alloc, "    float4 imm{d} = float4({d}, {d}, {d}, {d});\n", .{ k, vals[0], vals[1], vals[2], vals[3] });
     }
 }
 
@@ -308,8 +522,13 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
     if (!has_position) try app(w, alloc, "    float4 position [[position]];\n", .{});
     try app(w, alloc, "}};\n", .{});
 
-    try app(w, alloc, "vertex VSOut vs_main(VSIn in [[stage_in]]) {{\n    VSOut out;\n", .{});
+    if (prog.uses_const) {
+        try app(w, alloc, "vertex VSOut vs_main(VSIn in [[stage_in]], constant float4* c [[buffer(1)]]) {{\n    VSOut out;\n", .{});
+    } else {
+        try app(w, alloc, "vertex VSOut vs_main(VSIn in [[stage_in]]) {{\n    VSOut out;\n", .{});
+    }
     if (!has_position) try app(w, alloc, "    out.position = float4(0.0,0.0,0.0,1.0);\n", .{});
+    try emitLocals(w, alloc, prog);
     try emitBody(w, alloc, prog);
     try app(w, alloc, "    return out;\n}}\n", .{});
 }
@@ -321,7 +540,12 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
     }
     try app(w, alloc, "}};\n", .{});
 
-    try app(w, alloc, "fragment float4 fs_main(FSIn in [[stage_in]]) {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
+    if (prog.uses_const) {
+        try app(w, alloc, "fragment float4 fs_main(FSIn in [[stage_in]], constant float4* c [[buffer(1)]]) {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
+    } else {
+        try app(w, alloc, "fragment float4 fs_main(FSIn in [[stage_in]]) {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
+    }
+    try emitLocals(w, alloc, prog);
     try emitBody(w, alloc, prog);
     try app(w, alloc, "    return out0;\n}}\n", .{});
 }
@@ -330,15 +554,24 @@ fn emitBody(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Progr
     for (prog.instrs[0..prog.n_instr]) |*instr| {
         const op = instr.opName();
         if (std.mem.eql(u8, op, "END") or std.mem.eql(u8, op, "RET")) continue;
-        if (std.mem.eql(u8, op, "MOV") and instr.dst != null and instr.nsrc >= 1) {
-            try app(w, alloc, "    ", .{});
-            try opName(w, alloc, prog, instr.dst.?);
-            try app(w, alloc, " = ", .{});
-            try opName(w, alloc, prog, instr.srcs[0]);
-            try app(w, alloc, ";\n", .{});
-        } else {
+        const dst = instr.dst orelse {
+            try app(w, alloc, "    // no-dst: {s}\n", .{op});
+            continue;
+        };
+        if (!isSupported(op)) {
             try app(w, alloc, "    // unsupported: {s}\n", .{op});
+            continue;
         }
+        // dst.<mask> = (<rhs>).<mask>;
+        try app(w, alloc, "    ", .{});
+        try appendBase(w, alloc, prog, dst);
+        try app(w, alloc, ".", .{});
+        try appendMask(w, alloc, dst);
+        try app(w, alloc, " = (", .{});
+        try appendRhs(w, alloc, prog, instr);
+        try app(w, alloc, ").", .{});
+        try appendMask(w, alloc, dst);
+        try app(w, alloc, ";\n", .{});
     }
 }
 
@@ -381,5 +614,33 @@ test "emit MSL for passthrough vertex shader" {
 
     try std.testing.expectEqual(Stage.vertex, msl.stage);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "vertex VSOut vs_main") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position = in.a0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position.xyzw = (in.a0.xyzw).xyzw;") != null);
+}
+
+test "parse and emit arithmetic shader (MAD, DP4, swizzle, IMM, TEMP)" {
+    const src =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL IN[1]
+        \\DCL OUT[0], POSITION
+        \\DCL OUT[1], GENERIC[0]
+        \\DCL TEMP[0]
+        \\IMM[0] FLT32 { 0.5000, 0.5000, 0.0000, 1.0000}
+        \\  0: MAD TEMP[0], IN[0], IMM[0].xxxx, IMM[0]
+        \\  1: DP4 OUT[0].x, TEMP[0], IN[0]
+        \\  2: MOV OUT[1].xy, IN[1].yx
+        \\  3: END
+    ;
+    const prog = try parse(src);
+    try std.testing.expectEqual(@as(i64, 0), prog.max_temp);
+    try std.testing.expect(prog.imm_present[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), prog.imms[0][0], 0.001);
+
+    var msl = try emit(std.testing.allocator, &prog);
+    defer msl.deinit(std.testing.allocator);
+    // MAD lowered to a*b+c; DP4 as dot; writemask + swizzle preserved.
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "float4 t0 = float4(0.0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "imm0 = float4(0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position.x = (float4(dot(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.g1.xy = (in.a1.yxxx).xy;") != null);
 }
