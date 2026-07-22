@@ -28,6 +28,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .disk2_read_only = config.disk2_read_only,
         .enable_gpu = config.enable_gpu,
         .enable_virgl = config.enable_virgl,
+        .enable_net = config.enable_net,
         .display_width = config.display_width,
         .display_height = config.display_height,
     };

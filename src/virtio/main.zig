@@ -24,6 +24,7 @@ pub const blk = @import("blk.zig");
 pub const Input = @import("input.zig").Input;
 pub const input = @import("input.zig");
 pub const Gpu = @import("gpu.zig").Gpu;
+pub const Net = @import("net.zig").Net;
 pub const gpu = @import("gpu.zig");
 pub const Uart = @import("uart.zig").Uart;
 pub const uart = @import("uart.zig");
@@ -83,6 +84,7 @@ test {
     _ = @import("blk.zig");
     _ = @import("input.zig");
     _ = @import("gpu.zig");
+    _ = @import("net.zig");
 }
 
 test "DeviceId values" {

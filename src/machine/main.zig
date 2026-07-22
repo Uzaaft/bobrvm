@@ -17,6 +17,7 @@ const hypervisor = @import("../hypervisor/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic = @import("../gic/main.zig");
 const icc = @import("../gic/icc.zig");
+const mininat = @import("../net/mininat.zig");
 const pci = @import("../pci/main.zig");
 const dtb = @import("dtb.zig");
 
@@ -133,6 +134,9 @@ pub const MachineConfig = struct {
     /// Advertise virgl 3D acceleration (experimental translator).
     enable_virgl: bool = false,
 
+    /// Enable the virtio-net device (built-in NAT backend).
+    enable_net: bool = false,
+
     /// Display size for the virtio-gpu scanout.
     display_width: u32 = 1280,
     display_height: u32 = 800,
@@ -209,6 +213,11 @@ pub const Machine = struct {
     keyboard_slot: u8 = 0,
     mouse: ?*virtio.Input = null,
     mouse_slot: u8 = 0,
+
+    /// Virtio network device + built-in NAT backend.
+    net: ?*virtio.Net = null,
+    net_slot: u8 = 0,
+    nat: mininat.MiniNat = undefined,
 
     /// UART device (PL011 for earlycon).
     uart: ?*virtio.Uart = null,
@@ -302,6 +311,11 @@ pub const Machine = struct {
         if (self.mouse) |mouse| {
             mouse.deinit();
             self.mouse = null;
+        }
+
+        if (self.net) |net| {
+            net.deinit();
+            self.net = null;
         }
 
         if (self.uart) |uart| {
@@ -637,6 +651,7 @@ pub const Machine = struct {
                 }
                 if (self.keyboard) |kbd| kbd.pollEvents();
                 if (self.mouse) |mouse| mouse.pollEvents();
+                if (self.net) |net| net.poll();
                 self.machine_lock.unlock();
             }
 
@@ -805,6 +820,9 @@ pub const Machine = struct {
             } else if (self.mouse != null and slot == self.mouse_slot) {
                 const mouse = self.mouse.?;
                 if (is_write) mouse.write(offset, value) else result = mouse.read(offset);
+            } else if (self.net != null and slot == self.net_slot) {
+                const net = self.net.?;
+                if (is_write) net.write(offset, value) else result = net.read(offset);
             } else if (slot == 0 and self.console != null) {
                 const console = self.console.?;
                 if (is_write) console.write(offset, value) else result = console.read(offset);
@@ -1233,7 +1251,8 @@ pub const Machine = struct {
         // Count virtio devices: console (slot 0) + block devices + gpu
         // + keyboard + mouse (input accompanies the display)
         const virtio_count: u8 = 1 + self.config.blockDeviceCount() +
-            if (self.config.enable_gpu) @as(u8, 3) else 0;
+            (if (self.config.enable_gpu) @as(u8, 3) else 0) +
+            @intFromBool(self.config.enable_net);
 
         const config = dtb.DtbConfig{
             .ram_base = MemoryLayout.RAM_BASE,
@@ -1366,6 +1385,18 @@ pub const Machine = struct {
                 self.keyboard_slot,
                 self.mouse_slot,
             });
+        }
+
+        // Initialize network (slot after everything else) if enabled
+        if (self.config.enable_net) {
+            self.net_slot = 1 + self.config.blockDeviceCount() +
+                (if (self.config.enable_gpu) @as(u8, 3) else 0);
+            self.net = try virtio.Net.init(self.alloc);
+            self.net.?.setGuestMemory(getGuestMemoryWrapper);
+            self.net.?.transport.setIrqCallback(netIrqCallback, self);
+            self.nat = mininat.MiniNat.init(natReplyCallback, self);
+            self.net.?.setTxCallback(netTxCallback, self);
+            log.debug("initialized virtio-net at slot {} (built-in NAT)", .{self.net_slot});
         }
 
         // Initialize PCIe ECAM host bridge for UEFI boot
@@ -1797,6 +1828,26 @@ pub const Machine = struct {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.mouse_slot), level);
         }
+    }
+
+    fn netIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.net_slot), level);
+        }
+    }
+
+    /// Guest → host frame: hand to the NAT responder (vCPU thread,
+    /// machine lock held).
+    fn netTxCallback(frame: []const u8, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        self.nat.handleFrame(frame);
+    }
+
+    /// NAT responder → guest frame.
+    fn natReplyCallback(frame: []const u8, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.net) |net| net.queueRxFrame(frame);
     }
 
     fn uartIrqCallback(level: bool, userdata: ?*anyopaque) void {
