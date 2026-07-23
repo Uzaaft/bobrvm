@@ -65,6 +65,19 @@ pub const Scanout = struct {
     generation: u64 = 0,
     /// IOSurfaceRef backing `data` for the zero-copy present path, if any.
     surface: ?*anyopaque = null,
+    cursor: ?Cursor = null,
+};
+
+/// Hardware cursor sprite (BGRA), positioned via the virtio-gpu cursor queue.
+pub const Cursor = struct {
+    data: []const u8,
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    x: i32,
+    y: i32,
+    generation: u64 = 0,
 };
 
 pub const ContentScale = struct {
@@ -298,6 +311,9 @@ pub const RenderThread = struct {
     // Last scanout generation presented; skip re-upload when unchanged.
     // maxInt = "nothing presented yet" so the first frame always draws.
     last_generation: u64 = std.math.maxInt(u64),
+    // Same idea for the cursor: redraw on cursor-only movement even when
+    // the framebuffer itself (last_generation) hasn't changed.
+    last_cursor_generation: u64 = std.math.maxInt(u64),
 
     // Callback to Swift for frame presentation
     present_callback: ?*const fn (?*anyopaque) callconv(.c) void = null,
@@ -478,23 +494,38 @@ pub const RenderThread = struct {
         // Present the guest scanout when one exists.
         if (self.scanout_lock) |lock_fn| {
             if (lock_fn(self.scanout_userdata)) |scan| {
-                // Skip the upload+blit+present entirely when the guest
-                // hasn't drawn since our last frame (idle-screen case).
-                if (scan.generation == self.last_generation) {
+                const cursor_gen = if (scan.cursor) |c| c.generation else 0;
+                // Skip the upload+blit+present entirely when neither the
+                // framebuffer nor the cursor has changed since our last
+                // frame (idle-screen case) — cursor-only motion still needs
+                // a redraw even though the framebuffer generation is static.
+                if (scan.generation == self.last_generation and cursor_gen == self.last_cursor_generation) {
                     if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
                     self.pending_batch = null;
                     return;
                 }
+                const cursor_info: ?metal.CursorInfo = if (scan.cursor) |c| .{
+                    .data = c.data,
+                    .width = c.width,
+                    .height = c.height,
+                    .hot_x = c.hot_x,
+                    .hot_y = c.hot_y,
+                    .x = c.x,
+                    .y = c.y,
+                    .generation = c.generation,
+                } else null;
                 const ok = self.frame_renderer.renderFramebuffer(
                     scan.data,
                     scan.width,
                     scan.height,
                     scan.surface,
+                    cursor_info,
                 );
                 if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
                 self.pending_batch = null;
                 if (ok) {
                     self.last_generation = scan.generation;
+                    self.last_cursor_generation = cursor_gen;
                     if (self.present_callback) |cb| cb(self.present_userdata);
                 }
                 return;

@@ -285,6 +285,48 @@ pub const Device = struct {
         const pso = func(self.ptr, s, desc.ptr, &err) orelse return null;
         return .{ .ptr = pso };
     }
+
+    /// Create a sampler state from a descriptor. Returns null on failure.
+    pub fn newSamplerState(self: Device, desc: SamplerDescriptor) ?SamplerState {
+        const result = msgSendId1(self.ptr, sel("newSamplerStateWithDescriptor:"), desc.ptr) orelse return null;
+        return .{ .ptr = result };
+    }
+};
+
+pub const MTLSamplerMinMagFilter = enum(NSUInteger) {
+    nearest = 0,
+    linear = 1,
+};
+
+/// MTLSamplerDescriptor wrapper.
+pub const SamplerDescriptor = struct {
+    ptr: id,
+
+    pub fn create() ?SamplerDescriptor {
+        const class = cls("MTLSamplerDescriptor") orelse return null;
+        const obj = msgSendId(class, sel("alloc")) orelse return null;
+        const inited = msgSendId(obj, sel("init")) orelse return null;
+        return .{ .ptr = inited };
+    }
+
+    pub fn setMinMagFilter(self: SamplerDescriptor, filter: MTLSamplerMinMagFilter) void {
+        const func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, sel("setMinFilter:"), @intFromEnum(filter));
+        func(self.ptr, sel("setMagFilter:"), @intFromEnum(filter));
+    }
+
+    pub fn release(self: SamplerDescriptor) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
+};
+
+/// MTLSamplerState wrapper.
+pub const SamplerState = struct {
+    ptr: id,
+
+    pub fn release(self: SamplerState) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
 };
 
 /// MTLVertexFormat (subset used for guest vertex attributes).
@@ -405,6 +447,25 @@ pub const RenderPipelineDescriptor = struct {
         const s_fmt = sel("setPixelFormat:");
         const fmt_func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
         fmt_func(att, s_fmt, @intFromEnum(format));
+    }
+
+    /// Standard "over" alpha blending on color attachment 0 (source-alpha,
+    /// one-minus-source-alpha) — for the cursor sprite drawn on top of the
+    /// already-blitted framebuffer, which needs blending unlike the base
+    /// present path (a pure blit, no shaders, no compositing at all).
+    pub fn enableStandardAlphaBlending(self: RenderPipelineDescriptor) void {
+        const arr = msgSendId(self.ptr, sel("colorAttachments")) orelse return;
+        const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const att = idx_func(arr, sel("objectAtIndexedSubscript:"), 0) orelse return;
+        const set_bool: *const fn (id, SEL, BOOL) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_bool(att, sel("setBlendingEnabled:"), true);
+        const set_n: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_n(att, sel("setRgbBlendOperation:"), 0); // MTLBlendOperationAdd
+        set_n(att, sel("setAlphaBlendOperation:"), 0);
+        set_n(att, sel("setSourceRGBBlendFactor:"), 4); // MTLBlendFactorSourceAlpha
+        set_n(att, sel("setSourceAlphaBlendFactor:"), 4);
+        set_n(att, sel("setDestinationRGBBlendFactor:"), 5); // MTLBlendFactorOneMinusSourceAlpha
+        set_n(att, sel("setDestinationAlphaBlendFactor:"), 5);
     }
 
     pub fn release(self: RenderPipelineDescriptor) void {
@@ -590,6 +651,13 @@ pub const RenderCommandEncoder = struct {
         const s = sel("setFragmentTexture:atIndex:");
         const func: *const fn (id, SEL, ?id, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
         func(self.ptr, s, texture, index);
+    }
+
+    /// Set fragment sampler state.
+    pub fn setFragmentSamplerState(self: RenderCommandEncoder, sampler: ?SamplerState, index: NSUInteger) void {
+        const s = sel("setFragmentSamplerState:atIndex:");
+        const func: *const fn (id, SEL, ?id, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, if (sampler) |smp| smp.ptr else null, index);
     }
 
     /// Draw primitives.
@@ -811,6 +879,62 @@ pub const BlitCommandEncoder = struct {
 // Frame Renderer
 // =============================================================================
 
+/// Hardware cursor sprite to composite on top of the framebuffer, in the
+/// scanout's own pixel coordinate space (same units as `width`/`height`
+/// passed to `renderFramebuffer`).
+pub const CursorInfo = struct {
+    data: []const u8,
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    x: i32,
+    y: i32,
+    generation: u64,
+};
+
+/// Vertex layout matching `cursor_shader_source` below: `float2 position`
+/// (NDC) + `float2 texcoord`.
+const CursorVertex = extern struct {
+    pos: [2]f32,
+    uv: [2]f32,
+};
+
+/// Textured, alpha-blended quad — the cursor sprite is drawn on top of the
+/// already-blitted framebuffer, which itself is a pure (non-blending) blit.
+const cursor_shader_source =
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\
+    \\struct CursorVertexIn {
+    \\    float2 position;
+    \\    float2 texcoord;
+    \\};
+    \\
+    \\struct CursorVertexOut {
+    \\    float4 position [[position]];
+    \\    float2 texcoord;
+    \\};
+    \\
+    \\vertex CursorVertexOut bobrvm_cursor_vertex(
+    \\    const device CursorVertexIn* verts [[buffer(0)]],
+    \\    uint vid [[vertex_id]]
+    \\) {
+    \\    CursorVertexOut out;
+    \\    out.position = float4(verts[vid].position, 0.0, 1.0);
+    \\    out.texcoord = verts[vid].texcoord;
+    \\    return out;
+    \\}
+    \\
+    \\fragment float4 bobrvm_cursor_fragment(
+    \\    CursorVertexOut in [[stage_in]],
+    \\    texture2d<float> tex [[texture(0)]],
+    \\    sampler samp [[sampler(0)]]
+    \\) {
+    \\    return tex.sample(samp, in.texcoord);
+    \\}
+;
+
 /// Frame renderer for encoding Metal commands.
 pub const FrameRenderer = struct {
     device: Device,
@@ -828,6 +952,16 @@ pub const FrameRenderer = struct {
     surface_ref: ?*anyopaque = null,
     surface_width: u32 = 0,
     surface_height: u32 = 0,
+
+    /// Hardware cursor rendering: lazily-built pipeline + sampler, plus a
+    /// texture cache for the sprite (re-uploaded only when its generation
+    /// or size changes, not every frame).
+    cursor_pipeline: ?RenderPipelineState = null,
+    cursor_sampler: ?SamplerState = null,
+    cursor_texture: ?Texture = null,
+    cursor_tex_width: u32 = 0,
+    cursor_tex_height: u32 = 0,
+    cursor_last_gen: u64 = std.math.maxInt(u64),
 
     /// Initialize with opaque pointers from Swift.
     pub fn init(
@@ -848,6 +982,44 @@ pub const FrameRenderer = struct {
         if (self.surface_texture) |tex| tex.release();
         self.surface_texture = null;
         self.surface_ref = null;
+        if (self.cursor_pipeline) |p| p.release();
+        self.cursor_pipeline = null;
+        if (self.cursor_sampler) |s| s.release();
+        self.cursor_sampler = null;
+        if (self.cursor_texture) |t| t.release();
+        self.cursor_texture = null;
+    }
+
+    /// Build the cursor pipeline + sampler on first use. Returns false if
+    /// shader compilation or pipeline creation failed (caller just skips
+    /// drawing the cursor for this frame — the base framebuffer still
+    /// presents fine either way).
+    fn ensureCursorPipeline(self: *FrameRenderer) bool {
+        if (self.cursor_pipeline != null and self.cursor_sampler != null) return true;
+
+        if (self.cursor_pipeline == null) {
+            const lib = self.device.newLibraryWithSource(cursor_shader_source) orelse return false;
+            const vs = lib.newFunction("bobrvm_cursor_vertex") orelse return false;
+            const fs = lib.newFunction("bobrvm_cursor_fragment") orelse return false;
+
+            const desc = RenderPipelineDescriptor.create() orelse return false;
+            defer desc.release();
+            desc.setVertexFunction(vs);
+            desc.setFragmentFunction(fs);
+            desc.setColorFormat0(.bgra8Unorm);
+            desc.enableStandardAlphaBlending();
+
+            self.cursor_pipeline = self.device.newRenderPipelineState(desc) orelse return false;
+        }
+
+        if (self.cursor_sampler == null) {
+            const sdesc = SamplerDescriptor.create() orelse return false;
+            defer sdesc.release();
+            sdesc.setMinMagFilter(.nearest);
+            self.cursor_sampler = self.device.newSamplerState(sdesc) orelse return false;
+        }
+
+        return true;
     }
 
     /// Render a frame with the given clear color.
@@ -903,6 +1075,7 @@ pub const FrameRenderer = struct {
         width: u32,
         height: u32,
         surface: ?*anyopaque,
+        cursor: ?CursorInfo,
     ) bool {
         assert(width > 0 and height > 0);
         // `data` is only consumed by the upload fallback; the zero-copy path
@@ -967,10 +1140,87 @@ pub const FrameRenderer = struct {
         );
         blit.endEncoding();
 
+        if (cursor) |cur| {
+            self.drawCursor(cmd_buffer, dst_texture, cur, width, height);
+        }
+
         cmd_buffer.presentDrawable(drawable);
         cmd_buffer.commit();
 
         return true;
+    }
+
+    /// Composite the hardware cursor on top of the just-blitted drawable, in
+    /// a separate render pass (loadAction=.load preserves the blit) since
+    /// blit encoders have no compositing/blending capability at all. Any
+    /// failure here just skips drawing the cursor for this frame — the base
+    /// framebuffer still presents fine either way.
+    fn drawCursor(
+        self: *FrameRenderer,
+        cmd_buffer: CommandBuffer,
+        dst_texture: id,
+        cur: CursorInfo,
+        fb_width: u32,
+        fb_height: u32,
+    ) void {
+        if (cur.width == 0 or cur.height == 0) return;
+        if (!self.ensureCursorPipeline()) return;
+
+        if (self.cursor_texture == null or self.cursor_tex_width != cur.width or
+            self.cursor_tex_height != cur.height)
+        {
+            if (self.cursor_texture) |tex| tex.release();
+            self.cursor_texture = createTexture2D(self.device, .bgra8Unorm, cur.width, cur.height) orelse return;
+            self.cursor_tex_width = cur.width;
+            self.cursor_tex_height = cur.height;
+            self.cursor_last_gen = std.math.maxInt(u64); // force the upload below
+        }
+        if (self.cursor_last_gen != cur.generation) {
+            self.cursor_texture.?.replaceRegion(
+                .{ .size = .{ .width = cur.width, .height = cur.height } },
+                0,
+                cur.data.ptr,
+                @as(NSUInteger, cur.width) * 4,
+            );
+            self.cursor_last_gen = cur.generation;
+        }
+
+        // Position in screen pixels, top-left origin (guest convention) ->
+        // NDC (center origin, y-up).
+        const left: f32 = @floatFromInt(cur.x - @as(i32, @intCast(cur.hot_x)));
+        const top: f32 = @floatFromInt(cur.y - @as(i32, @intCast(cur.hot_y)));
+        const right = left + @as(f32, @floatFromInt(cur.width));
+        const bottom = top + @as(f32, @floatFromInt(cur.height));
+        const fw: f32 = @floatFromInt(fb_width);
+        const fh: f32 = @floatFromInt(fb_height);
+
+        const ndc_l = (left / fw) * 2.0 - 1.0;
+        const ndc_r = (right / fw) * 2.0 - 1.0;
+        const ndc_t = 1.0 - (top / fh) * 2.0;
+        const ndc_b = 1.0 - (bottom / fh) * 2.0;
+
+        // Triangle strip: TL, BL, TR, BR.
+        const verts = [4]CursorVertex{
+            .{ .pos = .{ ndc_l, ndc_t }, .uv = .{ 0, 0 } },
+            .{ .pos = .{ ndc_l, ndc_b }, .uv = .{ 0, 1 } },
+            .{ .pos = .{ ndc_r, ndc_t }, .uv = .{ 1, 0 } },
+            .{ .pos = .{ ndc_r, ndc_b }, .uv = .{ 1, 1 } },
+        };
+
+        const pass_desc = RenderPassDescriptor.create() orelse return;
+        const color_attachments = pass_desc.colorAttachments() orelse return;
+        const attachment = color_attachments.objectAtIndex(0) orelse return;
+        attachment.setTexture(dst_texture);
+        attachment.setLoadAction(.load);
+        attachment.setStoreAction(.store);
+
+        const encoder = cmd_buffer.renderCommandEncoderWithDescriptor(pass_desc) orelse return;
+        encoder.setRenderPipelineState(self.cursor_pipeline.?.ptr);
+        encoder.setVertexBytes(@ptrCast(&verts), @sizeOf([4]CursorVertex), 0);
+        encoder.setFragmentTexture(self.cursor_texture.?.ptr, 0);
+        encoder.setFragmentSamplerState(self.cursor_sampler, 0);
+        encoder.drawPrimitives(.triangleStrip, 0, 4);
+        encoder.endEncoding();
     }
 };
 

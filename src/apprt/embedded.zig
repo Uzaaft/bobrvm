@@ -568,6 +568,16 @@ pub const Surface = struct {
             .height = view.height,
             .generation = view.generation,
             .surface = view.surface,
+            .cursor = if (view.cursor) |c| .{
+                .data = c.data,
+                .width = c.width,
+                .height = c.height,
+                .hot_x = c.hot_x,
+                .hot_y = c.hot_y,
+                .x = c.x,
+                .y = c.y,
+                .generation = c.generation,
+            } else null,
         };
     }
 

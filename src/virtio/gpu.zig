@@ -134,6 +134,25 @@ pub const SetScanout = extern struct {
     resource_id: u32,
 };
 
+pub const CursorPos = extern struct {
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+    _padding: u32 = 0,
+};
+
+/// Shared layout for both UPDATE_CURSOR and MOVE_CURSOR (arrives on the
+/// cursor virtqueue, not the control queue). MOVE_CURSOR sends resource_id=0
+/// to mean "keep the current cursor image, just reposition it".
+pub const UpdateCursor = extern struct {
+    header: CtrlHeader,
+    pos: CursorPos,
+    resource_id: u32,
+    hot_x: u32,
+    hot_y: u32,
+    _padding: u32 = 0,
+};
+
 pub const ResourceFlush = extern struct {
     header: CtrlHeader,
     r: Rect,
@@ -347,6 +366,21 @@ pub const Gpu = struct {
     /// bring-up diagnostics without flooding the log).
     submit3d_seen: u32 = 0,
 
+    /// Hardware cursor state, set via the cursor virtqueue (UPDATE_CURSOR/
+    /// MOVE_CURSOR) — separate from the main scanout entirely. The guest
+    /// compositor draws the mouse pointer as a cursor plane, not into the
+    /// framebuffer, so without this the pointer never appears even though
+    /// input events (motion/clicks) are delivered and processed correctly.
+    cursor_resource_id: u32 = 0,
+    cursor_hot_x: u32 = 0,
+    cursor_hot_y: u32 = 0,
+    cursor_x: i32 = 0,
+    cursor_y: i32 = 0,
+    cursor_visible: bool = false,
+    /// Bumped on every cursor command so the renderer can redraw on
+    /// cursor-only movement even when frame_generation is unchanged.
+    cursor_generation: u64 = 0,
+
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
     pub const MAX_RESOURCE_DIM: u32 = 8192;
@@ -433,6 +467,22 @@ pub const Gpu = struct {
         self.frame_userdata = userdata;
     }
 
+    pub const CursorView = struct {
+        /// Cursor sprite pixels (BGRA, same layout as the framebuffer).
+        data: []const u8,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        /// Top-left position in screen coordinates (already includes the
+        /// guest's own placement — the renderer just subtracts the hotspot).
+        x: i32,
+        y: i32,
+        /// Bumped on every cursor command; lets the renderer redraw on
+        /// cursor-only movement even when the framebuffer hasn't changed.
+        generation: u64,
+    };
+
     pub const ScanoutView = struct {
         data: []const u8,
         width: u32,
@@ -442,7 +492,23 @@ pub const Gpu = struct {
         /// IOSurfaceRef backing `data` when the zero-copy path is active; the
         /// renderer wraps a texture over it instead of uploading `data`.
         surface: ?*anyopaque = null,
+        cursor: ?CursorView = null,
     };
+
+    fn cursorView(self: *Gpu) ?CursorView {
+        if (!self.cursor_visible or self.cursor_resource_id == 0) return null;
+        const res = self.resources.get(self.cursor_resource_id) orelse return null;
+        return .{
+            .data = res.host_data,
+            .width = res.width,
+            .height = res.height,
+            .hot_x = self.cursor_hot_x,
+            .hot_y = self.cursor_hot_y,
+            .x = self.cursor_x,
+            .y = self.cursor_y,
+            .generation = self.cursor_generation,
+        };
+    }
 
     /// Current scanout pixels (BGRA/XRGB 4 bytes per pixel), or null.
     /// Caller must be on the vCPU thread (unsynchronized).
@@ -456,6 +522,7 @@ pub const Gpu = struct {
                 .height = res.height,
                 .generation = self.frame_generation,
                 .surface = if (res.surface) |surf| surf.ref else null,
+                .cursor = self.cursorView(),
             };
         }
         // 3D scanout: present the render target's IOSurface directly when the
@@ -473,6 +540,7 @@ pub const Gpu = struct {
                 .height = self.scanout3d_h,
                 .generation = self.frame_generation,
                 .surface = surf,
+                .cursor = self.cursorView(),
             };
         }
         return null;
@@ -578,12 +646,52 @@ pub const Gpu = struct {
         // Cursor commands have no response; just consume them.
         while (self.cursor_last_avail != avail_idx) : (processed += 1) {
             const head = ring.availEntry(qc, self.cursor_last_avail, get_mem) orelse break;
+            self.processCursorCommand(qc, head, get_mem);
             ring.pushUsed(qc, head, 0, get_mem);
             self.cursor_last_avail +%= 1;
         }
 
         if (processed > 0) {
             self.transport.signalUsedBuffer();
+        }
+    }
+
+    fn processCursorCommand(self: *Gpu, qc: mmio.QueueConfig, head: u16, get_mem: ring.GetMemFn) void {
+        const chain = ring.Chain.collect(qc, head, get_mem);
+        const req = chain.request(get_mem) orelse return;
+        self.handleCursorCommand(req);
+    }
+
+    /// Decode + apply one UPDATE_CURSOR/MOVE_CURSOR command. Split out from
+    /// processCursorCommand so it's directly unit-testable with a synthetic
+    /// buffer, matching the cmdXxx(req) pattern used for the control queue.
+    fn handleCursorCommand(self: *Gpu, req: []const u8) void {
+        if (req.len < @sizeOf(UpdateCursor)) return;
+        const cmd = std.mem.bytesToValue(UpdateCursor, req[0..@sizeOf(UpdateCursor)]);
+        const cmd_type: CmdType = @enumFromInt(cmd.header.type);
+
+        self.scanout_mutex.lockUncancelable(global.io());
+        defer self.scanout_mutex.unlock(global.io());
+
+        switch (cmd_type) {
+            .update_cursor => {
+                self.cursor_resource_id = cmd.resource_id;
+                self.cursor_hot_x = cmd.hot_x;
+                self.cursor_hot_y = cmd.hot_y;
+                // Untrusted guest input: a plain @intCast would panic (and
+                // take the whole VM down) if the driver ever sends a
+                // position that doesn't fit i32 — clamp instead.
+                self.cursor_x = std.math.cast(i32, cmd.pos.x) orelse std.math.maxInt(i32);
+                self.cursor_y = std.math.cast(i32, cmd.pos.y) orelse std.math.maxInt(i32);
+                self.cursor_visible = cmd.resource_id != 0;
+                self.cursor_generation +%= 1;
+            },
+            .move_cursor => {
+                self.cursor_x = std.math.cast(i32, cmd.pos.x) orelse std.math.maxInt(i32);
+                self.cursor_y = std.math.cast(i32, cmd.pos.y) orelse std.math.maxInt(i32);
+                self.cursor_generation +%= 1;
+            },
+            else => {},
         }
     }
 
@@ -1533,4 +1641,80 @@ test "scanout frame generation advances only on flush of the scanout" {
     };
     _ = gpu.cmdResourceFlush(std.mem.asBytes(&flush_other));
     try testing.expectEqual(g, gpu.scanout().?.generation);
+}
+
+test "hardware cursor: update_cursor sets image+position, move_cursor repositions only" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    const Ctx = struct {
+        var mem: [4096]u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    gpu.setGuestMemory(Ctx.get);
+
+    // No cursor yet.
+    try testing.expect(gpu.cursorView() == null);
+
+    // Create the 4x4 cursor sprite resource the guest would've uploaded.
+    const create = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 7,
+        .format = 2,
+        .width = 4,
+        .height = 4,
+    };
+    _ = gpu.cmdResourceCreate2D(std.mem.asBytes(&create));
+
+    const update = UpdateCursor{
+        .header = .{ .type = @intFromEnum(CmdType.update_cursor) },
+        .pos = .{ .scanout_id = 0, .x = 100, .y = 50 },
+        .resource_id = 7,
+        .hot_x = 1,
+        .hot_y = 2,
+    };
+    gpu.handleCursorCommand(std.mem.asBytes(&update));
+
+    const view1 = gpu.cursorView() orelse return error.TestExpectedCursor;
+    try testing.expectEqual(@as(u32, 4), view1.width);
+    try testing.expectEqual(@as(u32, 4), view1.height);
+    try testing.expectEqual(@as(u32, 1), view1.hot_x);
+    try testing.expectEqual(@as(u32, 2), view1.hot_y);
+    try testing.expectEqual(@as(i32, 100), view1.x);
+    try testing.expectEqual(@as(i32, 50), view1.y);
+    const gen1 = view1.generation;
+
+    // MOVE_CURSOR (resource_id=0): repositions only, keeps the same image
+    // and hotspot, and still bumps the generation (redraw on motion alone).
+    const move = UpdateCursor{
+        .header = .{ .type = @intFromEnum(CmdType.move_cursor) },
+        .pos = .{ .scanout_id = 0, .x = 200, .y = 150 },
+        .resource_id = 0,
+        .hot_x = 0,
+        .hot_y = 0,
+    };
+    gpu.handleCursorCommand(std.mem.asBytes(&move));
+
+    const view2 = gpu.cursorView() orelse return error.TestExpectedCursor;
+    try testing.expectEqual(@as(i32, 200), view2.x);
+    try testing.expectEqual(@as(i32, 150), view2.y);
+    try testing.expectEqual(@as(u32, 1), view2.hot_x); // unchanged by move_cursor
+    try testing.expectEqual(@as(u32, 2), view2.hot_y);
+    try testing.expect(view2.generation != gen1);
+
+    // resource_id=0 on UPDATE_CURSOR hides the cursor.
+    const hide = UpdateCursor{
+        .header = .{ .type = @intFromEnum(CmdType.update_cursor) },
+        .pos = .{ .scanout_id = 0, .x = 200, .y = 150 },
+        .resource_id = 0,
+        .hot_x = 0,
+        .hot_y = 0,
+    };
+    gpu.handleCursorCommand(std.mem.asBytes(&hide));
+    try testing.expect(gpu.cursorView() == null);
 }
