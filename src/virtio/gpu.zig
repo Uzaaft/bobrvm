@@ -263,6 +263,89 @@ pub const GetCapset = extern struct {
     capset_version: u32,
 };
 
+pub const GetEdid = extern struct {
+    header: CtrlHeader,
+    scanout: u32,
+    _padding: u32 = 0,
+};
+
+pub const RespEdid = extern struct {
+    header: CtrlHeader,
+    size: u32,
+    _padding: u32 = 0,
+    edid: [1024]u8 = [_]u8{0} ** 1024,
+};
+
+/// Synthesize a minimal EDID 1.4 base block whose preferred (detailed)
+/// timing is `width`x`height` @ 60 Hz with CVT-reduced-blanking-style
+/// intervals. The DTD's active-pixel fields are 12-bit and its pixel clock
+/// is a u16 in 10 kHz units, so oversized modes are clamped there — the
+/// guest still learns the true size from GET_DISPLAY_INFO, which the Linux
+/// driver prefers for its added mode.
+pub fn buildEdid(width: u32, height: u32, out: *[128]u8) void {
+    @memset(out, 0);
+
+    // Header + vendor/product. Manufacturer id "BBR" (5 bits/letter, A=1).
+    out[0..8].* = .{ 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    const mfg: u16 = (2 << 10) | (2 << 5) | 18; // B, B, R
+    out[8] = @truncate(mfg >> 8);
+    out[9] = @truncate(mfg);
+    out[10] = 0x01; // product code 1 (LE)
+    out[17] = 34; // model year 2024 (deterministic; year = 1990 + n)
+    out[18] = 1; // EDID version
+    out[19] = 4; // EDID revision
+    out[20] = 0xA5; // digital input, 8 bits per color
+    // Physical size in cm assuming ~96 DPI (px * 25.4 / 96 / 10).
+    const w_mm: u32 = width * 254 / 960;
+    const h_mm: u32 = height * 254 / 960;
+    out[21] = @truncate(@min(w_mm / 10, 255));
+    out[22] = @truncate(@min(h_mm / 10, 255));
+    out[23] = 120; // gamma 2.2 (x100 - 100)
+    out[24] = 0x06; // features: preferred timing is native, sRGB default
+    // sRGB chromaticity coordinates (same block QEMU emits).
+    out[25..35].* = .{ 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54 };
+    // Standard timings: all unused.
+    @memset(out[38..54], 0x01);
+
+    // Detailed timing descriptor (bytes 54-71): the preferred mode.
+    const ha: u32 = @min(width, 4095);
+    const va: u32 = @min(height, 4095);
+    const hblank: u32 = 160; // CVT-RB horizontal blanking
+    const vblank: u32 = 30;
+    const clock_10khz: u32 = @min(
+        (ha + hblank) * (va + vblank) * 60 / 10_000,
+        std.math.maxInt(u16),
+    );
+    const dtd = out[54..72];
+    dtd[0] = @truncate(clock_10khz);
+    dtd[1] = @truncate(clock_10khz >> 8);
+    dtd[2] = @truncate(ha);
+    dtd[3] = @truncate(hblank);
+    dtd[4] = @truncate(((ha >> 8) << 4) | (hblank >> 8));
+    dtd[5] = @truncate(va);
+    dtd[6] = @truncate(vblank);
+    dtd[7] = @truncate(((va >> 8) << 4) | (vblank >> 8));
+    dtd[8] = 48; // hsync offset
+    dtd[9] = 32; // hsync width
+    dtd[10] = (3 << 4) | 5; // vsync offset 3, width 5
+    dtd[11] = 0; // no high bits for the sync values above
+    dtd[12] = @truncate(@min(w_mm, 4095));
+    dtd[13] = @truncate(@min(h_mm, 4095));
+    dtd[14] = @truncate(((@min(w_mm, 4095) >> 8) << 4) | (@min(h_mm, 4095) >> 8));
+    dtd[17] = 0x1E; // digital separate sync, +hsync +vsync
+
+    // Descriptor 2 (bytes 72-89): display name. 3 + 4: dummy descriptors.
+    out[72..77].* = .{ 0x00, 0x00, 0x00, 0xFC, 0x00 };
+    out[77..90].* = "bobrvm\n      ".*;
+    out[90..94].* = .{ 0x00, 0x00, 0x00, 0x10 };
+    out[108..112].* = .{ 0x00, 0x00, 0x00, 0x10 };
+
+    // No extension blocks; checksum makes the block sum to 0 mod 256.
+    var sum: u8 = 0;
+    for (out[0..127]) |b| sum +%= b;
+    out[127] = 0 -% sum;
+}
+
 /// Capset ids (VIRTIO_GPU_CAPSET_*).
 pub const CAPSET_VIRGL: u32 = 1;
 pub const CAPSET_VIRGL2: u32 = 2;
@@ -272,6 +355,10 @@ pub const CAPSET_VIRGL2: u32 = 2;
 /// grow as the translator does.
 pub const CAPS_V1_SIZE: u32 = 308;
 pub const CAPS_V2_SIZE: u32 = 1384;
+
+/// Display-changed event bit for config.events_read
+/// (VIRTIO_GPU_EVENT_DISPLAY): tells the guest to re-query display info.
+pub const EVENT_DISPLAY: u32 = 1 << 0;
 
 /// GPU config space.
 pub const Config = extern struct {
@@ -389,7 +476,7 @@ pub const Gpu = struct {
     pub fn init(alloc: Allocator, enable_virgl: bool) Error!*Gpu {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
-        var features = virtio_version_1;
+        var features = virtio_version_1 | Features.EDID;
         if (enable_virgl) features |= Features.VIRGL;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
         errdefer transport.deinit();
@@ -450,6 +537,31 @@ pub const Gpu = struct {
         assert(width <= MAX_RESOURCE_DIM and height <= MAX_RESOURCE_DIM);
         self.display_width = width;
         self.display_height = height;
+    }
+
+    /// Minimum live-resize dimension: below this guests produce unusable
+    /// modes and some fbcon setups wedge.
+    pub const MIN_DISPLAY_DIM: u32 = 320;
+
+    /// Live guest resolution change (host window resized). Updates the
+    /// advertised display info, flags VIRTIO_GPU_EVENT_DISPLAY, and raises
+    /// the config-change interrupt; the guest re-queries display info and
+    /// modesets via DRM hotplug. Caller must hold the machine lock — that
+    /// serializes this against the vCPU thread's MMIO/queue processing.
+    pub fn resizeDisplay(self: *Gpu, width: u32, height: u32) void {
+        // Host-UI input: clamp rather than assert.
+        const w = std.math.clamp(width, MIN_DISPLAY_DIM, MAX_RESOURCE_DIM);
+        const h = std.math.clamp(height, MIN_DISPLAY_DIM, MAX_RESOURCE_DIM);
+        if (w == self.display_width and h == self.display_height) return;
+
+        // Serialize against the renderer thread reading display state.
+        self.scanout_mutex.lockUncancelable(global.io());
+        self.display_width = w;
+        self.display_height = h;
+        self.scanout_mutex.unlock(global.io());
+
+        self.config.events_read |= EVENT_DISPLAY;
+        self.transport.signalConfigChange();
     }
 
     /// Set guest memory accessor.
@@ -743,6 +855,9 @@ pub const Gpu = struct {
             .get_capset => {
                 resp_type = self.cmdGetCapset(req, resp, &resp_len);
             },
+            .get_edid => {
+                resp_type = self.cmdGetEdid(req, resp, &resp_len);
+            },
             .ctx_create => {
                 resp_type = self.cmdCtxCreate(header);
             },
@@ -802,6 +917,22 @@ pub const Gpu = struct {
         @memcpy(resp[0..@sizeOf(DisplayInfoResp)], std.mem.asBytes(&info));
         resp_len.* = @sizeOf(DisplayInfoResp);
         return .resp_ok_display_info;
+    }
+
+    fn cmdGetEdid(self: *Gpu, req: []const u8, resp: []u8, resp_len: *u32) CmdType {
+        if (req.len < @sizeOf(GetEdid)) return .resp_err_invalid_parameter;
+        if (resp.len < @sizeOf(RespEdid)) return .resp_err_unspec;
+        const cmd = std.mem.bytesToValue(GetEdid, req[0..@sizeOf(GetEdid)]);
+        if (cmd.scanout != 0) return .resp_err_invalid_scanout_id;
+
+        var edid_resp = RespEdid{
+            .header = .{ .type = @intFromEnum(CmdType.resp_ok_edid) },
+            .size = 128,
+        };
+        buildEdid(self.display_width, self.display_height, edid_resp.edid[0..128]);
+        @memcpy(resp[0..@sizeOf(RespEdid)], std.mem.asBytes(&edid_resp));
+        resp_len.* = @sizeOf(RespEdid);
+        return .resp_ok_edid;
     }
 
     fn cmdResourceCreate2D(self: *Gpu, req: []const u8) CmdType {
@@ -1717,4 +1848,146 @@ test "hardware cursor: update_cursor sets image+position, move_cursor reposition
     };
     gpu.handleCursorCommand(std.mem.asBytes(&hide));
     try testing.expect(gpu.cursorView() == null);
+}
+
+test "EDID feature advertised" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    try testing.expect(gpu.transport.device_features & Features.EDID != 0);
+    // Low 32 bits via the MMIO register path (sel defaults to 0).
+    const low = gpu.read(@intFromEnum(mmio.Reg.device_features));
+    try testing.expect(low & @as(u32, @truncate(Features.EDID)) != 0);
+}
+
+test "get_edid returns a valid preferred-mode EDID" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+    gpu.setDisplaySize(1440, 900);
+
+    const req = GetEdid{
+        .header = .{ .type = @intFromEnum(CmdType.get_edid) },
+        .scanout = 0,
+    };
+    var resp_buf: [@sizeOf(RespEdid)]u8 = undefined;
+    var resp_len: u32 = 0;
+    const rt = gpu.cmdGetEdid(std.mem.asBytes(&req), &resp_buf, &resp_len);
+    try testing.expectEqual(CmdType.resp_ok_edid, rt);
+    try testing.expectEqual(@as(u32, @sizeOf(RespEdid)), resp_len);
+
+    const resp = std.mem.bytesToValue(RespEdid, resp_buf[0..@sizeOf(RespEdid)]);
+    try testing.expectEqual(@as(u32, 128), resp.size);
+    const edid = resp.edid[0..128];
+    // Magic header
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 }, edid[0..8]);
+    // Block checksums to 0 mod 256
+    var sum: u8 = 0;
+    for (edid) |b| sum +%= b;
+    try testing.expectEqual(@as(u8, 0), sum);
+    // DTD carries the preferred mode's active pixels
+    const ha = @as(u32, edid[56]) | (@as(u32, edid[58] >> 4) << 8);
+    const va = @as(u32, edid[59]) | (@as(u32, edid[61] >> 4) << 8);
+    try testing.expectEqual(@as(u32, 1440), ha);
+    try testing.expectEqual(@as(u32, 900), va);
+
+    // Non-zero scanout is rejected.
+    const bad = GetEdid{
+        .header = .{ .type = @intFromEnum(CmdType.get_edid) },
+        .scanout = 1,
+    };
+    try testing.expectEqual(
+        CmdType.resp_err_invalid_scanout_id,
+        gpu.cmdGetEdid(std.mem.asBytes(&bad), &resp_buf, &resp_len),
+    );
+}
+
+test "buildEdid clamps oversized modes to DTD field limits" {
+    var edid: [128]u8 = undefined;
+    buildEdid(7680, 4320, &edid);
+
+    var sum: u8 = 0;
+    for (edid) |b| sum +%= b;
+    try testing.expectEqual(@as(u8, 0), sum);
+
+    const ha = @as(u32, edid[56]) | (@as(u32, edid[58] >> 4) << 8);
+    const va = @as(u32, edid[59]) | (@as(u32, edid[61] >> 4) << 8);
+    try testing.expectEqual(@as(u32, 4095), ha);
+    try testing.expectEqual(@as(u32, 4095), va);
+    // Pixel clock clamped to u16
+    const clock = @as(u32, edid[54]) | (@as(u32, edid[55]) << 8);
+    try testing.expect(clock <= std.math.maxInt(u16));
+}
+
+test "resizeDisplay flags the display event and raises config-change" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    const Line = struct {
+        var level: bool = false;
+        fn cb(l: bool, _: ?*anyopaque) void {
+            level = l;
+        }
+    };
+    Line.level = false;
+    gpu.transport.setIrqCallback(Line.cb, null);
+
+    const gen_before = gpu.transport.config_generation;
+    gpu.resizeDisplay(1920, 1080);
+
+    // Event bit visible through the config-space read path.
+    try testing.expectEqual(EVENT_DISPLAY, gpu.read(@intFromEnum(mmio.Reg.config)));
+    try testing.expect(gpu.transport.interrupt_status.config_change);
+    try testing.expect(Line.level);
+    try testing.expectEqual(gen_before +% 1, gpu.transport.config_generation);
+
+    // Display info reflects the new size immediately.
+    var resp_buf: [@sizeOf(DisplayInfoResp)]u8 = undefined;
+    var resp_len: u32 = 0;
+    try testing.expectEqual(CmdType.resp_ok_display_info, gpu.cmdGetDisplayInfo(&resp_buf, &resp_len));
+    const info = std.mem.bytesToValue(DisplayInfoResp, resp_buf[0..@sizeOf(DisplayInfoResp)]);
+    try testing.expectEqual(@as(u32, 1920), info.pmodes[0].r.width);
+    try testing.expectEqual(@as(u32, 1080), info.pmodes[0].r.height);
+
+    // Guest clears the event via events_clear.
+    gpu.write(@intFromEnum(mmio.Reg.config) + @offsetOf(Config, "events_clear"), EVENT_DISPLAY);
+    try testing.expectEqual(@as(u32, 0), gpu.read(@intFromEnum(mmio.Reg.config)));
+
+    // Unchanged size is a no-op (no spurious generation bump).
+    const gen_after = gpu.transport.config_generation;
+    gpu.resizeDisplay(1920, 1080);
+    try testing.expectEqual(gen_after, gpu.transport.config_generation);
+
+    // Tiny sizes clamp to the minimum instead of wedging the guest.
+    gpu.resizeDisplay(1, 1);
+    try testing.expectEqual(Gpu.MIN_DISPLAY_DIM, gpu.display_width);
+    try testing.expectEqual(Gpu.MIN_DISPLAY_DIM, gpu.display_height);
+}
+
+test "guest modeset at new size after resizeDisplay" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    gpu.resizeDisplay(640, 480);
+
+    // Guest responds to the hotplug by creating a new resource at the new
+    // size and scanning it out.
+    const create = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 2,
+        .format = 2,
+        .width = 640,
+        .height = 480,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdResourceCreate2D(std.mem.asBytes(&create)));
+    const scan = SetScanout{
+        .header = .{ .type = @intFromEnum(CmdType.set_scanout) },
+        .r = .{ .width = 640, .height = 480 },
+        .scanout_id = 0,
+        .resource_id = 2,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdSetScanout(std.mem.asBytes(&scan)));
+
+    const view = gpu.scanout().?;
+    try testing.expectEqual(@as(u32, 640), view.width);
+    try testing.expectEqual(@as(u32, 480), view.height);
 }

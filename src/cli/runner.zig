@@ -82,6 +82,19 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             if (t) |thread| thread.detach();
         }
 
+        // Debug: request a live guest display resize after a delay
+        // (BOBRVM_TEST_RESIZE=WxH:delay_s), for verifying the resolution
+        // hotplug path headlessly (combine with BOBRVM_DUMP_FRAMES — the
+        // dumped frame filenames carry the scanout dimensions).
+        if (std.c.getenv("BOBRVM_TEST_RESIZE")) |spec_ptr| {
+            if (parseResizeSpec(std.mem.span(spec_ptr))) |spec| {
+                const t = std.Thread.spawn(.{}, testResizeLoop, .{ hw, spec }) catch null;
+                if (t) |thread| thread.detach();
+            } else {
+                log.warn("BOBRVM_TEST_RESIZE: expected WxH:delay_s, got '{s}'", .{std.mem.span(spec_ptr)});
+            }
+        }
+
         // Debug: type BOBRVM_TEST_TYPE on the virtio keyboard after
         // BOBRVM_TEST_TYPE_DELAY seconds (default 120), for verifying
         // the GUI shell path (VT keyboard -> tty1 getty) headlessly.
@@ -197,6 +210,30 @@ fn asciiToEvdev(char: u8) u16 {
         ';' => 39,
         else => 0,
     };
+}
+
+const ResizeSpec = struct {
+    width: u32,
+    height: u32,
+    delay_s: u64,
+};
+
+/// Parse "WxH:delay_s" (BOBRVM_TEST_RESIZE debug hook).
+fn parseResizeSpec(spec: []const u8) ?ResizeSpec {
+    const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return null;
+    const x = std.mem.indexOfScalar(u8, spec[0..colon], 'x') orelse return null;
+    return .{
+        .width = std.fmt.parseInt(u32, spec[0..x], 10) catch return null,
+        .height = std.fmt.parseInt(u32, spec[x + 1 .. colon], 10) catch return null,
+        .delay_s = std.fmt.parseInt(u64, spec[colon + 1 ..], 10) catch return null,
+    };
+}
+
+/// Request a guest display resize after a delay (BOBRVM_TEST_RESIZE hook).
+fn testResizeLoop(hw: *machine.Machine, spec: ResizeSpec) void {
+    sleepNs(spec.delay_s * std.time.ns_per_s);
+    log.info("requesting guest display resize to {}x{}", .{ spec.width, spec.height });
+    hw.requestDisplayResize(spec.width, spec.height);
 }
 
 /// Type a string on the virtio keyboard (BOBRVM_TEST_TYPE debug hook).

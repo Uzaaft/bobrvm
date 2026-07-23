@@ -96,6 +96,10 @@ typedef struct {
     bool disk2_read_only;
     /** Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP). */
     bool enable_net;
+    /** Initial guest display width in pixels (0 = default 1280). */
+    uint32_t display_width;
+    /** Initial guest display height in pixels (0 = default 800). */
+    uint32_t display_height;
 } bobrvm_vm_config_s;
 
 /* -------------------------------------------------------------------------- */
@@ -261,6 +265,18 @@ void bobrvm_surface_destroy(bobrvm_surface_t surface);
  * @param height New height in pixels.
  */
 void bobrvm_surface_set_size(bobrvm_surface_t surface, uint32_t width, uint32_t height);
+
+/**
+ * Request a live guest display resolution change. Updates the virtio-gpu
+ * display info and raises a config-change interrupt; the guest DRM driver
+ * re-queries and modesets (fbcon immediately, desktops via hotplug).
+ * Distinct from bobrvm_surface_set_size, which only resizes the host
+ * drawable.
+ *
+ * @param width Desired guest width in guest pixels.
+ * @param height Desired guest height in guest pixels.
+ */
+void bobrvm_surface_request_display_size(bobrvm_surface_t surface, uint32_t width, uint32_t height);
 
 /**
  * Set content scale for HiDPI displays.

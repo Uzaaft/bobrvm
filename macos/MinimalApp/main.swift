@@ -59,7 +59,10 @@ final class MetalView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer = metalLayer
-        metalLayer.contentsGravity = .resize
+        // Letterbox (not distort) the stale framebuffer while the window and
+        // the guest resolution disagree — i.e. between a live resize and the
+        // guest's modeset in response to the display hotplug.
+        metalLayer.contentsGravity = .resizeAspect
     }
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
@@ -143,7 +146,7 @@ final class MetalView: NSView {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     var view: MetalView!
     var timer: Timer?
@@ -155,6 +158,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Retained for the app's lifetime: Zig holds raw pointers to these.
     var device: MTLDevice!
     var queue: MTLCommandQueue!
+
+    /// Guest resolution follows backing pixels (Retina-native) instead of
+    /// logical points. Off by default: points give Fusion-like sane DPI.
+    var hidpi = false
+    var resizeDebounce: DispatchWorkItem?
+
+    /// Guest resolution for the current view size: points by default,
+    /// backing pixels with --hidpi. Width rounded down to even so the
+    /// guest's scanout resource keeps a tight (IOSurface-friendly) stride.
+    private func guestSize() -> (UInt32, UInt32) {
+        let scale = hidpi ? (window.backingScaleFactor) : 1.0
+        let s = view.bounds.size
+        let w = UInt32(max(s.width * scale, 1)) & ~1
+        let h = UInt32(max(s.height * scale, 1))
+        return (w, h)
+    }
+
+    /// Push the current window size to the guest (display hotplug) and the
+    /// host drawable. The guest modesets asynchronously; until then the old
+    /// framebuffer letterboxes.
+    func requestGuestResize() {
+        guard let surface else { return }
+        let (w, h) = guestSize()
+        bobrvm_surface_request_display_size(surface, w, h)
+        bobrvm_surface_set_size(surface, w, h)
+    }
+
+    private func scheduleGuestResize() {
+        resizeDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.requestGuestResize() }
+        resizeDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+    }
+
+    private func guestResizeNow() {
+        resizeDebounce?.cancel()
+        resizeDebounce = nil
+        requestGuestResize()
+    }
+
+    // Debounce during drags (each resize is a full guest modeset); commit
+    // immediately once the resize settles or the window changes mode/screen.
+    func windowDidResize(_ notification: Notification) {
+        if window.inLiveResize {
+            scheduleGuestResize()
+        } else {
+            guestResizeNow()
+        }
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) { guestResizeNow() }
+    func windowDidEnterFullScreen(_ notification: Notification) { guestResizeNow() }
+    func windowDidExitFullScreen(_ notification: Notification) { guestResizeNow() }
+    func windowDidChangeBackingProperties(_ notification: Notification) {
+        if hidpi {
+            view.metalLayer.contentsScale = window.backingScaleFactor
+            guestResizeNow()
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let width = 1280.0
@@ -168,6 +230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "bobrvm"
         window.center()
+        window.delegate = self
+        // Native fullscreen (green button / ⌃⌘F).
+        window.collectionBehavior.insert(.fullScreenPrimary)
 
         view = MetalView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         window.contentView = view
@@ -210,11 +275,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "--memory-mb": memoryMB = UInt64(args.next() ?? "") ?? memoryMB
             case "--net": enableNet = true
             case "--cpus": cpuCount = UInt8(args.next() ?? "") ?? cpuCount
+            case "--hidpi": hidpi = true
             default: print("unknown argument: \(arg)")
             }
         }
+        if hidpi {
+            view.metalLayer.contentsScale = window.backingScaleFactor
+        }
         guard let kernelPath = kernel else {
-            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--net] [--cpus 1] [--memory-mb 2048]")
+            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--net] [--cpus 1] [--memory-mb 2048] [--hidpi]")
             NSApp.terminate(nil)
             return
         }
@@ -233,6 +302,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         cfg.disk_read_only = diskC != nil && (disk?.hasSuffix(".iso") ?? false)
                         cfg.cmdline = cmdlineC
                         cfg.enable_net = enableNet
+                        let (gw, gh) = guestSize()
+                        cfg.display_width = gw
+                        cfg.display_height = gh
                         vm = bobrvm_vm_new(bobrApp, &cfg)
                     }
                 }
@@ -250,7 +322,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Unmanaged.passUnretained(queue).toOpaque()
         )
         guard surface != nil else { fatalError("bobrvm_surface_new failed") }
-        bobrvm_surface_set_size(surface, UInt32(width), UInt32(height))
+        let (gw, gh) = guestSize()
+        bobrvm_surface_set_size(surface, gw, gh)
 
         // Route input events from the view to the guest.
         view.surface = surface

@@ -415,6 +415,19 @@ pub const Machine = struct {
         self.kickCpu(0);
     }
 
+    /// Request a live guest display resolution change (host window resized).
+    /// Thread-safe: takes the machine lock, which serializes against all GPU
+    /// MMIO/queue processing on the vCPU thread. Lock order (machine_lock ->
+    /// scanout_mutex -> GIC via the irq callback) matches handleMmio's.
+    pub fn requestDisplayResize(self: *Machine, width: u32, height: u32) void {
+        const gpu = self.gpu orelse return;
+        self.machine_lock.lockUncancelable(global.io());
+        gpu.resizeDisplay(width, height);
+        self.machine_lock.unlock(global.io());
+        // Wake the guest from WFI so the config-change IRQ lands promptly.
+        self.kickCpu(0);
+    }
+
     /// Set console output callback.
     pub fn setConsoleOutput(
         self: *Machine,

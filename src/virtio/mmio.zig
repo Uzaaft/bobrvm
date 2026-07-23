@@ -360,6 +360,10 @@ pub const Transport = struct {
     pub fn signalConfigChange(self: *Transport) void {
         self.interrupt_status.config_change = true;
         self.config_generation +%= 1;
+        // Assert the (level) interrupt line
+        if (self.irq_callback) |cb| {
+            cb(true, self.irq_userdata);
+        }
     }
 
     /// Check if device is ready for I/O.
@@ -405,4 +409,31 @@ test "Transport status reset" {
     // Reset by writing 0
     transport.write(@intFromEnum(Reg.status), 0);
     try std.testing.expect(!transport.status.acknowledge);
+}
+
+test "Transport config change raises and ack clears the interrupt line" {
+    const transport = try Transport.init(std.testing.allocator, 16, 0, 2);
+    defer transport.deinit();
+
+    const Line = struct {
+        level: bool = false,
+        fn cb(level: bool, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.level = level;
+        }
+    };
+    var line = Line{};
+    transport.setIrqCallback(Line.cb, &line);
+
+    const gen_before = transport.config_generation;
+    transport.signalConfigChange();
+
+    try std.testing.expect(line.level);
+    try std.testing.expect(transport.interrupt_status.config_change);
+    try std.testing.expectEqual(gen_before +% 1, transport.read(@intFromEnum(Reg.config_generation)));
+
+    // ACK the config-change bit: line must deassert
+    transport.write(@intFromEnum(Reg.interrupt_ack), 0x2);
+    try std.testing.expect(!line.level);
+    try std.testing.expect(!transport.interrupt_status.config_change);
 }

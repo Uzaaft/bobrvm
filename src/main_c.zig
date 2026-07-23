@@ -230,6 +230,12 @@ pub export fn bobrvm_surface_set_size(surface: ?*apprt.Surface, width: u32, heig
     s.setSize(width, height);
 }
 
+pub export fn bobrvm_surface_request_display_size(surface: ?*apprt.Surface, width: u32, height: u32) void {
+    const s = surface orelse return;
+    if (width == 0 or height == 0) return;
+    s.requestDisplaySize(width, height);
+}
+
 pub export fn bobrvm_surface_set_content_scale(surface: ?*apprt.Surface, x: f64, y: f64) void {
     const s = surface orelse return;
     if (x <= 0.0 or y <= 0.0) return;

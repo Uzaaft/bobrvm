@@ -73,6 +73,9 @@ pub const VMConfig = extern struct {
     disk2_read_only: bool = true,
     /// Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP).
     enable_net: bool = false,
+    /// Initial guest display size in pixels (0 = machine default).
+    display_width: u32 = 0,
+    display_height: u32 = 0,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
@@ -106,6 +109,8 @@ pub const VMConfig = extern struct {
             .disk2_path = try dupeString(alloc, self.disk2_path),
             .disk2_read_only = self.disk2_read_only,
             .enable_net = self.enable_net,
+            .display_width = self.display_width,
+            .display_height = self.display_height,
         };
     }
 };
@@ -124,6 +129,8 @@ pub const OwnedVMConfig = struct {
     disk2_path: ?[]const u8 = null,
     disk2_read_only: bool = true,
     enable_net: bool = false,
+    display_width: u32 = 0,
+    display_height: u32 = 0,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.firmware_path) |p| alloc.free(p);
@@ -395,6 +402,8 @@ pub const VM = struct {
                 // GUI VMs always get a display device.
                 .enable_gpu = true,
                 .enable_net = self.config.enable_net,
+                .display_width = if (self.config.display_width != 0) self.config.display_width else 1280,
+                .display_height = if (self.config.display_height != 0) self.config.display_height else 800,
             };
 
             self.hw_machine = machine.Machine.init(self.alloc, machine_config) catch |err| {
@@ -611,6 +620,14 @@ pub const Surface = struct {
         // Post-condition: size updated
         assert(self.width == width);
         assert(self.height == height);
+    }
+
+    /// Request a live guest display resolution change (virtio-gpu display
+    /// hotplug). Unlike setSize, this reaches into the guest; the drawable
+    /// follows once the guest modesets. Safe to call from any thread.
+    pub fn requestDisplaySize(self: *Surface, width: u32, height: u32) void {
+        const hw = self.vm.hw_machine orelse return;
+        hw.requestDisplayResize(width, height);
     }
 
     pub fn setContentScale(self: *Surface, x: f64, y: f64) void {

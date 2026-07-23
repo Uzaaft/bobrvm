@@ -33,3 +33,4 @@ tests/integration/alpine/out/initramfs-minimal
 
 # Zig package mirror (local cache)
 zig-pkg/
+.claude/settings.local.json
