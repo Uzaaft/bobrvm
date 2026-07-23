@@ -130,7 +130,7 @@ pub const Transport = struct {
     irq_userdata: ?*anyopaque,
 
     pub const Error = Allocator.Error;
-    pub const MAX_QUEUES = 8;
+    pub const MAX_QUEUES = 16;
 
     pub fn init(
         alloc: Allocator,

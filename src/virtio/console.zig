@@ -15,6 +15,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const Queue = @import("queue.zig");
+const ring = @import("ring.zig");
 
 const log = std.log.scoped(.virtio_console);
 
@@ -39,6 +40,48 @@ pub const QueueIdx = enum(u32) {
     transmit = 1,
     control_receive = 2,
     control_transmit = 3,
+};
+
+/// Multiport control events (virtio 1.2 section 5.3.6.2).
+pub const ControlEvent = enum(u16) {
+    device_ready = 0,
+    device_add = 1,
+    device_remove = 2,
+    port_ready = 3,
+    console_port = 4,
+    resize = 5,
+    port_open = 6,
+    port_name = 7,
+    _,
+};
+
+/// Control message header (payload follows for e.g. port_name).
+pub const ControlMsg = extern struct {
+    id: u32,
+    event: u16,
+    value: u16,
+};
+
+/// One queued host→guest control message.
+const PendingCtrl = struct {
+    msg: ControlMsg,
+    payload: [48]u8 = undefined,
+    payload_len: u8 = 0,
+};
+
+/// A multiport serial port (ports 1..N; port 0 is the console itself).
+const Port = struct {
+    /// Static name announced via PORT_NAME (e.g. "org.qemu.guest_agent.0");
+    /// shows up in the guest at /sys/class/virtio-ports/vportXpY/name.
+    name: []const u8,
+    /// Guest→host data sink; unset means data is dropped.
+    output_callback: ?*const fn ([]const u8, ?*anyopaque) void = null,
+    output_userdata: ?*anyopaque = null,
+    /// Host→guest bytes awaiting rx buffers. Guarded by the console's
+    /// input_mutex (same append-on-host-thread/drain-on-vCPU pattern).
+    input_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    /// Guest-side open state (PORT_OPEN from the guest).
+    guest_open: bool = false,
 };
 
 /// Console device.
@@ -66,15 +109,38 @@ pub const Console = struct {
     /// Guest memory accessor.
     guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
 
+    /// Multiport: named ports 1..N (empty = plain single-port console).
+    ports: std.ArrayListUnmanaged(Port) = .empty,
+    /// Host→guest control messages awaiting control-rx buffers.
+    ctrl_pending: std.ArrayListUnmanaged(PendingCtrl) = .empty,
+    /// last_avail cursors for the multiport queues (control + per-port),
+    /// indexed by queue index. Port 0's queues keep using
+    /// receive_queue/transmit_queue.
+    mp_last_avail: [mmio.Transport.MAX_QUEUES]u16 = @splat(0),
+
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 128;
     pub const INPUT_BUFFER_MAX: usize = 64 * 1024;
 
-    pub fn init(alloc: Allocator) Error!*Console {
+    /// Queue indices for multiport port p (p >= 1).
+    fn portRxQueue(port: u32) u32 {
+        return 2 * (port + 1);
+    }
+    fn portTxQueue(port: u32) u32 {
+        return 2 * (port + 1) + 1;
+    }
+
+    /// `port_names`: names for extra ports 1..N (port 0 stays the hvc0
+    /// console). Empty keeps the device in plain single-port mode with
+    /// the exact pre-multiport behavior.
+    pub fn init(alloc: Allocator, port_names: []const []const u8) Error!*Console {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
-        const features = Features.SIZE | Features.EMERG_WRITE | virtio_version_1;
-        const transport = try mmio.Transport.init(alloc, 3, features, 2); // 3 = console device ID
+        var features = Features.SIZE | Features.EMERG_WRITE | virtio_version_1;
+        const multiport = port_names.len > 0;
+        if (multiport) features |= Features.MULTIPORT;
+        const num_queues: u8 = if (multiport) @intCast(4 + 2 * port_names.len) else 2;
+        const transport = try mmio.Transport.init(alloc, 3, features, num_queues);
         errdefer transport.deinit();
 
         var receive_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
@@ -84,10 +150,11 @@ pub const Console = struct {
         errdefer transmit_queue.deinit();
 
         const console = try alloc.create(Console);
+        errdefer alloc.destroy(console);
         console.* = .{
             .alloc = alloc,
             .transport = transport,
-            .config = .{},
+            .config = .{ .max_nr_ports = @intCast(1 + port_names.len) },
             .receive_queue = receive_queue,
             .transmit_queue = transmit_queue,
             .output_buffer = .empty,
@@ -97,6 +164,9 @@ pub const Console = struct {
             .output_userdata = null,
             .guest_memory = null,
         };
+        for (port_names) |name| {
+            try console.ports.append(alloc, .{ .name = name });
+        }
 
         // Set up notification callback
         transport.setNotifyCallback(handleNotify, console);
@@ -108,12 +178,44 @@ pub const Console = struct {
     }
 
     pub fn deinit(self: *Console) void {
+        for (self.ports.items) |*port| port.input_buffer.deinit(self.alloc);
+        self.ports.deinit(self.alloc);
+        self.ctrl_pending.deinit(self.alloc);
         self.output_buffer.deinit(self.alloc);
         self.input_buffer.deinit(self.alloc);
         self.transmit_queue.deinit();
         self.receive_queue.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
+    }
+
+    /// Attach a guest→host data sink for multiport port `id` (1-based).
+    pub fn setPortOutput(
+        self: *Console,
+        id: u32,
+        callback: *const fn ([]const u8, ?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        assert(id >= 1 and id <= self.ports.items.len);
+        self.ports.items[id - 1].output_callback = callback;
+        self.ports.items[id - 1].output_userdata = userdata;
+    }
+
+    /// Queue host→guest data for multiport port `id` (1-based). Same
+    /// threading contract as queueInput.
+    pub fn queuePortInput(self: *Console, id: u32, data: []const u8) Error!void {
+        assert(id >= 1 and id <= self.ports.items.len);
+        self.input_mutex.lockUncancelable(global.io());
+        defer self.input_mutex.unlock(global.io());
+        const port = &self.ports.items[id - 1];
+        if (port.input_buffer.items.len + data.len > INPUT_BUFFER_MAX) return;
+        try port.input_buffer.appendSlice(self.alloc, data);
+    }
+
+    /// Whether the guest has opened multiport port `id` (1-based).
+    pub fn portGuestOpen(self: *Console, id: u32) bool {
+        assert(id >= 1 and id <= self.ports.items.len);
+        return self.ports.items[id - 1].guest_open;
     }
 
     /// Set output callback (called when guest writes to console).
@@ -183,17 +285,197 @@ pub const Console = struct {
 
     fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
         const self: *Console = @ptrCast(@alignCast(userdata));
-        switch (@as(QueueIdx, @enumFromInt(queue_idx))) {
-            .receive => {
+        switch (queue_idx) {
+            0 => {
                 self.processReceiveQueue();
                 // Also check TX queue on any notification (some drivers don't notify TX)
                 self.processTransmitQueue();
             },
-            .transmit => {
-                self.processTransmitQueue();
+            1 => self.processTransmitQueue(),
+            2 => self.processControlRx(),
+            3 => {
+                self.processControlTx();
+                // The guest may have posted control-rx buffers before the
+                // handshake message; flush anything we just queued.
+                self.processControlRx();
+            },
+            else => {
+                const port_base = 4;
+                if (queue_idx < port_base) return;
+                const p: u32 = (queue_idx - port_base) / 2 + 1;
+                if (p > self.ports.items.len) return;
+                if ((queue_idx - port_base) % 2 == 0) {
+                    self.processPortRx(p);
+                } else {
+                    self.processPortTx(p);
+                }
+            },
+        }
+    }
+
+    /// Queue a host→guest control message (delivered via control-rx).
+    fn queueCtrl(self: *Console, id: u32, event: ControlEvent, value: u16, payload: []const u8) void {
+        var pending = PendingCtrl{
+            .msg = .{ .id = id, .event = @intFromEnum(event), .value = value },
+        };
+        const n = @min(payload.len, pending.payload.len);
+        @memcpy(pending.payload[0..n], payload[0..n]);
+        pending.payload_len = @intCast(n);
+        self.ctrl_pending.append(self.alloc, pending) catch {};
+    }
+
+    /// Guest→host control messages (queue 3): the multiport handshake.
+    fn processControlTx(self: *Console) void {
+        const qidx = @intFromEnum(QueueIdx.control_transmit);
+        const qc = self.transport.queues[qidx];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
+
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var processed: u32 = 0;
+        while (self.mp_last_avail[qidx] != avail_idx) : (processed += 1) {
+            const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            const chain = ring.Chain.collect(qc, head, get_mem);
+            if (chain.request(get_mem)) |req| {
+                if (req.len >= @sizeOf(ControlMsg)) {
+                    const msg = std.mem.bytesToValue(ControlMsg, req[0..@sizeOf(ControlMsg)]);
+                    self.handleControlMsg(msg);
+                }
+            }
+            ring.pushUsed(qc, head, 0, get_mem);
+            self.mp_last_avail[qidx] +%= 1;
+        }
+        if (processed > 0) self.transport.signalUsedBuffer();
+    }
+
+    fn handleControlMsg(self: *Console, msg: ControlMsg) void {
+        switch (@as(ControlEvent, @enumFromInt(msg.event))) {
+            .device_ready => {
+                if (msg.value != 1) return;
+                // Announce every port (0 = the console, 1..N = named).
+                var p: u32 = 0;
+                while (p <= self.ports.items.len) : (p += 1) {
+                    self.queueCtrl(p, .device_add, 0, &.{});
+                }
+            },
+            .port_ready => {
+                if (msg.value != 1) return;
+                if (msg.id == 0) {
+                    // Port 0 is the console (hvc0).
+                    self.queueCtrl(0, .console_port, 1, &.{});
+                    self.queueCtrl(0, .port_open, 1, &.{});
+                } else if (msg.id <= self.ports.items.len) {
+                    const port = &self.ports.items[msg.id - 1];
+                    self.queueCtrl(msg.id, .port_name, 1, port.name);
+                    // Host side is considered always-open: guest agents may
+                    // write immediately; data is dropped until a host
+                    // handler attaches via setPortOutput.
+                    self.queueCtrl(msg.id, .port_open, 1, &.{});
+                }
+            },
+            .port_open => {
+                if (msg.id >= 1 and msg.id <= self.ports.items.len) {
+                    self.ports.items[msg.id - 1].guest_open = msg.value == 1;
+                }
             },
             else => {},
         }
+    }
+
+    /// Host→guest control messages (queue 2): one message per buffer.
+    fn processControlRx(self: *Console) void {
+        const qidx = @intFromEnum(QueueIdx.control_receive);
+        const qc = self.transport.queues[qidx];
+        if (!qc.ready or qc.num == 0) return;
+        if (self.ctrl_pending.items.len == 0) return;
+        const get_mem = self.guest_memory orelse return;
+
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var sent: usize = 0;
+        while (self.mp_last_avail[qidx] != avail_idx and sent < self.ctrl_pending.items.len) {
+            const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            const chain = ring.Chain.collect(qc, head, get_mem);
+            const resp = chain.response(get_mem) orelse {
+                ring.pushUsed(qc, head, 0, get_mem);
+                self.mp_last_avail[qidx] +%= 1;
+                continue;
+            };
+            const pending = self.ctrl_pending.items[sent];
+            const total = @sizeOf(ControlMsg) + @as(usize, pending.payload_len);
+            if (resp.len < total) break;
+            @memcpy(resp[0..@sizeOf(ControlMsg)], std.mem.asBytes(&pending.msg));
+            @memcpy(resp[@sizeOf(ControlMsg)..][0..pending.payload_len], pending.payload[0..pending.payload_len]);
+            ring.pushUsed(qc, head, @intCast(total), get_mem);
+            self.mp_last_avail[qidx] +%= 1;
+            sent += 1;
+        }
+        if (sent > 0) {
+            self.ctrl_pending.replaceRangeAssumeCapacity(0, sent, &.{});
+            self.transport.signalUsedBuffer();
+        }
+    }
+
+    /// Guest→host data on multiport port p (1-based).
+    fn processPortTx(self: *Console, p: u32) void {
+        const qidx = portTxQueue(p);
+        if (qidx >= self.transport.queues.len) return;
+        const qc = self.transport.queues[qidx];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
+        const port = &self.ports.items[p - 1];
+
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var processed: u32 = 0;
+        while (self.mp_last_avail[qidx] != avail_idx) : (processed += 1) {
+            const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            const chain = ring.Chain.collect(qc, head, get_mem);
+            for (chain.slice()) |desc| {
+                if (desc.isWrite()) continue;
+                const data = get_mem(desc.addr, desc.len) orelse continue;
+                if (port.output_callback) |cb| cb(data, port.output_userdata);
+            }
+            ring.pushUsed(qc, head, 0, get_mem);
+            self.mp_last_avail[qidx] +%= 1;
+        }
+        if (processed > 0) self.transport.signalUsedBuffer();
+    }
+
+    /// Host→guest data on multiport port p (1-based).
+    fn processPortRx(self: *Console, p: u32) void {
+        const qidx = portRxQueue(p);
+        if (qidx >= self.transport.queues.len) return;
+        const qc = self.transport.queues[qidx];
+        if (!qc.ready or qc.num == 0) return;
+        const get_mem = self.guest_memory orelse return;
+        const port = &self.ports.items[p - 1];
+
+        self.input_mutex.lockUncancelable(global.io());
+        defer self.input_mutex.unlock(global.io());
+        if (port.input_buffer.items.len == 0) return;
+
+        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        var consumed: usize = 0;
+        var delivered: u32 = 0;
+        while (self.mp_last_avail[qidx] != avail_idx and consumed < port.input_buffer.items.len) {
+            const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            const chain = ring.Chain.collect(qc, head, get_mem);
+            var written: u32 = 0;
+            for (chain.slice()) |desc| {
+                if (!desc.isWrite()) continue;
+                const buf = get_mem(desc.addr, desc.len) orelse continue;
+                const remaining = port.input_buffer.items[consumed..];
+                if (remaining.len == 0) break;
+                const n: usize = @min(buf.len, remaining.len);
+                @memcpy(buf[0..n], remaining[0..n]);
+                consumed += n;
+                written += @intCast(n);
+            }
+            ring.pushUsed(qc, head, written, get_mem);
+            self.mp_last_avail[qidx] +%= 1;
+            delivered += written;
+        }
+        if (consumed > 0) port.input_buffer.replaceRangeAssumeCapacity(0, consumed, &.{});
+        if (delivered > 0) self.transport.signalUsedBuffer();
     }
 
     fn processReceiveQueue(self: *Console) void {
@@ -268,15 +550,24 @@ pub const Console = struct {
         }
     }
 
-    /// Poll the transmit queue. Can be called from vCPU loop.
+    /// Poll the transmit queues. Can be called from vCPU loop.
     pub fn pollTransmit(self: *Console) void {
         self.processTransmitQueue();
+        if (self.ports.items.len > 0) {
+            self.processControlTx();
+            for (1..self.ports.items.len + 1) |p| self.processPortTx(@intCast(p));
+        }
     }
 
-    /// Poll the receive queue for pending host input. Called from the
-    /// vCPU loop so all guest-memory access stays on one thread.
+    /// Poll the receive queues for pending host input/control messages.
+    /// Called from the vCPU loop so all guest-memory access stays on one
+    /// thread.
     pub fn pollReceive(self: *Console) void {
         self.processReceiveQueue();
+        if (self.ports.items.len > 0) {
+            self.processControlRx();
+            for (1..self.ports.items.len + 1) |p| self.processPortRx(@intCast(p));
+        }
     }
 
     /// Debug: dump queue state for diagnostics.
@@ -409,7 +700,7 @@ const mmioDeviceId = struct {
 // =============================================================================
 
 test "Console init" {
-    const console = try Console.init(std.testing.allocator);
+    const console = try Console.init(std.testing.allocator, &.{});
     defer console.deinit();
 
     // Check magic value
@@ -419,10 +710,14 @@ test "Console init" {
     // Check device ID
     const device_id = console.read(@intFromEnum(mmio.Reg.device_id));
     try std.testing.expectEqual(@as(u32, 3), device_id);
+
+    // No ports: plain 2-queue console without MULTIPORT.
+    try std.testing.expectEqual(@as(usize, 2), console.transport.queues.len);
+    try std.testing.expect(console.transport.device_features & Features.MULTIPORT == 0);
 }
 
 test "Console config read" {
-    const console = try Console.init(std.testing.allocator);
+    const console = try Console.init(std.testing.allocator, &.{});
     defer console.deinit();
 
     // Read cols (offset 0x100)
@@ -432,9 +727,143 @@ test "Console config read" {
 }
 
 test "Console queue input" {
-    const console = try Console.init(std.testing.allocator);
+    const console = try Console.init(std.testing.allocator, &.{});
     defer console.deinit();
 
     try console.queueInput("Hello, guest!");
     try std.testing.expectEqual(@as(usize, 13), console.input_buffer.items.len);
+}
+
+// -----------------------------------------------------------------------------
+// Multiport tests: synthetic guest memory + rings
+// -----------------------------------------------------------------------------
+
+const TestMem = struct {
+    var mem: [64 * 1024]u8 = undefined;
+    fn get(addr: u64, len: usize) ?[]u8 {
+        if (addr + len > mem.len) return null;
+        return mem[@intCast(addr)..][0..len];
+    }
+};
+
+/// Lay out one queue at `base`: descriptors at +0, avail at +0x400,
+/// used at +0x800.
+fn setupTestQueue(console: *Console, qidx: u32, base: u64) void {
+    console.transport.queues[qidx] = .{
+        .num = 8,
+        .ready = true,
+        .desc_addr = base,
+        .driver_addr = base + 0x400,
+        .device_addr = base + 0x800,
+    };
+}
+
+fn writeTestDesc(base: u64, idx: u16, addr: u64, len: u32, flags: u16) void {
+    const d = TestMem.get(base + @as(u64, idx) * 16, 16).?;
+    std.mem.writeInt(u64, d[0..8], addr, .little);
+    std.mem.writeInt(u32, d[8..12], len, .little);
+    std.mem.writeInt(u16, d[12..14], flags, .little);
+    std.mem.writeInt(u16, d[14..16], 0, .little);
+}
+
+fn pushTestAvail(base: u64, desc_idx: u16) void {
+    const avail = TestMem.get(base + 0x400, 64).?;
+    const idx = std.mem.readInt(u16, avail[2..4], .little);
+    std.mem.writeInt(u16, avail[4 + @as(usize, idx % 8) * 2 ..][0..2], desc_idx, .little);
+    std.mem.writeInt(u16, avail[2..4], idx +% 1, .little);
+}
+
+fn testUsedIdx(base: u64) u16 {
+    const used = TestMem.get(base + 0x800, 6).?;
+    return std.mem.readInt(u16, used[2..4], .little);
+}
+
+var test_port_out: std.ArrayListUnmanaged(u8) = .empty;
+fn testPortSink(data: []const u8, _: ?*anyopaque) void {
+    test_port_out.appendSlice(std.testing.allocator, data) catch {};
+}
+
+test "Console multiport: handshake announces and names ports" {
+    const console = try Console.init(std.testing.allocator, &.{"org.qemu.guest_agent.0"});
+    defer console.deinit();
+    @memset(&TestMem.mem, 0);
+    console.setGuestMemory(TestMem.get);
+
+    // Multiport advertised, 6 queues (rx/tx, ctrl rx/tx, port1 rx/tx).
+    try std.testing.expect(console.transport.device_features & Features.MULTIPORT != 0);
+    try std.testing.expectEqual(@as(usize, 6), console.transport.queues.len);
+    try std.testing.expectEqual(@as(u32, 2), console.config.max_nr_ports);
+
+    const CTRL_RX: u64 = 0x1000;
+    const CTRL_TX: u64 = 0x3000;
+    setupTestQueue(console, 2, CTRL_RX);
+    setupTestQueue(console, 3, CTRL_TX);
+
+    // Guest posts 8 writable 64-byte control-rx buffers at 0x8000.
+    for (0..8) |i| {
+        writeTestDesc(CTRL_RX, @intCast(i), 0x8000 + @as(u64, i) * 64, 64, ring.Desc.F_WRITE);
+        pushTestAvail(CTRL_RX, @intCast(i));
+    }
+
+    // Guest sends DEVICE_READY(value=1) on control-tx.
+    const ready = ControlMsg{ .id = 0, .event = @intFromEnum(ControlEvent.device_ready), .value = 1 };
+    @memcpy(TestMem.get(0x7000, 8).?, std.mem.asBytes(&ready));
+    writeTestDesc(CTRL_TX, 0, 0x7000, 8, 0);
+    pushTestAvail(CTRL_TX, 0);
+    console.pollTransmit();
+    console.pollReceive();
+
+    // DEVICE_ADD for ports 0 and 1 must have landed in control-rx.
+    try std.testing.expectEqual(@as(u16, 2), testUsedIdx(CTRL_RX));
+    const add0 = std.mem.bytesToValue(ControlMsg, TestMem.get(0x8000, 8).?[0..8]);
+    const add1 = std.mem.bytesToValue(ControlMsg, TestMem.get(0x8040, 8).?[0..8]);
+    try std.testing.expectEqual(@intFromEnum(ControlEvent.device_add), add0.event);
+    try std.testing.expectEqual(@as(u32, 0), add0.id);
+    try std.testing.expectEqual(@as(u32, 1), add1.id);
+
+    // Guest reports PORT_READY for port 1: expect PORT_NAME (with the
+    // name as payload) then PORT_OPEN.
+    const port_ready = ControlMsg{ .id = 1, .event = @intFromEnum(ControlEvent.port_ready), .value = 1 };
+    @memcpy(TestMem.get(0x7100, 8).?, std.mem.asBytes(&port_ready));
+    writeTestDesc(CTRL_TX, 1, 0x7100, 8, 0);
+    pushTestAvail(CTRL_TX, 1);
+    console.pollTransmit();
+    console.pollReceive();
+
+    try std.testing.expectEqual(@as(u16, 4), testUsedIdx(CTRL_RX));
+    const name_msg = std.mem.bytesToValue(ControlMsg, TestMem.get(0x8080, 8).?[0..8]);
+    try std.testing.expectEqual(@intFromEnum(ControlEvent.port_name), name_msg.event);
+    const name = TestMem.get(0x8080 + 8, 22).?;
+    try std.testing.expectEqualStrings("org.qemu.guest_agent.0", name);
+    const open_msg = std.mem.bytesToValue(ControlMsg, TestMem.get(0x80C0, 8).?[0..8]);
+    try std.testing.expectEqual(@intFromEnum(ControlEvent.port_open), open_msg.event);
+    try std.testing.expectEqual(@as(u16, 1), open_msg.value);
+
+    // Guest opens the port; both data directions flow.
+    const opened = ControlMsg{ .id = 1, .event = @intFromEnum(ControlEvent.port_open), .value = 1 };
+    @memcpy(TestMem.get(0x7200, 8).?, std.mem.asBytes(&opened));
+    writeTestDesc(CTRL_TX, 2, 0x7200, 8, 0);
+    pushTestAvail(CTRL_TX, 2);
+    console.pollTransmit();
+    try std.testing.expect(console.portGuestOpen(1));
+
+    // Host→guest: queuePortInput lands in the port-1 rx queue (idx 4).
+    const P1_RX: u64 = 0x9000;
+    setupTestQueue(console, 4, P1_RX);
+    writeTestDesc(P1_RX, 0, 0xA000, 64, ring.Desc.F_WRITE);
+    pushTestAvail(P1_RX, 0);
+    try console.queuePortInput(1, "ping");
+    console.pollReceive();
+    try std.testing.expectEqualStrings("ping", TestMem.get(0xA000, 4).?);
+
+    // Guest→host: port-1 tx (idx 5) reaches the port sink.
+    defer test_port_out.deinit(std.testing.allocator);
+    console.setPortOutput(1, testPortSink, null);
+    const P1_TX: u64 = 0xB000;
+    setupTestQueue(console, 5, P1_TX);
+    @memcpy(TestMem.get(0xC000, 4).?, "pong");
+    writeTestDesc(P1_TX, 0, 0xC000, 4, 0);
+    pushTestAvail(P1_TX, 0);
+    console.pollTransmit();
+    try std.testing.expectEqualStrings("pong", test_port_out.items);
 }

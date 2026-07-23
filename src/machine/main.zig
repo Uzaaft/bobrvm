@@ -1428,8 +1428,14 @@ pub const Machine = struct {
         self.uart.?.setIrqCallback(uartIrqCallback, self);
         log.debug("initialized UART at 0x{x}", .{MemoryLayout.UART_BASE});
 
-        // Initialize console (slot 0)
-        self.console = try virtio.Console.init(self.alloc);
+        // Initialize console (slot 0). The extra multiport ports are the
+        // guest-agent substrate: stock spice-vdagent and qemu-guest-agent
+        // attach to these names; host-side protocol handlers arrive with
+        // the clipboard/agent features (ports are inert until then).
+        self.console = try virtio.Console.init(self.alloc, &.{
+            "com.redhat.spice.0",
+            "org.qemu.guest_agent.0",
+        });
         if (self.console_output) |cb| {
             self.console.?.setOutputCallback(cb, self.console_userdata);
         }

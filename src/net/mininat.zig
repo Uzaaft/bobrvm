@@ -1373,9 +1373,21 @@ test "mininat: port forward — accept, handshake, and guest->host relay" {
     try net_compat.connect(client, @ptrCast(&dst), @sizeOf(std.posix.sockaddr.in));
 
     // Accept: a SYN to the guest's port 22 from the gateway must go out.
-    nat.flows_mutex.lockUncancelable(global.io());
-    const accepted = nat.pumpAccept();
-    nat.flows_mutex.unlock(global.io());
+    // Retry briefly — on Darwin the client's connect() can return a moment
+    // before the connection lands in the listener's accept queue.
+    var accepted = false;
+    var tries: u32 = 0;
+    while (!accepted and tries < 200) : (tries += 1) {
+        nat.flows_mutex.lockUncancelable(global.io());
+        accepted = nat.pumpAccept();
+        nat.flows_mutex.unlock(global.io());
+        if (!accepted) {
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 5 * std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+        }
+    }
     try testing.expect(accepted);
     try testing.expectEqual(@as(usize, 1), nat.tcp_flows.count());
     try testing.expectEqual(@as(usize, 1), test_replies.items.len);
