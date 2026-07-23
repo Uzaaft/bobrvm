@@ -567,6 +567,7 @@ pub const Surface = struct {
             .width = view.width,
             .height = view.height,
             .generation = view.generation,
+            .surface = view.surface,
         };
     }
 

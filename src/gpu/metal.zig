@@ -234,6 +234,35 @@ pub const Device = struct {
         return .{ .ptr = tex };
     }
 
+    /// Wrap an MTLTexture around an existing IOSurface — the texture aliases
+    /// the surface's memory, so writes to the surface (e.g. a guest scanout
+    /// transfer) are visible to the GPU with no upload. Used to eliminate the
+    /// per-frame replaceRegion copy on the 2D present path.
+    pub fn newTextureFromIOSurface(
+        self: Device,
+        format: MTLPixelFormat,
+        width: u32,
+        height: u32,
+        surface: *anyopaque,
+    ) ?Texture {
+        const desc_class = cls("MTLTextureDescriptor") orelse return null;
+        const s = sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:");
+        const dfunc: *const fn (Class, SEL, NSUInteger, NSUInteger, NSUInteger, BOOL) callconv(.c) ?id =
+            @ptrCast(&objc_msgSend);
+        const desc = dfunc(desc_class, s, @intFromEnum(format), width, height, false) orelse return null;
+
+        const set_usage: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_usage(desc, sel("setUsage:"), MTLTextureUsage.shader_read);
+        const set_storage: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_storage(desc, sel("setStorageMode:"), @intFromEnum(MTLStorageMode.shared));
+
+        const func: *const fn (id, SEL, id, *anyopaque, NSUInteger) callconv(.c) ?id =
+            @ptrCast(&objc_msgSend);
+        const tex = func(self.ptr, sel("newTextureWithDescriptor:iosurface:plane:"), desc, surface, 0) orelse
+            return null;
+        return .{ .ptr = tex };
+    }
+
     /// Compile a Metal shader library from MSL source text. Returns null on
     /// compile failure (the NSError is discarded — callers treat null as
     /// "shader did not compile").
@@ -787,10 +816,17 @@ pub const FrameRenderer = struct {
     queue: CommandQueue,
     layer: MetalLayer,
 
-    /// Cached staging texture for framebuffer uploads.
+    /// Cached staging texture for the fallback (copying) framebuffer path.
     fb_texture: ?Texture = null,
     fb_width: u32 = 0,
     fb_height: u32 = 0,
+
+    /// Cached texture aliasing the current scanout IOSurface (zero-copy path).
+    /// Rebuilt when the surface pointer or its size changes.
+    surface_texture: ?Texture = null,
+    surface_ref: ?*anyopaque = null,
+    surface_width: u32 = 0,
+    surface_height: u32 = 0,
 
     /// Initialize with opaque pointers from Swift.
     pub fn init(
@@ -808,6 +844,9 @@ pub const FrameRenderer = struct {
     pub fn deinit(self: *FrameRenderer) void {
         if (self.fb_texture) |tex| tex.release();
         self.fb_texture = null;
+        if (self.surface_texture) |tex| tex.release();
+        self.surface_texture = null;
+        self.surface_ref = null;
     }
 
     /// Render a frame with the given clear color.
@@ -850,14 +889,19 @@ pub const FrameRenderer = struct {
     }
 
     /// Render a frame with framebuffer data (2D scanout).
-    /// Uploads the BGRA pixels to a staging texture and blits it to the
-    /// drawable. The layer's drawable size is pinned to the framebuffer
-    /// size; CoreAnimation scales it to the view.
+    ///
+    /// When `surface` is non-null the pixels already live in that IOSurface, so
+    /// we blit a texture that aliases it directly — no CPU->GPU upload. When it
+    /// is null we fall back to uploading `data` into a staging texture via
+    /// replaceRegion. Either way the source is blitted to the drawable; the
+    /// layer's drawable size is pinned to the framebuffer size and
+    /// CoreAnimation scales it to the view.
     pub fn renderFramebuffer(
         self: *FrameRenderer,
         data: []const u8,
         width: u32,
         height: u32,
+        surface: ?*anyopaque,
     ) bool {
         assert(width > 0 and height > 0);
         assert(data.len >= @as(usize, width) * height * 4);
@@ -865,24 +909,44 @@ pub const FrameRenderer = struct {
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
 
-        // (Re)create the staging texture on size change.
-        if (self.fb_texture == null or self.fb_width != width or self.fb_height != height) {
-            if (self.fb_texture) |tex| tex.release();
-            self.fb_texture = createTexture2D(self.device, .bgra8Unorm, width, height) orelse
-                return false;
-            self.fb_width = width;
-            self.fb_height = height;
-            self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
-        }
-        const fb_tex = self.fb_texture.?;
-
-        // Upload pixels.
-        fb_tex.replaceRegion(
-            .{ .size = .{ .width = width, .height = height } },
-            0,
-            data.ptr,
-            @as(NSUInteger, width) * 4,
-        );
+        // Resolve the blit source: the shared IOSurface texture (zero-copy) or
+        // the uploaded staging texture (fallback).
+        const src_texture: Texture = if (surface) |surf| src: {
+            if (self.surface_texture == null or self.surface_ref != surf or
+                self.surface_width != width or self.surface_height != height)
+            {
+                if (self.surface_texture) |tex| tex.release();
+                self.surface_texture = self.device.newTextureFromIOSurface(
+                    .bgra8Unorm,
+                    width,
+                    height,
+                    surf,
+                ) orelse return false;
+                self.surface_ref = surf;
+                self.surface_width = width;
+                self.surface_height = height;
+                self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
+            }
+            break :src self.surface_texture.?;
+        } else src: {
+            // (Re)create the staging texture on size change.
+            if (self.fb_texture == null or self.fb_width != width or self.fb_height != height) {
+                if (self.fb_texture) |tex| tex.release();
+                self.fb_texture = createTexture2D(self.device, .bgra8Unorm, width, height) orelse
+                    return false;
+                self.fb_width = width;
+                self.fb_height = height;
+                self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
+            }
+            const fb_tex = self.fb_texture.?;
+            fb_tex.replaceRegion(
+                .{ .size = .{ .width = width, .height = height } },
+                0,
+                data.ptr,
+                @as(NSUInteger, width) * 4,
+            );
+            break :src fb_tex;
+        };
 
         // Blit to the drawable.
         const drawable = self.layer.nextDrawable() orelse return false;
@@ -891,7 +955,7 @@ pub const FrameRenderer = struct {
         const blit = cmd_buffer.blitCommandEncoder() orelse return false;
 
         blit.copyTexture(
-            fb_tex.ptr,
+            src_texture.ptr,
             .{},
             .{ .width = width, .height = height },
             dst_texture,
@@ -922,4 +986,34 @@ test "MTLViewport size" {
 
 test "MTLPixelFormat values" {
     try std.testing.expectEqual(@as(NSUInteger, 80), @intFromEnum(MTLPixelFormat.bgra8Unorm));
+}
+
+test "IOSurface-backed texture aliases CPU writes (zero-copy scanout)" {
+    const iosurface = @import("iosurface.zig");
+    const device = Device.createSystemDefault() orelse return error.SkipZigTest;
+
+    const w: u32 = 8;
+    const h: u32 = 4;
+    const surf = iosurface.IOSurface.createBGRA(w, h) orelse return error.SkipZigTest;
+    defer surf.release();
+
+    // Write a known BGRA pattern straight into the shared surface memory —
+    // this stands in for the guest's transfer_to_host_2d.
+    const px = surf.pixels(w * h * 4);
+    for (0..w * h) |i| {
+        px[i * 4 + 0] = @truncate(i * 4 + 1); // B
+        px[i * 4 + 1] = @truncate(i * 4 + 2); // G
+        px[i * 4 + 2] = @truncate(i * 4 + 3); // R
+        px[i * 4 + 3] = 0xFF; // A
+    }
+
+    // Wrap a texture over the SAME memory (no replaceRegion) and read it back
+    // through Metal: the GPU must see exactly what the CPU wrote.
+    const tex = device.newTextureFromIOSurface(.bgra8Unorm, w, h, surf.ref) orelse
+        return error.SkipZigTest;
+    defer tex.release();
+
+    var out: [w * h * 4]u8 = undefined;
+    tex.getBytes(&out, w * 4, .{ .size = .{ .width = w, .height = h } }, 0);
+    try std.testing.expectEqualSlices(u8, px, &out);
 }
