@@ -126,6 +126,12 @@ pub const IOSurface = struct {
     }
 };
 
+/// Base address of a surface identified only by its ref (e.g. one obtained
+/// from another module). Returns null if the ref has no mapping.
+pub fn baseAddressOf(ref: Ref) ?[*]u8 {
+    return IOSurfaceGetBaseAddress(ref);
+}
+
 test "iosurface: tight-stride BGRA surface is CPU-writable" {
     const surf = IOSurface.createBGRA(64, 32) orelse return error.SkipZigTest;
     defer surf.release();

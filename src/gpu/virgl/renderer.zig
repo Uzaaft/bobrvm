@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const metal = @import("../metal.zig");
 const proto = @import("protocol.zig");
 const tgsi = @import("tgsi.zig");
+const iosurface = @import("../iosurface.zig");
 
 const NSUInteger = metal.NSUInteger;
 
@@ -26,6 +27,10 @@ pub const Target = struct {
     width: u32,
     height: u32,
     format: metal.MTLPixelFormat,
+    /// IOSurface the texture is rendered into, when this target is presentable
+    /// (BGRA8). Lets the display renderer wrap its own texture over the same
+    /// pixels and blit them straight to screen — no readback, no re-upload.
+    surface: ?iosurface.IOSurface = null,
 };
 
 pub const Error = error{
@@ -134,7 +139,10 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         var it = self.targets.valueIterator();
-        while (it.next()) |t| t.tex.release();
+        while (it.next()) |t| {
+            t.tex.release();
+            if (t.surface) |s| s.release();
+        }
         self.targets.deinit();
         var pit = self.passthrough.valueIterator();
         while (pit.next()) |p| p.release();
@@ -156,21 +164,44 @@ pub const Renderer = struct {
     ) Error!void {
         if (width == 0 or height == 0) return Error.TextureCreateFailed;
         const mtl_fmt = mapFormat(format);
-        const tex = self.device.newTexture2D(
-            mtl_fmt,
-            width,
-            height,
-            metal.MTLTextureUsage.render_target | metal.MTLTextureUsage.shader_read,
-            .shared,
-        ) orelse return Error.TextureCreateFailed;
+        const usage = metal.MTLTextureUsage.render_target | metal.MTLTextureUsage.shader_read;
 
-        if (self.targets.fetchRemove(handle)) |old| old.value.tex.release();
+        // For a presentable (BGRA8) target, render into an IOSurface so the
+        // display renderer can wrap it and present without a readback round-trip.
+        // Any failure falls back to a plain texture (readback present path).
+        var surface: ?iosurface.IOSurface = null;
+        var tex: ?metal.Texture = null;
+        if (mtl_fmt == .bgra8Unorm) {
+            if (iosurface.IOSurface.createBGRA(width, height)) |surf| {
+                if (self.device.newTextureFromIOSurface(mtl_fmt, width, height, surf.ref, usage)) |t| {
+                    surface = surf;
+                    tex = t;
+                } else {
+                    surf.release();
+                }
+            }
+        }
+        const final_tex = tex orelse (self.device.newTexture2D(mtl_fmt, width, height, usage, .shared) orelse
+            return Error.TextureCreateFailed);
+
+        if (self.targets.fetchRemove(handle)) |old| {
+            old.value.tex.release();
+            if (old.value.surface) |s| s.release();
+        }
         try self.targets.put(handle, .{
-            .tex = tex,
+            .tex = final_tex,
             .width = width,
             .height = height,
             .format = mtl_fmt,
+            .surface = surface,
         });
+    }
+
+    /// The IOSurfaceRef a target renders into, if it is presentable (BGRA8) and
+    /// IOSurface-backed. The display renderer uses it for zero-copy present.
+    pub fn targetSurfaceRef(self: *Renderer, handle: ResourceHandle) ?*anyopaque {
+        const target = self.targets.get(handle) orelse return null;
+        return if (target.surface) |s| s.ref else null;
     }
 
     pub fn getTarget(self: *Renderer, handle: ResourceHandle) ?Target {
@@ -568,6 +599,42 @@ test "clear render target produces exact pixels" {
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expect_g)), @as(f32, @floatFromInt(buf[o + 1])), 1.5);
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expect_r)), @as(f32, @floatFromInt(buf[o + 2])), 1.5);
         try std.testing.expectEqual(expect_a, buf[o + 3]);
+    }
+}
+
+test "BGRA render target is IOSurface-backed and presents without readback" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch |err| {
+        if (err == Error.NoMetalDevice) return error.SkipZigTest;
+        return err;
+    };
+    defer r.deinit();
+
+    const w: u32 = 16;
+    const h: u32 = 8;
+    try r.createRenderTarget(1, .b8g8r8a8_unorm, w, h);
+
+    // A presentable BGRA target must expose an IOSurface for zero-copy present.
+    const ref = r.targetSurfaceRef(1) orelse return error.SkipZigTest;
+
+    // Clear on the GPU (clearTarget commits + waits), then read the pixels
+    // straight from the IOSurface's shared memory — no getBytes readback. This
+    // is exactly what the display renderer relies on for 3D direct-present.
+    try r.clearTarget(1, .{ 0.25, 0.5, 0.75, 1.0 });
+
+    const base = iosurface.baseAddressOf(ref) orelse return error.SkipZigTest;
+    const px = base[0 .. @as(usize, w) * h * 4];
+
+    const expect_b: u8 = @intFromFloat(@round(0.75 * 255.0));
+    const expect_g: u8 = @intFromFloat(@round(0.5 * 255.0));
+    const expect_r: u8 = @intFromFloat(@round(0.25 * 255.0));
+    const samples = [_]usize{ 0, (w * h / 2), (w * h - 1) };
+    for (samples) |p| {
+        const o = p * 4;
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expect_b)), @as(f32, @floatFromInt(px[o + 0])), 1.5);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expect_g)), @as(f32, @floatFromInt(px[o + 1])), 1.5);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expect_r)), @as(f32, @floatFromInt(px[o + 2])), 1.5);
+        try std.testing.expectEqual(@as(u8, 255), px[o + 3]);
     }
 }
 

@@ -244,6 +244,7 @@ pub const Device = struct {
         width: u32,
         height: u32,
         surface: *anyopaque,
+        usage: NSUInteger,
     ) ?Texture {
         const desc_class = cls("MTLTextureDescriptor") orelse return null;
         const s = sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:");
@@ -252,7 +253,7 @@ pub const Device = struct {
         const desc = dfunc(desc_class, s, @intFromEnum(format), width, height, false) orelse return null;
 
         const set_usage: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
-        set_usage(desc, sel("setUsage:"), MTLTextureUsage.shader_read);
+        set_usage(desc, sel("setUsage:"), usage);
         const set_storage: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
         set_storage(desc, sel("setStorageMode:"), @intFromEnum(MTLStorageMode.shared));
 
@@ -904,7 +905,9 @@ pub const FrameRenderer = struct {
         surface: ?*anyopaque,
     ) bool {
         assert(width > 0 and height > 0);
-        assert(data.len >= @as(usize, width) * height * 4);
+        // `data` is only consumed by the upload fallback; the zero-copy path
+        // reads pixels straight from `surface`.
+        assert(surface != null or data.len >= @as(usize, width) * height * 4);
 
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
@@ -921,6 +924,7 @@ pub const FrameRenderer = struct {
                     width,
                     height,
                     surf,
+                    MTLTextureUsage.shader_read, // blit source only
                 ) orelse return false;
                 self.surface_ref = surf;
                 self.surface_width = width;
@@ -1009,7 +1013,7 @@ test "IOSurface-backed texture aliases CPU writes (zero-copy scanout)" {
 
     // Wrap a texture over the SAME memory (no replaceRegion) and read it back
     // through Metal: the GPU must see exactly what the CPU wrote.
-    const tex = device.newTextureFromIOSurface(.bgra8Unorm, w, h, surf.ref) orelse
+    const tex = device.newTextureFromIOSurface(.bgra8Unorm, w, h, surf.ref, MTLTextureUsage.shader_read) orelse
         return error.SkipZigTest;
     defer tex.release();
 

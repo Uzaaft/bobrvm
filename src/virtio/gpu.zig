@@ -338,6 +338,11 @@ pub const Gpu = struct {
     scanout3d_data: []u8 = &.{},
     scanout3d_w: u32 = 0,
     scanout3d_h: u32 = 0,
+    /// True once a flush found the 3D scanout target IOSurface-backed, so the
+    /// readback into scanout3d_data is skipped. The surface ref itself is NOT
+    /// cached — scanout() re-derives it live from the (mutex-guarded) target so
+    /// a destroyed/recreated target can never leave a dangling ref behind.
+    scanout3d_direct: bool = false,
     /// Count of submit_3d commands seen (used to log the first few for
     /// bring-up diagnostics without flooding the log).
     submit3d_seen: u32 = 0,
@@ -453,13 +458,21 @@ pub const Gpu = struct {
                 .surface = if (res.surface) |surf| surf.ref else null,
             };
         }
-        // 3D scanout: served from the GPU-texture readback buffer.
-        if (self.scanout3d_data.len > 0 and self.scanout3d_w > 0) {
+        // 3D scanout: present the render target's IOSurface directly when the
+        // target is still live and IOSurface-backed, otherwise the readback
+        // buffer. Re-derive the ref live (guarded by scanout_mutex) so a
+        // destroyed/recreated target yields null here instead of a dangling ref.
+        const surf = if (self.scanout3d_direct)
+            self.gpu_device.scanoutSurfaceRef(self.scanout_resource_id)
+        else
+            null;
+        if (self.scanout3d_w > 0 and (surf != null or self.scanout3d_data.len > 0)) {
             return .{
                 .data = self.scanout3d_data,
                 .width = self.scanout3d_w,
                 .height = self.scanout3d_h,
                 .generation = self.frame_generation,
+                .surface = surf,
             };
         }
         return null;
@@ -787,6 +800,18 @@ pub const Gpu = struct {
         if (self.resources.contains(id)) return; // 2D path
         const res = self.gpu_device.getResource(id) orelse return;
         if (res.width == 0 or res.height == 0) return;
+
+        // Zero-copy path: the target renders straight into an IOSurface, so
+        // just mark direct-present — scanout() re-derives the live ref itself.
+        if (self.gpu_device.scanoutSurfaceRef(id) != null) {
+            self.scanout3d_direct = true;
+            self.scanout3d_w = res.width;
+            self.scanout3d_h = res.height;
+            return;
+        }
+
+        // Fallback: read the rendered pixels back into a host buffer.
+        self.scanout3d_direct = false;
         const needed = @as(usize, res.width) * res.height * 4;
         if (self.scanout3d_data.len != needed) {
             const nb = if (self.scanout3d_data.len == 0)
@@ -1442,9 +1467,15 @@ test "3D scanout presents rendered GPU pixels" {
 
     const view = gpu.scanout() orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 32), view.width);
+    // Pixels come from the render target's IOSurface directly (zero-copy 3D
+    // present) when available, otherwise from the readback buffer.
+    const pixels = if (view.surface) |surf|
+        (iosurface.baseAddressOf(surf) orelse return error.TestUnexpectedResult)[0 .. @as(usize, view.width) * view.height * 4]
+    else
+        view.data;
     const c = ((16 * 32) + 16) * 4;
     // Red in BGRA host memory: B<40, G<40, R>200.
-    try testing.expect(view.data[c + 2] > 200 and view.data[c + 1] < 40 and view.data[c + 0] < 40);
+    try testing.expect(pixels[c + 2] > 200 and pixels[c + 1] < 40 and pixels[c + 0] < 40);
 }
 
 test "scanout frame generation advances only on flush of the scanout" {
