@@ -487,7 +487,7 @@ fn emitLocals(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
 /// Translate a parsed program to MSL. Only the MOV subset is emitted;
 /// unsupported opcodes become comments so the shader still compiles.
 pub fn emit(alloc: Allocator, prog: *const Program) Error!Msl {
-    var w = std.ArrayListUnmanaged(u8){};
+    var w: std.ArrayListUnmanaged(u8) = .empty;
     errdefer w.deinit(alloc);
 
     try app(&w, alloc, "#include <metal_stdlib>\nusing namespace metal;\n", .{});

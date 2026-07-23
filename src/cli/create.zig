@@ -7,7 +7,7 @@ const Config = @import("Config.zig");
 
 const log = std.log.scoped(.cli);
 
-pub fn execute(alloc: Allocator, args: *std.process.ArgIterator) !void {
+pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     const name = args.next() orelse {
         log.err("missing VM name", .{});
         printHelp();
@@ -37,7 +37,7 @@ pub fn execute(alloc: Allocator, args: *std.process.ArgIterator) !void {
     const stdout = std.posix.STDOUT_FILENO;
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "Created VM '{s}'\n", .{name}) catch return;
-    _ = std.posix.write(stdout, msg) catch {};
+    _ = std.c.write(stdout, msg.ptr, msg.len);
 }
 
 fn printHelp() void {
@@ -50,7 +50,7 @@ fn printHelp() void {
         \\  <name>    Name for the VM configuration
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, help) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, help.ptr, help.len);
     Config.printOptions();
 
     const examples =
@@ -59,5 +59,5 @@ fn printHelp() void {
         \\  bobrvm create devbox --kernel vmlinuz --disk root.raw
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, examples) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, examples.ptr, examples.len);
 }

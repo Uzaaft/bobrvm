@@ -14,6 +14,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
@@ -61,7 +62,7 @@ pub const Net = struct {
     /// Frames waiting for guest RX buffers. Guarded by rx_mutex: backend
     /// threads append, the vCPU thread drains via pollRx.
     rx_frames: std.ArrayListUnmanaged([]u8),
-    rx_mutex: std.Thread.Mutex,
+    rx_mutex: std.Io.Mutex,
 
     /// Guest memory accessor.
     guest_memory: ?ring.GetMemFn,
@@ -97,8 +98,8 @@ pub const Net = struct {
             .config = .{ .mac = GUEST_MAC },
             .rx_last_avail = 0,
             .tx_last_avail = 0,
-            .rx_frames = .{},
-            .rx_mutex = .{},
+            .rx_frames = .empty,
+            .rx_mutex = .init,
             .guest_memory = null,
             .tx_callback = null,
             .tx_userdata = null,
@@ -133,8 +134,8 @@ pub const Net = struct {
         if (frame.len == 0 or frame.len > MAX_FRAME) return;
         const copy = self.alloc.dupe(u8, frame) catch return;
 
-        self.rx_mutex.lock();
-        defer self.rx_mutex.unlock();
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
         if (self.rx_frames.items.len >= MAX_RX_QUEUED) {
             self.alloc.free(copy);
             return;
@@ -148,8 +149,8 @@ pub const Net = struct {
     /// (leaving data in their own buffers) when this is false, so the
     /// queue never overflows. Thread-safe.
     pub fn rxReady(self: *Net) bool {
-        self.rx_mutex.lock();
-        defer self.rx_mutex.unlock();
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
         return self.rx_frames.items.len < RX_BACKPRESSURE;
     }
 
@@ -267,8 +268,8 @@ pub const Net = struct {
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
 
-        self.rx_mutex.lock();
-        defer self.rx_mutex.unlock();
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
         if (self.rx_frames.items.len == 0) return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;

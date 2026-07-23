@@ -16,6 +16,8 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const metal = @import("../gpu/metal.zig");
+const global = @import("../global.zig");
+const thread_compat = @import("../compat/thread.zig");
 
 const log = std.log.scoped(.renderer);
 
@@ -90,8 +92,8 @@ pub const Mailbox = struct {
     write: u32 = 0,
     read: u32 = 0,
     len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
 
     pub fn init() Mailbox {
         return .{};
@@ -100,26 +102,28 @@ pub const Mailbox = struct {
     /// Push a message to the mailbox.
     /// Blocks if mailbox is full (backpressure).
     pub fn push(self: *Mailbox, msg: Message) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         // Wait for space
         while (self.len.load(.acquire) >= MAILBOX_CAPACITY) {
-            self.cond.wait(&self.mutex);
+            self.cond.waitUncancelable(io, &self.mutex);
         }
 
         self.data[self.write % MAILBOX_CAPACITY] = msg;
         self.write +%= 1;
         _ = self.len.fetchAdd(1, .release);
 
-        self.cond.signal();
+        self.cond.signal(io);
     }
 
     /// Try to push without blocking.
     /// Returns false if mailbox is full.
     pub fn tryPush(self: *Mailbox, msg: Message) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.len.load(.acquire) >= MAILBOX_CAPACITY) {
             return false;
@@ -129,15 +133,16 @@ pub const Mailbox = struct {
         self.write +%= 1;
         _ = self.len.fetchAdd(1, .release);
 
-        self.cond.signal();
+        self.cond.signal(io);
         return true;
     }
 
     /// Pop a message from the mailbox.
     /// Returns null if empty.
     pub fn pop(self: *Mailbox) ?Message {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.len.load(.acquire) == 0) {
             return null;
@@ -147,18 +152,21 @@ pub const Mailbox = struct {
         self.read +%= 1;
         _ = self.len.fetchSub(1, .release);
 
-        self.cond.signal();
+        self.cond.signal(io);
         return msg;
     }
 
     /// Wait for a message with timeout.
     /// Returns null on timeout.
     pub fn waitPop(self: *Mailbox, timeout_ns: u64) ?Message {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.len.load(.acquire) == 0) {
-            self.cond.timedWait(&self.mutex, timeout_ns) catch {};
+            thread_compat.waitTimeout(&self.cond, io, &self.mutex, .{
+                .duration = .{ .raw = .{ .nanoseconds = @intCast(timeout_ns) }, .clock = .awake },
+            }) catch {};
             if (self.len.load(.acquire) == 0) {
                 return null;
             }
@@ -178,9 +186,10 @@ pub const Mailbox = struct {
 
     /// Wake up a waiting consumer.
     pub fn wakeup(self: *Mailbox) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.cond.signal();
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.cond.signal(io);
     }
 };
 
@@ -197,7 +206,7 @@ pub const Wakeup = struct {
     pub fn notify(self: *Wakeup) void {
         const prev = self.state.swap(NOTIFIED, .release);
         if (prev == WAITING) {
-            std.Thread.Futex.wake(&self.state, 1);
+            global.io().futexWake(u32, &self.state.raw, 1);
         }
     }
 
@@ -218,7 +227,7 @@ pub const Wakeup = struct {
                 continue;
             }
 
-            std.Thread.Futex.wait(&self.state, WAITING);
+            global.io().futexWaitUncancelable(u32, &self.state.raw, WAITING);
             s = self.state.load(.acquire);
         }
     }
@@ -240,7 +249,9 @@ pub const Wakeup = struct {
                 continue;
             }
 
-            std.Thread.Futex.timedWait(&self.state, WAITING, timeout_ns) catch {};
+            global.io().futexWaitTimeout(u32, &self.state.raw, WAITING, .{
+                .duration = .{ .raw = .{ .nanoseconds = @intCast(timeout_ns) }, .clock = .awake },
+            }) catch {};
             s = self.state.load(.acquire);
             return s == NOTIFIED;
         }

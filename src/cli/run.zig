@@ -8,7 +8,7 @@ const runner = @import("runner.zig");
 
 const log = std.log.scoped(.cli);
 
-pub fn execute(alloc: Allocator, args: *std.process.ArgIterator) !void {
+pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     const config = Config.parseArgs(args) catch |err| {
         if (err == error.HelpRequested) {
             printHelp();
@@ -27,7 +27,7 @@ fn printHelp() void {
         \\Run a VM directly with the specified options.
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, help) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, help.ptr, help.len);
     Config.printOptions();
 
     const examples =
@@ -37,5 +37,5 @@ fn printHelp() void {
         \\  bobrvm run --firmware QEMU_EFI.fd --disk root.raw --disk2 install.iso
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, examples) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, examples.ptr, examples.len);
 }

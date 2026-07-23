@@ -8,7 +8,7 @@ const runner = @import("runner.zig");
 
 const log = std.log.scoped(.cli);
 
-pub fn execute(alloc: Allocator, args: *std.process.ArgIterator) !void {
+pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     const name = args.next() orelse {
         log.err("missing VM name", .{});
         printHelp();
@@ -43,5 +43,5 @@ fn printHelp() void {
         \\Use 'bobrvm list' to see available VMs.
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, help) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, help.ptr, help.len);
 }

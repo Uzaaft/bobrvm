@@ -17,8 +17,8 @@ pub fn build(b: *std.Build) void {
     // A sandboxed `nix build` sets NIX_BUILD_TOP but not IN_NIX_SHELL;
     // `nix develop` sets both. Codesigning must run in the dev shell (the
     // CLI needs the hypervisor entitlement) but can't run in the sandbox.
-    const in_nix_shell = b.graph.env_map.get("IN_NIX_SHELL") != null;
-    const is_nix_build = b.graph.env_map.get("NIX_BUILD_TOP") != null and !in_nix_shell;
+    const in_nix_shell = b.graph.environ_map.get("IN_NIX_SHELL") != null;
+    const is_nix_build = b.graph.environ_map.get("NIX_BUILD_TOP") != null and !in_nix_shell;
     // Swift/Xcode/Ghostty steps never run under nix (nix builds the Zig core
     // only); resolving the ghostty dependency inside a nix shell also fails
     // because ghostty's apple-sdk detection can't see the real Darwin SDK.
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     // Link system frameworks on macOS
     if (target.result.os.tag == .macos) {
         // Add framework search path from SDKROOT if available
-        if (b.graph.env_map.get("SDKROOT")) |sdk| {
+        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
             const library_path = b.fmt("{s}/usr/lib", .{sdk});
@@ -88,7 +88,7 @@ pub fn build(b: *std.Build) void {
 
     // Link system frameworks for CLI on macOS
     if (target.result.os.tag == .macos) {
-        if (b.graph.env_map.get("SDKROOT")) |sdk| {
+        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
             const library_path = b.fmt("{s}/usr/lib", .{sdk});
@@ -157,7 +157,7 @@ pub fn build(b: *std.Build) void {
         // nix's xcrun/xcodebuild shims sit ahead of /usr/bin on PATH and
         // resolve the SDK to a mismatched nix-provided one; put the real
         // system toolchain first so swiftc finds Xcode's actual SDK.
-        if (b.graph.env_map.get("PATH")) |path| {
+        if (b.graph.environ_map.get("PATH")) |path| {
             gui_build.setEnvironmentVariable("PATH", b.fmt("/usr/bin:/bin:{s}", .{path}));
         }
 
@@ -183,7 +183,7 @@ pub fn build(b: *std.Build) void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
-        if (b.graph.env_map.get("SDKROOT")) |sdk| {
+        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
             const library_path = b.fmt("{s}/usr/lib", .{sdk});
@@ -241,8 +241,22 @@ pub fn build(b: *std.Build) void {
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // XCFramework + app steps (macOS only, never under nix)
-    if (target.result.os.tag == .macos and !in_nix) {
+    // XCFramework + app steps (macOS only, never under nix). The vendored
+    // ghostty dependency pins its own build.zig to zig 0.15.2 exactly
+    // (build.zig.zon requireZig) and hasn't been updated for 0.16+; skip
+    // this whole block on other compilers rather than hard error, so the
+    // core lib/cli/gui/test targets keep working on newer system zig.
+    const zig_version = @import("builtin").zig_version;
+    const ghostty_zig_compatible = zig_version.major == 0 and zig_version.minor == 15;
+    if (target.result.os.tag == .macos and !in_nix and !ghostty_zig_compatible) {
+        std.debug.print(
+            "note: skipping ghostty-lib/xcframework/run steps — the vendored " ++
+                "ghostty dependency requires zig 0.15.2, this is {}. Use `nix develop` " ++
+                "for those steps; gui/cli/test/install are unaffected.\n",
+            .{zig_version},
+        );
+    }
+    if (target.result.os.tag == .macos and !in_nix and ghostty_zig_compatible) {
         const ghostty_steps = addGhosttySteps(b, optimize);
         const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
         ghostty_step.dependOn(ghostty_steps.install_root_step);

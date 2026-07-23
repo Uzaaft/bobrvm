@@ -56,7 +56,7 @@ fn logToStderr(
     const stderr = std.posix.STDERR_FILENO;
     var buf: [4096]u8 = undefined;
     const msg = nosuspend std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
-    _ = std.posix.write(stderr, msg) catch return;
+    _ = std.c.write(stderr, msg.ptr, msg.len);
 }
 
 /// Log to macOS unified logging system.

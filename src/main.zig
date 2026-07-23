@@ -35,15 +35,15 @@ fn logFn(
     const stderr = std.posix.STDERR_FILENO;
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
-    _ = std.posix.write(stderr, msg) catch return;
+    _ = std.c.write(stderr, msg.ptr, msg.len);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(minimal: std.process.Init.Minimal) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    cli.dispatch(alloc) catch |err| {
+    cli.dispatch(alloc, minimal) catch |err| {
         switch (err) {
             error.HelpRequested, error.VersionRequested => return,
             error.UnknownSubcommand => std.process.exit(1),

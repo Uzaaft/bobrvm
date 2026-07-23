@@ -10,6 +10,15 @@ const os = @import("../os/main.zig");
 
 const log = std.log.scoped(.cli);
 
+/// zig 0.16 removed std.Thread.sleep in favor of the Io.Clock
+/// abstraction; thin wrapper for these debug-hook sleeps.
+fn sleepNs(ns: u64) void {
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = @intCast(ns) },
+        .clock = .awake,
+    }, global.io()) catch {};
+}
+
 pub fn run(alloc: Allocator, config: *const Config) !void {
     global.state.init();
     defer global.state.deinit();
@@ -60,15 +69,15 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
 
     // Debug: dump scanout frames when BOBRVM_DUMP_FRAMES=<dir> is set.
     if (config.enable_gpu) {
-        if (std.posix.getenv("BOBRVM_DUMP_FRAMES")) |dir| {
-            frame_dump_dir = dir;
+        if (std.c.getenv("BOBRVM_DUMP_FRAMES")) |dir| {
+            frame_dump_dir = std.mem.span(dir);
             frame_machine = hw;
             hw.setFrameCallback(frameDump, null);
         }
 
         // Debug: periodically inject synthetic key presses so guest-side
         // virtio-input delivery can be verified headlessly.
-        if (std.posix.getenv("BOBRVM_TEST_KEYS") != null) {
+        if (std.c.getenv("BOBRVM_TEST_KEYS") != null) {
             const t = std.Thread.spawn(.{}, testKeyLoop, .{hw}) catch null;
             if (t) |thread| thread.detach();
         }
@@ -76,9 +85,10 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         // Debug: type BOBRVM_TEST_TYPE on the virtio keyboard after
         // BOBRVM_TEST_TYPE_DELAY seconds (default 120), for verifying
         // the GUI shell path (VT keyboard -> tty1 getty) headlessly.
-        if (std.posix.getenv("BOBRVM_TEST_TYPE")) |text| {
-            const delay_s: u64 = if (std.posix.getenv("BOBRVM_TEST_TYPE_DELAY")) |d|
-                std.fmt.parseInt(u64, d, 10) catch 120
+        if (std.c.getenv("BOBRVM_TEST_TYPE")) |text_ptr| {
+            const text = std.mem.span(text_ptr);
+            const delay_s: u64 = if (std.c.getenv("BOBRVM_TEST_TYPE_DELAY")) |d|
+                std.fmt.parseInt(u64, std.mem.span(d), 10) catch 120
             else
                 120;
             const t = std.Thread.spawn(.{}, testTypeLoop, .{ hw, text, delay_s }) catch null;
@@ -89,7 +99,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
     // the guest. Ctrl-] detaches and shuts down, like telnet.
     const stdin_fd = std.posix.STDIN_FILENO;
-    const stdin_is_tty = std.posix.isatty(stdin_fd);
+    const stdin_is_tty = std.c.isatty(stdin_fd) != 0;
     if (stdin_is_tty) {
         if (std.posix.tcgetattr(stdin_fd)) |t| {
             saved_termios = t;
@@ -128,13 +138,13 @@ var frame_count: u32 = 0;
 
 /// Inject 'a' key presses every second (BOBRVM_TEST_KEYS debug hook).
 fn testKeyLoop(hw: *machine.Machine) void {
-    std.Thread.sleep(15 * std.time.ns_per_s);
+    sleepNs(15 * std.time.ns_per_s);
     var i: u32 = 0;
     while (i < 600) : (i += 1) {
         hw.injectKey(30, true); // KEY_A
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        sleepNs(50 * std.time.ns_per_ms);
         hw.injectKey(30, false);
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        sleepNs(1 * std.time.ns_per_s);
     }
 }
 
@@ -191,15 +201,15 @@ fn asciiToEvdev(char: u8) u16 {
 
 /// Type a string on the virtio keyboard (BOBRVM_TEST_TYPE debug hook).
 fn testTypeLoop(hw: *machine.Machine, text: []const u8, delay_s: u64) void {
-    std.Thread.sleep(delay_s * std.time.ns_per_s);
+    sleepNs(delay_s * std.time.ns_per_s);
     log.info("typing test string on virtio keyboard", .{});
     for (text) |char| {
         const code = asciiToEvdev(char);
         if (code == 0) continue;
         hw.injectKey(code, true);
-        std.Thread.sleep(40 * std.time.ns_per_ms);
+        sleepNs(40 * std.time.ns_per_ms);
         hw.injectKey(code, false);
-        std.Thread.sleep(80 * std.time.ns_per_ms);
+        sleepNs(80 * std.time.ns_per_ms);
     }
 }
 
@@ -218,9 +228,9 @@ fn frameDump(_: ?*anyopaque) void {
     const path = std.fmt.bufPrint(&buf, "{s}/frame-{d}-{d}x{d}.bgra", .{
         dir, frame_count, scan.width, scan.height,
     }) catch return;
-    const file = std.fs.cwd().createFile(path, .{}) catch return;
-    defer file.close();
-    file.writeAll(scan.data) catch {};
+    const file = std.Io.Dir.cwd().createFile(global.io(), path, .{}) catch return;
+    defer file.close(global.io());
+    file.writePositionalAll(global.io(), scan.data, 0) catch {};
     log.info("dumped frame {} ({}x{})", .{ frame_count, scan.width, scan.height });
 }
 
@@ -255,7 +265,7 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
 
 fn consoleOutput(data: []const u8, _: ?*anyopaque) void {
     const stdout = std.posix.STDOUT_FILENO;
-    _ = std.posix.write(stdout, data) catch {};
+    _ = std.c.write(stdout, data.ptr, data.len);
 }
 
 var cleanup_machine: ?*machine.Machine = null;

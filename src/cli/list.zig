@@ -17,8 +17,8 @@ pub fn execute(alloc: Allocator) !void {
     const stdout = std.posix.STDOUT_FILENO;
 
     if (names.len == 0) {
-        _ = std.posix.write(stdout, "No VMs configured.\n") catch {};
-        _ = std.posix.write(stdout, "Use 'bobrvm create <name> [options]' to create one.\n") catch {};
+        _ = std.c.write(stdout, "No VMs configured.\n".ptr, "No VMs configured.\n".len);
+        _ = std.c.write(stdout, "Use 'bobrvm create <name> [options]' to create one.\n".ptr, "Use 'bobrvm create <name> [options]' to create one.\n".len);
         return;
     }
 
@@ -29,7 +29,7 @@ pub fn execute(alloc: Allocator) !void {
         "CPUS",
         "DISK",
     }) catch return;
-    _ = std.posix.write(stdout, header) catch {};
+    _ = std.c.write(stdout, header.ptr, header.len);
 
     for (names) |name| {
         var loaded = Config.load(alloc, name) catch |err| {
@@ -50,6 +50,6 @@ pub fn execute(alloc: Allocator) !void {
             config.vcpu_count,
             disk_display,
         }) catch continue;
-        _ = std.posix.write(stdout, line) catch {};
+        _ = std.c.write(stdout, line.ptr, line.len);
     }
 }

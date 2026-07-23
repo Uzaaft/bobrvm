@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 
 const log = std.log.scoped(.uart);
 
@@ -73,7 +74,7 @@ pub const Uart = struct {
     rx_fifo: [RX_FIFO_SIZE]u8 = undefined,
     rx_head: usize = 0,
     rx_len: usize = 0,
-    rx_mutex: std.Thread.Mutex = .{},
+    rx_mutex: std.Io.Mutex = .init,
 
     /// Last IRQ level we reported, to avoid redundant callbacks.
     irq_level: bool = false,
@@ -104,20 +105,20 @@ pub const Uart = struct {
 
     /// Queue host input for the guest. Drops bytes if the FIFO is full.
     pub fn queueInput(self: *Uart, data: []const u8) void {
-        self.rx_mutex.lock();
+        self.rx_mutex.lockUncancelable(global.io());
         for (data) |byte| {
             if (self.rx_len >= RX_FIFO_SIZE) break;
             const tail = (self.rx_head + self.rx_len) % RX_FIFO_SIZE;
             self.rx_fifo[tail] = byte;
             self.rx_len += 1;
         }
-        self.rx_mutex.unlock();
+        self.rx_mutex.unlock(global.io());
         self.updateIrq();
     }
 
     fn rxPop(self: *Uart) ?u8 {
-        self.rx_mutex.lock();
-        defer self.rx_mutex.unlock();
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
         if (self.rx_len == 0) return null;
         const byte = self.rx_fifo[self.rx_head];
         self.rx_head = (self.rx_head + 1) % RX_FIFO_SIZE;
@@ -126,8 +127,8 @@ pub const Uart = struct {
     }
 
     fn rxEmpty(self: *Uart) bool {
-        self.rx_mutex.lock();
-        defer self.rx_mutex.unlock();
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
         return self.rx_len == 0;
     }
 

@@ -12,6 +12,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
+const thread_compat = @import("../compat/thread.zig");
 
 const hypervisor = @import("../hypervisor/main.zig");
 const virtio = @import("../virtio/main.zig");
@@ -175,8 +177,8 @@ const VcpuRunState = struct {
     /// WFI wait: the vCPU thread blocks here when the guest halts with no
     /// deliverable interrupt; kickCpu signals it so device IRQs from
     /// other threads wake it immediately instead of after the poll tick.
-    wake_mutex: std.Thread.Mutex = .{},
-    wake_cond: std.Thread.Condition = .{},
+    wake_mutex: std.Io.Mutex = .init,
+    wake_cond: std.Io.Condition = .init,
 };
 
 pub const Machine = struct {
@@ -261,9 +263,9 @@ pub const Machine = struct {
 
     /// Machine-wide lock ("big machine lock"): serializes device and GIC
     /// state across vCPU threads and host input threads.
-    machine_lock: std.Thread.Mutex = .{},
+    machine_lock: std.Io.Mutex = .init,
 
-    pub const Error = hypervisor.Error || Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.WriteError || std.Thread.SpawnError || error{
+    pub const Error = hypervisor.Error || Allocator.Error || std.Io.File.OpenError || std.Io.File.ReadPositionalError || std.Io.File.StatError || std.Thread.SpawnError || error{
         KernelTooLarge,
         InitrdTooLarge,
         FirmwareTooLarge,
@@ -281,7 +283,7 @@ pub const Machine = struct {
         machine.* = .{
             .alloc = alloc,
             .config = config,
-            .vcpus = .{},
+            .vcpus = .empty,
         };
         machine.cpu_states = try alloc.alloc(VcpuRunState, config.vcpu_count);
         for (machine.cpu_states) |*state| state.* = .{};
@@ -378,9 +380,9 @@ pub const Machine = struct {
     /// Inject host input into the guest consoles. Thread-safe: buffers
     /// are drained on the vCPU thread.
     pub fn injectConsoleInput(self: *Machine, data: []const u8) void {
-        self.machine_lock.lock();
+        self.machine_lock.lockUncancelable(global.io());
         if (self.uart) |uart| uart.queueInput(data);
-        self.machine_lock.unlock();
+        self.machine_lock.unlock(global.io());
         if (self.console) |console| console.queueInput(data) catch {};
         self.kickCpu(0);
     }
@@ -541,9 +543,9 @@ pub const Machine = struct {
         // Kick every sync-loop vCPU out of hv_vcpu_run and wake any that
         // are WFI-halted on the condvar so they observe running=false.
         for (self.cpu_states) |*state| {
-            state.wake_mutex.lock();
-            state.wake_cond.signal();
-            state.wake_mutex.unlock();
+            state.wake_mutex.lockUncancelable(global.io());
+            state.wake_cond.signal(global.io());
+            state.wake_mutex.unlock(global.io());
             if (state.vcpu) |v| v.forceExit() catch {};
         }
 
@@ -652,9 +654,9 @@ pub const Machine = struct {
             // clears the pending interrupt at each hv_vcpu_run entry, so a
             // one-shot assert loses interrupts the guest had masked.
             _ = state.pending_irq.swap(false, .acq_rel);
-            self.machine_lock.lock();
+            self.machine_lock.lockUncancelable(global.io());
             const irq_line = if (self.gic_device) |g| g.hasDeliverableIrq(cpu_id) else false;
-            self.machine_lock.unlock();
+            self.machine_lock.unlock(global.io());
             try vcpu.setPendingInterrupt(.irq, irq_line);
 
             // Unmask the HVF vtimer once the guest has EOI'd PPI 27.
@@ -665,7 +667,7 @@ pub const Machine = struct {
             // Poll host-input-fed queues (vCPU 0 only; MMIO kicks from any
             // CPU are processed inline under the machine lock).
             if (cpu_id == 0) {
-                self.machine_lock.lock();
+                self.machine_lock.lockUncancelable(global.io());
                 if (self.console) |console| {
                     console.pollTransmit();
                     console.pollReceive();
@@ -673,7 +675,7 @@ pub const Machine = struct {
                 if (self.keyboard) |kbd| kbd.pollEvents();
                 if (self.mouse) |mouse| mouse.pollEvents();
                 if (self.net) |net| net.poll();
-                self.machine_lock.unlock();
+                self.machine_lock.unlock(global.io());
             }
 
             const exit_info = try vcpu.run();
@@ -690,44 +692,46 @@ pub const Machine = struct {
                     const ec = exit_info.exceptionClass();
                     switch (ec) {
                         .data_abort_lower, .data_abort_same => {
-                            self.machine_lock.lock();
-                            defer self.machine_lock.unlock();
+                            self.machine_lock.lockUncancelable(global.io());
+                            defer self.machine_lock.unlock(global.io());
                             try self.handleMmio(vcpu, exit_info);
                         },
                         .wf_trapped => {
                             // Poll console/input queues while halted
                             if (cpu_id == 0) {
-                                self.machine_lock.lock();
+                                self.machine_lock.lockUncancelable(global.io());
                                 if (self.console) |console| {
                                     console.pollTransmit();
                                     console.pollReceive();
                                 }
                                 if (self.keyboard) |kbd| kbd.pollEvents();
                                 if (self.mouse) |mouse| mouse.pollEvents();
-                                self.machine_lock.unlock();
+                                self.machine_lock.unlock(global.io());
                             }
                             try vcpu.advancePC(exit_info);
                             // Wait for an interrupt instead of busy-spinning.
                             // Skip the wait entirely if one is already
                             // deliverable; otherwise block until kickCpu
                             // signals or the 1ms timer-poll cap elapses.
-                            self.machine_lock.lock();
+                            self.machine_lock.lockUncancelable(global.io());
                             const has_irq = if (self.gic_device) |g| g.hasDeliverableIrq(cpu_id) else false;
-                            self.machine_lock.unlock();
+                            self.machine_lock.unlock(global.io());
                             if (!has_irq and !state.pending_irq.load(.acquire)) {
-                                state.wake_mutex.lock();
-                                state.wake_cond.timedWait(&state.wake_mutex, 1_000_000) catch {};
-                                state.wake_mutex.unlock();
+                                state.wake_mutex.lockUncancelable(global.io());
+                                thread_compat.waitTimeout(&state.wake_cond, global.io(), &state.wake_mutex, .{
+                                    .duration = .{ .raw = .{ .nanoseconds = 1_000_000 }, .clock = .awake },
+                                }) catch {};
+                                state.wake_mutex.unlock(global.io());
                             }
                         },
                         .hvc_aarch64, .smc_aarch64 => {
-                            self.machine_lock.lock();
-                            defer self.machine_lock.unlock();
+                            self.machine_lock.lockUncancelable(global.io());
+                            defer self.machine_lock.unlock(global.io());
                             try self.handlePsci(vcpu, exit_info);
                         },
                         .msr_mrs_system => {
-                            self.machine_lock.lock();
-                            defer self.machine_lock.unlock();
+                            self.machine_lock.lockUncancelable(global.io());
+                            defer self.machine_lock.unlock(global.io());
                             try self.handleSysReg(vcpu, cpu_id, exit_info);
                         },
                         else => {
@@ -744,11 +748,11 @@ pub const Machine = struct {
                 .vtimer_activated => {
                     // Pend the virtual timer PPI (intid 27). HVF masks the
                     // vtimer on this exit; we unmask when the guest EOIs.
-                    self.machine_lock.lock();
+                    self.machine_lock.lockUncancelable(global.io());
                     if (self.gic_device) |gic_dev| {
                         gic_dev.setPpiPending(cpu_id, 27, true);
                     }
-                    self.machine_lock.unlock();
+                    self.machine_lock.unlock(global.io());
                     try vcpu.setPendingInterrupt(.irq, true);
                 },
                 .unknown => {
@@ -1150,10 +1154,10 @@ pub const Machine = struct {
     fn loadKernel(self: *Machine, path: []const u8) !void {
         log.info("loading kernel: {s}", .{path});
 
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(global.io(), path, .{});
+        defer file.close(global.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(global.io());
         const kernel_size = stat.size;
 
         if (kernel_size > self.config.ram_size / 2) {
@@ -1165,18 +1169,20 @@ pub const Machine = struct {
         const ram_offset = MemoryLayout.KERNEL_BASE - MemoryLayout.RAM_BASE;
         const ram = self.ram.?;
 
-        // Read kernel into RAM
-        const bytes_read = try file.readAll(ram[ram_offset..]);
+        // Read kernel into RAM. Bounded to the file's own size (not the
+        // whole remaining RAM slice, which can be multiple GB) — some Io
+        // backends reject a single positional read that large with EINVAL.
+        const bytes_read = try file.readPositionalAll(global.io(), ram[ram_offset..][0..kernel_size], 0);
         log.info("loaded kernel: {} bytes at 0x{x}", .{ bytes_read, MemoryLayout.KERNEL_BASE });
     }
 
     fn loadInitrd(self: *Machine, path: []const u8) !void {
         log.info("loading initrd: {s}", .{path});
 
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(global.io(), path, .{});
+        defer file.close(global.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(global.io());
         const initrd_size = stat.size;
 
         // Calculate offset into RAM
@@ -1188,8 +1194,9 @@ pub const Machine = struct {
             return error.InitrdTooLarge;
         }
 
-        // Read initrd into RAM
-        const bytes_read = try file.readAll(ram[ram_offset..]);
+        // Read initrd into RAM. Bounded to the file's own size (see
+        // loadKernel for why we don't just pass the whole RAM slice).
+        const bytes_read = try file.readPositionalAll(global.io(), ram[ram_offset..][0..initrd_size], 0);
 
         // Track initrd location for DTB
         self.initrd_start = MemoryLayout.INITRD_BASE;
@@ -1230,10 +1237,10 @@ pub const Machine = struct {
         const firmware_path = self.config.firmware_path orelse return;
         log.info("loading firmware: {s}", .{firmware_path});
 
-        const file = try std.fs.cwd().openFile(firmware_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(global.io(), firmware_path, .{});
+        defer file.close(global.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(global.io());
         const firmware_size = stat.size;
 
         if (firmware_size > MemoryLayout.PFLASH_CODE_SIZE) {
@@ -1246,8 +1253,9 @@ pub const Machine = struct {
         // Zero-fill the pflash region first (firmware may be smaller than region)
         @memset(pflash, 0xFF); // Flash is typically 0xFF when erased
 
-        // Read firmware into pflash CODE region
-        const bytes_read = try file.readAll(pflash);
+        // Read firmware into pflash CODE region (bounded to the file's own
+        // size — see loadKernel for why we don't pass the whole region).
+        const bytes_read = try file.readPositionalAll(global.io(), pflash[0..firmware_size], 0);
         log.info("loaded firmware: {} bytes at 0x{x}", .{ bytes_read, MemoryLayout.PFLASH_CODE_BASE });
 
         // Load or create VARS file
@@ -1262,16 +1270,18 @@ pub const Machine = struct {
 
         // If vars_path is specified, try to load existing vars
         if (self.config.vars_path) |vars_path| {
-            const file = std.fs.cwd().openFile(vars_path, .{}) catch |err| {
+            const file = std.Io.Dir.cwd().openFile(global.io(), vars_path, .{}) catch |err| {
                 if (err == error.FileNotFound) {
                     log.info("UEFI vars file not found, will be created on shutdown: {s}", .{vars_path});
                     return;
                 }
                 return err;
             };
-            defer file.close();
+            defer file.close(global.io());
 
-            const bytes_read = try file.readAll(pflash_vars);
+            const stat = try file.stat(global.io());
+            const vars_size = @min(stat.size, pflash_vars.len);
+            const bytes_read = try file.readPositionalAll(global.io(), pflash_vars[0..vars_size], 0);
             log.info("loaded UEFI vars: {} bytes from {s}", .{ bytes_read, vars_path });
         }
     }
@@ -1927,9 +1937,9 @@ pub const Machine = struct {
         state.pending_irq.store(true, .release);
         // Wake a WFI-halted vCPU (blocked on the condvar) and force a
         // running one out of hv_vcpu_run.
-        state.wake_mutex.lock();
-        state.wake_cond.signal();
-        state.wake_mutex.unlock();
+        state.wake_mutex.lockUncancelable(global.io());
+        state.wake_cond.signal(global.io());
+        state.wake_mutex.unlock(global.io());
         if (state.vcpu) |v| v.forceExit() catch {};
     }
 };

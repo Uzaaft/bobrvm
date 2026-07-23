@@ -70,8 +70,8 @@ pub const VM = struct {
         vm.* = .{
             .alloc = alloc,
             .created = true,
-            .regions = .{},
-            .vcpus = .{},
+            .regions = .empty,
+            .vcpus = .empty,
         };
 
         // Post-condition: VM is created

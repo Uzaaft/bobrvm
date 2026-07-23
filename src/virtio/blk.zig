@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const Queue = @import("queue.zig");
 
@@ -126,7 +127,7 @@ pub const Block = struct {
     request_queue: Queue.VirtQueue,
 
     /// Backing file.
-    file: ?std.fs.File,
+    file: ?std.Io.File,
     capacity_bytes: u64,
     read_only: bool,
 
@@ -137,7 +138,7 @@ pub const Block = struct {
     interrupt_callback: ?*const fn (userdata: ?*anyopaque) void,
     interrupt_userdata: ?*anyopaque,
 
-    pub const Error = Allocator.Error || std.fs.File.OpenError;
+    pub const Error = Allocator.Error || std.Io.File.OpenError;
     pub const QUEUE_SIZE: u16 = 256;
     pub const SECTOR_SIZE: u64 = 512;
 
@@ -180,7 +181,7 @@ pub const Block = struct {
     }
 
     pub fn deinit(self: *Block) void {
-        if (self.file) |f| f.close();
+        if (self.file) |f| f.close(global.io());
         self.request_queue.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
@@ -188,19 +189,19 @@ pub const Block = struct {
 
     /// Attach a disk image file.
     pub fn attachDisk(self: *Block, path: []const u8, read_only: bool) !void {
-        const flags: std.fs.File.OpenFlags = if (read_only)
+        const flags: std.Io.Dir.OpenFileOptions = if (read_only)
             .{ .mode = .read_only }
         else
             .{ .mode = .read_write };
 
-        const file = try std.fs.cwd().openFile(path, flags);
-        errdefer file.close();
+        const file = try std.Io.Dir.cwd().openFile(global.io(), path, flags);
+        errdefer file.close(global.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(global.io());
         const size = stat.size;
 
         // Close any existing file
-        if (self.file) |f| f.close();
+        if (self.file) |f| f.close(global.io());
 
         self.file = file;
         self.capacity_bytes = size;
@@ -402,7 +403,7 @@ pub const Block = struct {
                     if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
                     const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
                     if (offset + buf.len > self.capacity_bytes) return .io_err;
-                    const n = file.preadAll(buf, offset) catch return .io_err;
+                    const n = file.readPositionalAll(global.io(), buf, offset) catch return .io_err;
                     // Short read within capacity: zero-fill (sparse tail).
                     @memset(buf[n..], 0);
                     offset += buf.len;
@@ -418,14 +419,14 @@ pub const Block = struct {
                     if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
                     const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
                     if (offset + buf.len > self.capacity_bytes) return .io_err;
-                    file.pwriteAll(buf, offset) catch return .io_err;
+                    file.writePositionalAll(global.io(), buf, offset) catch return .io_err;
                     offset += buf.len;
                 }
                 return .ok;
             },
             .flush => {
                 if (self.file) |f| {
-                    f.sync() catch return .io_err;
+                    f.sync(global.io()) catch return .io_err;
                 }
                 return .ok;
             },

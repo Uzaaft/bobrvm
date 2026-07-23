@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const Queue = @import("queue.zig");
 const ring = @import("ring.zig");
@@ -207,7 +208,7 @@ pub const Input = struct {
     /// Pending events to deliver. Guarded by events_mutex: the host
     /// UI thread appends, the vCPU thread drains via pollEvents.
     pending_events: std.ArrayListUnmanaged(InputEvent),
-    events_mutex: std.Thread.Mutex,
+    events_mutex: std.Io.Mutex,
 
     /// Shadow avail-ring cursors.
     event_last_avail: u16,
@@ -252,8 +253,8 @@ pub const Input = struct {
             .subtype = subtype,
             .event_queue = event_queue,
             .status_queue = status_queue,
-            .pending_events = .{},
-            .events_mutex = .{},
+            .pending_events = .empty,
+            .events_mutex = .init,
             .event_last_avail = 0,
             .status_last_avail = 0,
             .name = switch (subtype) {
@@ -389,8 +390,8 @@ pub const Input = struct {
     pub const PENDING_EVENTS_MAX: usize = 1024;
 
     fn queueEvent(self: *Input, event: InputEvent) !void {
-        self.events_mutex.lock();
-        defer self.events_mutex.unlock();
+        self.events_mutex.lockUncancelable(global.io());
+        defer self.events_mutex.unlock(global.io());
         // Bound the queue so a wedged guest can't grow it forever.
         if (self.pending_events.items.len >= PENDING_EVENTS_MAX) return;
         try self.pending_events.append(self.alloc, event);
@@ -562,8 +563,8 @@ pub const Input = struct {
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
 
-        self.events_mutex.lock();
-        defer self.events_mutex.unlock();
+        self.events_mutex.lockUncancelable(global.io());
+        defer self.events_mutex.unlock(global.io());
         if (self.pending_events.items.len == 0) return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;

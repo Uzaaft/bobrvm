@@ -13,6 +13,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
+
+/// zig 0.16 removed std.Thread.sleep in favor of the Io.Clock
+/// abstraction; thin wrapper for these vCPU-loop sleeps.
+fn sleepNs(ns: u64) void {
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = @intCast(ns) },
+        .clock = .awake,
+    }, global.io()) catch {};
+}
 const c = @import("c.zig");
 const Vcpu = @import("vcpu.zig").Vcpu;
 const ExitInfo = @import("vcpu.zig").ExitInfo;
@@ -231,7 +241,7 @@ pub const VcpuRunner = struct {
 
             // Check if halted (WFI)
             if (self.halted.load(.acquire)) {
-                std.Thread.sleep(1_000_000); // 1ms
+                sleepNs(1_000_000); // 1ms
                 continue;
             }
 
@@ -709,8 +719,8 @@ pub const VMRunner = struct {
         return .{
             .alloc = alloc,
             .vm = vm,
-            .vcpu_runners = .{},
-            .mmio_handlers = .{},
+            .vcpu_runners = .empty,
+            .mmio_handlers = .empty,
         };
     }
 
@@ -775,7 +785,7 @@ pub const VMRunner = struct {
         const stuck_threshold_ms: i64 = 500; // Consider stuck after 500ms
 
         while (self.running.load(.acquire)) {
-            std.Thread.sleep(kick_interval_ms * 1_000_000); // Convert to ns
+            sleepNs(kick_interval_ms * 1_000_000); // Convert to ns
 
             for (self.vcpu_runners.items) |*runner| {
                 const time_since_exit = runner.getTimeSinceLastExit();

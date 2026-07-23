@@ -30,8 +30,8 @@ pub const GlobalState = struct {
         if (self.initialized) return;
 
         // Parse BOBRVM_LOG environment variable if set
-        if (std.posix.getenv("BOBRVM_LOG")) |env_value| {
-            self.logging = parseLoggingConfig(env_value);
+        if (std.c.getenv("BOBRVM_LOG")) |env_value| {
+            self.logging = parseLoggingConfig(std.mem.span(env_value));
         }
 
         // Register signal handlers for graceful shutdown
@@ -52,6 +52,21 @@ pub const GlobalState = struct {
         self.active_app = app;
     }
 };
+
+/// The process-wide Io implementation backing every std.Io.Mutex/Condition
+/// lock/wait in bobrvm. We're a plain multi-threaded (not async) program —
+/// every vCPU/renderer/NAT-poll thread is a real std.Thread.spawn thread —
+/// so Zig's built-in "single threaded" Threaded instance is the right fit:
+/// Mutex/Condition futex ops only special-case on the target's
+/// builtin.single_threaded (false for us), so they still use real OS futex
+/// syscalls here; this preset only skips the async/concurrent worker pool
+/// we never use. Being a static value (no init() call required) also means
+/// it's safe from unit tests that construct components directly, without
+/// going through GlobalState.init(). Pattern follows Ghostty's global.io(),
+/// simplified since we don't thread Io through call signatures.
+pub fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
 
 /// Signal cleanup callback - destroys the active app.
 fn signalCleanup() void {

@@ -14,8 +14,19 @@
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
+const net_compat = @import("../compat/net.zig");
+const global = @import("../global.zig");
 
 const log = std.log.scoped(.mininat);
+
+/// Wall-clock seconds since epoch, for flow idle-timeout bookkeeping.
+/// zig 0.16 removed std.time.timestamp() in favor of the Io.Clock
+/// abstraction; this is a thin wrapper since we just need coarse,
+/// relative "how long has this flow been idle" comparisons.
+fn nowSeconds() i64 {
+    const ns = std.Io.Clock.real.now(global.io()).nanoseconds;
+    return @intCast(@divTrunc(ns, std.time.ns_per_s));
+}
 
 pub const GUEST_IP = [4]u8{ 10, 0, 2, 15 };
 pub const GATEWAY_IP = [4]u8{ 10, 0, 2, 2 };
@@ -83,7 +94,7 @@ pub const MiniNat = struct {
     udp_flows: std.AutoHashMap(UdpKey, UdpFlow),
     tcp_flows: std.AutoHashMap(TcpKey, TcpFlow),
     icmp_flows: std.AutoHashMap(IcmpKey, IcmpFlow),
-    flows_mutex: std.Thread.Mutex = .{},
+    flows_mutex: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
 
@@ -135,13 +146,13 @@ pub const MiniNat = struct {
             self.poll_thread = null;
         }
         var iter = self.udp_flows.valueIterator();
-        while (iter.next()) |flow| std.posix.close(flow.socket);
+        while (iter.next()) |flow| net_compat.socketClose(flow.socket);
         self.udp_flows.deinit();
         var titer = self.tcp_flows.valueIterator();
-        while (titer.next()) |flow| std.posix.close(flow.socket);
+        while (titer.next()) |flow| net_compat.socketClose(flow.socket);
         self.tcp_flows.deinit();
         var iiter = self.icmp_flows.valueIterator();
-        while (iiter.next()) |flow| std.posix.close(flow.socket);
+        while (iiter.next()) |flow| net_compat.socketClose(flow.socket);
         self.icmp_flows.deinit();
     }
 
@@ -251,8 +262,8 @@ pub const MiniNat = struct {
             .remote_port = remote_port,
         };
 
-        self.flows_mutex.lock();
-        defer self.flows_mutex.unlock();
+        self.flows_mutex.lockUncancelable(global.io());
+        defer self.flows_mutex.unlock(global.io());
 
         const gop = self.udp_flows.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -260,7 +271,7 @@ pub const MiniNat = struct {
                 _ = self.udp_flows.remove(key);
                 return;
             }
-            const sock = std.posix.socket(
+            const sock = net_compat.socketCreate(
                 std.posix.AF.INET,
                 std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
                 0,
@@ -268,15 +279,15 @@ pub const MiniNat = struct {
                 _ = self.udp_flows.remove(key);
                 return;
             };
-            gop.value_ptr.* = .{ .socket = sock, .last_used = std.time.timestamp() };
+            gop.value_ptr.* = .{ .socket = sock, .last_used = nowSeconds() };
         }
-        gop.value_ptr.last_used = std.time.timestamp();
+        gop.value_ptr.last_used = nowSeconds();
 
         var addr = std.posix.sockaddr.in{
             .port = std.mem.nativeToBig(u16, remote_port),
             .addr = @bitCast(remote_ip),
         };
-        _ = std.posix.sendto(
+        _ = net_compat.sendto(
             gop.value_ptr.socket,
             payload,
             0,
@@ -296,8 +307,8 @@ pub const MiniNat = struct {
     ) void {
         const key = IcmpKey{ .remote_ip = remote_ip, .id = id };
 
-        self.flows_mutex.lock();
-        defer self.flows_mutex.unlock();
+        self.flows_mutex.lockUncancelable(global.io());
+        defer self.flows_mutex.unlock(global.io());
 
         const gop = self.icmp_flows.getOrPut(key) catch return;
         if (!gop.found_existing) {
@@ -305,7 +316,7 @@ pub const MiniNat = struct {
                 _ = self.icmp_flows.remove(key);
                 return;
             }
-            const sock = std.posix.socket(
+            const sock = net_compat.socketCreate(
                 std.posix.AF.INET,
                 std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
                 std.posix.IPPROTO.ICMP,
@@ -313,9 +324,9 @@ pub const MiniNat = struct {
                 _ = self.icmp_flows.remove(key);
                 return;
             };
-            gop.value_ptr.* = .{ .socket = sock, .last_used = std.time.timestamp() };
+            gop.value_ptr.* = .{ .socket = sock, .last_used = nowSeconds() };
         }
-        gop.value_ptr.last_used = std.time.timestamp();
+        gop.value_ptr.last_used = nowSeconds();
         gop.value_ptr.last_seq = seq;
 
         var req: [1500]u8 = undefined;
@@ -334,7 +345,7 @@ pub const MiniNat = struct {
             .port = 0,
             .addr = @bitCast(remote_ip),
         };
-        _ = std.posix.sendto(
+        _ = net_compat.sendto(
             gop.value_ptr.socket,
             req[0..total],
             0,
@@ -349,8 +360,8 @@ pub const MiniNat = struct {
         while (self.running.load(.acquire)) {
             var delivered = false;
 
-            self.flows_mutex.lock();
-            const now = std.time.timestamp();
+            self.flows_mutex.lockUncancelable(global.io());
+            const now = nowSeconds();
             var expired: ?UdpKey = null;
             var iter = self.udp_flows.iterator();
             while (iter.next()) |entry| {
@@ -362,7 +373,7 @@ pub const MiniNat = struct {
                     continue;
                 }
 
-                const n = std.posix.recvfrom(flow.socket, &buf, 0, null, null) catch |err| {
+                const n = net_compat.recvfrom(flow.socket, &buf, 0, null, null) catch |err| {
                     if (err != error.WouldBlock) expired = key;
                     continue;
                 };
@@ -373,7 +384,7 @@ pub const MiniNat = struct {
             }
             if (expired) |key| {
                 if (self.udp_flows.fetchRemove(key)) |entry| {
-                    std.posix.close(entry.value.socket);
+                    net_compat.socketClose(entry.value.socket);
                 }
             }
 
@@ -388,7 +399,7 @@ pub const MiniNat = struct {
                     continue;
                 }
 
-                const n = std.posix.recvfrom(flow.socket, &buf, 0, null, null) catch |err| {
+                const n = net_compat.recvfrom(flow.socket, &buf, 0, null, null) catch |err| {
                     if (err != error.WouldBlock) expired_icmp = key;
                     continue;
                 };
@@ -399,15 +410,18 @@ pub const MiniNat = struct {
             }
             if (expired_icmp) |key| {
                 if (self.icmp_flows.fetchRemove(key)) |entry| {
-                    std.posix.close(entry.value.socket);
+                    net_compat.socketClose(entry.value.socket);
                 }
             }
 
             if (self.pumpTcp(&buf)) delivered = true;
-            self.flows_mutex.unlock();
+            self.flows_mutex.unlock(global.io());
 
             if (!delivered) {
-                std.Thread.sleep(2 * std.time.ns_per_ms);
+                std.Io.Clock.Duration.sleep(.{
+                    .raw = .{ .nanoseconds = 2 * std.time.ns_per_ms },
+                    .clock = .awake,
+                }, global.io()) catch {};
             }
         }
     }
@@ -418,7 +432,7 @@ pub const MiniNat = struct {
     /// iterator valid.
     fn pumpTcp(self: *MiniNat, buf: []u8) bool {
         var work = false;
-        const now = std.time.timestamp();
+        const now = nowSeconds();
         var remove_key: ?TcpKey = null;
 
         // Back-pressure: if the guest RX queue is backed up, don't pull
@@ -447,7 +461,7 @@ pub const MiniNat = struct {
                 const ready = std.posix.poll(&pfd, 0) catch 0;
                 if (ready == 0 or (pfd[0].revents & std.posix.POLL.OUT) == 0) continue;
 
-                std.posix.getsockoptError(flow.socket) catch {
+                net_compat.getsockoptError(flow.socket) catch {
                     self.tcpSendRst(key, flow.rcv_nxt);
                     remove_key = key;
                     continue;
@@ -464,7 +478,7 @@ pub const MiniNat = struct {
             // Relay available host data to the guest — unless the guest RX
             // side is backed up, in which case defer (no drop).
             if (!rx_ok) continue;
-            const n = std.posix.recv(flow.socket, buf[0..TCP_MSS], 0) catch |e| {
+            const n = net_compat.recv(flow.socket, buf[0..TCP_MSS], 0) catch |e| {
                 if (e == error.WouldBlock) continue;
                 self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_RST | TCP_ACK, &.{});
                 remove_key = key;
@@ -485,7 +499,7 @@ pub const MiniNat = struct {
 
         if (remove_key) |key| {
             if (self.tcp_flows.fetchRemove(key)) |entry| {
-                std.posix.close(entry.value.socket);
+                net_compat.socketClose(entry.value.socket);
             }
         }
         return work;
@@ -606,8 +620,8 @@ pub const MiniNat = struct {
             .remote_port = dst_port,
         };
 
-        self.flows_mutex.lock();
-        defer self.flows_mutex.unlock();
+        self.flows_mutex.lockUncancelable(global.io());
+        defer self.flows_mutex.unlock(global.io());
 
         if (flags & TCP_SYN != 0 and flags & TCP_ACK == 0) {
             self.tcpOpen(key, seq);
@@ -619,10 +633,10 @@ pub const MiniNat = struct {
             if (flags & TCP_RST == 0) self.tcpSendRst(key, seq + @as(u32, @intCast(payload.len)));
             return;
         };
-        flow.last_used = std.time.timestamp();
+        flow.last_used = nowSeconds();
 
         if (flags & TCP_RST != 0) {
-            std.posix.close(flow.socket);
+            net_compat.socketClose(flow.socket);
             _ = self.tcp_flows.remove(key);
             return;
         }
@@ -647,7 +661,7 @@ pub const MiniNat = struct {
         // past our rcv_nxt.
         if (flags & TCP_FIN != 0 and seq +% @as(u32, @intCast(payload.len)) == flow.rcv_nxt) {
             flow.rcv_nxt +%= 1; // FIN consumes a sequence number
-            std.posix.shutdown(flow.socket, .send) catch {};
+            net_compat.shutdown(flow.socket, .send) catch {};
             self.tcpSendAck(key, flow);
             flow.state = .fin_wait;
         }
@@ -669,7 +683,7 @@ pub const MiniNat = struct {
     fn tcpOpen(self: *MiniNat, key: TcpKey, guest_seq: u32) void {
         if (self.tcp_flows.count() >= TCP_FLOW_MAX) return;
 
-        const sock = std.posix.socket(
+        const sock = net_compat.socketCreate(
             std.posix.AF.INET,
             std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
             0,
@@ -679,10 +693,10 @@ pub const MiniNat = struct {
             .port = std.mem.nativeToBig(u16, key.remote_port),
             .addr = @bitCast(key.remote_ip),
         };
-        std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch |err| {
+        net_compat.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch |err| {
             // EINPROGRESS is expected for a nonblocking connect.
             if (err != error.WouldBlock and err != error.ConnectionPending) {
-                std.posix.close(sock);
+                net_compat.socketClose(sock);
                 return;
             }
         };
@@ -694,10 +708,10 @@ pub const MiniNat = struct {
             .state = .connecting,
             .snd_nxt = 0x1000,
             .rcv_nxt = guest_seq +% 1, // SYN consumes a sequence number
-            .last_used = std.time.timestamp(),
+            .last_used = nowSeconds(),
         };
         self.tcp_flows.put(key, flow) catch {
-            std.posix.close(sock);
+            net_compat.socketClose(sock);
             return;
         };
         // SYN-ACK is sent once the host connect completes (pollLoop).
@@ -927,7 +941,7 @@ pub const MiniNat = struct {
 
 const testing = std.testing;
 
-var test_replies: std.ArrayListUnmanaged([]u8) = .{};
+var test_replies: std.ArrayListUnmanaged([]u8) = .empty;
 var test_alloc: std.mem.Allocator = undefined;
 
 fn testReply(frame: []const u8, _: ?*anyopaque) void {
@@ -938,7 +952,7 @@ fn testReply(frame: []const u8, _: ?*anyopaque) void {
 fn clearReplies() void {
     for (test_replies.items) |r| test_alloc.free(r);
     test_replies.deinit(test_alloc);
-    test_replies = .{};
+    test_replies = .empty;
 }
 
 test "mininat: ARP request for gateway gets a reply" {

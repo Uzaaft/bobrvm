@@ -5,6 +5,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const global = @import("../global.zig");
+const file_compat = @import("../compat/file.zig");
 
 const Config = @This();
 
@@ -34,7 +36,7 @@ pub const ParseError = error{
     MissingName,
 };
 
-pub fn parseArgs(args: *std.process.ArgIterator) (Allocator.Error || ParseError)!Config {
+pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseError)!Config {
     var config = Config{};
 
     while (args.next()) |arg| {
@@ -149,21 +151,21 @@ pub fn validate(self: *const Config) ParseError!void {
 }
 
 pub fn getConfigDir(alloc: Allocator) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHomeDir);
     return std.fs.path.join(alloc, &.{ home, ".config", "bobrvm", "vms" });
 }
 
 pub fn ensureConfigDir(alloc: Allocator) ![]const u8 {
     const dir_path = try getConfigDir(alloc);
-    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+    std.Io.Dir.createDirAbsolute(global.io(), dir_path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             const parent = std.fs.path.dirname(dir_path) orelse return err;
-            std.fs.makeDirAbsolute(parent) catch |e| switch (e) {
+            std.Io.Dir.createDirAbsolute(global.io(), parent, .default_dir) catch |e| switch (e) {
                 error.PathAlreadyExists => {},
                 else => return e,
             };
-            std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
+            std.Io.Dir.createDirAbsolute(global.io(), dir_path, .default_dir) catch |e| switch (e) {
                 error.PathAlreadyExists => {},
                 else => return e,
             };
@@ -192,11 +194,11 @@ pub fn save(self: *const Config, alloc: Allocator) !void {
     const json_bytes = try std.json.Stringify.valueAlloc(alloc, self.*, .{ .whitespace = .indent_2 });
     defer alloc.free(json_bytes);
 
-    const file = try std.fs.createFileAbsolute(config_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.createFileAbsolute(global.io(), config_path, .{});
+    defer file.close(global.io());
 
-    _ = try file.write(json_bytes);
-    _ = try file.write("\n");
+    try file.writePositionalAll(global.io(), json_bytes, 0);
+    try file.writePositionalAll(global.io(), "\n", json_bytes.len);
 }
 
 pub const LoadedConfig = struct {
@@ -212,15 +214,15 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
-    const file = std.fs.openFileAbsolute(config_path, .{}) catch |err| {
+    const file = std.Io.Dir.openFileAbsolute(global.io(), config_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             log.err("VM '{s}' not found", .{name});
         }
         return err;
     };
-    defer file.close();
+    defer file.close(global.io());
 
-    const content = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const content = try file_compat.readToEndAlloc(file, alloc, 1024 * 1024);
     defer alloc.free(content);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -243,7 +245,7 @@ pub fn delete(alloc: Allocator, name: []const u8) !void {
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
-    std.fs.deleteFileAbsolute(config_path) catch |err| {
+    std.Io.Dir.deleteFileAbsolute(global.io(), config_path) catch |err| {
         if (err == error.FileNotFound) {
             log.err("VM '{s}' not found", .{name});
         }
@@ -255,13 +257,13 @@ pub fn listAll(alloc: Allocator) ![][]const u8 {
     const dir_path = try getConfigDir(alloc);
     defer alloc.free(dir_path);
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(global.io(), dir_path, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
             return &.{};
         }
         return err;
     };
-    defer dir.close();
+    defer dir.close(global.io());
 
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -270,7 +272,7 @@ pub fn listAll(alloc: Allocator) ![][]const u8 {
     }
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(global.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
@@ -298,5 +300,5 @@ pub fn printOptions() void {
         \\  --cmdline <str>       Kernel command line
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, help) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, help.ptr, help.len);
 }

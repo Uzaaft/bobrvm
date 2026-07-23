@@ -89,9 +89,9 @@ pub const DtbBuilder = struct {
     pub fn init(alloc: Allocator) DtbBuilder {
         return .{
             .alloc = alloc,
-            .struct_buf = .{},
-            .strings_buf = .{},
-            .string_offsets = .{},
+            .struct_buf = .empty,
+            .strings_buf = .empty,
+            .string_offsets = .empty,
         };
     }
 

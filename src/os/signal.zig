@@ -46,10 +46,10 @@ fn installHandlers() void {
     log.debug("signal handlers installed", .{});
 }
 
-fn handleSignal(sig: c_int) callconv(.c) void {
+fn handleSignal(sig: posix.SIG) callconv(.c) void {
     const sig_name: []const u8 = switch (sig) {
-        posix.SIG.INT => "SIGINT",
-        posix.SIG.TERM => "SIGTERM",
+        .INT => "SIGINT",
+        .TERM => "SIGTERM",
         else => "unknown",
     };
 
@@ -65,10 +65,10 @@ fn handleSignal(sig: c_int) callconv(.c) void {
         .flags = 0,
     };
 
-    posix.sigaction(@intCast(sig), &default_handler, null);
-    posix.raise(@intCast(sig)) catch {};
+    posix.sigaction(sig, &default_handler, null);
+    posix.raise(sig) catch {};
 
     // If we get here, just exit
     _ = sig_name;
-    std.process.exit(128 + @as(u8, @intCast(sig)));
+    std.process.exit(128 + @as(u8, @intCast(@intFromEnum(sig))));
 }

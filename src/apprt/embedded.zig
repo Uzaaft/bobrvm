@@ -178,7 +178,7 @@ pub const App = struct {
         app.* = .{
             .alloc = alloc,
             .runtime = runtime.*,
-            .vms = .{},
+            .vms = .empty,
         };
 
         // Post-condition: app is initialized
@@ -325,7 +325,7 @@ pub const VM = struct {
             .app = app,
             .config = owned_config,
             .state = .stopped,
-            .surfaces = .{},
+            .surfaces = .empty,
         };
 
         // Post-condition: VM starts stopped with no surfaces

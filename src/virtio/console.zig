@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const Queue = @import("queue.zig");
 
@@ -56,7 +57,7 @@ pub const Console = struct {
     /// Input buffer (host → guest). Guarded by input_mutex: the host
     /// input thread appends, the vCPU thread drains.
     input_buffer: std.ArrayListUnmanaged(u8),
-    input_mutex: std.Thread.Mutex,
+    input_mutex: std.Io.Mutex,
 
     /// Callback for output data.
     output_callback: ?*const fn (data: []const u8, userdata: ?*anyopaque) void,
@@ -89,9 +90,9 @@ pub const Console = struct {
             .config = .{},
             .receive_queue = receive_queue,
             .transmit_queue = transmit_queue,
-            .output_buffer = .{},
-            .input_buffer = .{},
-            .input_mutex = .{},
+            .output_buffer = .empty,
+            .input_buffer = .empty,
+            .input_mutex = .init,
             .output_callback = null,
             .output_userdata = null,
             .guest_memory = null,
@@ -136,8 +137,8 @@ pub const Console = struct {
     /// Queue input data to send to guest. Called from the host input
     /// thread; delivery happens on the vCPU thread via pollReceive.
     pub fn queueInput(self: *Console, data: []const u8) Error!void {
-        self.input_mutex.lock();
-        defer self.input_mutex.unlock();
+        self.input_mutex.lockUncancelable(global.io());
+        defer self.input_mutex.unlock(global.io());
         // Bound the buffer so a wedged guest can't grow it forever.
         if (self.input_buffer.items.len + data.len > INPUT_BUFFER_MAX) return;
         try self.input_buffer.appendSlice(self.alloc, data);
@@ -200,8 +201,8 @@ pub const Console = struct {
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
 
-        self.input_mutex.lock();
-        defer self.input_mutex.unlock();
+        self.input_mutex.lockUncancelable(global.io());
+        defer self.input_mutex.unlock(global.io());
         if (self.input_buffer.items.len == 0) return;
 
         const avail_ring = get_mem(qc.driver_addr, 6) orelse return;

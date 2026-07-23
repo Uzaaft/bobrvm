@@ -36,8 +36,8 @@ pub const DispatchError = error{
     VersionRequested,
 };
 
-pub fn dispatch(alloc: Allocator) !void {
-    var args = std.process.args();
+pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
+    var args = minimal.args.iterate();
     _ = args.skip();
 
     const subcmd_str = args.next() orelse {
@@ -111,10 +111,10 @@ fn printUsage() void {
         \\Run 'bobrvm <command> --help' for command-specific help.
         \\
     ;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, usage) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, usage.ptr, usage.len);
 }
 
 fn printVersion() void {
     const version = "bobrvm 0.1.0\n";
-    _ = std.posix.write(std.posix.STDOUT_FILENO, version) catch {};
+    _ = std.c.write(std.posix.STDOUT_FILENO, version.ptr, version.len);
 }

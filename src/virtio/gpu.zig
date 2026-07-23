@@ -13,6 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 const virgl = @import("../gpu/virgl/main.zig");
@@ -293,7 +294,7 @@ pub const Gpu = struct {
 
     /// Guards resource host_data lifetime + scanout id: the vCPU thread
     /// mutates while the renderer thread reads via lockScanout.
-    scanout_mutex: std.Thread.Mutex,
+    scanout_mutex: std.Io.Mutex,
 
     /// Current scanout.
     scanout_resource_id: u32,
@@ -353,7 +354,7 @@ pub const Gpu = struct {
             .ctrl_last_avail = 0,
             .cursor_last_avail = 0,
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
-            .scanout_mutex = .{},
+            .scanout_mutex = .init,
             .scanout_resource_id = 0,
             .frame_generation = 0,
             .display_width = 1280,
@@ -453,16 +454,16 @@ pub const Gpu = struct {
     /// Must be paired with unlockScanout; the view is only valid while
     /// the lock is held.
     pub fn lockScanout(self: *Gpu) ?ScanoutView {
-        self.scanout_mutex.lock();
+        self.scanout_mutex.lockUncancelable(global.io());
         const view = self.scanout() orelse {
-            self.scanout_mutex.unlock();
+            self.scanout_mutex.unlock(global.io());
             return null;
         };
         return view;
     }
 
     pub fn unlockScanout(self: *Gpu) void {
-        self.scanout_mutex.unlock();
+        self.scanout_mutex.unlock(global.io());
     }
 
     // =========================================================================
@@ -572,8 +573,8 @@ pub const Gpu = struct {
         var resp_len: u32 = @sizeOf(CtrlHeader);
 
         // Serialize against the renderer thread reading the scanout.
-        self.scanout_mutex.lock();
-        defer self.scanout_mutex.unlock();
+        self.scanout_mutex.lockUncancelable(global.io());
+        defer self.scanout_mutex.unlock(global.io());
 
         switch (cmd_type) {
             .get_display_info => {
@@ -694,7 +695,7 @@ pub const Gpu = struct {
             .width = cmd.width,
             .height = cmd.height,
             .host_data = host_data,
-            .entries = .{},
+            .entries = .empty,
         }) catch {
             self.alloc.free(host_data);
             return .resp_err_out_of_memory;
@@ -902,7 +903,7 @@ pub const Gpu = struct {
             if (self.virgl_enabled and self.gpu_device.getResource(cmd.resource_id) != null) {
                 const gop = self.backing3d.getOrPut(cmd.resource_id) catch
                     return .resp_err_out_of_memory;
-                if (!gop.found_existing) gop.value_ptr.* = .{};
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
                 break :blk gop.value_ptr;
             }
             return .resp_err_invalid_resource_id;
