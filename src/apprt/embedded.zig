@@ -457,16 +457,17 @@ pub const VM = struct {
 
     pub fn pause(self: *VM) void {
         if (self.state == .running) {
-            self.stop();
+            // Real pause: vCPUs park, all guest state stays intact.
+            // (This used to stop() the machine — "resume" was a cold boot.)
+            if (self.hw_machine) |hw| hw.pause();
             self.state = .paused;
         }
     }
 
     pub fn unpause(self: *VM) void {
         if (self.state == .paused) {
-            self.start() catch {
-                log.err("failed to unpause machine", .{});
-            };
+            if (self.hw_machine) |hw| hw.unpause();
+            self.state = .running;
         }
     }
 

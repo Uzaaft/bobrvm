@@ -261,6 +261,11 @@ pub const Machine = struct {
     /// Running state.
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Paused: vCPU threads park on their wake condvars instead of
+    /// entering hv_vcpu_run. All guest state (RAM, registers, devices)
+    /// is preserved, unlike stop.
+    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Pending IRQ flag (set by GIC when interrupt should be injected).
     /// Per-CPU run state (allocated for vcpu_count at init).
     cpu_states: []VcpuRunState = &.{},
@@ -574,6 +579,31 @@ pub const Machine = struct {
         log.info("machine stop requested", .{});
     }
 
+    /// Freeze the guest in place: vCPUs are kicked out of hv_vcpu_run and
+    /// park on their wake condvars; RAM, registers and device state stay
+    /// intact. Thread-safe (atomics + syscalls only). Guest wall-clock
+    /// time keeps advancing while paused (CNTVCT is host-time based), so
+    /// the guest sees a time jump on resume.
+    pub fn pause(self: *Machine) void {
+        if (!self.running.load(.acquire)) return;
+        if (self.paused.swap(true, .acq_rel)) return;
+        log.info("pausing machine", .{});
+        for (self.cpu_states) |*state| {
+            if (state.vcpu) |v| v.forceExit() catch {};
+        }
+    }
+
+    /// Resume a paused guest exactly where it stopped. Thread-safe.
+    pub fn unpause(self: *Machine) void {
+        if (!self.paused.swap(false, .acq_rel)) return;
+        log.info("resuming machine", .{});
+        for (self.cpu_states) |*state| {
+            state.wake_mutex.lockUncancelable(global.io());
+            state.wake_cond.signal(global.io());
+            state.wake_mutex.unlock(global.io());
+        }
+    }
+
     /// Kick a specific vCPU to wake it from WFI/sleep.
     /// Injects an IRQ and forces an exit from hv_vcpu_run.
     pub fn kickVcpu(self: *Machine, vcpu_id: u32) void {
@@ -671,6 +701,18 @@ pub const Machine = struct {
         const state = &self.cpu_states[cpu_id];
 
         while (self.running.load(.acquire)) {
+            // Pause gate: park until unpaused (or stopping). The 50ms
+            // timeout is only a missed-wakeup backstop — unpause()/stop()
+            // signal the condvar for prompt wakeups.
+            while (self.paused.load(.acquire) and self.running.load(.acquire)) {
+                state.wake_mutex.lockUncancelable(global.io());
+                thread_compat.waitTimeout(&state.wake_cond, global.io(), &state.wake_mutex, .{
+                    .duration = .{ .raw = .{ .nanoseconds = 50_000_000 }, .clock = .awake },
+                }) catch {};
+                state.wake_mutex.unlock(global.io());
+            }
+            if (!self.running.load(.acquire)) break;
+
             // Check for pending IRQ before running
             // Drive the IRQ line from GIC state on every iteration: HVF
             // clears the pending interrupt at each hv_vcpu_run entry, so a

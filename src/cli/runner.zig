@@ -109,6 +109,19 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         }
     }
 
+    // Debug: pause the machine after a delay, resume after a duration
+    // (BOBRVM_TEST_PAUSE=delay_s:duration_s) — verifies real pause/resume
+    // headlessly (guest execution provably freezes, then continues).
+    if (std.c.getenv("BOBRVM_TEST_PAUSE")) |spec_ptr| {
+        const spec = std.mem.span(spec_ptr);
+        if (std.mem.indexOfScalar(u8, spec, ':')) |colon| blk: {
+            const delay_s = std.fmt.parseInt(u64, spec[0..colon], 10) catch break :blk;
+            const duration_s = std.fmt.parseInt(u64, spec[colon + 1 ..], 10) catch break :blk;
+            const t = std.Thread.spawn(.{}, testPauseLoop, .{ hw, delay_s, duration_s }) catch null;
+            if (t) |thread| thread.detach();
+        }
+    }
+
     // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
     // the guest. Ctrl-] detaches and shuts down, like telnet.
     const stdin_fd = std.posix.STDIN_FILENO;
@@ -210,6 +223,16 @@ fn asciiToEvdev(char: u8) u16 {
         ';' => 39,
         else => 0,
     };
+}
+
+/// Pause then resume the machine (BOBRVM_TEST_PAUSE debug hook).
+fn testPauseLoop(hw: *machine.Machine, delay_s: u64, duration_s: u64) void {
+    sleepNs(delay_s * std.time.ns_per_s);
+    log.info("pausing machine for {}s", .{duration_s});
+    hw.pause();
+    sleepNs(duration_s * std.time.ns_per_s);
+    log.info("resuming machine", .{});
+    hw.unpause();
 }
 
 const ResizeSpec = struct {
