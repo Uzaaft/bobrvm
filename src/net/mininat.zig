@@ -770,14 +770,8 @@ pub const MiniNat = struct {
         sum += (@as(u32, dst_ip[2]) << 8) | dst_ip[3];
         sum += 6; // protocol
         sum += @intCast(segment.len);
-
-        var i: usize = 0;
-        while (i + 1 < segment.len) : (i += 2) {
-            sum += (@as(u32, segment[i]) << 8) | segment[i + 1];
-        }
-        if (i < segment.len) sum += @as(u32, segment[i]) << 8;
-        while (sum >> 16 != 0) sum = (sum & 0xFFFF) + (sum >> 16);
-        return @truncate(~sum);
+        sum += sumBE(segment);
+        return fold(sum);
     }
 
     fn handleIcmp(self: *MiniNat, frame: []const u8, ihl: usize) void {
@@ -920,18 +914,61 @@ pub const MiniNat = struct {
 
     /// RFC 1071 Internet checksum.
     fn checksum(data: []const u8) u16 {
-        var sum: u32 = 0;
-        var i: usize = 0;
-        while (i + 1 < data.len) : (i += 2) {
-            sum += std.mem.readInt(u16, data[i..][0..2], .big);
-        }
-        if (i < data.len) {
-            sum += @as(u32, data[i]) << 8;
-        }
-        while (sum >> 16 != 0) {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
+        return fold(sumBE(data));
+    }
+
+    /// Ones-complement fold of an unfolded accumulator into the final 16-bit
+    /// Internet checksum: wrap the carries back in, then invert.
+    fn fold(acc: u32) u16 {
+        var sum = acc;
+        while (sum >> 16 != 0) sum = (sum & 0xFFFF) + (sum >> 16);
         return @truncate(~sum);
+    }
+
+    /// Sum of the big-endian 16-bit words in `data` (RFC 1071), returned
+    /// *unfolded* so callers can add pseudo-header terms before folding.
+    ///
+    /// A big-endian word at an even offset weights its high byte by 256 and
+    /// its low byte by 1, so the whole word sum is
+    /// `256*Σ(even-offset bytes) + Σ(odd-offset bytes)`. That decomposition
+    /// lets us widen and add a full vector of bytes each iteration, then split
+    /// the even/odd lanes once at the end — the classic SIMD shape (broadcast,
+    /// wide loop, reduce, scalar remainder). Bytes are ≤255 and real frames are
+    /// ≤64 KiB, so the u32 lanes never overflow.
+    fn sumBE(data: []const u8) u32 {
+        // Byte-wide vector. The even/odd lane split and the scalar-remainder
+        // parity argument both require an even lane count; real vector widths
+        // are powers of two, but guard it so a future odd width fails loudly.
+        const lanes = comptime std.simd.suggestVectorLength(u8) orelse 16;
+        comptime if (lanes % 2 != 0) @compileError("sumBE requires an even vector width");
+        const Bytes = @Vector(lanes, u8);
+        const Wide = @Vector(lanes, u32);
+        const even_mask: Wide = comptime blk: {
+            var m: [lanes]u32 = undefined;
+            for (&m, 0..) |*x, k| x.* = if (k % 2 == 0) 1 else 0;
+            break :blk m;
+        };
+
+        var acc: Wide = @splat(0);
+        var i: usize = 0;
+        while (i + lanes <= data.len) : (i += lanes) {
+            const chunk: Bytes = data[i..][0..lanes].*;
+            acc += @as(Wide, chunk); // widen u8 -> u32, add every lane at once
+        }
+
+        // Reduce: total = Σ all bytes, even = Σ even-offset bytes.
+        // 256*Σeven + Σodd == total + 255*Σeven.
+        const total: u32 = @reduce(.Add, acc);
+        const even: u32 = @reduce(.Add, acc * even_mask);
+        var sum: u32 = total + 255 * even;
+
+        // Scalar remainder. `i` is a multiple of `lanes` (even), so the tail
+        // offsets keep the same even/odd parity as the whole buffer.
+        while (i + 1 < data.len) : (i += 2) {
+            sum += (@as(u32, data[i]) << 8) | data[i + 1];
+        }
+        if (i < data.len) sum += @as(u32, data[i]) << 8;
+        return sum;
     }
 };
 
@@ -1101,4 +1138,46 @@ test "mininat: ICMP echo to a remote host is reframed for the guest" {
     try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, rep_icmp[4..6], .big));
     try testing.expectEqual(@as(u16, 42), std.mem.readInt(u16, rep_icmp[6..8], .big));
     try testing.expect(std.mem.eql(u8, rep_icmp[8..13], "hello"));
+}
+
+test "mininat: SIMD checksum matches a scalar reference at every length/parity" {
+    // Straight, unvectorized RFC 1071 sum — the oracle the SIMD path must equal.
+    const ref = struct {
+        fn sum(data: []const u8) u16 {
+            var s: u32 = 0;
+            var i: usize = 0;
+            while (i + 1 < data.len) : (i += 2) {
+                s += (@as(u32, data[i]) << 8) | data[i + 1];
+            }
+            if (i < data.len) s += @as(u32, data[i]) << 8;
+            while (s >> 16 != 0) s = (s & 0xFFFF) + (s >> 16);
+            return @truncate(~s);
+        }
+    }.sum;
+
+    var buf: [600]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i * 131 + 7); // varied, non-trivial
+
+    // Sweep lengths across the vector boundary and both parities, and vary the
+    // start offset so lane alignment differs run to run.
+    for (0..buf.len) |len| {
+        for ([_]usize{ 0, 1, 3 }) |off| {
+            if (off + len > buf.len) continue;
+            const slice = buf[off .. off + len];
+            try testing.expectEqual(ref(slice), MiniNat.checksum(slice));
+        }
+    }
+}
+
+test "mininat: checksum of a known IPv4 header is correct" {
+    // Canonical RFC-1071 worked example (checksum field zeroed).
+    var hdr = [_]u8{
+        0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
+        0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01,
+        0xc0, 0xa8, 0x00, 0xc7,
+    };
+    try testing.expectEqual(@as(u16, 0xb861), MiniNat.checksum(&hdr));
+    // Writing the checksum back in makes the header sum to zero (checks to 0xffff).
+    std.mem.writeInt(u16, hdr[10..12], 0xb861, .big);
+    try testing.expectEqual(@as(u16, 0), MiniNat.checksum(&hdr));
 }

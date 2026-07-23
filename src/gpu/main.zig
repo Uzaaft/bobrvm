@@ -288,6 +288,14 @@ pub const GpuDevice = struct {
         return true;
     }
 
+    /// The IOSurfaceRef the given rendered resource presents from, if it is a
+    /// presentable target backed by an IOSurface. Non-null means the scanout
+    /// can be shown with no readback (the display renderer wraps this surface).
+    pub fn scanoutSurfaceRef(self: *GpuDevice, handle: ResourceHandle) ?*anyopaque {
+        const r = if (self.renderer) |*rr| rr else return null;
+        return r.targetSurfaceRef(handle);
+    }
+
     fn destroyResource(self: *GpuDevice, data: []const u8) Error!void {
         if (data.len < 4) return;
         const handle = std.mem.readInt(u32, data[0..4], .little);
@@ -588,16 +596,30 @@ test "GpuDevice renders with translated guest shaders end to end" {
     const buf: u32 = 30;
 
     try gpu.createResourceRecord(.{
-        .handle = rt,       .target = .texture_2d, .format = .b8g8r8a8_unorm,
-        .width = 64,        .height = 64,          .depth = 1,
-        .array_size = 1,    .last_level = 0,       .nr_samples = 0,
-        .flags = 0,         .bind = PipeBind.render_target,
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
     });
     try gpu.createResourceRecord(.{
-        .handle = buf,      .target = .buffer,     .format = .none,
-        .width = 24,        .height = 0,           .depth = 1,
-        .array_size = 1,    .last_level = 0,       .nr_samples = 0,
-        .flags = 0,         .bind = PipeBind.vertex_buffer,
+        .handle = buf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
     });
     if (gpu.renderer == null) return error.SkipZigTest;
 

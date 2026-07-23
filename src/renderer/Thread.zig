@@ -63,6 +63,8 @@ pub const Scanout = struct {
     height: u32,
     /// Content generation; unchanged since last present means skip.
     generation: u64 = 0,
+    /// IOSurfaceRef backing `data` for the zero-copy present path, if any.
+    surface: ?*anyopaque = null,
 };
 
 pub const ContentScale = struct {
@@ -487,6 +489,7 @@ pub const RenderThread = struct {
                     scan.data,
                     scan.width,
                     scan.height,
+                    scan.surface,
                 );
                 if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
                 self.pending_batch = null;

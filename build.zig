@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         root_module.linkFramework("MetalKit", .{});
         root_module.linkFramework("QuartzCore", .{});
         root_module.linkFramework("IOSurface", .{});
+        root_module.linkFramework("CoreFoundation", .{});
         root_module.linkSystemLibrary("objc", .{});
 
         // Add C source for os_log wrapper
@@ -101,6 +102,7 @@ pub fn build(b: *std.Build) void {
         cli_module.linkFramework("Metal", .{});
         cli_module.linkFramework("QuartzCore", .{});
         cli_module.linkFramework("IOSurface", .{});
+        cli_module.linkFramework("CoreFoundation", .{});
         cli_module.linkSystemLibrary("objc", .{});
 
         cli_module.addCSourceFile(.{
@@ -195,6 +197,7 @@ pub fn build(b: *std.Build) void {
         test_module.linkFramework("Metal", .{});
         test_module.linkFramework("QuartzCore", .{});
         test_module.linkFramework("IOSurface", .{});
+        test_module.linkFramework("CoreFoundation", .{});
         test_module.linkSystemLibrary("objc", .{});
     }
 

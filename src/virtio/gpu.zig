@@ -18,6 +18,7 @@ const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 const virgl = @import("../gpu/virgl/main.zig");
 const gpu_module = @import("../gpu/main.zig");
+const iosurface = @import("../gpu/iosurface.zig");
 
 const log = std.log.scoped(.virtio_gpu);
 
@@ -267,8 +268,13 @@ pub const Resource2D = struct {
     format: u32,
     width: u32,
     height: u32,
-    /// Host copy of the pixels (width * height * 4).
+    /// Host copy of the pixels (width * height * 4). When `surface` is set this
+    /// slice aliases the IOSurface's memory rather than a heap allocation.
     host_data: []u8,
+    /// IOSurface backing `host_data`, if the zero-copy scanout path is active.
+    /// Present means the render thread can wrap an MTLTexture over these pixels
+    /// directly, skipping the per-frame CPU->GPU upload.
+    surface: ?iosurface.IOSurface = null,
     /// Guest backing pages (scatter-gather).
     entries: std.ArrayListUnmanaged(MemEntry),
 
@@ -276,6 +282,11 @@ pub const Resource2D = struct {
 
     pub fn stride(self: *const Resource2D) u32 {
         return self.width * BYTES_PER_PIXEL;
+    }
+
+    /// Release the pixel storage — either the IOSurface or the heap buffer.
+    pub fn freePixels(self: *const Resource2D, alloc: Allocator) void {
+        if (self.surface) |surf| surf.release() else alloc.free(self.host_data);
     }
 };
 
@@ -327,6 +338,11 @@ pub const Gpu = struct {
     scanout3d_data: []u8 = &.{},
     scanout3d_w: u32 = 0,
     scanout3d_h: u32 = 0,
+    /// True once a flush found the 3D scanout target IOSurface-backed, so the
+    /// readback into scanout3d_data is skipped. The surface ref itself is NOT
+    /// cached — scanout() re-derives it live from the (mutex-guarded) target so
+    /// a destroyed/recreated target can never leave a dangling ref behind.
+    scanout3d_direct: bool = false,
     /// Count of submit_3d commands seen (used to log the first few for
     /// bring-up diagnostics without flooding the log).
     submit3d_seen: u32 = 0,
@@ -381,7 +397,7 @@ pub const Gpu = struct {
     pub fn deinit(self: *Gpu) void {
         var iter = self.resources.valueIterator();
         while (iter.next()) |res| {
-            self.alloc.free(res.host_data);
+            res.freePixels(self.alloc);
             res.entries.deinit(self.alloc);
         }
         self.resources.deinit();
@@ -423,6 +439,9 @@ pub const Gpu = struct {
         height: u32,
         /// Content generation; unchanged means the renderer can skip.
         generation: u64,
+        /// IOSurfaceRef backing `data` when the zero-copy path is active; the
+        /// renderer wraps a texture over it instead of uploading `data`.
+        surface: ?*anyopaque = null,
     };
 
     /// Current scanout pixels (BGRA/XRGB 4 bytes per pixel), or null.
@@ -436,15 +455,24 @@ pub const Gpu = struct {
                 .width = res.width,
                 .height = res.height,
                 .generation = self.frame_generation,
+                .surface = if (res.surface) |surf| surf.ref else null,
             };
         }
-        // 3D scanout: served from the GPU-texture readback buffer.
-        if (self.scanout3d_data.len > 0 and self.scanout3d_w > 0) {
+        // 3D scanout: present the render target's IOSurface directly when the
+        // target is still live and IOSurface-backed, otherwise the readback
+        // buffer. Re-derive the ref live (guarded by scanout_mutex) so a
+        // destroyed/recreated target yields null here instead of a dangling ref.
+        const surf = if (self.scanout3d_direct)
+            self.gpu_device.scanoutSurfaceRef(self.scanout_resource_id)
+        else
+            null;
+        if (self.scanout3d_w > 0 and (surf != null or self.scanout3d_data.len > 0)) {
             return .{
                 .data = self.scanout3d_data,
                 .width = self.scanout3d_w,
                 .height = self.scanout3d_h,
                 .generation = self.frame_generation,
+                .surface = surf,
             };
         }
         return null;
@@ -679,12 +707,20 @@ pub const Gpu = struct {
         }
 
         const size = @as(usize, cmd.width) * cmd.height * Resource2D.BYTES_PER_PIXEL;
-        const host_data = self.alloc.alloc(u8, size) catch return .resp_err_out_of_memory;
+
+        // Prefer an IOSurface so the render thread can present these pixels with
+        // no upload (zero-copy). Fall back to a heap buffer when IOSurface is
+        // unavailable or would pad the row stride (e.g. headless CI, odd width).
+        const surface = iosurface.IOSurface.createBGRA(cmd.width, cmd.height);
+        const host_data = if (surface) |surf|
+            surf.pixels(size)
+        else
+            self.alloc.alloc(u8, size) catch return .resp_err_out_of_memory;
         @memset(host_data, 0);
 
         // Replace any existing resource with this id.
         if (self.resources.fetchRemove(cmd.resource_id)) |old| {
-            self.alloc.free(old.value.host_data);
+            old.value.freePixels(self.alloc);
             var entries = old.value.entries;
             entries.deinit(self.alloc);
         }
@@ -695,9 +731,10 @@ pub const Gpu = struct {
             .width = cmd.width,
             .height = cmd.height,
             .host_data = host_data,
+            .surface = surface,
             .entries = .empty,
         }) catch {
-            self.alloc.free(host_data);
+            if (surface) |surf| surf.release() else self.alloc.free(host_data);
             return .resp_err_out_of_memory;
         };
 
@@ -709,7 +746,7 @@ pub const Gpu = struct {
         const cmd = std.mem.bytesToValue(ResourceUnref, req[0..@sizeOf(ResourceUnref)]);
 
         if (self.resources.fetchRemove(cmd.resource_id)) |entry| {
-            self.alloc.free(entry.value.host_data);
+            entry.value.freePixels(self.alloc);
             var entries = entry.value.entries;
             entries.deinit(self.alloc);
             if (self.scanout_resource_id == cmd.resource_id) {
@@ -763,6 +800,18 @@ pub const Gpu = struct {
         if (self.resources.contains(id)) return; // 2D path
         const res = self.gpu_device.getResource(id) orelse return;
         if (res.width == 0 or res.height == 0) return;
+
+        // Zero-copy path: the target renders straight into an IOSurface, so
+        // just mark direct-present — scanout() re-derives the live ref itself.
+        if (self.gpu_device.scanoutSurfaceRef(id) != null) {
+            self.scanout3d_direct = true;
+            self.scanout3d_w = res.width;
+            self.scanout3d_h = res.height;
+            return;
+        }
+
+        // Fallback: read the rendered pixels back into a host buffer.
+        self.scanout3d_direct = false;
         const needed = @as(usize, res.width) * res.height * 4;
         if (self.scanout3d_data.len != needed) {
             const nb = if (self.scanout3d_data.len == 0)
@@ -1347,10 +1396,17 @@ test "3D scanout presents rendered GPU pixels" {
 
     // A 3D render-target resource that will also be the scanout.
     try gpu.gpu_device.createResourceRecord(.{
-        .handle = 10,    .target = .texture_2d, .format = .b8g8r8a8_unorm,
-        .width = 32,     .height = 32,          .depth = 1,
-        .array_size = 1, .last_level = 0,       .nr_samples = 0,
-        .flags = 0,      .bind = 1 << 1, // PIPE_BIND_RENDER_TARGET
+        .handle = 10,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 32,
+        .height = 32,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = 1 << 1, // PIPE_BIND_RENDER_TARGET
     });
     if (gpu.gpu_device.renderer == null) return error.SkipZigTest;
 
@@ -1411,9 +1467,15 @@ test "3D scanout presents rendered GPU pixels" {
 
     const view = gpu.scanout() orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 32), view.width);
+    // Pixels come from the render target's IOSurface directly (zero-copy 3D
+    // present) when available, otherwise from the readback buffer.
+    const pixels = if (view.surface) |surf|
+        (iosurface.baseAddressOf(surf) orelse return error.TestUnexpectedResult)[0 .. @as(usize, view.width) * view.height * 4]
+    else
+        view.data;
     const c = ((16 * 32) + 16) * 4;
     // Red in BGRA host memory: B<40, G<40, R>200.
-    try testing.expect(view.data[c + 2] > 200 and view.data[c + 1] < 40 and view.data[c + 0] < 40);
+    try testing.expect(pixels[c + 2] > 200 and pixels[c + 1] < 40 and pixels[c + 0] < 40);
 }
 
 test "scanout frame generation advances only on flush of the scanout" {
