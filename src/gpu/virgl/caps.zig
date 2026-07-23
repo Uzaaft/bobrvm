@@ -72,8 +72,40 @@ pub fn writeV2(buf: []u8) void {
     put.set(buf, Off.max_uniform_blocks, 14);
     put.set(buf, Off.max_viewports, 16);
     put.set(buf, Off.max_texture_gather_components, 4);
-    // Format masks and bset remain zero until the translator can honor
-    // specific formats/features.
+
+    // Per-format support masks. Each mask is a bitmap indexed by PIPE_FORMAT
+    // (our proto.Format mirrors those values): bit f → mask[f/32] |= 1<<(f%32).
+    // The guest virgl driver consults render/sampler here when creating a
+    // context; all-zero masks mean "no renderable format" → eglCreateContext
+    // fails with EGL_BAD_MATCH. Advertise only what the Metal translator can
+    // actually back.
+    const setFmt = struct {
+        fn f(b: []u8, mask_off: usize, fmt: u32) void {
+            const word = mask_off + (fmt / 32) * 4;
+            const cur = std.mem.readInt(u32, b[word..][0..4], .little);
+            std.mem.writeInt(u32, b[word..][0..4], cur | (@as(u32, 1) << @intCast(fmt % 32)), .little);
+        }
+    };
+    // Color formats usable as both render targets and sampler views.
+    const color = [_]u32{ 1, 2, 3, 4, 67 }; // BGRA8, BGRX8, ARGB8, XRGB8, RGBA8
+    for (color) |c| {
+        setFmt.f(buf, Off.render_mask, c);
+        setFmt.f(buf, Off.sampler_mask, c);
+    }
+    // Single/two-channel sampler formats.
+    const extra_sampler = [_]u32{ 9, 10, 12, 32 }; // L8, A8, L8A8, R32_FLOAT-ish
+    for (extra_sampler) |c| setFmt.f(buf, Off.sampler_mask, c);
+    // Depth/stencil formats.
+    const depth = [_]u32{ 16, 18, 19, 20, 21 }; // Z16, Z32F, Z24S8, S8Z24, Z24X8
+    for (depth) |d| setFmt.f(buf, Off.depthstencil_mask, d);
+    // Vertex attribute formats (float N + common unorm color attrib).
+    const vtx = [_]u32{ 28, 29, 30, 31, 67 }; // R32F, RG32F, RGB32F, RGBA32F, RGBA8
+    for (vtx) |v| setFmt.f(buf, Off.vertexbuffer_mask, v);
+
+    // bset (boolean feature set) intentionally left zero: advertising a
+    // feature the translator does not implement would make the guest emit
+    // commands we cannot honor. Format masks alone are what a basic context
+    // needs; features get enabled as the translator grows.
 }
 
 // =============================================================================

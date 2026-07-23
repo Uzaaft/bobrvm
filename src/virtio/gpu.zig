@@ -326,6 +326,9 @@ pub const Gpu = struct {
     scanout3d_data: []u8 = &.{},
     scanout3d_w: u32 = 0,
     scanout3d_h: u32 = 0,
+    /// Count of submit_3d commands seen (used to log the first few for
+    /// bring-up diagnostics without flooding the log).
+    submit3d_seen: u32 = 0,
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
@@ -364,6 +367,7 @@ pub const Gpu = struct {
             .scanout3d_data = &.{},
             .scanout3d_w = 0,
             .scanout3d_h = 0,
+            .submit3d_seen = 0,
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -990,6 +994,7 @@ pub const Gpu = struct {
             @memset(blob, 0);
         }
         resp_len.* = @sizeOf(CtrlHeader) + size;
+        log.info("virgl get_capset id={} size={}", .{ cmd.capset_id, size });
         return .resp_ok_capset;
     }
 
@@ -997,6 +1002,7 @@ pub const Gpu = struct {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (header.ctx_id == 0) return .resp_err_invalid_context_id;
         self.gpu_device.createContextId(header.ctx_id) catch return .resp_err_out_of_memory;
+        log.info("virgl ctx_create ctx_id={}", .{header.ctx_id});
         return .resp_ok_nodata;
     }
 
@@ -1052,6 +1058,14 @@ pub const Gpu = struct {
             }
             return .resp_err_invalid_parameter;
         };
+
+        // Bring-up diagnostic: log the first few submits' leading opcode so we
+        // can see whether the guest reaches real 3D command submission.
+        if (self.submit3d_seen < 12) {
+            self.submit3d_seen += 1;
+            const op0: u8 = if (cmd_data.len >= 4) @truncate(std.mem.readInt(u32, cmd_data[0..4], .little)) else 0xff;
+            log.info("virgl submit_3d #{} ctx={} bytes={} first_op={}", .{ self.submit3d_seen, header.ctx_id, cmd_data.len, op0 });
+        }
 
         self.gpu_device.submit(header.ctx_id, cmd_data) catch {
             return .resp_err_unspec;
