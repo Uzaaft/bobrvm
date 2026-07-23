@@ -28,9 +28,29 @@ fn errnoError() Error {
 }
 
 pub fn socketCreate(domain: u32, socket_type: u32, protocol: u32) Error!posix.socket_t {
-    const rc = socket(@intCast(domain), @intCast(socket_type), @intCast(protocol));
+    // SOCK_NONBLOCK/SOCK_CLOEXEC baked into the type argument is a Linux-only
+    // extension — Darwin's socket() doesn't understand it (silently creates
+    // a normal *blocking* socket instead of erroring), so every socket we
+    // made ended up blocking despite callers asking for nonblocking. That
+    // turned a stalled connect()/recv() to an unresponsive host into a hang
+    // of the entire machine-lock-guarded vCPU loop. Strip the bits and apply
+    // O_NONBLOCK via fcntl afterward instead, matching what zig 0.15's
+    // std.posix.socket() used to do for us on Darwin.
+    const want_nonblock = (socket_type & posix.SOCK.NONBLOCK) != 0;
+    const filtered_type = socket_type & ~@as(u32, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
+
+    const rc = socket(@intCast(domain), @intCast(filtered_type), @intCast(protocol));
     if (rc == -1) return errnoError();
+    if (want_nonblock) setNonBlocking(rc);
     return rc;
+}
+
+fn setNonBlocking(fd: posix.socket_t) void {
+    const cur = std.c.fcntl(fd, std.c.F.GETFL);
+    if (cur == -1) return;
+    var flags: std.c.O = @bitCast(@as(u32, @intCast(cur)));
+    flags.NONBLOCK = true;
+    _ = std.c.fcntl(fd, std.c.F.SETFL, @as(u32, @bitCast(flags)));
 }
 
 pub fn socketClose(fd: posix.socket_t) void {
@@ -90,4 +110,31 @@ pub fn getsockoptError(sockfd: posix.socket_t) Error!void {
     const rc = std.c.getsockopt(sockfd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_code), &size);
     if (rc == -1) return errnoError();
     if (err_code != 0) return error.Unexpected;
+}
+
+const testing = std.testing;
+
+test "socketCreate with SOCK.NONBLOCK actually produces a non-blocking fd" {
+    // Regression test: Darwin's socket() silently ignores SOCK_NONBLOCK
+    // baked into the type argument (a Linux-only trick) instead of
+    // erroring, so it's easy to end up with an accidentally-blocking
+    // socket that then hangs connect()/recv() forever under the
+    // machine-lock-guarded vCPU loop.
+    const sock = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    defer socketClose(sock);
+
+    const flags = std.c.fcntl(sock, std.c.F.GETFL);
+    try testing.expect(flags != -1);
+    const o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+    try testing.expect(o.NONBLOCK);
+}
+
+test "socketCreate without SOCK.NONBLOCK leaves a blocking fd" {
+    const sock = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer socketClose(sock);
+
+    const flags = std.c.fcntl(sock, std.c.F.GETFL);
+    try testing.expect(flags != -1);
+    const o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+    try testing.expect(!o.NONBLOCK);
 }
