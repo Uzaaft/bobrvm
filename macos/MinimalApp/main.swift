@@ -12,11 +12,48 @@
 import AppKit
 import Metal
 import QuartzCore
+import CoreGraphics
 
 final class MetalView: NSView {
     let metalLayer = CAMetalLayer()
     var surface: bobrvm_surface_t?
     var lastFlags = NSEvent.ModifierFlags()
+
+    // Click-to-capture mouse grab (VMware/Parallels-style): while captured,
+    // the host cursor is hidden and unassociated from the display so raw
+    // hardware deltas keep flowing past the screen edges — otherwise the
+    // host cursor simply can't move further once it hits the edge of the
+    // physical display, capping how far the guest pointer could ever travel.
+    // Release with Control+Option (VMware Fusion's default host-key combo).
+    var mouseCaptured = false
+    var virtualX: CGFloat = 0
+    var virtualY: CGFloat = 0
+
+    func captureMouse() {
+        guard !mouseCaptured else { return }
+        mouseCaptured = true
+        CGAssociateMouseAndMouseCursorPosition(0)
+        NSCursor.hide()
+        virtualX = bounds.midX
+        virtualY = bounds.midY
+        window?.title = "bobrvm (mouse captured — ⌃⌥ to release)"
+    }
+
+    func releaseMouse() {
+        guard mouseCaptured else { return }
+        mouseCaptured = false
+        CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+        // Warp the host cursor back to the window's center so it reappears
+        // somewhere sane instead of wherever it silently drifted while hidden.
+        if let window, let screen = window.screen ?? NSScreen.screens.first {
+            let centerInWindow = NSPoint(x: bounds.midX, y: bounds.midY)
+            let centerOnScreen = window.convertPoint(toScreen: convert(centerInWindow, to: nil))
+            let mainScreenHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
+            CGWarpMouseCursorPosition(CGPoint(x: centerOnScreen.x, y: mainScreenHeight - centerOnScreen.y))
+        }
+        window?.title = "bobrvm"
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -53,10 +90,14 @@ final class MetalView: NSView {
         if let flag = flagFor[event.keyCode] {
             sendKey(event, pressed: event.modifierFlags.contains(flag))
         }
+        if mouseCaptured, event.modifierFlags.contains(.control), event.modifierFlags.contains(.option) {
+            releaseMouse()
+        }
         lastFlags = event.modifierFlags
     }
 
     override func mouseDown(with event: NSEvent) {
+        if !mouseCaptured { captureMouse() }
         guard let surface else { return }
         bobrvm_surface_mouse_button(surface, BOBRVM_MOUSE_LEFT, true)
     }
@@ -78,9 +119,19 @@ final class MetalView: NSView {
 
     private func sendMousePos(_ event: NSEvent) {
         guard let surface else { return }
-        let p = convert(event.locationInWindow, from: nil)
-        // Flip to top-left origin to match the guest's coordinate space.
-        bobrvm_surface_mouse_pos(surface, p.x, bounds.height - p.y)
+        if mouseCaptured {
+            // event.deltaX/deltaY are raw hardware deltas (positive deltaY
+            // = moved down), which already matches the guest's top-left,
+            // y-down convention — no flip needed here, unlike the absolute
+            // path below.
+            virtualX += event.deltaX
+            virtualY += event.deltaY
+            bobrvm_surface_mouse_pos(surface, virtualX, virtualY)
+        } else {
+            let p = convert(event.locationInWindow, from: nil)
+            // Flip to top-left origin to match the guest's coordinate space.
+            bobrvm_surface_mouse_pos(surface, p.x, bounds.height - p.y)
+        }
     }
 
     override func mouseMoved(with event: NSEvent) { sendMousePos(event) }
@@ -203,6 +254,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.surface = surface
         window.makeFirstResponder(view)
         window.acceptsMouseMovedEvents = true
+
+        // Safety net: don't leave the host cursor hidden/ungrabbed if the
+        // user switches away from the app some other way than ⌃⌥.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.view.releaseMouse() }
 
         // Drive frames at 60 Hz. (CVDisplayLink integration comes with
         // the full app; a timer is enough to verify the pipeline.)
