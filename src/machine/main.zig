@@ -139,6 +139,10 @@ pub const MachineConfig = struct {
     /// Enable the virtio-net device (built-in NAT backend).
     enable_net: bool = false,
 
+    /// Host→guest TCP port forwards (implies enable_net). The slice must
+    /// stay valid until startSync() has initialized the devices.
+    forwards: []const mininat.Forward = &.{},
+
     /// Display size for the virtio-gpu scanout.
     display_width: u32 = 1280,
     display_height: u32 = 800,
@@ -1506,6 +1510,13 @@ pub const Machine = struct {
             self.net.?.transport.setIrqCallback(netIrqCallback, self);
             self.nat = mininat.MiniNat.init(self.alloc, natReplyCallback, self);
             self.nat.setRxReady(natRxReadyCallback, self);
+            for (self.config.forwards) |fwd| {
+                self.nat.addForward(fwd) catch |err| {
+                    log.err("port forward {}->{} failed: {} (port in use?)", .{
+                        fwd.host_port, fwd.guest_port, err,
+                    });
+                };
+            }
             try self.nat.start();
             self.net.?.setTxCallback(netTxCallback, self);
             log.debug("initialized virtio-net at slot {} (built-in NAT)", .{self.net_slot});

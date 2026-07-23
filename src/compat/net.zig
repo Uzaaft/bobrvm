@@ -92,6 +92,28 @@ pub fn connect(sockfd: posix.socket_t, addr: *const posix.sockaddr, len: posix.s
     if (rc == -1) return errnoError();
 }
 
+pub fn bind(sockfd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) Error!void {
+    if (std.c.bind(sockfd, addr, len) != 0) return errnoError();
+}
+
+pub fn listen(sockfd: posix.socket_t, backlog: c_uint) Error!void {
+    if (std.c.listen(sockfd, backlog) != 0) return errnoError();
+}
+
+/// Accept one pending connection; the returned fd is made non-blocking
+/// (Darwin does not inherit O_NONBLOCK from the listener).
+pub fn accept(sockfd: posix.socket_t) Error!posix.socket_t {
+    const rc = std.c.accept(sockfd, null, null);
+    if (rc == -1) return errnoError();
+    setNonBlocking(rc);
+    return rc;
+}
+
+pub fn setReuseAddr(sockfd: posix.socket_t) void {
+    const one: c_int = 1;
+    _ = std.c.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
+}
+
 pub const ShutdownHow = enum { recv, send, both };
 
 pub fn shutdown(sockfd: posix.socket_t, how: ShutdownHow) Error!void {

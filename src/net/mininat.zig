@@ -73,7 +73,30 @@ const TcpKey = struct {
     remote_port: u16,
 };
 
-const TcpState = enum { connecting, established, fin_wait, closed };
+const TcpState = enum {
+    /// Outbound: host connect() in flight; SYN-ACK goes to the guest when
+    /// it completes.
+    connecting,
+    /// Inbound (port forward): our synthetic SYN was sent to the guest;
+    /// waiting for its SYN-ACK.
+    syn_to_guest,
+    established,
+    fin_wait,
+    closed,
+};
+
+/// A host→guest port forward rule.
+pub const Forward = struct {
+    host_port: u16,
+    guest_port: u16,
+};
+
+/// A listening host socket for one forward rule.
+const Listener = struct {
+    socket: std.posix.socket_t,
+    guest_port: u16,
+    host_port: u16,
+};
 
 /// A forwarded TCP connection (guest ↔ host socket).
 const TcpFlow = struct {
@@ -107,6 +130,13 @@ pub const MiniNat = struct {
     rx_ready: ?*const fn (?*anyopaque) bool = null,
     rx_ready_userdata: ?*anyopaque = null,
 
+    /// Host→guest port-forward listeners. Populated by addForward()
+    /// BEFORE start(); immutable afterwards (pollLoop reads unlocked).
+    listeners: std.ArrayListUnmanaged(Listener) = .empty,
+    /// Ephemeral "remote" port allocator for inbound flows (the guest
+    /// sees forwarded connections as coming from GATEWAY_IP:ephemeral).
+    next_inbound_port: u16 = 49152,
+
     pub const UDP_FLOW_MAX: usize = 256;
     pub const UDP_IDLE_TIMEOUT_S: i64 = 60;
     pub const TCP_FLOW_MAX: usize = 256;
@@ -133,6 +163,31 @@ pub const MiniNat = struct {
         self.rx_ready_userdata = userdata;
     }
 
+    /// Add a host→guest port forward: connections accepted on the host's
+    /// TCP host_port are proxied to the guest's guest_port. Must be called
+    /// before start().
+    pub fn addForward(self: *MiniNat, fwd: Forward) !void {
+        const sock = try net_compat.socketCreate(
+            std.posix.AF.INET,
+            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
+            0,
+        );
+        errdefer net_compat.socketClose(sock);
+        net_compat.setReuseAddr(sock);
+        var addr = std.posix.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, fwd.host_port),
+            .addr = 0, // INADDR_ANY
+        };
+        try net_compat.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+        try net_compat.listen(sock, 8);
+        try self.listeners.append(self.alloc, .{
+            .socket = sock,
+            .guest_port = fwd.guest_port,
+            .host_port = fwd.host_port,
+        });
+        log.info("forwarding host tcp/{} -> guest tcp/{}", .{ fwd.host_port, fwd.guest_port });
+    }
+
     /// Start the reply-poll thread (forwards socket replies to the guest).
     pub fn start(self: *MiniNat) !void {
         self.running.store(true, .release);
@@ -154,6 +209,8 @@ pub const MiniNat = struct {
         var iiter = self.icmp_flows.valueIterator();
         while (iiter.next()) |flow| net_compat.socketClose(flow.socket);
         self.icmp_flows.deinit();
+        for (self.listeners.items) |l| net_compat.socketClose(l.socket);
+        self.listeners.deinit(self.alloc);
     }
 
     /// Handle one guest → host Ethernet frame.
@@ -415,6 +472,7 @@ pub const MiniNat = struct {
             }
 
             if (self.pumpTcp(&buf)) delivered = true;
+            if (self.pumpAccept()) delivered = true;
             self.flows_mutex.unlock(global.io());
 
             if (!delivered) {
@@ -475,6 +533,10 @@ pub const MiniNat = struct {
                 continue;
             }
 
+            // Inbound handshake in flight: no data relay until the guest's
+            // SYN-ACK arrives (handleTcp flips the state to established).
+            if (flow.state == .syn_to_guest) continue;
+
             // Relay available host data to the guest — unless the guest RX
             // side is backed up, in which case defer (no drop).
             if (!rx_ok) continue;
@@ -503,6 +565,58 @@ pub const MiniNat = struct {
             }
         }
         return work;
+    }
+
+    /// Accept pending connections on forward listeners and open the
+    /// guest-side handshake: the guest sees a SYN from GATEWAY_IP with an
+    /// ephemeral source port. Caller holds flows_mutex.
+    fn pumpAccept(self: *MiniNat) bool {
+        var work = false;
+        for (self.listeners.items) |l| {
+            while (true) {
+                const sock = net_compat.accept(l.socket) catch break;
+                if (self.tcp_flows.count() >= TCP_FLOW_MAX) {
+                    net_compat.socketClose(sock);
+                    break;
+                }
+                const key = self.allocInboundKey(l.guest_port) orelse {
+                    net_compat.socketClose(sock);
+                    break;
+                };
+                const flow = TcpFlow{
+                    .socket = sock,
+                    .state = .syn_to_guest,
+                    .snd_nxt = 0x2000,
+                    .rcv_nxt = 0, // learned from the guest's SYN-ACK
+                    .last_used = nowSeconds(),
+                };
+                self.tcp_flows.put(key, flow) catch {
+                    net_compat.socketClose(sock);
+                    break;
+                };
+                self.tcpSend(key, 0x2000, 0, TCP_SYN, &.{});
+                self.tcp_flows.getPtr(key).?.snd_nxt +%= 1; // SYN consumes a seq
+                work = true;
+            }
+        }
+        return work;
+    }
+
+    /// Pick an unused (guest_port, GATEWAY_IP, ephemeral) key for an
+    /// inbound flow. Caller holds flows_mutex.
+    fn allocInboundKey(self: *MiniNat, guest_port: u16) ?TcpKey {
+        var attempts: u32 = 0;
+        while (attempts < 16384) : (attempts += 1) {
+            const port = self.next_inbound_port;
+            self.next_inbound_port = if (port == 65535) 49152 else port + 1;
+            const key = TcpKey{
+                .guest_port = guest_port,
+                .remote_ip = GATEWAY_IP,
+                .remote_port = port,
+            };
+            if (!self.tcp_flows.contains(key)) return key;
+        }
+        return null;
     }
 
     /// Build remote → guest UDP frame.
@@ -602,8 +716,10 @@ pub const MiniNat = struct {
         if (frame.len < tcp_off + 20) return;
         const ip = frame[ETH_HDR..];
         const dst_ip = ip[16..20];
-        // Only forward off-net destinations.
-        if (std.mem.eql(u8, dst_ip[0..3], GATEWAY_IP[0..3])) return;
+        // On-net destinations are never proxied outbound — but replies on
+        // inbound (port-forwarded) flows are addressed to GATEWAY_IP, so
+        // they must still reach the flow lookup below.
+        const on_net = std.mem.eql(u8, dst_ip[0..3], GATEWAY_IP[0..3]);
 
         const tcp = frame[tcp_off..];
         const src_port = std.mem.readInt(u16, tcp[0..2], .big);
@@ -624,13 +740,17 @@ pub const MiniNat = struct {
         defer self.flows_mutex.unlock(global.io());
 
         if (flags & TCP_SYN != 0 and flags & TCP_ACK == 0) {
-            self.tcpOpen(key, seq);
+            if (!on_net) self.tcpOpen(key, seq);
             return;
         }
 
         const flow = self.tcp_flows.getPtr(key) orelse {
             // Unknown connection: RST it so the guest gives up quickly.
-            if (flags & TCP_RST == 0) self.tcpSendRst(key, seq + @as(u32, @intCast(payload.len)));
+            // (Not for on-net packets — the gateway itself runs no
+            // services; silence matches the old drop behavior.)
+            if (!on_net and flags & TCP_RST == 0) {
+                self.tcpSendRst(key, seq + @as(u32, @intCast(payload.len)));
+            }
             return;
         };
         flow.last_used = nowSeconds();
@@ -638,6 +758,16 @@ pub const MiniNat = struct {
         if (flags & TCP_RST != 0) {
             net_compat.socketClose(flow.socket);
             _ = self.tcp_flows.remove(key);
+            return;
+        }
+
+        // Inbound flow: the guest's SYN-ACK completes the handshake.
+        if (flow.state == .syn_to_guest) {
+            if (flags & TCP_SYN != 0 and flags & TCP_ACK != 0) {
+                flow.rcv_nxt = seq +% 1; // guest SYN consumes a seq
+                flow.state = .established;
+                self.tcpSendAck(key, flow);
+            }
             return;
         }
 
@@ -1180,4 +1310,97 @@ test "mininat: checksum of a known IPv4 header is correct" {
     // Writing the checksum back in makes the header sum to zero (checks to 0xffff).
     std.mem.writeInt(u16, hdr[10..12], 0xb861, .big);
     try testing.expectEqual(@as(u16, 0), MiniNat.checksum(&hdr));
+}
+
+fn buildGuestTcpFrame(
+    buf: *[54 + 64]u8,
+    guest_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: []const u8,
+) []const u8 {
+    const total = 54 + payload.len;
+    @memset(buf[0..total], 0);
+    @memcpy(buf[0..6], &GATEWAY_MAC);
+    @memcpy(buf[6..12], &[_]u8{ 0x52, 0x54, 0, 0x12, 0x34, 0x56 });
+    std.mem.writeInt(u16, buf[12..14], ETHERTYPE_IP, .big);
+    const ip = buf[14..];
+    ip[0] = 0x45;
+    std.mem.writeInt(u16, ip[2..4], @intCast(40 + payload.len), .big);
+    ip[9] = 6; // TCP
+    @memcpy(ip[12..16], &GUEST_IP);
+    @memcpy(ip[16..20], &GATEWAY_IP);
+    const tcp = buf[34..];
+    std.mem.writeInt(u16, tcp[0..2], guest_port, .big);
+    std.mem.writeInt(u16, tcp[2..4], dst_port, .big);
+    std.mem.writeInt(u32, tcp[4..8], seq, .big);
+    std.mem.writeInt(u32, tcp[8..12], ack, .big);
+    tcp[12] = 5 << 4;
+    tcp[13] = flags;
+    @memcpy(tcp[20..][0..payload.len], payload);
+    return buf[0..total];
+}
+
+test "mininat: port forward — accept, handshake, and guest->host relay" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    defer {
+        var titer = nat.tcp_flows.valueIterator();
+        while (titer.next()) |flow| net_compat.socketClose(flow.socket);
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+        for (nat.listeners.items) |l| net_compat.socketClose(l.socket);
+        nat.listeners.deinit(testing.allocator);
+    }
+
+    // Listener on an ephemeral host port (0 = kernel-assigned).
+    try nat.addForward(.{ .host_port = 0, .guest_port = 22 });
+    var sa: std.posix.sockaddr.in = undefined;
+    var sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    try testing.expect(std.c.getsockname(nat.listeners.items[0].socket, @ptrCast(&sa), &sa_len) == 0);
+
+    // A blocking loopback client connects (lands in the backlog).
+    const client = try net_compat.socketCreate(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer net_compat.socketClose(client);
+    var dst = std.posix.sockaddr.in{
+        .port = sa.port,
+        .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
+    };
+    try net_compat.connect(client, @ptrCast(&dst), @sizeOf(std.posix.sockaddr.in));
+
+    // Accept: a SYN to the guest's port 22 from the gateway must go out.
+    nat.flows_mutex.lockUncancelable(global.io());
+    const accepted = nat.pumpAccept();
+    nat.flows_mutex.unlock(global.io());
+    try testing.expect(accepted);
+    try testing.expectEqual(@as(usize, 1), nat.tcp_flows.count());
+    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
+    const syn = test_replies.items[0];
+    try testing.expectEqual(@as(u16, 22), std.mem.readInt(u16, syn[36..38], .big)); // dst = guest port
+    try testing.expectEqual(MiniNat.TCP_SYN, syn[47]); // flags: SYN only
+    const eph_port = std.mem.readInt(u16, syn[34..36], .big);
+
+    // Guest answers SYN-ACK: flow must establish and we must ACK.
+    var fbuf: [54 + 64]u8 = undefined;
+    const synack = buildGuestTcpFrame(&fbuf, 22, eph_port, 777, 0x2001, MiniNat.TCP_SYN | MiniNat.TCP_ACK, &.{});
+    nat.handleFrame(synack);
+    const key = TcpKey{ .guest_port = 22, .remote_ip = GATEWAY_IP, .remote_port = eph_port };
+    const flow = nat.tcp_flows.getPtr(key).?;
+    try testing.expectEqual(TcpState.established, flow.state);
+    try testing.expectEqual(@as(u32, 778), flow.rcv_nxt);
+    try testing.expectEqual(@as(usize, 2), test_replies.items.len);
+    const ackf = test_replies.items[1];
+    try testing.expectEqual(MiniNat.TCP_ACK, ackf[47]);
+    try testing.expectEqual(@as(u32, 778), std.mem.readInt(u32, ackf[42..46], .big));
+
+    // Guest payload is relayed to the host client socket.
+    const data = buildGuestTcpFrame(&fbuf, 22, eph_port, 778, 0x2001, MiniNat.TCP_PSH | MiniNat.TCP_ACK, "hello");
+    nat.handleFrame(data);
+    var rx: [16]u8 = undefined;
+    const n = try net_compat.recv(client, &rx, 0);
+    try testing.expectEqualStrings("hello", rx[0..n]);
 }

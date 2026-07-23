@@ -29,6 +29,16 @@ enable_virgl: bool = false,
 enable_net: bool = false,
 display_width: u32 = 1280,
 display_height: u32 = 800,
+/// Host→guest TCP port forwards (--forward host:guest, repeatable).
+forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
+forward_count: u8 = 0,
+
+pub const MAX_FORWARDS = 8;
+
+pub const PortForward = struct {
+    host_port: u16 = 0,
+    guest_port: u16 = 0,
+};
 
 pub const ParseError = error{
     InvalidArgument,
@@ -107,6 +117,29 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
             config.enable_gpu = true;
             config.enable_virgl = true;
         } else if (std.mem.eql(u8, arg, "--net")) {
+            config.enable_net = true;
+        } else if (std.mem.eql(u8, arg, "--forward")) {
+            const val = args.next() orelse {
+                log.err("--forward requires a value (host_port:guest_port)", .{});
+                return ParseError.InvalidArgument;
+            };
+            if (config.forward_count >= MAX_FORWARDS) {
+                log.err("too many --forward rules (max {})", .{MAX_FORWARDS});
+                return ParseError.InvalidArgument;
+            }
+            const sep = std.mem.indexOfScalar(u8, val, ':') orelse {
+                log.err("--forward format is host_port:guest_port", .{});
+                return ParseError.InvalidArgument;
+            };
+            const hp = std.fmt.parseInt(u16, val[0..sep], 10) catch 0;
+            const gp = std.fmt.parseInt(u16, val[sep + 1 ..], 10) catch 0;
+            if (hp == 0 or gp == 0) {
+                log.err("invalid --forward ports: {s}", .{val});
+                return ParseError.InvalidArgument;
+            }
+            config.forwards[config.forward_count] = .{ .host_port = hp, .guest_port = gp };
+            config.forward_count += 1;
+            // Forwarding implies networking.
             config.enable_net = true;
         } else if (std.mem.eql(u8, arg, "--display")) {
             const val = args.next() orelse {

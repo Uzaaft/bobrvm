@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const Config = @import("Config.zig");
 const global = @import("../global.zig");
 const machine = @import("../machine/main.zig");
+const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
 
 const log = std.log.scoped(.cli);
@@ -23,6 +24,12 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     global.state.init();
     defer global.state.deinit();
 
+    // Must outlive the machine: MachineConfig.forwards borrows this array.
+    var forwards_buf: [Config.MAX_FORWARDS]mininat.Forward = undefined;
+    for (config.forwards[0..config.forward_count], 0..) |f, i| {
+        forwards_buf[i] = .{ .host_port = f.host_port, .guest_port = f.guest_port };
+    }
+
     const machine_config = machine.MachineConfig{
         .ram_size = config.memory_mb * 1024 * 1024,
         .vcpu_count = config.vcpu_count,
@@ -38,6 +45,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_gpu = config.enable_gpu,
         .enable_virgl = config.enable_virgl,
         .enable_net = config.enable_net,
+        .forwards = forwards_buf[0..config.forward_count],
         .display_width = config.display_width,
         .display_height = config.display_height,
     };
