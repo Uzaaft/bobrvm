@@ -227,6 +227,10 @@ pub const Machine = struct {
     net_slot: u8 = 0,
     nat: mininat.MiniNat = undefined,
 
+    /// Virtio entropy device (always present; instant guest RNG seeding).
+    rng: ?*virtio.Rng = null,
+    rng_slot: u8 = 0,
+
     /// UART device (PL011 for earlycon).
     uart: ?*virtio.Uart = null,
 
@@ -325,6 +329,11 @@ pub const Machine = struct {
             self.nat.stop();
             net.deinit();
             self.net = null;
+        }
+
+        if (self.rng) |rng_dev| {
+            rng_dev.deinit();
+            self.rng = null;
         }
 
         if (self.uart) |uart| {
@@ -872,6 +881,9 @@ pub const Machine = struct {
             } else if (self.net != null and slot == self.net_slot) {
                 const net = self.net.?;
                 if (is_write) net.write(offset, value) else result = net.read(offset);
+            } else if (self.rng != null and slot == self.rng_slot) {
+                const rng_dev = self.rng.?;
+                if (is_write) rng_dev.write(offset, value) else result = rng_dev.read(offset);
             } else if (slot == 0 and self.console != null) {
                 const console = self.console.?;
                 if (is_write) console.write(offset, value) else result = console.read(offset);
@@ -1304,10 +1316,11 @@ pub const Machine = struct {
         defer builder.deinit();
 
         // Count virtio devices: console (slot 0) + block devices + gpu
-        // + keyboard + mouse (input accompanies the display)
+        // + keyboard + mouse (input accompanies the display) + net + rng
+        // (rng is always present, in the last slot)
         const virtio_count: u8 = 1 + self.config.blockDeviceCount() +
             (if (self.config.enable_gpu) @as(u8, 3) else 0) +
-            @intFromBool(self.config.enable_net);
+            @intFromBool(self.config.enable_net) + 1;
 
         const config = dtb.DtbConfig{
             .ram_base = MemoryLayout.RAM_BASE,
@@ -1455,6 +1468,15 @@ pub const Machine = struct {
             self.net.?.setTxCallback(netTxCallback, self);
             log.debug("initialized virtio-net at slot {} (built-in NAT)", .{self.net_slot});
         }
+
+        // Entropy device: always present, in the slot after everything else.
+        self.rng_slot = 1 + self.config.blockDeviceCount() +
+            (if (self.config.enable_gpu) @as(u8, 3) else 0) +
+            @intFromBool(self.config.enable_net);
+        self.rng = try virtio.Rng.init(self.alloc);
+        self.rng.?.setGuestMemory(getGuestMemoryWrapper);
+        self.rng.?.transport.setIrqCallback(rngIrqCallback, self);
+        log.debug("initialized virtio-rng at slot {}", .{self.rng_slot});
 
         // Initialize PCIe ECAM host bridge for UEFI boot
         if (self.config.isFirmwareBoot()) {
@@ -1870,6 +1892,13 @@ pub const Machine = struct {
         // Virtio slot N is GIC_SPI 32+N → intid 64 + N.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.gpu_slot), level);
+        }
+    }
+
+    fn rngIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.rng_slot), level);
         }
     }
 
