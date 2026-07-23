@@ -7,7 +7,7 @@
 //
 // Build: ./macos/MinimalApp/build.sh
 // Run:   BobrvmDisplay --kernel Image --initrd initrd [--disk d.img] \
-//            [--cmdline '...'] [--memory-mb 2048]
+//            [--cmdline '...'] [--memory-mb 2048] [--net]
 
 import AppKit
 import Metal
@@ -146,6 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var disk: String? = nil
         var cmdline = "console=hvc0 earlycon=pl011,0x09000000"
         var memoryMB: UInt64 = 2048
+        var enableNet = false
 
         var args = CommandLine.arguments.dropFirst().makeIterator()
         while let arg = args.next() {
@@ -155,11 +156,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "--disk": disk = args.next()
             case "--cmdline": cmdline = args.next() ?? cmdline
             case "--memory-mb": memoryMB = UInt64(args.next() ?? "") ?? memoryMB
+            case "--net": enableNet = true
             default: print("unknown argument: \(arg)")
             }
         }
         guard let kernelPath = kernel else {
-            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img]")
+            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--net] [--memory-mb 2048]")
             NSApp.terminate(nil)
             return
         }
@@ -177,6 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         cfg.disk_path = diskC
                         cfg.disk_read_only = diskC != nil && (disk?.hasSuffix(".iso") ?? false)
                         cfg.cmdline = cmdlineC
+                        cfg.enable_net = enableNet
                         vm = bobrvm_vm_new(bobrApp, &cfg)
                     }
                 }

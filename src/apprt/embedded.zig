@@ -71,6 +71,8 @@ pub const VMConfig = extern struct {
     disk2_path: ?[*:0]const u8 = null,
     /// Whether secondary disk is read-only (default: true for ISO).
     disk2_read_only: bool = true,
+    /// Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP).
+    enable_net: bool = false,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
@@ -103,6 +105,7 @@ pub const VMConfig = extern struct {
             .disk_read_only = self.disk_read_only,
             .disk2_path = try dupeString(alloc, self.disk2_path),
             .disk2_read_only = self.disk2_read_only,
+            .enable_net = self.enable_net,
         };
     }
 };
@@ -120,6 +123,7 @@ pub const OwnedVMConfig = struct {
     disk_read_only: bool = false,
     disk2_path: ?[]const u8 = null,
     disk2_read_only: bool = true,
+    enable_net: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.firmware_path) |p| alloc.free(p);
@@ -390,6 +394,7 @@ pub const VM = struct {
                 .cmdline = self.config.cmdline orelse "console=hvc0 earlycon=pl011,0x09000000",
                 // GUI VMs always get a display device.
                 .enable_gpu = true,
+                .enable_net = self.config.enable_net,
             };
 
             self.hw_machine = machine.Machine.init(self.alloc, machine_config) catch |err| {

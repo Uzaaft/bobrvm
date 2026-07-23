@@ -41,6 +41,21 @@ const UdpFlow = struct {
     last_used: i64,
 };
 
+const IcmpKey = struct {
+    remote_ip: [4]u8,
+    /// Guest-chosen ICMP echo identifier (ping's pid-derived id).
+    id: u16,
+};
+
+/// A forwarded ICMP echo "flow": one unprivileged DGRAM ICMP socket per
+/// (remote host, guest id). last_seq lets us stamp the guest's sequence
+/// number back onto whatever the kernel/remote host actually returns.
+const IcmpFlow = struct {
+    socket: std.posix.socket_t,
+    last_used: i64,
+    last_seq: u16 = 0,
+};
+
 const TcpKey = struct {
     guest_port: u16,
     remote_ip: [4]u8,
@@ -67,6 +82,7 @@ pub const MiniNat = struct {
     alloc: std.mem.Allocator,
     udp_flows: std.AutoHashMap(UdpKey, UdpFlow),
     tcp_flows: std.AutoHashMap(TcpKey, TcpFlow),
+    icmp_flows: std.AutoHashMap(IcmpKey, IcmpFlow),
     flows_mutex: std.Thread.Mutex = .{},
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
@@ -84,6 +100,8 @@ pub const MiniNat = struct {
     pub const UDP_IDLE_TIMEOUT_S: i64 = 60;
     pub const TCP_FLOW_MAX: usize = 256;
     pub const TCP_IDLE_TIMEOUT_S: i64 = 300;
+    pub const ICMP_FLOW_MAX: usize = 256;
+    pub const ICMP_IDLE_TIMEOUT_S: i64 = 60;
     /// Our advertised window / max relayed segment payload.
     pub const TCP_MSS: usize = 1400;
 
@@ -94,6 +112,7 @@ pub const MiniNat = struct {
             .alloc = alloc,
             .udp_flows = std.AutoHashMap(UdpKey, UdpFlow).init(alloc),
             .tcp_flows = std.AutoHashMap(TcpKey, TcpFlow).init(alloc),
+            .icmp_flows = std.AutoHashMap(IcmpKey, IcmpFlow).init(alloc),
         };
     }
 
@@ -121,6 +140,9 @@ pub const MiniNat = struct {
         var titer = self.tcp_flows.valueIterator();
         while (titer.next()) |flow| std.posix.close(flow.socket);
         self.tcp_flows.deinit();
+        var iiter = self.icmp_flows.valueIterator();
+        while (iiter.next()) |flow| std.posix.close(flow.socket);
+        self.icmp_flows.deinit();
     }
 
     /// Handle one guest → host Ethernet frame.
@@ -263,6 +285,64 @@ pub const MiniNat = struct {
         ) catch {};
     }
 
+    /// Forward a guest ICMP echo request to a real remote host via an
+    /// unprivileged DGRAM ICMP socket (no root required on macOS/Linux).
+    fn forwardIcmp(
+        self: *MiniNat,
+        remote_ip: [4]u8,
+        id: u16,
+        seq: u16,
+        payload: []const u8,
+    ) void {
+        const key = IcmpKey{ .remote_ip = remote_ip, .id = id };
+
+        self.flows_mutex.lock();
+        defer self.flows_mutex.unlock();
+
+        const gop = self.icmp_flows.getOrPut(key) catch return;
+        if (!gop.found_existing) {
+            if (self.icmp_flows.count() > ICMP_FLOW_MAX) {
+                _ = self.icmp_flows.remove(key);
+                return;
+            }
+            const sock = std.posix.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
+                std.posix.IPPROTO.ICMP,
+            ) catch {
+                _ = self.icmp_flows.remove(key);
+                return;
+            };
+            gop.value_ptr.* = .{ .socket = sock, .last_used = std.time.timestamp() };
+        }
+        gop.value_ptr.last_used = std.time.timestamp();
+        gop.value_ptr.last_seq = seq;
+
+        var req: [1500]u8 = undefined;
+        const total = 8 + payload.len;
+        if (total > req.len) return;
+        req[0] = 8; // echo request
+        req[1] = 0; // code
+        std.mem.writeInt(u16, req[2..4], 0, .big);
+        std.mem.writeInt(u16, req[4..6], id, .big);
+        std.mem.writeInt(u16, req[6..8], seq, .big);
+        @memcpy(req[8..total], payload);
+        const icmp_csum = checksum(req[0..total]);
+        std.mem.writeInt(u16, req[2..4], icmp_csum, .big);
+
+        var addr = std.posix.sockaddr.in{
+            .port = 0,
+            .addr = @bitCast(remote_ip),
+        };
+        _ = std.posix.sendto(
+            gop.value_ptr.socket,
+            req[0..total],
+            0,
+            @ptrCast(&addr),
+            @sizeOf(std.posix.sockaddr.in),
+        ) catch {};
+    }
+
     /// Poll host sockets for replies and frame them back to the guest.
     fn pollLoop(self: *MiniNat) void {
         var buf: [2048]u8 = undefined;
@@ -293,6 +373,32 @@ pub const MiniNat = struct {
             }
             if (expired) |key| {
                 if (self.udp_flows.fetchRemove(key)) |entry| {
+                    std.posix.close(entry.value.socket);
+                }
+            }
+
+            var expired_icmp: ?IcmpKey = null;
+            var iiter = self.icmp_flows.iterator();
+            while (iiter.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const flow = entry.value_ptr;
+
+                if (now - flow.last_used > ICMP_IDLE_TIMEOUT_S) {
+                    expired_icmp = key;
+                    continue;
+                }
+
+                const n = std.posix.recvfrom(flow.socket, &buf, 0, null, null) catch |err| {
+                    if (err != error.WouldBlock) expired_icmp = key;
+                    continue;
+                };
+                if (n == 0) continue;
+                flow.last_used = now;
+                self.handleIcmpSocketReply(key, flow.last_seq, buf[0..n]);
+                delivered = true;
+            }
+            if (expired_icmp) |key| {
+                if (self.icmp_flows.fetchRemove(key)) |entry| {
                     std.posix.close(entry.value.socket);
                 }
             }
@@ -414,6 +520,55 @@ pub const MiniNat = struct {
         std.mem.writeInt(u16, udp[6..8], 0, .big); // checksum disabled
 
         @memcpy(out[ETH_HDR + 28 ..][0..payload.len], payload);
+
+        self.reply(out[0..total], self.reply_userdata);
+    }
+
+    /// Build remote → guest ICMP echo reply frame. `icmp_msg` is whatever
+    /// the host's DGRAM ICMP socket handed back; the id/seq are stamped
+    /// with the guest's original values since the kernel may have
+    /// rewritten the id on the way out for its own demuxing.
+    /// Handle bytes read from a DGRAM ICMP flow socket. macOS/BSD hand
+    /// back the full IP packet (header + ICMP message) on recvfrom, not
+    /// just the ICMP part like UDP recvfrom does — skip the IP header
+    /// before reframing for the guest.
+    fn handleIcmpSocketReply(self: *MiniNat, key: IcmpKey, seq: u16, raw: []const u8) void {
+        if (raw.len < 20 or raw[0] >> 4 != 4) return;
+        const rihl: usize = @as(usize, raw[0] & 0x0F) * 4;
+        if (raw.len <= rihl) return;
+        self.replyIcmp(key, seq, raw[rihl..]);
+    }
+
+    fn replyIcmp(self: *MiniNat, key: IcmpKey, seq: u16, icmp_msg: []const u8) void {
+        if (icmp_msg.len < 8) return;
+        if (icmp_msg[0] != 0) return; // only relay echo replies
+
+        var out: [2048 + 42]u8 = undefined;
+        const total = ETH_HDR + 20 + icmp_msg.len;
+        if (total > out.len) return;
+
+        @memcpy(out[0..6], &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
+        @memcpy(out[6..12], &GATEWAY_MAC);
+        std.mem.writeInt(u16, out[12..14], ETHERTYPE_IP, .big);
+
+        const ip = out[ETH_HDR..];
+        @memset(ip[0..20], 0);
+        ip[0] = 0x45;
+        std.mem.writeInt(u16, ip[2..4], @intCast(20 + icmp_msg.len), .big);
+        ip[8] = 64;
+        ip[9] = 1; // icmp
+        @memcpy(ip[12..16], &key.remote_ip);
+        @memcpy(ip[16..20], &GUEST_IP);
+        const ip_csum = checksum(ip[0..20]);
+        std.mem.writeInt(u16, ip[10..12], ip_csum, .big);
+
+        const icmp = out[ETH_HDR + 20 ..][0..icmp_msg.len];
+        @memcpy(icmp, icmp_msg);
+        std.mem.writeInt(u16, icmp[4..6], key.id, .big);
+        std.mem.writeInt(u16, icmp[6..8], seq, .big);
+        std.mem.writeInt(u16, icmp[2..4], 0, .big);
+        const icmp_csum = checksum(icmp);
+        std.mem.writeInt(u16, icmp[2..4], icmp_csum, .big);
 
         self.reply(out[0..total], self.reply_userdata);
     }
@@ -614,13 +769,21 @@ pub const MiniNat = struct {
     fn handleIcmp(self: *MiniNat, frame: []const u8, ihl: usize) void {
         const ip = frame[ETH_HDR..];
         const dst_ip = ip[16..20];
-        if (!std.mem.eql(u8, dst_ip, &GATEWAY_IP) and !std.mem.eql(u8, dst_ip, &DNS_IP)) {
-            return;
-        }
 
         const icmp_off = ETH_HDR + ihl;
         if (frame.len < icmp_off + 8) return;
         if (frame[icmp_off] != 8) return; // echo request only
+
+        // Arbitrary remote host: forward the echo request via a real
+        // (unprivileged) ICMP socket instead of faking a local reply.
+        if (!std.mem.eql(u8, dst_ip, &GATEWAY_IP) and !std.mem.eql(u8, dst_ip, &DNS_IP)) {
+            if (dst_ip[0] == 255) return; // broadcast
+            const icmp = frame[icmp_off..];
+            const id = std.mem.readInt(u16, icmp[4..6], .big);
+            const seq = std.mem.readInt(u16, icmp[6..8], .big);
+            self.forwardIcmp(dst_ip[0..4].*, id, seq, icmp[8..]);
+            return;
+        }
 
         // Echo reply: swap MACs and IPs, flip type, fix checksums.
         var out: [1600]u8 = undefined;
@@ -785,6 +948,7 @@ test "mininat: ARP request for gateway gets a reply" {
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
     }
 
     var req: [42]u8 = undefined;
@@ -816,6 +980,7 @@ test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
     }
 
     var req: [ETH_HDR + 20 + 8 + 244]u8 = undefined;
@@ -853,6 +1018,7 @@ test "mininat: ICMP echo to gateway gets a reply" {
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
     }
 
     var req: [ETH_HDR + 20 + 12]u8 = undefined;
@@ -875,4 +1041,50 @@ test "mininat: ICMP echo to gateway gets a reply" {
     try testing.expectEqual(@as(u8, 0), rep[ETH_HDR + 20]); // echo reply
     try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 12 ..][0..4], &GATEWAY_IP));
     try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 16 ..][0..4], &GUEST_IP));
+}
+
+test "mininat: ICMP echo to a remote host is reframed for the guest" {
+    // Regression test: macOS/BSD DGRAM ICMP sockets hand recvfrom() the
+    // full IP packet (header + ICMP message), not just the ICMP message
+    // like UDP recvfrom does. handleIcmpSocketReply must skip that IP
+    // header — otherwise every remote ping reply is silently dropped
+    // (the IP header's first byte, 0x45, fails the "is this an echo
+    // reply" type==0 check).
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+    }
+
+    const remote_ip = [4]u8{ 8, 8, 8, 8 };
+    const key = IcmpKey{ .remote_ip = remote_ip, .id = 0x1234 };
+
+    // Simulate exactly what recvfrom() on the DGRAM ICMP socket returns:
+    // a 20-byte IPv4 header followed by an ICMP echo reply.
+    var raw: [20 + 8 + 5]u8 = undefined;
+    @memset(&raw, 0);
+    raw[0] = 0x45; // version 4, IHL 5 (20-byte header)
+    @memcpy(raw[12..16], &remote_ip);
+    const icmp = raw[20..];
+    icmp[0] = 0; // echo reply
+    icmp[1] = 0; // code
+    std.mem.writeInt(u16, icmp[4..6], 0x9999, .big); // kernel-rewritten id
+    std.mem.writeInt(u16, icmp[6..8], 7, .big); // kernel/remote seq
+    @memcpy(icmp[8..13], "hello");
+
+    nat.handleIcmpSocketReply(key, 42, &raw);
+
+    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
+    const rep = test_replies.items[0];
+    try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 12 ..][0..4], &remote_ip));
+    try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 16 ..][0..4], &GUEST_IP));
+    const rep_icmp = rep[ETH_HDR + 20 ..];
+    try testing.expectEqual(@as(u8, 0), rep_icmp[0]); // echo reply
+    // id/seq are stamped with the guest's originals, not the kernel's.
+    try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, rep_icmp[4..6], .big));
+    try testing.expectEqual(@as(u16, 42), std.mem.readInt(u16, rep_icmp[6..8], .big));
+    try testing.expect(std.mem.eql(u8, rep_icmp[8..13], "hello"));
 }

@@ -94,6 +94,8 @@ typedef struct {
     const char* disk2_path;
     /** Whether secondary disk is read-only (default: true for ISO). */
     bool disk2_read_only;
+    /** Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP). */
+    bool enable_net;
 } bobrvm_vm_config_s;
 
 /* -------------------------------------------------------------------------- */
