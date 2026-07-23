@@ -143,6 +143,34 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("cli", "Run the headless CLI");
     cli_step.dependOn(&cli_run.step);
 
+    // GUI run step - build the minimal Swift display app (macos/MinimalApp)
+    // and run it. Doesn't touch ghostty/xcodebuild, so unlike the full
+    // Xcode "run" step below it works fine inside a nix dev shell too.
+    if (target.result.os.tag == .macos) {
+        // swiftc must use the real system Xcode/SDK, not the nix-provided
+        // SDKROOT/DEVELOPER_DIR (a mismatched Swift toolchain + SDK pair
+        // fails to compile the Swift standard library module).
+        const gui_build = b.addSystemCommand(&.{"macos/MinimalApp/build.sh"});
+        gui_build.step.dependOn(b.getInstallStep());
+        gui_build.removeEnvironmentVariable("SDKROOT");
+        gui_build.removeEnvironmentVariable("DEVELOPER_DIR");
+        // nix's xcrun/xcodebuild shims sit ahead of /usr/bin on PATH and
+        // resolve the SDK to a mismatched nix-provided one; put the real
+        // system toolchain first so swiftc finds Xcode's actual SDK.
+        if (b.graph.env_map.get("PATH")) |path| {
+            gui_build.setEnvironmentVariable("PATH", b.fmt("/usr/bin:/bin:{s}", .{path}));
+        }
+
+        const gui_run = b.addSystemCommand(&.{"zig-out/bin/BobrvmDisplay"});
+        gui_run.step.dependOn(&gui_build.step);
+        if (b.args) |args| {
+            gui_run.addArgs(args);
+        }
+
+        const gui_step = b.step("gui", "Build and run the minimal Swift GUI display app");
+        gui_step.dependOn(&gui_run.step);
+    }
+
     // Test module
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
