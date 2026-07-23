@@ -7,7 +7,7 @@
 //
 // Build: ./macos/MinimalApp/build.sh
 // Run:   BobrvmDisplay --kernel Image --initrd initrd [--disk d.img] \
-//            [--cmdline '...'] [--memory-mb 2048] [--net]
+//            [--cmdline '...'] [--memory-mb 2048] [--net] [--cpus 1]
 
 import AppKit
 import Metal
@@ -198,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var cmdline = "console=hvc0 earlycon=pl011,0x09000000"
         var memoryMB: UInt64 = 2048
         var enableNet = false
+        var cpuCount: UInt8 = 1
 
         var args = CommandLine.arguments.dropFirst().makeIterator()
         while let arg = args.next() {
@@ -208,11 +209,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "--cmdline": cmdline = args.next() ?? cmdline
             case "--memory-mb": memoryMB = UInt64(args.next() ?? "") ?? memoryMB
             case "--net": enableNet = true
+            case "--cpus": cpuCount = UInt8(args.next() ?? "") ?? cpuCount
             default: print("unknown argument: \(arg)")
             }
         }
         guard let kernelPath = kernel else {
-            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--net] [--memory-mb 2048]")
+            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--net] [--cpus 1] [--memory-mb 2048]")
             NSApp.terminate(nil)
             return
         }
@@ -224,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     cmdline.withCString { cmdlineC in
                         var cfg = bobrvm_vm_config_s()
                         cfg.memory_bytes = memoryMB * 1024 * 1024
-                        cfg.vcpu_count = 1
+                        cfg.vcpu_count = cpuCount
                         cfg.kernel_path = kernelC
                         cfg.initrd_path = initrdC
                         cfg.disk_path = diskC
