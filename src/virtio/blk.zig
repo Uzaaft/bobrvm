@@ -117,6 +117,28 @@ pub const RequestHeader = extern struct {
     sector: u64,
 };
 
+/// One discard/write-zeroes segment (virtio 1.2 section 5.2.6): the data
+/// descriptor of those requests carries an array of these.
+pub const DiscardWriteZeroes = extern struct {
+    sector: u64,
+    num_sectors: u32,
+    /// Bit 0: unmap (write-zeroes may deallocate). Reserved otherwise.
+    flags: u32 = 0,
+};
+
+/// Darwin fcntl(F_PUNCHHOLE) argument (sys/fcntl.h); deallocates a
+/// byte range of an APFS file, which then reads back as zeros.
+const FPunchhole = extern struct {
+    fp_flags: c_uint = 0,
+    reserved: c_uint = 0,
+    fp_offset: c_longlong,
+    fp_length: c_longlong,
+};
+
+/// APFS punch-hole granularity: both offset and length must be
+/// multiples of the filesystem block size.
+const PUNCH_ALIGN: u64 = 4096;
+
 /// Block device.
 pub const Block = struct {
     alloc: Allocator,
@@ -146,7 +168,7 @@ pub const Block = struct {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         const features = Features.SIZE_MAX | Features.SEG_MAX | Features.BLK_SIZE |
-            Features.FLUSH | virtio_version_1;
+            Features.FLUSH | Features.DISCARD | Features.WRITE_ZEROES | virtio_version_1;
         const transport = try mmio.Transport.init(alloc, 2, features, 1); // 2 = block device ID
         errdefer transport.deinit();
 
@@ -161,6 +183,15 @@ pub const Block = struct {
                 .size_max = 4096,
                 .seg_max = 128,
                 .blk_size = 512,
+                // Discard/write-zeroes limits: 2 GiB per request, one
+                // segment per request, 4 KiB granularity (APFS punch-hole
+                // alignment; 8 sectors).
+                .max_discard_sectors = 4_194_304,
+                .max_discard_seg = 1,
+                .discard_sector_alignment = @intCast(PUNCH_ALIGN / SECTOR_SIZE),
+                .max_write_zeroes_sectors = 4_194_304,
+                .max_write_zeroes_seg = 1,
+                .write_zeroes_may_unmap = 1,
             },
             .request_queue = request_queue,
             .file = null,
@@ -444,8 +475,81 @@ pub const Block = struct {
                 }
                 return .io_err;
             },
+            .discard, .write_zeroes => {
+                if (self.read_only) return .io_err;
+                if (self.file == null) return .io_err;
+                // The readable data descriptors carry an array of segments.
+                for (data) |desc| {
+                    if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
+                    if (desc.len % @sizeOf(DiscardWriteZeroes) != 0) return .unsupp;
+                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
+                    var off: usize = 0;
+                    while (off < buf.len) : (off += @sizeOf(DiscardWriteZeroes)) {
+                        const seg = std.mem.bytesToValue(
+                            DiscardWriteZeroes,
+                            buf[off..][0..@sizeOf(DiscardWriteZeroes)],
+                        );
+                        const st = self.executeDiscardSegment(seg, req_type == .write_zeroes);
+                        if (st != .ok) return st;
+                    }
+                }
+                return .ok;
+            },
             else => return .unsupp,
         }
+    }
+
+    /// Apply one discard/write-zeroes segment. Discard is advisory: the
+    /// aligned interior is hole-punched (APFS reclaims the space and reads
+    /// back zeros) and failures are ignored. Write-zeroes must be exact, so
+    /// any remainder the punch couldn't cover is explicitly zeroed.
+    fn executeDiscardSegment(self: *Block, seg: DiscardWriteZeroes, must_zero: bool) Status {
+        const file = self.file orelse return .io_err;
+        const start = seg.sector * SECTOR_SIZE;
+        const len = @as(u64, seg.num_sectors) * SECTOR_SIZE;
+        if (len == 0) return .ok;
+        if (start + len > self.capacity_bytes or start + len < start) return .io_err;
+
+        // Punch the aligned interior so sparse files actually shrink.
+        const hole_start = std.mem.alignForward(u64, start, PUNCH_ALIGN);
+        const hole_end = std.mem.alignBackward(u64, start + len, PUNCH_ALIGN);
+        var punched = false;
+        if (hole_end > hole_start) {
+            var args = FPunchhole{
+                .fp_offset = @intCast(hole_start),
+                .fp_length = @intCast(hole_end - hole_start),
+            };
+            punched = std.c.fcntl(file.handle, std.c.F.PUNCHHOLE, &args) == 0;
+        }
+
+        if (!must_zero) return .ok; // discard: advisory, done either way
+
+        // write_zeroes: explicitly zero whatever the punch didn't cover.
+        var zeros: [65536]u8 = @splat(0);
+        var ranges: [2][2]u64 = undefined;
+        var n_ranges: usize = 0;
+        if (punched) {
+            if (start < hole_start) {
+                ranges[n_ranges] = .{ start, hole_start };
+                n_ranges += 1;
+            }
+            if (hole_end < start + len) {
+                ranges[n_ranges] = .{ hole_end, start + len };
+                n_ranges += 1;
+            }
+        } else {
+            ranges[0] = .{ start, start + len };
+            n_ranges = 1;
+        }
+        for (ranges[0..n_ranges]) |range| {
+            var pos = range[0];
+            while (pos < range[1]) {
+                const chunk = @min(range[1] - pos, zeros.len);
+                file.writePositionalAll(global.io(), zeros[0..chunk], pos) catch return .io_err;
+                pos += chunk;
+            }
+        }
+        return .ok;
     }
 
     /// Get MMIO region size.
@@ -490,4 +594,113 @@ test "RequestHeader size" {
 test "Config size" {
     // Ensure config is properly aligned
     try std.testing.expect(@sizeOf(Config) >= 56);
+}
+
+test "discard and write_zeroes advertised" {
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+
+    try std.testing.expect(blk.transport.device_features & Features.DISCARD != 0);
+    try std.testing.expect(blk.transport.device_features & Features.WRITE_ZEROES != 0);
+    try std.testing.expect(blk.config.max_discard_sectors > 0);
+    try std.testing.expectEqual(@as(u32, 8), blk.config.discard_sector_alignment);
+}
+
+test "write_zeroes zeroes exactly the requested range" {
+    const io = global.io();
+    const path = ".zig-cache/blk-wz-test.raw";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        var pattern: [64 * 1024]u8 = @splat(0xAA);
+        try f.writePositionalAll(io, &pattern, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, false);
+
+    // Zero a deliberately unaligned range: sectors 3..9 (1536..4608).
+    const seg = DiscardWriteZeroes{ .sector = 3, .num_sectors = 6 };
+    try std.testing.expectEqual(Status.ok, blk.executeDiscardSegment(seg, true));
+
+    var buf: [64 * 1024]u8 = undefined;
+    const f = blk.file.?;
+    _ = try f.readPositionalAll(io, &buf, 0);
+    // Before, inside, after.
+    for (buf[0..1536]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    for (buf[1536..4608]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (buf[4608 .. 8 * 1024]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+test "discard punches aligned range and rejects out-of-bounds" {
+    const io = global.io();
+    const path = ".zig-cache/blk-discard-test.raw";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        var pattern: [64 * 1024]u8 = @splat(0xBB);
+        try f.writePositionalAll(io, &pattern, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, false);
+
+    // 4K-aligned discard: sectors 8..24 (4096..12288). On APFS the punched
+    // hole reads back as zeros.
+    const seg = DiscardWriteZeroes{ .sector = 8, .num_sectors = 16 };
+    try std.testing.expectEqual(Status.ok, blk.executeDiscardSegment(seg, false));
+
+    var buf: [16 * 1024]u8 = undefined;
+    _ = try blk.file.?.readPositionalAll(io, &buf, 0);
+    for (buf[0..4096]) |b| try std.testing.expectEqual(@as(u8, 0xBB), b);
+    for (buf[4096..12288]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (buf[12288..]) |b| try std.testing.expectEqual(@as(u8, 0xBB), b);
+
+    // Out-of-bounds segment must fail, not corrupt.
+    const oob = DiscardWriteZeroes{ .sector = 1 << 40, .num_sectors = 8 };
+    try std.testing.expectEqual(Status.io_err, blk.executeDiscardSegment(oob, false));
+}
+
+test "discard request path via executeRequest" {
+    const io = global.io();
+    const path = ".zig-cache/blk-discard-req-test.raw";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        var pattern: [32 * 1024]u8 = @splat(0xCC);
+        try f.writePositionalAll(io, &pattern, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, false);
+
+    // Fake guest memory holding the segment array at 0x1000.
+    const Ctx = struct {
+        var mem: [4096]u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    const seg = DiscardWriteZeroes{ .sector = 8, .num_sectors = 8 };
+    @memcpy(Ctx.mem[0..@sizeOf(DiscardWriteZeroes)], std.mem.asBytes(&seg));
+
+    const header = RequestHeader{ .type = @intFromEnum(RequestType.discard), .sector = 0 };
+    const data = [_]Block.GuestDesc{
+        .{ .addr = 0x1000, .len = @sizeOf(DiscardWriteZeroes), .flags = 0, .next = 0 },
+    };
+    var written: u32 = 0;
+    try std.testing.expectEqual(Status.ok, blk.executeRequest(header, &data, Ctx.get, &written));
+
+    // Read-only disks refuse.
+    blk.read_only = true;
+    try std.testing.expectEqual(Status.io_err, blk.executeRequest(header, &data, Ctx.get, &written));
 }
