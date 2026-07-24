@@ -20,13 +20,27 @@ pub const RENDERER_USE_EGL: c_int = 1;
 pub const RENDERER_THREAD_SYNC: c_int = 2;
 pub const RENDERER_VENUS: c_int = 1 << 6;
 pub const RENDERER_NO_VIRGL: c_int = 1 << 7;
+pub const RENDERER_RENDER_SERVER: c_int = 1 << 9;
 
-/// Init flags proven on macOS/MoltenVK (tools/virgl_smoke.c): drive the Venus
-/// path and skip the virgl-GL (vrend) winsys entirely — that winsys needs an
-/// EGL/ANGLE display which does not initialize on macOS ("EGL is not supported
-/// on this platform"), and without NO_VIRGL init fails with "invalid renderer
-/// vrend callbacks". Venus talks to Vulkan (MoltenVK) directly.
-pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL;
+/// Init flags proven on macOS (see docs/gpu-venus-moltenvk.md):
+///  - VENUS: enable the Vulkan transport.
+///  - NO_VIRGL: skip the virgl-GL (vrend) winsys — it needs an EGL/ANGLE display
+///    that doesn't init on macOS, and without it init fails "invalid vrend
+///    callbacks".
+///  - RENDER_SERVER: Venus runs in a `virgl_render_server` subprocess. This is
+///    required — in-process venus returns EINVAL at context create in this
+///    build. The server path comes from the RENDER_SERVER_EXEC_PATH env
+///    (set via setRenderServerPath before init).
+pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL | RENDERER_RENDER_SERVER;
+
+/// Point virglrenderer at the `virgl_render_server` binary. Must be called
+/// before init(); virglrenderer reads RENDER_SERVER_EXEC_PATH from the env when
+/// it forks the Venus render server. Requires the macOS-patched virglrenderer
+/// (SOCK_STREAM proxy + kqueue fix; tools/build-virglrenderer-macos.sh).
+pub fn setRenderServerPath(path: [:0]const u8) void {
+    _ = setenv("RENDER_SERVER_EXEC_PATH", path.ptr, 1);
+}
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) callconv(.c) c_int;
 
 /// Capset ids (mesa/virglrenderer): VIRGL=1, VIRGL2=2, GFXSTREAM=3, VENUS=4.
 pub const CAPSET_VIRGL: u32 = 1;

@@ -175,12 +175,19 @@ pub fn build(b: *std.Build) void {
 
     // ==========================================================================
     // Venus GPU backend smoke test (macOS): prove the Zig↔virglrenderer(venus)
-    // FFI links and initializes. Opt-in via `zig build venus-smoke`; needs the
-    // Homebrew GPU stack (molten-vk, vulkan-loader, virglrenderer w/ venus).
-    // See docs/gpu-venus-moltenvk.md.
+    // FFI creates a Venus context through the render server. Opt-in via
+    // `zig build venus-smoke`; needs the macOS-patched virglrenderer
+    // (tools/build-virglrenderer-macos.sh → ~/.local/opt/virgl-macos) + the
+    // KosmicKrisp ICD + vulkan-loader/spirv-tools/angle. See docs/gpu-venus-moltenvk.md.
     // ==========================================================================
     if (target.result.os.tag == .macos) {
-        const virgl_prefix = "/opt/homebrew/opt/virglrenderer";
+        // The Venus path needs the macOS-patched virglrenderer (SOCK_STREAM
+        // proxy + kqueue fix) built by tools/build-virglrenderer-macos.sh, which
+        // installs to ~/.local/opt/virgl-macos. Override with -Dvirgl-prefix.
+        const home = b.graph.environ_map.get("HOME") orelse "/tmp";
+        const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-macos", .{home});
+        const virgl_prefix = b.option([]const u8, "virgl-prefix", "virglrenderer(venus) install prefix") orelse default_virgl_prefix;
+        const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
 
         const venus_mod = b.createModule(.{
             .root_source_file = b.path("src/gpu/venus.zig"),
@@ -196,11 +203,10 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         venus_smoke_mod.addImport("venus", venus_mod);
-        venus_smoke_mod.addLibraryPath(.{ .cwd_relative = virgl_prefix ++ "/lib" });
+        venus_smoke_mod.addLibraryPath(.{ .cwd_relative = virgl_lib });
         venus_smoke_mod.linkSystemLibrary("virglrenderer", .{});
-        // virglrenderer's transitive deps have absolute install names, but its
-        // own dylib is resolved via this rpath.
-        venus_smoke_mod.addRPath(.{ .cwd_relative = virgl_prefix ++ "/lib" });
+        // virglrenderer's own dylib is resolved via this rpath.
+        venus_smoke_mod.addRPath(.{ .cwd_relative = virgl_lib });
 
         const venus_smoke_exe = b.addExecutable(.{
             .name = "venus_smoke",
@@ -217,16 +223,21 @@ pub fn build(b: *std.Build) void {
         });
         sign_venus_smoke.step.dependOn(&install_venus_smoke.step);
 
-        // Run it. The build step wires the runtime library + ICD env.
+        // Run it. Wire the KosmicKrisp ICD, the render-server binary, and the
+        // runtime library path (fixed virglrenderer + loader + spirv + angle).
         const run_venus_smoke = b.addSystemCommand(&.{"zig-out/bin/venus_smoke"});
         run_venus_smoke.setEnvironmentVariable(
             "VK_ICD_FILENAMES",
-            "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
+            b.fmt("{s}/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json", .{virgl_prefix}),
+        );
+        run_venus_smoke.setEnvironmentVariable(
+            "RENDER_SERVER_EXEC_PATH",
+            b.fmt("{s}/libexec/virgl_render_server", .{virgl_prefix}),
         );
         run_venus_smoke.setEnvironmentVariable(
             "DYLD_LIBRARY_PATH",
-            "/opt/homebrew/opt/angle/lib:/opt/homebrew/opt/vulkan-loader/lib:" ++
-                "/opt/homebrew/opt/molten-vk/lib:/opt/homebrew/lib",
+            b.fmt("{s}:/opt/homebrew/opt/vulkan-loader/lib:/opt/homebrew/opt/spirv-tools/lib:" ++
+                "/opt/homebrew/opt/angle/lib:/opt/homebrew/lib", .{virgl_lib}),
         );
         run_venus_smoke.step.dependOn(&sign_venus_smoke.step);
 
