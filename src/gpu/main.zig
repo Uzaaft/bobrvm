@@ -1416,6 +1416,145 @@ test "GpuDevice depth-tests draws (far fragment loses to near)" {
     try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
 }
 
+test "GpuDevice executes TGSI control flow (IF on a uniform)" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const vbuf: u32 = 30;
+    try gpu.createResourceRecord(.{
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    // Branch on CONST[0].x: non-zero -> green, zero -> red.
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\nDCL TEMP[0]\nIMM[0] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}\nIMM[1] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}\n0: IF CONST[0].xxxx :3\n1: MOV TEMP[0], IMM[1]\n2: ELSE :4\n3: MOV TEMP[0], IMM[0]\n4: ENDIF\n5: MOV OUT[0], TEMP[0]\n6: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1);
+    b.w(52);
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
+    // CONST[0] = (1, 0, 0, 0): the IF takes the green branch.
+    b.cmd(12, 0, 6);
+    b.w(1);
+    b.w(0);
+    b.f(1.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.cmd(8, 0, 12);
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    for (0..9) |_| b.w(0);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const center = ((32 * 64) + 32) * 4;
+    // Green branch taken (BGRA).
+    try std.testing.expect(px[center + 1] > 200); // G
+    try std.testing.expect(px[center + 2] < 40); // R
+}
+
 test "GpuDevice captures shader TGSI text and binds by stage" {
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);

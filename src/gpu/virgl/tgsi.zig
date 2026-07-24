@@ -389,21 +389,91 @@ fn appendMask(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, o: Operand) !voi
     while (i < o.swz_len) : (i += 1) try app(w, alloc, "{c}", .{o.swz[i]});
 }
 
-fn isSupported(op: []const u8) bool {
+fn isSupportedName(op: []const u8) bool {
     const ops = [_][]const u8{
-        "MOV", "ADD", "SUB", "MUL", "MAD", "DP2", "DP3", "DP4",
-        "MAX", "MIN", "RCP", "RSQ", "FRC", "FLR", "ABS", "SQRT",
-        "TEX", "TXP",
+        "MOV",   "ADD", "SUB", "MUL",   "MAD",   "DP2", "DP3", "DP4",
+        "MAX",   "MIN", "RCP", "RSQ",   "FRC",   "FLR", "ABS", "SQRT",
+        "TEX",   "TXP", "CMP", "LRP",   "SLT",   "SGE", "SEQ", "SNE",
+        "POW",   "EX2", "LG2", "SIN",   "COS",   "TRUNC", "ROUND",
+        "SSG",   "DDX", "DDY",
     };
     for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
     return false;
 }
 
 /// Emit the float4 right-hand-side expression for a supported opcode.
-fn appendRhs(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, instr: *const Instr) !void {
-    const op = instr.opName();
+fn appendRhsNamed(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, instr: *const Instr, op: []const u8) !void {
     const s = instr.srcs;
-    if (std.mem.eql(u8, op, "TEX")) {
+    if (std.mem.eql(u8, op, "CMP")) {
+        // dst = (src0 < 0) ? src1 : src2, per component.
+        try app(w, alloc, "select(", .{});
+        try appendSrc(w, alloc, prog, s[2]);
+        try app(w, alloc, ", ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ", (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ") < 0.0f)", .{});
+    } else if (std.mem.eql(u8, op, "LRP")) {
+        // dst = src0*src1 + (1-src0)*src2 = mix(src2, src1, src0).
+        try app(w, alloc, "mix(", .{});
+        try appendSrc(w, alloc, prog, s[2]);
+        try app(w, alloc, ", ", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ", ", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "SLT") or std.mem.eql(u8, op, "SGE") or
+        std.mem.eql(u8, op, "SEQ") or std.mem.eql(u8, op, "SNE"))
+    {
+        const cmp: []const u8 = if (std.mem.eql(u8, op, "SLT")) "<" else if (std.mem.eql(u8, op, "SGE")) ">=" else if (std.mem.eql(u8, op, "SEQ")) "==" else "!=";
+        try app(w, alloc, "float4((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ") {s} (", .{cmp});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "POW")) {
+        try app(w, alloc, "float4(pow((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x, (", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ").x))", .{});
+    } else if (std.mem.eql(u8, op, "EX2")) {
+        try app(w, alloc, "float4(exp2((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x))", .{});
+    } else if (std.mem.eql(u8, op, "LG2")) {
+        try app(w, alloc, "float4(log2((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x))", .{});
+    } else if (std.mem.eql(u8, op, "SIN")) {
+        try app(w, alloc, "float4(sin((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x))", .{});
+    } else if (std.mem.eql(u8, op, "COS")) {
+        try app(w, alloc, "float4(cos((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x))", .{});
+    } else if (std.mem.eql(u8, op, "TRUNC")) {
+        try app(w, alloc, "trunc(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "ROUND")) {
+        try app(w, alloc, "rint(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "SSG")) {
+        try app(w, alloc, "sign(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "DDX")) {
+        try app(w, alloc, "dfdx(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "DDY")) {
+        try app(w, alloc, "dfdy(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "TEX")) {
         // dst = tex0.sample(smp0, coord.xy)   (2D targets only for now;
         // the sampler operand selects the unit — single unit so far.)
         try app(w, alloc, "tex0.sample(smp0, (", .{});
@@ -593,13 +663,53 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
 
 fn emitBody(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program) !void {
     for (prog.instrs[0..prog.n_instr]) |*instr| {
-        const op = instr.opName();
+        var op = instr.opName();
         if (std.mem.eql(u8, op, "END") or std.mem.eql(u8, op, "RET")) continue;
+
+        // Control flow and side-effect statements (no dst register).
+        if (std.mem.eql(u8, op, "IF") or std.mem.eql(u8, op, "UIF")) {
+            // The condition is the instruction's first (only) operand,
+            // which the generic parser stores in `dst`.
+            const cond = instr.dst orelse continue;
+            try app(w, alloc, "    if ((", .{});
+            try appendSrc(w, alloc, prog, cond);
+            try app(w, alloc, ").x != 0.0f) {{\n", .{});
+            continue;
+        }
+        if (std.mem.eql(u8, op, "ELSE")) {
+            try app(w, alloc, "    }} else {{\n", .{});
+            continue;
+        }
+        if (std.mem.eql(u8, op, "ENDIF")) {
+            try app(w, alloc, "    }}\n", .{});
+            continue;
+        }
+        if (std.mem.eql(u8, op, "KILL")) {
+            try app(w, alloc, "    discard_fragment();\n", .{});
+            continue;
+        }
+        if (std.mem.eql(u8, op, "KILL_IF")) {
+            // Kill when ANY component of the (first-operand) src is
+            // negative. That operand is stored in `dst` by the parser.
+            const cond = instr.dst orelse continue;
+            try app(w, alloc, "    if (any((", .{});
+            try appendSrc(w, alloc, prog, cond);
+            try app(w, alloc, ") < 0.0f)) discard_fragment();\n", .{});
+            continue;
+        }
+
+        // "_SAT" suffix: clamp the result to [0, 1].
+        var saturate = false;
+        if (std.mem.endsWith(u8, op, "_SAT")) {
+            saturate = true;
+            op = op[0 .. op.len - 4];
+        }
+
         const dst = instr.dst orelse {
             try app(w, alloc, "    // no-dst: {s}\n", .{op});
             continue;
         };
-        if (!isSupported(op)) {
+        if (!isSupportedName(op)) {
             try app(w, alloc, "    // unsupported: {s}\n", .{op});
             continue;
         }
@@ -608,8 +718,12 @@ fn emitBody(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Progr
         try appendBase(w, alloc, prog, dst);
         try app(w, alloc, ".", .{});
         try appendMask(w, alloc, dst);
-        try app(w, alloc, " = (", .{});
-        try appendRhs(w, alloc, prog, instr);
+        if (saturate) {
+            try app(w, alloc, " = saturate(", .{});
+        } else {
+            try app(w, alloc, " = (", .{});
+        }
+        try appendRhsNamed(w, alloc, prog, instr, op);
         try app(w, alloc, ").", .{});
         try appendMask(w, alloc, dst);
         try app(w, alloc, ";\n", .{});

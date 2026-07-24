@@ -937,6 +937,46 @@ test "draw triangle from an uploaded vertex buffer" {
     try std.testing.expect(buf[1] < 40);
 }
 
+test "TGSI control flow and extended opcodes compile on Metal" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch return error.SkipZigTest;
+    defer r.deinit();
+
+    const fs_text =
+        \\FRAG
+        \\DCL IN[0], GENERIC[0]
+        \\DCL OUT[0], COLOR
+        \\DCL CONST[0]
+        \\DCL TEMP[0]
+        \\DCL TEMP[1]
+        \\IMM[0] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}
+        \\IMM[1] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}
+        \\  0: IF CONST[0].xxxx :4
+        \\  1:   MOV TEMP[0], IMM[1]
+        \\  2: ELSE :5
+        \\  3:   MOV TEMP[0], IMM[0]
+        \\  4: ENDIF
+        \\  5: CMP TEMP[1], IN[0], TEMP[0], IMM[0]
+        \\  6: LRP TEMP[1], CONST[0], TEMP[1], TEMP[0]
+        \\  7: POW TEMP[1].x, TEMP[1].xxxx, IMM[0].xxxx
+        \\  8: SLT TEMP[1].y, IN[0], TEMP[0]
+        \\  9: MOV_SAT OUT[0], TEMP[1]
+        \\ 10: KILL_IF -IN[0].wwww
+        \\ 11: END
+    ;
+    const prog = try tgsi.parse(fs_text);
+    var msl = try tgsi.emit(alloc, &prog);
+    defer msl.deinit(alloc);
+
+    const z = try alloc.dupeZ(u8, msl.source);
+    defer alloc.free(z);
+    const lib = r.device.newLibraryWithSource(z) orelse {
+        std.debug.print("MSL failed to compile:\n{s}\n", .{msl.source});
+        return error.TestUnexpectedResult;
+    };
+    lib.release();
+}
+
 test "TGSI→MSL output compiles on a real Metal device" {
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
