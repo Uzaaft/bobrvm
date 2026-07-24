@@ -868,6 +868,11 @@ pub const Machine = struct {
             defer alloc.free(data);
             try builder.section("p9", data);
         }
+        if (self.gpu) |gpu_dev| {
+            const data = try snapshot.serializeGpu(alloc, gpu_dev);
+            defer alloc.free(data);
+            try builder.section("gpu", data);
+        }
 
         return try builder.finish();
     }
@@ -917,6 +922,9 @@ pub const Machine = struct {
         }
         if (reader.section("p9")) |data| {
             if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
+        }
+        if (reader.section("gpu")) |data| {
+            if (self.gpu) |gpu_dev| try snapshot.deserializeGpu(gpu_dev, data);
         }
         _ = alloc;
     }
@@ -1112,6 +1120,9 @@ pub const Machine = struct {
         }
         if (reader.section("p9")) |data| {
             if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
+        }
+        if (reader.section("gpu")) |data| {
+            if (self.gpu) |gpu_dev| try snapshot.deserializeGpu(gpu_dev, data);
         }
 
         // vCPU 0 registers — we are its owning thread.

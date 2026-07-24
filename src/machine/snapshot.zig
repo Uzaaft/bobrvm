@@ -432,6 +432,61 @@ pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void 
 }
 
 // =============================================================================
+// GPU (2D scanout state only)
+// =============================================================================
+//
+// Serializes the transport, display size, and the 2D framebuffer resources
+// (id/format/dims + host pixels) so a GUI VM restores with its screen
+// intact instead of a black frame until the guest's next redraw. virgl 3D
+// contexts/resources are NOT captured (reset on restore, per QEMU policy).
+
+pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, g.transport);
+    try out.int(u16, g.ctrl_last_avail);
+    try out.int(u16, g.cursor_last_avail);
+    try out.int(u32, g.config.events_read);
+    try out.int(u32, g.display_width);
+    try out.int(u32, g.display_height);
+    try out.int(u32, g.scanout_resource_id);
+    try out.int(u32, g.resources.count());
+    var it = g.resources.iterator();
+    while (it.next()) |e| {
+        const r = e.value_ptr;
+        try out.int(u32, r.id);
+        try out.int(u32, r.format);
+        try out.int(u32, r.width);
+        try out.int(u32, r.height);
+        try out.blob(r.host_data);
+    }
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeGpu(g: *virtio.Gpu, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, g.transport);
+    g.ctrl_last_avail = try cur.int(u16);
+    g.cursor_last_avail = try cur.int(u16);
+    g.config.events_read = try cur.int(u32);
+    g.display_width = try cur.int(u32);
+    g.display_height = try cur.int(u32);
+    const scanout_id = try cur.int(u32);
+    const nres = try cur.int(u32);
+    var i: u32 = 0;
+    while (i < nres) : (i += 1) {
+        const id = try cur.int(u32);
+        const format = try cur.int(u32);
+        const width = try cur.int(u32);
+        const height = try cur.int(u32);
+        const pixels = try cur.blob();
+        try g.restore2dResource(id, format, width, height, pixels);
+    }
+    g.scanout_resource_id = scanout_id;
+    g.frame_generation +%= 1; // force the renderer to re-present
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -504,6 +559,40 @@ test "snapshot: console device roundtrip (multiport)" {
     try testing.expectEqualStrings("pending host input", con2.input_buffer.items);
     try testing.expectEqualStrings("agent bytes", con2.ports.items[0].input_buffer.items);
     try testing.expect(con2.ports.items[0].guest_open);
+}
+
+test "snapshot: gpu 2D framebuffer survives roundtrip" {
+    const gpu = try virtio.Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    // A 4x2 scanout resource with a known pixel pattern (4*2*4 = 32 bytes).
+    var pattern: [32]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i * 3 + 1);
+    try gpu.restore2dResource(7, 2, 4, 2, &pattern);
+    const res = gpu.resources.getPtr(7).?;
+    gpu.scanout_resource_id = 7;
+    gpu.setDisplaySize(4, 2);
+    gpu.transport.status = @bitCast(@as(u8, 0x0F));
+
+    const data = try serializeGpu(testing.allocator, gpu);
+    defer testing.allocator.free(data);
+
+    const gpu2 = try virtio.Gpu.init(testing.allocator, false);
+    defer gpu2.deinit();
+    try deserializeGpu(gpu2, data);
+
+    try testing.expectEqual(@as(u32, 7), gpu2.scanout_resource_id);
+    try testing.expectEqual(@as(u32, 4), gpu2.display_width);
+    try testing.expectEqual(@as(u32, 2), gpu2.display_height);
+    try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(gpu2.transport.status)));
+    const r2 = gpu2.resources.getPtr(7).?;
+    try testing.expectEqual(@as(u32, 4), r2.width);
+    try testing.expectEqual(@as(u32, 2), r2.height);
+    try testing.expectEqualSlices(u8, res.host_data, r2.host_data);
+    // Restored scanout serves the same pixels.
+    const view = gpu2.scanout().?;
+    try testing.expectEqual(@as(u32, 4), view.width);
+    try testing.expectEqualSlices(u8, res.host_data, view.data);
 }
 
 test "snapshot: VcpuState is a stable extern layout" {

@@ -539,6 +539,40 @@ pub const Gpu = struct {
         self.display_height = height;
     }
 
+    /// Recreate a 2D resource from snapshot state: a heap-backed pixel copy
+    /// (no IOSurface — the renderer re-wraps on the next present) with no
+    /// guest backing entries (the guest re-attaches after restore). Replaces
+    /// any existing resource with the same id. Used by snapshot restore.
+    pub fn restore2dResource(
+        self: *Gpu,
+        id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+        pixels: []const u8,
+    ) Error!void {
+        const host = try self.alloc.alloc(u8, pixels.len);
+        errdefer self.alloc.free(host);
+        @memcpy(host, pixels);
+        if (self.resources.fetchRemove(id)) |old| {
+            old.value.freePixels(self.alloc);
+            var entries = old.value.entries;
+            entries.deinit(self.alloc);
+        }
+        self.resources.put(id, .{
+            .id = id,
+            .format = format,
+            .width = width,
+            .height = height,
+            .host_data = host,
+            .surface = null,
+            .entries = .empty,
+        }) catch |err| {
+            self.alloc.free(host);
+            return err;
+        };
+    }
+
     /// Minimum live-resize dimension: below this guests produce unusable
     /// modes and some fbcon setups wedge.
     pub const MIN_DISPLAY_DIM: u32 = 320;
