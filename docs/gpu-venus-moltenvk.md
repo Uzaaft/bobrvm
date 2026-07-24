@@ -68,6 +68,30 @@ write and maintain ourselves. Caveat to stay honest about: fp64/GS/TF-heavy
 apps run slow (software paths) or degrade; the common desktop/GTK/Qt/compositing
 workload does not lean on them and runs on native features.
 
+## ⚠ Host Vulkan driver: KosmicKrisp, not MoltenVK (corrected 2026-07-24)
+
+The `startergo/virglrenderer` venus build targets **KosmicKrisp** — LunarG's
+Mesa-based Vulkan-on-Metal driver (Vulkan 1.3 conformant, merged into Mesa 26.0,
+Oct 2025; requires **Metal 4 → macOS 26+**, satisfied here on macOS 27). Evidence:
+the dylib imports guest memory via `VK_EXT_external_memory_metal` /
+`vkr_context_import_resource_metal`, and the tap README says "Venus support via
+KosmicKrisp". MoltenVK does **not** expose Metal external memory, so venus can't
+share resources through it: `virgl_renderer_init(VENUS|NO_VIRGL)` succeeds and
+the Venus capset reports present, but `context_create_with_flags(capset=VENUS)`
+returns **EINVAL (22)** against the MoltenVK ICD.
+
+Consequence: the earlier `tools/mvk_probe.c` ceiling numbers were measured
+against the *wrong* driver. The real Venus ceiling is **KosmicKrisp's** Vulkan
+1.3 feature set (reported ~MoltenVK parity as of Mesa 26.0). Re-probe once
+KosmicKrisp is installed.
+
+**Getting KosmicKrisp** (no Homebrew formula): build from Mesa source —
+`meson setup <mesa> -Dplatforms=macos -Dvulkan-drivers=kosmickrisp
+-Dgallium-drivers= -Dopengl=false --prefer-static`, then point
+`VK_ICD_FILENAMES` at the resulting `kosmickrisp_icd.*.json`. Venus also ships a
+`virgl_render_server` (`…/libexec/virgl_render_server`, `RENDER_SERVER_EXEC_PATH`)
+— may be required for the venus process model.
+
 ## Host components
 
 - `molten-vk` (Homebrew 1.4.1): `/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib`.

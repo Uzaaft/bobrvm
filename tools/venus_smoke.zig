@@ -30,5 +30,20 @@ pub fn main() !void {
         std.debug.print("venus-smoke: VENUS capset absent — venus not enabled in this virglrenderer\n", .{});
         std.process.exit(2);
     }
+
+    // Exercise the bridge API surface: fill the Venus caps blob and create a
+    // Venus-capset context (the two operations a guest does first).
+    var caps: [4096]u8 = undefined;
+    host.fillCaps(venus.CAPSET_VENUS, v.max_ver, caps[0..v.max_size]);
+    std.debug.print("  fill_caps(VENUS, ver={d}) wrote {d} bytes; head={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ v.max_ver, v.max_size, caps[0], caps[1], caps[2], caps[3] });
+
+    host.createVenusContext(1) catch |e| {
+        std.debug.print("createVenusContext FAILED: {s}\n", .{@errorName(e)});
+        std.process.exit(3);
+    };
+    std.debug.print("  createVenusContext(1) OK\n", .{});
+    host.destroyContext(1);
+    std.debug.print("  destroyContext(1) OK\n", .{});
+
     std.debug.print("venus-smoke ok\n", .{});
 }
