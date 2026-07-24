@@ -152,10 +152,36 @@ The host stack is proven. Progress:
    with `cli-venus.entitlements` (hypervisor + disable-library-validation).
    **Not runtime-tested** — needs a guest + HVF (sandbox blocks both). The
    `venus.Host` calls it makes are the same ones lldb-verified in `venus_smoke`.
-3. TODO: verify real command submission (`submit_cmd`) with a live guest — watch
-   the teardown framing note above.
-4. TODO: present — map the venus output blob → IOSurface/Metal for scanout.
-5. TODO: guest bring-up (Zink+venus image) → `glxinfo` ≥ 4.3 — user-machine handoff.
+3. ✅ Runtime env self-config: `venus.ensureHost()` sets `RENDER_SERVER_EXEC_PATH`
+   + `VK_ICD_FILENAMES` from the build prefix (user env still wins). Only
+   `DYLD_LIBRARY_PATH` must be set pre-launch (dyld reads it at exec).
+4. TODO: present — map the venus output blob → IOSurface/Metal for scanout
+   (needed to *see* the desktop; NOT needed for the glxinfo version proof).
+5. TODO: verify real command submission + `glxinfo` ≥ 4.3 — user-machine handoff.
+
+## Handoff: testing `glxinfo` ≥ 4.3 on a real machine
+
+The version proof needs the Venus capset + context creation (both done), not the
+present path. On a Mac with the built stack:
+
+```
+# 1. (re)build the macOS-patched virglrenderer + KosmicKrisp if needed:
+tools/build-virglrenderer-macos.sh        # → ~/.local/opt/virgl-macos
+tools/build-kosmickrisp.sh                # → KK dylib in /opt/homebrew/lib
+
+# 2. build bobrvm with the venus backend:
+zig build -Dgpu-venus
+
+# 3. run with the vulkan-loader on DYLD path (the only env still required):
+export DYLD_LIBRARY_PATH=/opt/homebrew/opt/vulkan-loader/lib:/opt/homebrew/opt/spirv-tools/lib:/opt/homebrew/opt/angle/lib:/opt/homebrew/lib
+zig-out/bin/bobrvm --kernel <k> --gpu ...   # boot a guest whose Mesa has venus + zink
+
+# 4. in the guest (needs kernel virtio-gpu + Mesa ≥ recent with venus & zink):
+MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink glxinfo | grep "OpenGL version"
+```
+
+If the bridge is correct this reports GL ≥ 4.3. Not yet run — no venus+zink guest
+image on hand, and the CI sandbox blocks HVF.
 
 ## Host components
 
