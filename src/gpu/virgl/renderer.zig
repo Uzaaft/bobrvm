@@ -984,6 +984,44 @@ test "draw triangle from an uploaded vertex buffer" {
     try std.testing.expect(buf[1] < 40);
 }
 
+test "TGSI integer/bitwise opcodes compile on Metal" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch return error.SkipZigTest;
+    defer r.deinit();
+
+    const vs_text =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL OUT[0], POSITION
+        \\DCL TEMP[0]
+        \\DCL TEMP[1]
+        \\  0: F2I TEMP[0], IN[0]
+        \\  1: UADD TEMP[1], TEMP[0], TEMP[0]
+        \\  2: UMAD TEMP[1], TEMP[0], TEMP[0], TEMP[1]
+        \\  3: SHL TEMP[0], TEMP[1], TEMP[1]
+        \\  4: AND TEMP[0], TEMP[0], TEMP[1]
+        \\  5: XOR TEMP[0], TEMP[0], TEMP[1]
+        \\  6: NOT TEMP[0], TEMP[0]
+        \\  7: INEG TEMP[0], TEMP[0]
+        \\  8: ISLT TEMP[1], TEMP[0], TEMP[1]
+        \\  9: USGE TEMP[1], TEMP[0], TEMP[1]
+        \\ 10: IMAX TEMP[0], TEMP[0], TEMP[1]
+        \\ 11: I2F TEMP[0], TEMP[0]
+        \\ 12: MOV OUT[0], TEMP[0]
+        \\ 13: END
+    ;
+    const prog = try tgsi.parse(vs_text);
+    var msl = try tgsi.emit(alloc, &prog);
+    defer msl.deinit(alloc);
+    const z = try alloc.dupeZ(u8, msl.source);
+    defer alloc.free(z);
+    const lib = r.device.newLibraryWithSource(z) orelse {
+        std.debug.print("MSL failed to compile:\n{s}\n", .{msl.source});
+        return error.TestUnexpectedResult;
+    };
+    lib.release();
+}
+
 test "TGSI ALU opcodes (XPD/NRM/DST/LIT/CEIL) compile on Metal" {
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;

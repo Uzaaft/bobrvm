@@ -396,15 +396,108 @@ fn isSupportedName(op: []const u8) bool {
         "TEX",   "TXP", "CMP", "LRP",   "SLT",   "SGE", "SEQ", "SNE",
         "POW",   "EX2", "LG2", "SIN",   "COS",   "TRUNC", "ROUND",
         "SSG",   "DDX", "DDY", "CEIL",  "XPD",   "NRM",   "DST",   "LIT",
+        "I2F",   "U2F", "F2I", "F2U",   "INEG",  "IABS",  "UADD",  "UMUL",
+        "UMAD",  "IMUL_HI", "ISHR", "USHR", "SHL", "AND",  "OR",    "XOR",
+        "NOT",   "ISLT", "ISGE", "USLT", "USGE", "IMAX",  "IMIN",  "UMAX", "UMIN",
     };
     for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
     return false;
 }
 
 /// Emit the float4 right-hand-side expression for a supported opcode.
+/// Metal operator/function for an integer binary TGSI opcode, or null.
+fn intBinOp(op: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, op, "UADD")) return "+";
+    if (std.mem.eql(u8, op, "UMUL") or std.mem.eql(u8, op, "UMAD")) return "*";
+    if (std.mem.eql(u8, op, "SHL")) return "<<";
+    if (std.mem.eql(u8, op, "ISHR") or std.mem.eql(u8, op, "USHR")) return ">>";
+    if (std.mem.eql(u8, op, "AND")) return "&";
+    if (std.mem.eql(u8, op, "OR")) return "|";
+    if (std.mem.eql(u8, op, "XOR")) return "^";
+    if (std.mem.eql(u8, op, "IMAX") or std.mem.eql(u8, op, "UMAX")) return "max";
+    if (std.mem.eql(u8, op, "IMIN") or std.mem.eql(u8, op, "UMIN")) return "min";
+    return null;
+}
+
+/// Whether an integer binary op operates on signed int4 (vs uint4).
+fn intOpSigned(op: []const u8) bool {
+    return std.mem.eql(u8, op, "ISHR") or std.mem.eql(u8, op, "ISLT") or
+        std.mem.eql(u8, op, "ISGE") or std.mem.eql(u8, op, "IMAX") or
+        std.mem.eql(u8, op, "IMIN");
+}
+
 fn appendRhsNamed(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, instr: *const Instr, op: []const u8) !void {
     const s = instr.srcs;
-    if (std.mem.eql(u8, op, "CEIL")) {
+    // --- integer / bitwise ops (registers reinterpreted via as_type) ---
+    if (std.mem.eql(u8, op, "I2F")) {
+        try app(w, alloc, "float4(as_type<int4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "U2F")) {
+        try app(w, alloc, "float4(as_type<uint4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "F2I")) {
+        try app(w, alloc, "as_type<float4>(int4(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "F2U")) {
+        try app(w, alloc, "as_type<float4>(uint4(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "INEG")) {
+        try app(w, alloc, "as_type<float4>(-as_type<int4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "IABS")) {
+        try app(w, alloc, "as_type<float4>(abs(as_type<int4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")))", .{});
+    } else if (std.mem.eql(u8, op, "NOT")) {
+        try app(w, alloc, "as_type<float4>(~as_type<uint4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, "))", .{});
+    } else if (std.mem.eql(u8, op, "ISLT") or std.mem.eql(u8, op, "ISGE") or
+        std.mem.eql(u8, op, "USLT") or std.mem.eql(u8, op, "USGE"))
+    {
+        const ty = if (op[0] == 'I') "int4" else "uint4";
+        const cmp: []const u8 = if (std.mem.endsWith(u8, op, "SLT")) "<" else ">=";
+        // true -> 0xFFFFFFFF (int -1), false -> 0, per TGSI integer set-ops.
+        try app(w, alloc, "as_type<float4>(-int4(as_type<{s}>(", .{ty});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ") {s} as_type<{s}>(", .{ cmp, ty });
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ")))", .{});
+    } else if (intBinOp(op)) |mcop| {
+        // dst = as_type<float4>( as_type<T>(s0) OP as_type<T>(s1) ), T per op.
+        const ty = if (intOpSigned(op)) "int4" else "uint4";
+        try app(w, alloc, "as_type<float4>(", .{});
+        if (std.mem.eql(u8, op, "UMAD")) {
+            // s0*s1 + s2 (unsigned).
+            try app(w, alloc, "as_type<uint4>(", .{});
+            try appendSrc(w, alloc, prog, s[0]);
+            try app(w, alloc, ") * as_type<uint4>(", .{});
+            try appendSrc(w, alloc, prog, s[1]);
+            try app(w, alloc, ") + as_type<uint4>(", .{});
+            try appendSrc(w, alloc, prog, s[2]);
+            try app(w, alloc, ")", .{});
+        } else if (!std.mem.eql(u8, mcop, "max") and !std.mem.eql(u8, mcop, "min")) {
+            // binary infix operator (arith/bitwise/shift)
+            try app(w, alloc, "as_type<{s}>(", .{ty});
+            try appendSrc(w, alloc, prog, s[0]);
+            try app(w, alloc, ") {s} as_type<{s}>(", .{ mcop, ty });
+            try appendSrc(w, alloc, prog, s[1]);
+            try app(w, alloc, ")", .{});
+        } else {
+            // function-style (max/min)
+            try app(w, alloc, "{s}(as_type<{s}>(", .{ mcop, ty });
+            try appendSrc(w, alloc, prog, s[0]);
+            try app(w, alloc, "), as_type<{s}>(", .{ty});
+            try appendSrc(w, alloc, prog, s[1]);
+            try app(w, alloc, "))", .{});
+        }
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "CEIL")) {
         try app(w, alloc, "ceil(", .{});
         try appendSrc(w, alloc, prog, s[0]);
         try app(w, alloc, ")", .{});
