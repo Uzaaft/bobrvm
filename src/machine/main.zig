@@ -149,6 +149,11 @@ pub const MachineConfig = struct {
     /// The slice must stay valid until startSync() has initialized devices.
     shared_dir: ?[]const u8 = null,
 
+    /// Restore machine state from this suspend image instead of booting.
+    /// The rest of the config (RAM size, devices) must match the config
+    /// the image was taken with.
+    restore_path: ?[]const u8 = null,
+
     /// Display size for the virtio-gpu scanout.
     display_width: u32 = 1280,
     display_height: u32 = 800,
@@ -318,6 +323,7 @@ pub const Machine = struct {
         KernelTooLarge,
         InitrdTooLarge,
         FirmwareTooLarge,
+        RestoreFailed,
     };
 
     pub fn init(alloc: Allocator, config: MachineConfig) Error!*Machine {
@@ -620,18 +626,21 @@ pub const Machine = struct {
             MemoryLayout.RAM_BASE + self.config.ram_size,
         });
 
-        // Load kernel/initrd only for direct boot (not firmware)
-        if (!self.config.isFirmwareBoot()) {
-            if (self.config.kernel_path) |kernel_path| {
-                try self.loadKernel(kernel_path);
+        // Load kernel/initrd/DTB only when booting fresh — a restore
+        // overwrites all of RAM from the suspend image anyway.
+        if (self.config.restore_path == null) {
+            if (!self.config.isFirmwareBoot()) {
+                if (self.config.kernel_path) |kernel_path| {
+                    try self.loadKernel(kernel_path);
+                }
+                if (self.config.initrd_path) |initrd_path| {
+                    try self.loadInitrd(initrd_path);
+                }
             }
-            if (self.config.initrd_path) |initrd_path| {
-                try self.loadInitrd(initrd_path);
-            }
-        }
 
-        // Generate and load DTB
-        try self.generateDtb();
+            // Generate and load DTB
+            try self.generateDtb();
+        }
 
         // Initialize GIC (interrupt controller)
         try self.initGic();
@@ -882,6 +891,143 @@ pub const Machine = struct {
         _ = alloc;
     }
 
+    /// Suspend-to-disk image magic.
+    const SUSPEND_MAGIC = "BBRVSUSP";
+    const SUSPEND_VERSION: u32 = 1;
+    const RAM_CHUNK: usize = 64 * 1024;
+
+    /// Write the paused machine (device/vCPU state + RAM) to a file.
+    /// Pauses the machine if it isn't already; caller decides whether to
+    /// unpause or shut down afterwards. Zero RAM chunks become file
+    /// holes, so the image is roughly the guest's working set on APFS.
+    pub fn suspendToDisk(self: *Machine, path: []const u8) !void {
+        const was_paused = self.paused.load(.acquire);
+        if (!was_paused) self.pause();
+        errdefer if (!was_paused) self.unpause();
+
+        const state = try self.captureState(self.alloc);
+        defer self.alloc.free(state);
+        const ram = self.ram orelse return error.NoRam;
+
+        const io = global.io();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+
+        var header: [8 + 4 + 8 + 8]u8 = undefined;
+        @memcpy(header[0..8], SUSPEND_MAGIC);
+        std.mem.writeInt(u32, header[8..12], SUSPEND_VERSION, .little);
+        std.mem.writeInt(u64, header[12..20], state.len, .little);
+        std.mem.writeInt(u64, header[20..28], ram.len, .little);
+        try file.writePositionalAll(io, &header, 0);
+        try file.writePositionalAll(io, state, header.len);
+
+        // RAM: skip all-zero chunks (they read back as zeros from holes).
+        const ram_base: u64 = header.len + state.len;
+        var off: usize = 0;
+        var written_bytes: usize = 0;
+        while (off < ram.len) : (off += RAM_CHUNK) {
+            const chunk = ram[off..@min(off + RAM_CHUNK, ram.len)];
+            if (std.mem.allEqual(u8, chunk, 0)) continue;
+            try file.writePositionalAll(io, chunk, ram_base + off);
+            written_bytes += chunk.len;
+        }
+        // Pin the file's logical size even if the tail was a hole.
+        if (std.c.ftruncate(file.handle, @intCast(ram_base + ram.len)) != 0) {
+            return error.Truncate;
+        }
+        log.info("suspended to {s} ({} KiB state, {} MiB RAM written)", .{
+            path, state.len / 1024, written_bytes / (1024 * 1024),
+        });
+    }
+
+    /// Restore state from a suspend image. Runs on vCPU 0's owning
+    /// thread (called from startSync before the run loop), so registers
+    /// apply directly. Single-vCPU images only for now.
+    fn restoreFromFile(self: *Machine, path: []const u8, vcpu: *hypervisor.Vcpu) Error!void {
+        const io = global.io();
+        const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch {
+            log.err("cannot open suspend image {s}", .{path});
+            return Error.RestoreFailed;
+        };
+        defer file.close(io);
+
+        self.restoreFromFileInner(file, vcpu) catch |err| {
+            log.err("restore from {s} failed: {}", .{ path, err });
+            return Error.RestoreFailed;
+        };
+        log.info("restored machine state from {s}", .{path});
+    }
+
+    fn restoreFromFileInner(self: *Machine, file: std.Io.File, vcpu: *hypervisor.Vcpu) !void {
+        const io = global.io();
+        var header: [28]u8 = undefined;
+        const got = try file.readPositionalAll(io, &header, 0);
+        if (got != header.len or !std.mem.eql(u8, header[0..8], SUSPEND_MAGIC)) {
+            return error.BadImage;
+        }
+        if (std.mem.readInt(u32, header[8..12], .little) != SUSPEND_VERSION) {
+            return error.BadVersion;
+        }
+        const state_len = std.mem.readInt(u64, header[12..20], .little);
+        const ram_len = std.mem.readInt(u64, header[20..28], .little);
+        const ram = self.ram orelse return error.NoRam;
+        if (ram_len != ram.len) return error.RamSizeMismatch;
+
+        const state = try self.alloc.alloc(u8, @intCast(state_len));
+        defer self.alloc.free(state);
+        if (try file.readPositionalAll(io, state, header.len) != state.len) {
+            return error.BadImage;
+        }
+
+        // RAM (holes read back as zeros; fresh mapping is already zero,
+        // but read the full image for simplicity/correctness).
+        const ram_base: u64 = header.len + state_len;
+        var off: usize = 0;
+        while (off < ram.len) : (off += RAM_CHUNK) {
+            const chunk = ram[off..@min(off + RAM_CHUNK, ram.len)];
+            const n = try file.readPositionalAll(io, chunk, ram_base + off);
+            if (n < chunk.len) @memset(chunk[n..], 0);
+        }
+
+        // Devices + GIC.
+        const reader = try snapshot.Reader.init(state);
+        if (reader.section("vcpu1")) |_| return error.SmpRestoreUnsupported;
+        if (reader.section("gic")) |data| {
+            if (self.gic_device) |gic_dev| try snapshot.deserializeGic(gic_dev, data);
+        }
+        if (reader.section("console")) |data| {
+            if (self.console) |con| try snapshot.deserializeConsole(self.alloc, con, data);
+        }
+        if (reader.section("blk1")) |data| {
+            if (self.block) |blk| try snapshot.deserializeBlock(blk, data);
+        }
+        if (reader.section("blk2")) |data| {
+            if (self.block2) |blk| try snapshot.deserializeBlock(blk, data);
+        }
+        if (reader.section("rng")) |data| {
+            if (self.rng) |rng_dev| try snapshot.deserializeRng(rng_dev, data);
+        }
+        if (reader.section("net")) |data| {
+            if (self.net) |net| try snapshot.deserializeNet(net, data);
+        }
+        if (reader.section("kbd")) |data| {
+            if (self.keyboard) |kbd| try snapshot.deserializeInput(kbd, data);
+        }
+        if (reader.section("mouse")) |data| {
+            if (self.mouse) |mouse| try snapshot.deserializeInput(mouse, data);
+        }
+        if (reader.section("p9")) |data| {
+            if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
+        }
+
+        // vCPU 0 registers — we are its owning thread.
+        const vdata = reader.section("vcpu0") orelse return error.BadImage;
+        if (vdata.len != @sizeOf(snapshot.VcpuState)) return error.BadImage;
+        var vstate: snapshot.VcpuState = undefined;
+        @memcpy(std.mem.asBytes(&vstate), vdata);
+        try snapshot.restoreVcpu(vcpu, &vstate);
+    }
+
     /// Kick a specific vCPU to wake it from WFI/sleep.
     /// Injects an IRQ and forces an exit from hv_vcpu_run.
     pub fn kickVcpu(self: *Machine, vcpu_id: u32) void {
@@ -929,18 +1075,21 @@ pub const Machine = struct {
             MemoryLayout.RAM_BASE + self.config.ram_size,
         });
 
-        // Load kernel/initrd only for direct boot (not firmware)
-        if (!self.config.isFirmwareBoot()) {
-            if (self.config.kernel_path) |kernel_path| {
-                try self.loadKernel(kernel_path);
+        // Load kernel/initrd/DTB only when booting fresh — a restore
+        // overwrites all of RAM from the suspend image anyway.
+        if (self.config.restore_path == null) {
+            if (!self.config.isFirmwareBoot()) {
+                if (self.config.kernel_path) |kernel_path| {
+                    try self.loadKernel(kernel_path);
+                }
+                if (self.config.initrd_path) |initrd_path| {
+                    try self.loadInitrd(initrd_path);
+                }
             }
-            if (self.config.initrd_path) |initrd_path| {
-                try self.loadInitrd(initrd_path);
-            }
-        }
 
-        // Generate and load DTB
-        try self.generateDtb();
+            // Generate and load DTB
+            try self.generateDtb();
+        }
 
         // Initialize GIC (interrupt controller)
         try self.initGic();
@@ -959,6 +1108,12 @@ pub const Machine = struct {
         try self.setupVcpuState(vcpu, 0);
         self.cpu_states[0].vcpu = vcpu;
         self.cpu_states[0].started.store(true, .release);
+
+        // Restoring: we ARE vCPU 0's owning thread here, so registers,
+        // RAM, and device state can be applied directly before running.
+        if (self.config.restore_path) |path| {
+            try self.restoreFromFile(path, vcpu);
+        }
 
         self.running.store(true, .release);
         log.info("machine started, running vCPU loop", .{});
@@ -2364,6 +2519,7 @@ pub const Machine = struct {
 const MachineError = error{
     KernelTooLarge,
     InitrdTooLarge,
+    RestoreFailed,
 };
 
 test {

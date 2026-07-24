@@ -105,6 +105,18 @@ pub const SystemRegister = enum(c.hv_sys_reg_t) {
     afsr0_el1 = c.HV_SYS_REG_AFSR0_EL1,
     afsr1_el1 = c.HV_SYS_REG_AFSR1_EL1,
     amair_el1 = c.HV_SYS_REG_AMAIR_EL1,
+
+    // Pointer-authentication keys
+    apiakeylo_el1 = c.HV_SYS_REG_APIAKEYLO_EL1,
+    apiakeyhi_el1 = c.HV_SYS_REG_APIAKEYHI_EL1,
+    apibkeylo_el1 = c.HV_SYS_REG_APIBKEYLO_EL1,
+    apibkeyhi_el1 = c.HV_SYS_REG_APIBKEYHI_EL1,
+    apdakeylo_el1 = c.HV_SYS_REG_APDAKEYLO_EL1,
+    apdakeyhi_el1 = c.HV_SYS_REG_APDAKEYHI_EL1,
+    apdbkeylo_el1 = c.HV_SYS_REG_APDBKEYLO_EL1,
+    apdbkeyhi_el1 = c.HV_SYS_REG_APDBKEYHI_EL1,
+    apgakeylo_el1 = c.HV_SYS_REG_APGAKEYLO_EL1,
+    apgakeyhi_el1 = c.HV_SYS_REG_APGAKEYHI_EL1,
 };
 
 /// SIMD/FP registers (Q0-Q31, 128-bit each).

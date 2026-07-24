@@ -34,6 +34,8 @@ forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
 forward_count: u8 = 0,
 /// Host directory shared with the guest via 9p (--share).
 shared_dir: ?[]const u8 = null,
+/// Suspend image to restore instead of booting (--restore).
+restore_path: ?[]const u8 = null,
 
 pub const MAX_FORWARDS = 8;
 
@@ -123,6 +125,11 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--share")) {
             config.shared_dir = args.next() orelse {
                 log.err("--share requires a directory path", .{});
+                return ParseError.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "--restore")) {
+            config.restore_path = args.next() orelse {
+                log.err("--restore requires a suspend image path", .{});
                 return ParseError.InvalidArgument;
             };
         } else if (std.mem.eql(u8, arg, "--forward")) {

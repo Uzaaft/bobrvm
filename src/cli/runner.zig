@@ -47,6 +47,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_net = config.enable_net,
         .forwards = forwards_buf[0..config.forward_count],
         .shared_dir = config.shared_dir,
+        .restore_path = config.restore_path,
         .display_width = config.display_width,
         .display_height = config.display_height,
     };
@@ -126,6 +127,17 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             const t = std.Thread.spawn(.{}, testQgaLoop, .{ hw, delay_s }) catch null;
             if (t) |thread| thread.detach();
         } else |_| {}
+    }
+
+    // Debug: suspend to disk after a delay and shut down
+    // (BOBRVM_TEST_SUSPEND=delay_s:path). Restore with --restore <path>.
+    if (std.c.getenv("BOBRVM_TEST_SUSPEND")) |spec_ptr| {
+        const spec = std.mem.span(spec_ptr);
+        if (std.mem.indexOfScalar(u8, spec, ':')) |colon| blk: {
+            const delay_s = std.fmt.parseInt(u64, spec[0..colon], 10) catch break :blk;
+            const t = std.Thread.spawn(.{}, testSuspendLoop, .{ hw, delay_s, spec[colon + 1 ..] }) catch null;
+            if (t) |thread| thread.detach();
+        }
     }
 
     // Debug: pause the machine after a delay, resume after a duration
@@ -250,6 +262,17 @@ fn testQgaLoop(hw: *machine.Machine, delay_s: u64) void {
     log.info("probing guest agent (sync+ping+interfaces)", .{});
     hw.pingGuestAgent();
     hw.queryGuestIps();
+}
+
+/// Suspend to disk then shut down (BOBRVM_TEST_SUSPEND debug hook).
+fn testSuspendLoop(hw: *machine.Machine, delay_s: u64, path: []const u8) void {
+    sleepNs(delay_s * std.time.ns_per_s);
+    log.info("suspending machine to {s}", .{path});
+    hw.suspendToDisk(path) catch |err| {
+        log.err("suspend failed: {}", .{err});
+        return;
+    };
+    hw.requestStop();
 }
 
 /// Pause then resume the machine (BOBRVM_TEST_PAUSE debug hook).
