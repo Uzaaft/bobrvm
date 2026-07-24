@@ -189,6 +189,11 @@ pub export fn bobrvm_vm_shutdown_graceful(vm: ?*apprt.VM) void {
     v.requestGracefulShutdown();
 }
 
+pub export fn bobrvm_vm_host_clipboard_changed(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.hostClipboardChanged();
+}
+
 pub export fn bobrvm_vm_resume(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.unpause();

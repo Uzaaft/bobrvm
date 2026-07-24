@@ -413,6 +413,14 @@ pub const VM = struct {
 
             // Set console output callback
             self.hw_machine.?.setConsoleOutput(consoleOutputCallback, self);
+
+            // Bridge the vdagent clipboard channel to the app's system
+            // clipboard callbacks (NSPasteboard on the Swift side).
+            self.hw_machine.?.setClipboardHandlers(
+                guestClipboardCallback,
+                requestHostClipboardCallback,
+                self,
+            );
         }
 
         // Run the synchronous vCPU loop on a dedicated thread (the same
@@ -460,6 +468,35 @@ pub const VM = struct {
     /// keep stop() as the force fallback.
     pub fn requestGracefulShutdown(self: *VM) void {
         if (self.hw_machine) |hw| hw.requestGuestShutdown();
+    }
+
+    /// Host clipboard changed: announce to the guest (vdagent GRAB). The
+    /// guest pulls the data via read_clipboard when it wants to paste.
+    pub fn hostClipboardChanged(self: *VM) void {
+        if (self.hw_machine) |hw| hw.hostClipboardGrab();
+    }
+
+    /// Guest copied text (vCPU thread): push to the system clipboard.
+    fn guestClipboardCallback(text: []const u8, userdata: ?*anyopaque) void {
+        const self: *VM = @ptrCast(@alignCast(userdata));
+        const cb = self.app.runtime.write_clipboard orelse return;
+        const c = self.alloc.dupeZ(u8, text) catch return;
+        defer self.alloc.free(c);
+        cb(self.app.runtime.userdata, c.ptr);
+    }
+
+    /// Guest wants to paste (vCPU thread): pull the system clipboard and
+    /// answer through the machine.
+    fn requestHostClipboardCallback(userdata: ?*anyopaque) void {
+        const self: *VM = @ptrCast(@alignCast(userdata));
+        const read_cb = self.app.runtime.read_clipboard orelse return;
+        var text: ?[*:0]u8 = null;
+        if (!read_cb(self.app.runtime.userdata, &text)) return;
+        const t = text orelse return;
+        if (self.hw_machine) |hw| hw.sendHostClipboard(std.mem.span(t));
+        if (self.app.runtime.free_clipboard) |free_cb| {
+            free_cb(self.app.runtime.userdata, t);
+        }
     }
 
     pub fn pause(self: *VM) void {

@@ -253,6 +253,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bobrvm_init()
 
         var runtimeCfg = bobrvm_runtime_config_s()
+        // Clipboard bridge (guest vdagent <-> NSPasteboard). Callbacks run
+        // on the vCPU thread; NSPasteboard tolerates background access for
+        // simple string get/set.
+        runtimeCfg.read_clipboard = { _, outText in
+            guard let text = NSPasteboard.general.string(forType: .string) else { return false }
+            outText?.pointee = strdup(text)
+            return true
+        }
+        runtimeCfg.write_clipboard = { _, text in
+            guard let text else { return }
+            let s = String(cString: text)
+            DispatchQueue.main.async {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(s, forType: .string)
+            }
+        }
+        runtimeCfg.free_clipboard = { _, text in
+            free(text)
+        }
         bobrApp = bobrvm_app_new(&runtimeCfg)
         guard bobrApp != nil else { fatalError("bobrvm_app_new failed") }
 
@@ -339,9 +358,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Drive frames at 60 Hz. (CVDisplayLink integration comes with
         // the full app; a timer is enough to verify the pipeline.)
+        // Piggyback a ~0.5s host-clipboard poll: on changeCount
+        // transitions, announce a vdagent GRAB so the guest can paste.
+        var tick = 0
+        var lastChangeCount = NSPasteboard.general.changeCount
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self, let surface = self.surface else { return }
             bobrvm_surface_draw(surface)
+            tick += 1
+            if tick % 30 == 0 {
+                let count = NSPasteboard.general.changeCount
+                if count != lastChangeCount {
+                    lastChangeCount = count
+                    if let vm = self.vm { bobrvm_vm_host_clipboard_changed(vm) }
+                }
+            }
         }
     }
 

@@ -223,6 +223,13 @@ void bobrvm_vm_resume(bobrvm_vm_t vm);
 void bobrvm_vm_shutdown_graceful(bobrvm_vm_t vm);
 
 /**
+ * Notify the guest that the HOST clipboard changed (vdagent GRAB). The
+ * guest pulls the text via the runtime read_clipboard callback when it
+ * pastes. Call on NSPasteboard changeCount transitions.
+ */
+void bobrvm_vm_host_clipboard_changed(bobrvm_vm_t vm);
+
+/**
  * Kick a specific vCPU to wake it from WFI/sleep.
  * Injects an IRQ and forces an exit from hv_vcpu_run.
  * Useful for debugging when vCPU is stuck in WFI.

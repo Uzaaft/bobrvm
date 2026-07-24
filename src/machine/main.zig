@@ -245,6 +245,10 @@ pub const Machine = struct {
     /// ("org.qemu.guest_agent.0"). Talks to the stock distro agent.
     qga: ?agent.Qga = null,
 
+    /// spice-vdagent clipboard channel on console port SPICE_PORT
+    /// ("com.redhat.spice.0"). Talks to the stock spice-vdagent daemon.
+    vdagent: ?agent.Vdagent = null,
+
     /// UART device (PL011 for earlycon).
     uart: ?*virtio.Uart = null,
 
@@ -360,6 +364,11 @@ pub const Machine = struct {
             self.qga = null;
         }
 
+        if (self.vdagent) |*v| {
+            v.deinit();
+            self.vdagent = null;
+        }
+
         if (self.uart) |uart| {
             self.alloc.destroy(uart);
             self.uart = null;
@@ -446,6 +455,46 @@ pub const Machine = struct {
         const mouse = self.mouse orelse return;
         mouse.injectScroll(dx, dy) catch {};
         self.kickCpu(0);
+    }
+
+    fn vdagentSendCallback(data: []const u8, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        const console = self.console orelse return;
+        console.queuePortInput(SPICE_PORT, data) catch {};
+        self.kickCpu(0);
+    }
+
+    fn vdagentFeedCallback(data: []const u8, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.vdagent) |*v| v.feed(data);
+    }
+
+    /// Wire host-clipboard integration: `on_guest_clipboard` fires (on the
+    /// vCPU thread) when the guest copies text; `request_host_clipboard`
+    /// fires when the guest wants to paste — answer with
+    /// sendHostClipboard().
+    pub fn setClipboardHandlers(
+        self: *Machine,
+        on_guest_clipboard: *const fn ([]const u8, ?*anyopaque) void,
+        request_host_clipboard: *const fn (?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        if (self.vdagent) |*v| {
+            v.on_guest_clipboard = on_guest_clipboard;
+            v.on_guest_clipboard_userdata = userdata;
+            v.request_host_clipboard = request_host_clipboard;
+            v.request_host_clipboard_userdata = userdata;
+        }
+    }
+
+    /// Announce a host clipboard change to the guest. Thread-safe.
+    pub fn hostClipboardGrab(self: *Machine) void {
+        if (self.vdagent) |*v| v.hostClipboardGrab();
+    }
+
+    /// Deliver host clipboard text (answers the guest's request).
+    pub fn sendHostClipboard(self: *Machine, text: []const u8) void {
+        if (self.vdagent) |*v| v.sendClipboard(text);
     }
 
     /// Send bytes to the guest agent port (host→guest). Thread-safe.
@@ -1506,6 +1555,10 @@ pub const Machine = struct {
         // qemu-guest-agent channel on the second named port.
         self.qga = agent.Qga.init(self.alloc, qgaSendCallback, self);
         self.console.?.setPortOutput(QGA_PORT, qgaFeedCallback, self);
+
+        // spice-vdagent clipboard channel on the first named port.
+        self.vdagent = agent.Vdagent.init(self.alloc, vdagentSendCallback, self);
+        self.console.?.setPortOutput(SPICE_PORT, vdagentFeedCallback, self);
 
         // Initialize primary block device (slot 1) if disk_path is set
         if (self.config.disk_path) |disk_path| {
