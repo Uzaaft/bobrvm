@@ -42,6 +42,10 @@ pub const DrawOpts = struct {
     depth: ?ResourceHandle = null,
     /// Depth test/write state; null = no depth testing.
     dss: ?metal.DepthStencilState = null,
+    /// Additional color render targets (MRT) beyond the primary at slot 0;
+    /// bound at color attachments 1..N. Empty for the common single-target
+    /// case (in which the pass is byte-identical to before MRT).
+    extra_color: []const ResourceHandle = &.{},
 };
 
 /// Resolved Metal blend state for a pipeline's color attachment (raw
@@ -535,6 +539,7 @@ pub const Renderer = struct {
         format: metal.MTLPixelFormat,
         has_depth: bool,
         blend: ?BlendDesc,
+        extra_formats: []const metal.MTLPixelFormat,
     ) Error!metal.RenderPipelineState {
         const vlib = self.device.newLibraryWithSource(vs_msl) orelse return Error.ShaderCompileFailed;
         defer vlib.release();
@@ -550,6 +555,7 @@ pub const Renderer = struct {
         desc.setVertexFunction(vfn);
         desc.setFragmentFunction(ffn);
         desc.setColorFormat0(format);
+        for (extra_formats, 0..) |ef, i| desc.setColorFormatN(i + 1, ef);
         if (has_depth) desc.setDepthFormat(.depth32Float);
         if (blend) |b| desc.setColorBlend(
             b.enabled,
@@ -633,7 +639,7 @@ pub const Renderer = struct {
         opts: DrawOpts,
     ) Error!void {
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
-        const pass = try self.beginLoadPassOpts(target_handle, opts.depth);
+        const pass = try self.beginLoadPassMrt(target_handle, opts.depth, opts.extra_color);
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
         self.applyOpts(pass.enc, opts);
@@ -666,7 +672,7 @@ pub const Renderer = struct {
         };
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
         const ibuf = self.buffers.get(ibuf_handle) orelse return Error.UnknownTarget;
-        const pass = try self.beginLoadPassOpts(target_handle, opts.depth);
+        const pass = try self.beginLoadPassMrt(target_handle, opts.depth, opts.extra_color);
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
         self.applyOpts(pass.enc, opts);
@@ -682,8 +688,18 @@ pub const Renderer = struct {
     };
 
     /// beginLoadPass with an optional depth attachment (loadAction=load
-    /// so depth composes across draws; cleared via clearDepthTarget).
+    /// so depth composes across draws; cleared via clearDepthTarget) and
+    /// optional additional MRT color attachments at slots 1..N.
     fn beginLoadPassOpts(self: *Renderer, target_handle: ResourceHandle, depth: ?ResourceHandle) Error!LoadPass {
+        return self.beginLoadPassMrt(target_handle, depth, &.{});
+    }
+
+    fn beginLoadPassMrt(
+        self: *Renderer,
+        target_handle: ResourceHandle,
+        depth: ?ResourceHandle,
+        extra_color: []const ResourceHandle,
+    ) Error!LoadPass {
         const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
         const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
         const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
@@ -691,6 +707,13 @@ pub const Renderer = struct {
         att.setTexture(target.tex.ptr);
         att.setLoadAction(.load);
         att.setStoreAction(.store);
+        for (extra_color, 0..) |eh, i| {
+            const et = self.targets.get(eh) orelse return Error.UnknownTarget;
+            const eatt = attachments.objectAtIndex(i + 1) orelse return Error.EncoderFailed;
+            eatt.setTexture(et.tex.ptr);
+            eatt.setLoadAction(.load);
+            eatt.setStoreAction(.store);
+        }
         if (depth) |dh| {
             if (self.depth_targets.get(dh)) |dt| {
                 const datt = pass.depthAttachment() orelse return Error.EncoderFailed;
@@ -1142,7 +1165,7 @@ test "translated shaders build a real pipeline and draw a triangle" {
     // Vertex layout: attribute 0 = float2 at offset 0, stride 8. Metal
     // expands the float2 to (x,y,0,1) for the float4 shader input.
     const attrs = [_]Renderer.VertexAttr{.{ .format = .float2, .offset = 0, .buffer_index = 0 }};
-    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm, false, null);
+    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm, false, null, &.{});
     defer pso.release();
 
     const w: u32 = 64;

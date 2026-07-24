@@ -678,8 +678,22 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
         try app(w, alloc, "}};\n", .{});
     }
 
+    // MRT output struct (>1 color output). Single-output keeps float4.
+    const mrt = prog.n_out > 1;
+    if (mrt) {
+        try app(w, alloc, "struct FSOut {{\n", .{});
+        for (prog.out_decls[0..prog.n_out]) |d| {
+            try app(w, alloc, "    float4 c{d} [[color({d})]];\n", .{ d.index, d.index });
+        }
+        try app(w, alloc, "}};\n", .{});
+    }
+
     // Build the parameter list (omit an empty [[stage_in]] — invalid MSL).
-    try app(w, alloc, "fragment float4 fs_main(", .{});
+    if (mrt) {
+        try app(w, alloc, "fragment FSOut fs_main(", .{});
+    } else {
+        try app(w, alloc, "fragment float4 fs_main(", .{});
+    }
     var need_comma = false;
     if (has_in) {
         try app(w, alloc, "FSIn in [[stage_in]]", .{});
@@ -694,10 +708,31 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
         if (need_comma) try app(w, alloc, ", ", .{});
         try app(w, alloc, "texture2d<float> tex0 [[texture(0)]], sampler smp0 [[sampler(0)]]", .{});
     }
-    try app(w, alloc, ") {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
-    try emitLocals(w, alloc, prog);
-    try emitBody(w, alloc, prog);
-    try app(w, alloc, "    return out0;\n}}\n", .{});
+    // Count fragment color outputs (OUT[n]); >1 => MRT, emit a struct
+    // with [[color(n)]] members. ==1 keeps the plain float4 return so the
+    // mesa-validated single-target path is byte-identical.
+    const n_color = prog.n_out;
+    if (n_color > 1) {
+        try app(w, alloc, ") {{\n", .{});
+        var ci: usize = 0;
+        while (ci < n_color) : (ci += 1) {
+            try app(w, alloc, "    float4 out{d} = float4(0.0,0.0,0.0,1.0);\n", .{prog.out_decls[ci].index});
+        }
+        try emitLocals(w, alloc, prog);
+        try emitBody(w, alloc, prog);
+        try app(w, alloc, "    FSOut fso;\n", .{});
+        ci = 0;
+        while (ci < n_color) : (ci += 1) {
+            const idx = prog.out_decls[ci].index;
+            try app(w, alloc, "    fso.c{d} = out{d};\n", .{ idx, idx });
+        }
+        try app(w, alloc, "    return fso;\n}}\n", .{});
+    } else {
+        try app(w, alloc, ") {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
+        try emitLocals(w, alloc, prog);
+        try emitBody(w, alloc, prog);
+        try app(w, alloc, "    return out0;\n}}\n", .{});
+    }
 }
 
 fn emitBody(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program) !void {

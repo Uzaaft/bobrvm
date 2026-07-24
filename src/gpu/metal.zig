@@ -517,13 +517,16 @@ pub const RenderPipelineDescriptor = struct {
 
     /// Set the pixel format of color attachment 0.
     pub fn setColorFormat0(self: RenderPipelineDescriptor, format: MTLPixelFormat) void {
+        self.setColorFormatN(0, format);
+    }
+
+    /// Set the pixel format of color attachment `idx` (MRT).
+    pub fn setColorFormatN(self: RenderPipelineDescriptor, idx: NSUInteger, format: MTLPixelFormat) void {
         const arr = msgSendId(self.ptr, sel("colorAttachments")) orelse return;
-        const s_idx = sel("objectAtIndexedSubscript:");
         const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
-        const att = idx_func(arr, s_idx, 0) orelse return;
-        const s_fmt = sel("setPixelFormat:");
+        const att = idx_func(arr, sel("objectAtIndexedSubscript:"), idx) orelse return;
         const fmt_func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
-        fmt_func(att, s_fmt, @intFromEnum(format));
+        fmt_func(att, sel("setPixelFormat:"), @intFromEnum(format));
     }
 
     pub fn setDepthFormat(self: RenderPipelineDescriptor, format: MTLPixelFormat) void {
