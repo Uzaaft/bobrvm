@@ -24,6 +24,18 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     global.state.init();
     defer global.state.deinit();
 
+    // --restore <snapshot dir>: revert disks (clonefile the snapshot's
+    // copies back over the originals) and point the machine at the
+    // directory's state.img. A plain file path is used as-is.
+    var restore_buf: [1024]u8 = undefined;
+    var restore_path = config.restore_path;
+    if (config.restore_path) |rp| {
+        if (isDirectory(rp)) {
+            try revertSnapshotDisks(alloc, rp);
+            restore_path = try std.fmt.bufPrint(&restore_buf, "{s}/state.img", .{rp});
+        }
+    }
+
     // Must outlive the machine: MachineConfig.forwards borrows this array.
     var forwards_buf: [Config.MAX_FORWARDS]mininat.Forward = undefined;
     for (config.forwards[0..config.forward_count], 0..) |f, i| {
@@ -47,7 +59,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_net = config.enable_net,
         .forwards = forwards_buf[0..config.forward_count],
         .shared_dir = config.shared_dir,
-        .restore_path = config.restore_path,
+        .restore_path = restore_path,
         .display_width = config.display_width,
         .display_height = config.display_height,
     };
@@ -127,6 +139,17 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             const t = std.Thread.spawn(.{}, testQgaLoop, .{ hw, delay_s }) catch null;
             if (t) |thread| thread.detach();
         } else |_| {}
+    }
+
+    // Debug: take a live snapshot after a delay, VM keeps running
+    // (BOBRVM_TEST_SNAPSHOT=delay_s:dir). Revert with --restore <dir>.
+    if (std.c.getenv("BOBRVM_TEST_SNAPSHOT")) |spec_ptr| {
+        const spec = std.mem.span(spec_ptr);
+        if (std.mem.indexOfScalar(u8, spec, ':')) |colon| blk: {
+            const delay_s = std.fmt.parseInt(u64, spec[0..colon], 10) catch break :blk;
+            const t = std.Thread.spawn(.{}, testSnapshotLoop, .{ hw, delay_s, spec[colon + 1 ..] }) catch null;
+            if (t) |thread| thread.detach();
+        }
     }
 
     // Debug: suspend to disk after a delay and shut down
@@ -262,6 +285,55 @@ fn testQgaLoop(hw: *machine.Machine, delay_s: u64) void {
     log.info("probing guest agent (sync+ping+interfaces)", .{});
     hw.pingGuestAgent();
     hw.queryGuestIps();
+}
+
+// Darwin libc (zig 0.16's std.c.stat doesn't resolve on macOS; the
+// plain symbol is correct on arm64).
+extern "c" fn stat(path: [*:0]const u8, st: *std.c.Stat) c_int;
+
+fn isDirectory(path: []const u8) bool {
+    var st: std.c.Stat = undefined;
+    var buf: [1024:0]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    if (stat(buf[0..path.len :0].ptr, &st) != 0) return false;
+    return std.c.S.ISDIR(st.mode);
+}
+
+/// Revert every disk recorded in a snapshot's meta.json: clonefile the
+/// snapshot copy back over the original path (destructive by design —
+/// that's what reverting to a snapshot means).
+fn revertSnapshotDisks(alloc: Allocator, dir: []const u8) !void {
+    const file_compat = @import("../compat/file.zig");
+    var path_buf: [1024]u8 = undefined;
+    const meta_path = try std.fmt.bufPrint(&path_buf, "{s}/meta.json", .{dir});
+    const meta_file = try std.Io.Dir.cwd().openFile(global.io(), meta_path, .{ .mode = .read_only });
+    defer meta_file.close(global.io());
+    const meta_bytes = try file_compat.readToEndAlloc(meta_file, alloc, 1024 * 1024);
+    defer alloc.free(meta_bytes);
+
+    const Meta = struct {
+        disks: []struct { orig: []const u8, copy: []const u8 },
+    };
+    var parsed = try std.json.parseFromSlice(Meta, alloc, meta_bytes, .{});
+    defer parsed.deinit();
+
+    for (parsed.value.disks) |disk| {
+        var copy_buf: [1024]u8 = undefined;
+        const copy_path = try std.fmt.bufPrint(&copy_buf, "{s}/{s}", .{ dir, disk.copy });
+        log.info("reverting disk {s} from snapshot", .{disk.orig});
+        try machine.Machine.cloneFile(alloc, copy_path, disk.orig);
+    }
+}
+
+/// Take a live snapshot; VM keeps running (BOBRVM_TEST_SNAPSHOT hook).
+fn testSnapshotLoop(hw: *machine.Machine, delay_s: u64, dir: []const u8) void {
+    sleepNs(delay_s * std.time.ns_per_s);
+    log.info("taking snapshot into {s}", .{dir});
+    hw.snapshotTo(dir) catch |err| {
+        log.err("snapshot failed: {}", .{err});
+    };
 }
 
 /// Suspend to disk then shut down (BOBRVM_TEST_SUSPEND debug hook).

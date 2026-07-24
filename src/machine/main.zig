@@ -26,6 +26,9 @@ const agent = @import("../agent/main.zig");
 pub const snapshot = @import("snapshot.zig");
 
 const log = std.log.scoped(.machine);
+
+// Darwin copy-on-write file clone (instant on APFS; snapshot substrate).
+extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: u32) c_int;
 const enable_debug_logs = builtin.mode == .Debug;
 
 /// Thread-local machine pointer for guest memory access.
@@ -889,6 +892,70 @@ pub const Machine = struct {
             if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
         }
         _ = alloc;
+    }
+
+    /// Take a live snapshot: freeze, write the suspend image plus
+    /// copy-on-write clones of every writable disk into `dir` (instant
+    /// on APFS via clonefile), then RESUME — the VM keeps running.
+    /// Revert later with --restore <dir>.
+    pub fn snapshotTo(self: *Machine, dir: []const u8) !void {
+        const io = global.io();
+        std.Io.Dir.cwd().createDir(io, dir, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        self.pause();
+        defer self.unpause();
+
+        var path_buf: [1024]u8 = undefined;
+        const state_path = try std.fmt.bufPrint(&path_buf, "{s}/state.img", .{dir});
+        try self.suspendToDisk(state_path);
+
+        // Clone writable disks (quiescent: the machine is paused and all
+        // blk writes are synchronous on the parked vCPU thread).
+        var meta = std.ArrayListUnmanaged(u8).empty;
+        defer meta.deinit(self.alloc);
+        try meta.appendSlice(self.alloc, "{\"disks\":[");
+        var disk_idx: u32 = 0;
+        const candidates = [_]struct { path: ?[]const u8, writable: bool }{
+            .{ .path = self.config.disk_path, .writable = !self.config.disk_read_only },
+            .{ .path = self.config.disk2_path, .writable = !self.config.disk2_read_only },
+        };
+        for (candidates) |cand| {
+            const disk_path = cand.path orelse continue;
+            if (!cand.writable) continue;
+            var name_buf: [64]u8 = undefined;
+            const copy_name = std.fmt.bufPrint(&name_buf, "disk{d}.raw", .{disk_idx}) catch unreachable;
+            var copy_buf: [1024]u8 = undefined;
+            const copy_path = try std.fmt.bufPrint(&copy_buf, "{s}/{s}", .{ dir, copy_name });
+            try cloneFile(self.alloc, disk_path, copy_path);
+            if (disk_idx > 0) try meta.append(self.alloc, ',');
+            try meta.appendSlice(self.alloc, "{\"orig\":\"");
+            try meta.appendSlice(self.alloc, disk_path);
+            try meta.appendSlice(self.alloc, "\",\"copy\":\"");
+            try meta.appendSlice(self.alloc, copy_name);
+            try meta.appendSlice(self.alloc, "\"}");
+            disk_idx += 1;
+        }
+        try meta.appendSlice(self.alloc, "]}");
+
+        const meta_path = try std.fmt.bufPrint(&path_buf, "{s}/meta.json", .{dir});
+        const meta_file = try std.Io.Dir.cwd().createFile(io, meta_path, .{});
+        defer meta_file.close(io);
+        try meta_file.writePositionalAll(io, meta.items, 0);
+
+        log.info("snapshot written to {s} ({} disk clones)", .{ dir, disk_idx });
+    }
+
+    /// Copy-on-write file clone (instant on APFS); replaces dst.
+    pub fn cloneFile(alloc: Allocator, src: []const u8, dst: []const u8) !void {
+        const src_z = try alloc.dupeZ(u8, src);
+        defer alloc.free(src_z);
+        const dst_z = try alloc.dupeZ(u8, dst);
+        defer alloc.free(dst_z);
+        _ = std.c.unlink(dst_z.ptr);
+        if (clonefile(src_z.ptr, dst_z.ptr, 0) != 0) return error.CloneFailed;
     }
 
     /// Suspend-to-disk image magic.
