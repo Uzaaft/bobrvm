@@ -1120,8 +1120,42 @@ pub const Gpu = struct {
 
         const res = self.gpu_device.getResource(cmd.resource_id) orelse
             return .resp_err_invalid_resource_id;
-        // Textures need row/layer-aware upload; defer them. Buffers first.
-        if (res.target != .buffer) return .resp_ok_nodata;
+        if (res.target != .buffer) {
+            // Texture upload: gather the box rect from the scattered guest
+            // backing into staging, then a region replaceRegion. 32-bit
+            // formats only so far (everything mesa uses for scanout/simple
+            // texturing); stride 0 means tightly packed.
+            const list = self.backing3d.getPtr(cmd.resource_id) orelse return .resp_err_unspec;
+            if (list.items.len == 0) return .resp_err_unspec;
+            const bpp: u64 = 4;
+            const row_bytes: u64 = @as(u64, cmd.box.w) * bpp;
+            if (row_bytes == 0 or cmd.box.h == 0) return .resp_ok_nodata;
+            const stride: u64 = if (cmd.stride != 0) cmd.stride else row_bytes;
+            const total_u64 = row_bytes * cmd.box.h;
+            if (total_u64 > 512 * 1024 * 1024) return .resp_err_invalid_parameter;
+            const total: usize = @intCast(total_u64);
+            const staging = self.alloc.alloc(u8, total) catch return .resp_err_out_of_memory;
+            defer self.alloc.free(staging);
+            var y: u32 = 0;
+            while (y < cmd.box.h) : (y += 1) {
+                const src_off = cmd.offset + @as(u64, y) * stride;
+                const dst_row = staging[@intCast(@as(u64, y) * row_bytes)..][0..@intCast(row_bytes)];
+                if (!copyFromBacking(list.items, src_off, dst_row, get_mem)) {
+                    return .resp_err_unspec;
+                }
+            }
+            // No Metal backing (decode-only CI) is not an error.
+            _ = self.gpu_device.uploadToTextureRegion(
+                cmd.resource_id,
+                cmd.box.x,
+                cmd.box.y,
+                cmd.box.w,
+                cmd.box.h,
+                staging,
+                @intCast(row_bytes),
+            );
+            return .resp_ok_nodata;
+        }
 
         const list = self.backing3d.getPtr(cmd.resource_id) orelse return .resp_err_unspec;
         if (list.items.len == 0) return .resp_err_unspec;
@@ -1553,6 +1587,79 @@ test "transfer_to_host_2d full-width fast path matches guest backing" {
     // host copy must match the guest backing byte-for-byte
     const res = gpu.resources.get(1).?;
     try testing.expect(std.mem.eql(u8, res.host_data, guest));
+}
+
+test "transfer_to_host_3d uploads guest TEXTURE data via replaceRegion" {
+    const gpu = try Gpu.init(testing.allocator, true);
+    defer gpu.deinit();
+
+    // A 2x2 BGRA texture: 4 distinct pixels.
+    const nbytes: u32 = 2 * 2 * 4;
+    const guest = try testing.allocator.alloc(u8, nbytes);
+    defer testing.allocator.free(guest);
+    for (guest, 0..) |*b, i| b.* = @truncate(i * 11 + 5);
+
+    const Ctx = struct {
+        var mem: []u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    Ctx.mem = guest;
+    gpu.setGuestMemory(Ctx.get);
+
+    // texture_2d (2) with sampler_view bind (1<<3).
+    const create = ResourceCreate3D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_3d) },
+        .resource_id = 1,
+        .target = 2,
+        .format = @intFromEnum(@import("../gpu/virgl/protocol.zig").Format.b8g8r8a8_unorm),
+        .bind = 1 << 3,
+        .width = 2,
+        .height = 2,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdResourceCreate3D(std.mem.asBytes(&create)));
+    if (gpu.gpu_device.renderer == null) return error.SkipZigTest;
+
+    const AttachMsg = extern struct { hdr: ResourceAttachBacking, entry: MemEntry };
+    const attach = AttachMsg{
+        .hdr = .{
+            .header = .{ .type = @intFromEnum(CmdType.resource_attach_backing) },
+            .resource_id = 1,
+            .nr_entries = 1,
+        },
+        .entry = .{ .addr = 0x1000, .length = nbytes },
+    };
+    var empty_chain = ring.Chain{};
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdResourceAttachBacking(std.mem.asBytes(&attach), &empty_chain, Ctx.get),
+    );
+
+    // Full-rect transfer (tight stride via stride=0).
+    const xfer = TransferHost3D{
+        .header = .{ .type = @intFromEnum(CmdType.transfer_to_host_3d) },
+        .box = .{ .x = 0, .y = 0, .z = 0, .w = 2, .h = 2, .d = 1 },
+        .offset = 0,
+        .resource_id = 1,
+        .level = 0,
+        .stride = 0,
+        .layer_stride = 0,
+    };
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get));
+
+    // Read the texture back from the GPU: must match the guest bytes.
+    var out: [nbytes]u8 = undefined;
+    try testing.expect(gpu.gpu_device.readbackResource(1, &out));
+    try testing.expectEqualSlices(u8, guest, &out);
 }
 
 test "transfer_to_host_3d uploads guest vertex data into the resource's MTLBuffer" {

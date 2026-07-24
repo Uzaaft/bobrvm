@@ -222,6 +222,21 @@ pub const GpuDevice = struct {
         return r.uploadTexture(handle, data, bytes_per_row);
     }
 
+    /// Upload a sub-rect into a texture resource (transfer_to_host_3d).
+    pub fn uploadToTextureRegion(
+        self: *GpuDevice,
+        handle: ResourceHandle,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        data: []const u8,
+        bytes_per_row: u32,
+    ) bool {
+        const r = self.ensureRenderer() orelse return false;
+        return r.uploadTextureRegion(handle, x, y, w, h, data, bytes_per_row);
+    }
+
     /// Upload guest data into a buffer resource's MTLBuffer at `offset`.
     /// Returns false if there is no GPU-backed buffer for the handle.
     pub fn uploadToBuffer(self: *GpuDevice, handle: ResourceHandle, offset: u32, data: []const u8) bool {

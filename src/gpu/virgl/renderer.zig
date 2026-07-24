@@ -332,9 +332,29 @@ pub const Renderer = struct {
     /// mip-0 rect at the given stride).
     pub fn uploadTexture(self: *Renderer, handle: ResourceHandle, data: []const u8, bytes_per_row: u32) bool {
         const target = self.targets.get(handle) orelse return false;
-        if (data.len < @as(usize, bytes_per_row) * target.height) return false;
+        return self.uploadTextureRegion(handle, 0, 0, target.width, target.height, data, bytes_per_row);
+    }
+
+    /// Upload a sub-rect of a sampler texture (guest transfer_to_host_3d).
+    pub fn uploadTextureRegion(
+        self: *Renderer,
+        handle: ResourceHandle,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        data: []const u8,
+        bytes_per_row: u32,
+    ) bool {
+        const target = self.targets.get(handle) orelse return false;
+        if (w == 0 or h == 0) return false;
+        if (x + w > target.width or y + h > target.height) return false;
+        if (data.len < @as(usize, bytes_per_row) * h) return false;
         target.tex.replaceRegion(
-            .{ .size = .{ .width = target.width, .height = target.height } },
+            .{
+                .origin = .{ .x = x, .y = y },
+                .size = .{ .width = w, .height = h },
+            },
             0,
             data.ptr,
             bytes_per_row,
