@@ -227,6 +227,28 @@ pub const Context = struct {
         return self.const_data[stage].items;
     }
 
+    /// Record a sampler view (texture binding descriptor).
+    pub fn createSamplerView(
+        self: *Context,
+        handle: ObjectHandle,
+        resource_handle: ResourceHandle,
+        format: proto.Format,
+    ) Error!void {
+        try self.sampler_views.put(handle, .{
+            .handle = handle,
+            .resource_handle = resource_handle,
+            .format = format,
+            .first_layer = 0,
+            .last_layer = 0,
+            .first_level = 0,
+            .last_level = 0,
+            .swizzle_r = 0,
+            .swizzle_g = 1,
+            .swizzle_b = 2,
+            .swizzle_a = 3,
+        });
+    }
+
     pub fn deinit(self: *Context) void {
         var sh_it = self.shaders.valueIterator();
         while (sh_it.next()) |sh| {

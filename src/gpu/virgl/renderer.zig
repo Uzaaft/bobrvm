@@ -98,6 +98,9 @@ pub const Renderer = struct {
     /// PSO's color format must match the render target it draws into).
     passthrough: std.AutoHashMap(NSUInteger, metal.RenderPipelineState),
     passthrough_lib: ?metal.Library,
+    /// Lazily-created linear-filtering sampler shared by all sampled draws
+    /// (per-guest sampler-state translation lands with GL3).
+    default_sampler: ?metal.SamplerState = null,
     /// Guest buffer resources (vertex/index/constant) backed by MTLBuffers
     /// in shared storage, so guest uploads are a plain memcpy (no copy on
     /// the GPU side — the buffer is read in place by the vertex stage).
@@ -308,6 +311,44 @@ pub const Renderer = struct {
 
     /// Back a guest buffer resource with an MTLBuffer of `size` bytes.
     /// Idempotent per handle (re-create releases the old buffer).
+    /// Create a texture a fragment shader can sample (guest texture
+    /// resources with the sampler_view bind). Shared storage so uploads
+    /// are plain replaceRegion copies.
+    pub fn createSamplerTexture(
+        self: *Renderer,
+        handle: ResourceHandle,
+        format: proto.Format,
+        width: u32,
+        height: u32,
+    ) Error!void {
+        const px = mapFormat(format);
+        const tex = self.device.newTexture2D(px, width, height, metal.MTLTextureUsage.shader_read, .shared) orelse
+            return Error.TextureCreateFailed;
+        if (self.targets.fetchRemove(handle)) |old| old.value.tex.release();
+        try self.targets.put(handle, .{ .tex = tex, .width = width, .height = height, .format = px });
+    }
+
+    /// Upload pixel data into a sampler texture (bytes are the full
+    /// mip-0 rect at the given stride).
+    pub fn uploadTexture(self: *Renderer, handle: ResourceHandle, data: []const u8, bytes_per_row: u32) bool {
+        const target = self.targets.get(handle) orelse return false;
+        if (data.len < @as(usize, bytes_per_row) * target.height) return false;
+        target.tex.replaceRegion(
+            .{ .size = .{ .width = target.width, .height = target.height } },
+            0,
+            data.ptr,
+            bytes_per_row,
+        );
+        return true;
+    }
+
+    fn ensureSampler(self: *Renderer) ?metal.SamplerState {
+        if (self.default_sampler) |s| return s;
+        const desc = metal.SamplerDescriptor.create() orelse return null;
+        self.default_sampler = self.device.newSamplerState(desc);
+        return self.default_sampler;
+    }
+
     pub fn createBuffer(self: *Renderer, handle: ResourceHandle, size: u32) Error!void {
         if (size == 0) return Error.TextureCreateFailed;
         const buf = self.device.newBufferWithLength(size) orelse return Error.TextureCreateFailed;
@@ -479,12 +520,14 @@ pub const Renderer = struct {
         prim: metal.MTLPrimitiveType,
         vs_consts: []const u8,
         fs_consts: []const u8,
+        frag_tex: ?ResourceHandle,
     ) Error!void {
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
         const pass = try self.beginLoadPass(target_handle);
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
         bindConsts(pass.enc, vs_consts, fs_consts);
+        self.bindFragTexture(pass.enc, frag_tex);
         pass.enc.drawPrimitives(prim, 0, vertex_count);
         pass.enc.endEncoding();
         pass.cmd.commit();
@@ -506,6 +549,7 @@ pub const Renderer = struct {
         prim: metal.MTLPrimitiveType,
         vs_consts: []const u8,
         fs_consts: []const u8,
+        frag_tex: ?ResourceHandle,
     ) Error!void {
         // Metal has no 8-bit indices; those need index-widening (deferred).
         const index_type: metal.MTLIndexType = switch (index_size) {
@@ -519,6 +563,7 @@ pub const Renderer = struct {
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
         bindConsts(pass.enc, vs_consts, fs_consts);
+        self.bindFragTexture(pass.enc, frag_tex);
         pass.enc.drawIndexedPrimitives(prim, index_count, index_type, ibuf, ibuf_offset);
         pass.enc.endEncoding();
         pass.cmd.commit();
@@ -551,6 +596,15 @@ pub const Renderer = struct {
     fn bindConsts(enc: metal.RenderCommandEncoder, vs: []const u8, fs: []const u8) void {
         if (vs.len > 0) enc.setVertexBytes(vs.ptr, vs.len, 1);
         if (fs.len > 0) enc.setFragmentBytes(fs.ptr, fs.len, 1);
+    }
+
+    /// Bind the fragment stage's sampled texture + default sampler at
+    /// index 0 (single texture unit so far).
+    fn bindFragTexture(self: *Renderer, enc: metal.RenderCommandEncoder, frag_tex: ?ResourceHandle) void {
+        const handle = frag_tex orelse return;
+        const target = self.targets.get(handle) orelse return;
+        enc.setFragmentTexture(target.tex.ptr, 0);
+        enc.setFragmentSamplerState(self.ensureSampler(), 0);
     }
 
     /// Map a Gallium primitive type to Metal's. Metal has no loop/fan/quad

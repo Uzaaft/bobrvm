@@ -86,6 +86,7 @@ pub const Program = struct {
     imm_present: [MAX_IMM]bool = [_]bool{false} ** MAX_IMM,
     /// Whether any CONST[] was referenced (needs a uniform buffer binding).
     uses_const: bool = false,
+    uses_sampler: bool = false,
 };
 
 pub const MAX_IMM = 64;
@@ -173,10 +174,9 @@ fn stripLeadingNumber(line: []const u8) []const u8 {
 
 /// Parse TGSI text into a Program.
 pub fn parse(text: []const u8) Error!Program {
-    var prog: Program = undefined;
-    prog.n_in = 0;
-    prog.n_out = 0;
-    prog.n_instr = 0;
+    // Field defaults apply (n_* = 0, uses_* = false); `undefined` would
+    // leave the bool flags as garbage when never set by trackOperand.
+    var prog: Program = .{ .stage = .vertex };
 
     var have_header = false;
 
@@ -281,6 +281,7 @@ fn trackOperand(prog: *Program, o: Operand) void {
             prog.max_temp = @intCast(o.index);
         },
         .constant => prog.uses_const = true,
+        .sampler => prog.uses_sampler = true,
         else => {},
     }
 }
@@ -392,6 +393,7 @@ fn isSupported(op: []const u8) bool {
     const ops = [_][]const u8{
         "MOV", "ADD", "SUB", "MUL", "MAD", "DP2", "DP3", "DP4",
         "MAX", "MIN", "RCP", "RSQ", "FRC", "FLR", "ABS", "SQRT",
+        "TEX", "TXP",
     };
     for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
     return false;
@@ -401,7 +403,20 @@ fn isSupported(op: []const u8) bool {
 fn appendRhs(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, instr: *const Instr) !void {
     const op = instr.opName();
     const s = instr.srcs;
-    if (std.mem.eql(u8, op, "MOV")) {
+    if (std.mem.eql(u8, op, "TEX")) {
+        // dst = tex0.sample(smp0, coord.xy)   (2D targets only for now;
+        // the sampler operand selects the unit — single unit so far.)
+        try app(w, alloc, "tex0.sample(smp0, (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xy)", .{});
+    } else if (std.mem.eql(u8, op, "TXP")) {
+        // Projective: divide coords by w before sampling.
+        try app(w, alloc, "tex0.sample(smp0, (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xy / (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").w)", .{});
+    } else if (std.mem.eql(u8, op, "MOV")) {
         try appendSrc(w, alloc, prog, s[0]);
     } else if (std.mem.eql(u8, op, "ADD")) {
         try appendSrc(w, alloc, prog, s[0]);
@@ -519,7 +534,9 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
             try app(w, alloc, "    float4 position [[position]];\n", .{});
             has_position = true;
         } else {
-            try app(w, alloc, "    float4 g{d} [[user(locn{d})]];\n", .{ d.index, d.index });
+            // Varying linkage keys on the SEMANTIC index (GENERIC[n]),
+            // not the register index — the FS declares its own registers.
+            try app(w, alloc, "    float4 g{d} [[user(locn{d})]];\n", .{ d.index, d.semantic_index });
         }
     }
     if (!has_position) try app(w, alloc, "    float4 position [[position]];\n", .{});
@@ -547,7 +564,7 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
     if (has_in) {
         try app(w, alloc, "struct FSIn {{\n", .{});
         for (prog.in_decls[0..prog.n_in]) |d| {
-            try app(w, alloc, "    float4 a{d} [[user(locn{d})]];\n", .{ d.index, d.index });
+            try app(w, alloc, "    float4 a{d} [[user(locn{d})]];\n", .{ d.index, d.semantic_index });
         }
         try app(w, alloc, "}};\n", .{});
     }
@@ -562,6 +579,11 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
     if (prog.uses_const) {
         if (need_comma) try app(w, alloc, ", ", .{});
         try app(w, alloc, "constant float4* c [[buffer(1)]]", .{});
+        need_comma = true;
+    }
+    if (prog.uses_sampler) {
+        if (need_comma) try app(w, alloc, ", ", .{});
+        try app(w, alloc, "texture2d<float> tex0 [[texture(0)]], sampler smp0 [[sampler(0)]]", .{});
     }
     try app(w, alloc, ") {{\n    float4 out0 = float4(0.0,0.0,0.0,1.0);\n", .{});
     try emitLocals(w, alloc, prog);

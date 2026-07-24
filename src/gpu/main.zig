@@ -211,7 +211,15 @@ pub const GpuDevice = struct {
             r.createBuffer(res.handle, res.width) catch {};
         } else if (res.bind & PipeBind.render_target != 0) {
             r.createRenderTarget(res.handle, res.format, res.width, if (res.height == 0) 1 else res.height) catch {};
+        } else if (res.bind & PipeBind.sampler_view != 0) {
+            r.createSamplerTexture(res.handle, res.format, res.width, if (res.height == 0) 1 else res.height) catch {};
         }
+    }
+
+    /// Upload pixel data into a texture resource (sampler textures).
+    pub fn uploadToTexture(self: *GpuDevice, handle: ResourceHandle, data: []const u8, bytes_per_row: u32) bool {
+        const r = self.ensureRenderer() orelse return false;
+        return r.uploadTexture(handle, data, bytes_per_row);
     }
 
     /// Upload guest data into a buffer resource's MTLBuffer at `offset`.
@@ -349,6 +357,14 @@ pub const GpuDevice = struct {
                                 try ctx.createSurface(handle, res_handle, fmt);
                             }
                         },
+                        .sampler_view => {
+                            // [res_handle, format, first/last elem, swizzle].
+                            if (payload.len >= 2) {
+                                const res_handle = payload[0];
+                                const fmt: virgl.protocol.Format = @enumFromInt(payload[1]);
+                                try ctx.createSamplerView(handle, res_handle, fmt);
+                            }
+                        },
                         else => dec.skip(header.length - 1),
                     }
                 },
@@ -403,6 +419,24 @@ pub const GpuDevice = struct {
                             r.clearTarget(res_handle, clear_cmd.color) catch {};
                         }
                     }
+                },
+
+                .set_sampler_views => {
+                    // [shader_type, start_slot, view handles...].
+                    if (header.length >= 2) {
+                        const shader_type = try dec.readU32();
+                        const start_slot = try dec.readU32();
+                        const n: u16 = header.length - 2;
+                        var k: u16 = 0;
+                        while (k < n) : (k += 1) {
+                            const vh = try dec.readU32();
+                            const slot = start_slot + k;
+                            if (shader_type < 6 and slot < 16) {
+                                ctx.sampler_views_bound[shader_type][slot] =
+                                    if (vh == 0) null else vh;
+                            }
+                        }
+                    } else dec.skip(header.length);
                 },
 
                 .set_constant_buffer => {
@@ -473,6 +507,14 @@ pub const GpuDevice = struct {
                                     // stages' inline constants at buffer(1).
                                     const vs_c = ctx.constants(0);
                                     const fs_c = ctx.constants(1);
+                                    // Fragment texture: bound sampler view 0
+                                    // (stage 1 = fragment) -> resource.
+                                    var frag_tex: ?u32 = null;
+                                    if (ctx.sampler_views_bound[1][0]) |view_h| {
+                                        if (ctx.sampler_views.get(view_h)) |view| {
+                                            frag_tex = view.resource_handle;
+                                        }
+                                    }
                                     if (draw_cmd.indexed and ctx.index_buffer != 0) {
                                         r.drawIndexedWithPipeline(
                                             target,
@@ -486,9 +528,10 @@ pub const GpuDevice = struct {
                                             prim,
                                             vs_c,
                                             fs_c,
+                                            frag_tex,
                                         ) catch {};
                                     } else {
-                                        r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim, vs_c, fs_c) catch {};
+                                        r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim, vs_c, fs_c, frag_tex) catch {};
                                     }
                                 } else {
                                     // Passthrough fallback (no bound shaders yet).
@@ -954,6 +997,171 @@ test "GpuDevice draws indexed with uniform constants (buffer(1) binding)" {
     // GREEN (BGRA): the uniform's color, via the indexed triangle 1-2-3.
     try std.testing.expect(px[center + 1] > 200); // G
     try std.testing.expect(px[center + 2] < 40); // R
+    try std.testing.expect(px[center + 0] < 40); // B
+    try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
+}
+
+test "GpuDevice samples a guest texture through TEX (fragment texturing)" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const vbuf: u32 = 30;
+    const tex: u32 = 40;
+
+    try gpu.createResourceRecord(.{
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
+    });
+    // A 1x1 sampled texture: every sample returns its single texel.
+    try gpu.createResourceRecord(.{
+        .handle = tex,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 1,
+        .height = 1,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.sampler_view,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    // Orange texel (BGRA).
+    const orange = [_]u8{ 0, 165, 255, 255 };
+    try std.testing.expect(gpu.uploadToTexture(tex, &orange, 4));
+
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\n0: MOV OUT[0], IN[0]\n1: MOV OUT[1], IN[0]\n2: END\n";
+    const fs_text = "FRAG\nDCL IN[0], GENERIC[0]\nDCL OUT[0], COLOR\nDCL SAMP[0]\n0: TEX OUT[0], IN[0], SAMP[0], 2D\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5); // vertex_elements: one r32g32_float element
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
+    b.w(0);
+    b.cmd(31, 0, 2); // bind vs
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2); // bind fs
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1); // bind vertex_elements
+    b.w(52);
+    // create sampler_view (object type 6): [handle, res, format, ...]
+    b.cmd(1, 6, 6);
+    b.w(70);
+    b.w(tex);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    // set_sampler_views: fragment stage, slot 0 -> view 70
+    b.cmd(10, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(70);
+    b.cmd(1, 8, 3); // surface
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3); // set_framebuffer
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3); // set_vertex_buffers
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
+    b.cmd(7, 0, 8); // clear black
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.cmd(8, 0, 12); // draw
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    for (0..9) |_| b.w(0);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const center = ((32 * 64) + 32) * 4;
+    // Orange from the sampled texel (BGRA).
+    try std.testing.expect(px[center + 2] > 200); // R
+    try std.testing.expect(px[center + 1] > 120 and px[center + 1] < 210); // G ~165
     try std.testing.expect(px[center + 0] < 40); // B
     try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
 }
