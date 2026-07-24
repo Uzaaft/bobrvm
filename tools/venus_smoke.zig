@@ -12,11 +12,13 @@ const std = @import("std");
 const venus = @import("venus");
 
 pub fn main() !void {
-    var host = venus.Host.init() catch |e| {
-        std.debug.print("venus init FAILED: {s}\n", .{@errorName(e)});
+    // ensureHost() self-configures RENDER_SERVER_EXEC_PATH + VK_ICD_FILENAMES
+    // from the build's virgl prefix (the same path gpu.zig uses).
+    const host = venus.ensureHost() orelse {
+        std.debug.print("venus init FAILED (host unavailable)\n", .{});
         std.process.exit(1);
     };
-    defer host.deinit();
+    defer venus.deinitHost();
 
     const v = host.getCapset(venus.CAPSET_VENUS);
     const v1 = host.getCapset(venus.CAPSET_VIRGL);

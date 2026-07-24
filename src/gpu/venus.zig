@@ -13,6 +13,7 @@
 //! top of this in later milestones.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const log = std.log.scoped(.venus);
 
 // --- virglrenderer flags (virglrenderer.h) ---
@@ -272,11 +273,29 @@ pub const Host = struct {
 // its own instance.
 var global_host: ?Host = null;
 
+/// Configure the render-server binary + KosmicKrisp ICD paths from the build's
+/// virgl install prefix, without clobbering values the user set in the env. The
+/// render server (RENDER_SERVER_EXEC_PATH) and ICD (VK_ICD_FILENAMES) can be set
+/// after launch since virglrenderer reads them at init; DYLD_LIBRARY_PATH cannot
+/// (dyld reads it at exec) so the vulkan-loader path still comes from the env.
+fn configureEnv() void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (getenv("RENDER_SERVER_EXEC_PATH") == null) {
+        const p = std.fmt.bufPrintZ(&buf, "{s}/libexec/virgl_render_server", .{build_options.virgl_prefix}) catch return;
+        _ = setenv("RENDER_SERVER_EXEC_PATH", p.ptr, 1);
+    }
+    if (getenv("VK_ICD_FILENAMES") == null) {
+        const p = std.fmt.bufPrintZ(&buf, "{s}/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json", .{build_options.virgl_prefix}) catch return;
+        _ = setenv("VK_ICD_FILENAMES", p.ptr, 1);
+    }
+}
+extern "c" fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]const u8;
+
 /// Initialize (once) and return the process Venus host, or null if the host
 /// stack is unavailable (wrong/missing driver, render server can't start, …).
-/// The caller should have set the render-server path first (setRenderServerPath).
 pub fn ensureHost() ?*Host {
     if (global_host == null) {
+        configureEnv();
         global_host = Host.init() catch {
             log.warn("venus host init failed — venus GPU path unavailable", .{});
             return null;

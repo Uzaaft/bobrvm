@@ -39,6 +39,9 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "gpu_venus", gpu_venus);
+    // Carried into venus.zig so it can self-configure the render-server binary +
+    // KosmicKrisp ICD paths from this install prefix (no manual env needed).
+    build_options.addOption([]const u8, "virgl_prefix", virgl_prefix);
 
     // Applies the build_options import and, when venus is enabled, the
     // virglrenderer link, to a module that compiles the GPU device.
@@ -223,6 +226,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        venus_mod.addOptions("build_options", build_options);
 
         const venus_smoke_mod = b.createModule(.{
             .root_source_file = b.path("tools/venus_smoke.zig"),
