@@ -85,12 +85,54 @@ against the *wrong* driver. The real Venus ceiling is **KosmicKrisp's** Vulkan
 1.3 feature set (reported ~MoltenVK parity as of Mesa 26.0). Re-probe once
 KosmicKrisp is installed.
 
-**Getting KosmicKrisp** (no Homebrew formula): build from Mesa source —
-`meson setup <mesa> -Dplatforms=macos -Dvulkan-drivers=kosmickrisp
--Dgallium-drivers= -Dopengl=false --prefer-static`, then point
-`VK_ICD_FILENAMES` at the resulting `kosmickrisp_icd.*.json`. Venus also ships a
-`virgl_render_server` (`…/libexec/virgl_render_server`, `RENDER_SERVER_EXEC_PATH`)
-— may be required for the venus process model.
+**KosmicKrisp built** (Mesa 26.3-devel, `tools/`-style script in scratchpad):
+`meson setup -Dplatforms=macos -Dvulkan-drivers=kosmickrisp -Dgallium-drivers=
+-Dopengl=false -Dzstd=disabled -Dvideo-codecs= -Dllvm=enabled --prefer-static`.
+Deps: `libclc` + `llvm` (KosmicKrisp forces `with_driver_using_cl` for its
+precompiled shaders) + `spirv-llvm-translator` (must match LLVM major.minor:
+22.1) + `spirv-tools`/`spirv-headers`. Produces `libvulkan_kosmickrisp.dylib` +
+`kosmickrisp_mesa_icd.aarch64.json` (library_path `/opt/homebrew/lib/…`, so
+symlink the built dylib there). **Measured ceiling** (`tools/mvk_probe.c` via the
+loader with `VK_ICD_FILENAMES` = KK ICD): Vulkan **1.4**, tessellation, compute,
+huge SSBO limits, `logicOp`/`shaderCullDistance`/`conditional_rendering`/
+`multi_draw` (all better than MoltenVK); still no fp64/geometryShader/
+`VK_EXT_transform_feedback` (Metal-fundamental → Zink lowers).
+
+## ⛔ BLOCKER: Venus render-server transport is broken on macOS
+
+Venus in this virglrenderer build runs in a **render-server subprocess**
+(`virgl_render_server`), and that proxy sets up its control channel with
+`socketpair(AF_UNIX, SOCK_SEQPACKET, …)`. **macOS has no `AF_UNIX`/`SOCK_SEQPACKET`**
+→ `errno 43 EPROTONOSUPPORT` → `failed to initialize venus renderer`. In-process
+venus (init without `RENDER_SERVER`) returns **EINVAL** at
+`context_create_with_flags(VENUS)` — this build's venus is render-server-only.
+Net: neither venus path works on macOS as shipped.
+
+**Fix step 1 (DONE, works):** the tap's `virglrenderer-macos-unified.patch`
+*already* implements length-prefixed framing for non-SEQPACKET sockets
+(`render_context_socket_header`, `ntohl(hdr.length)`, gated on `is_seqpacket`)
+but left the socket type as `SOCK_SEQPACKET` on the `__APPLE__` branch in **both**
+`server/render_socket.c` **and** `src/proxy/proxy_socket.c`. Rebuilding
+virglrenderer 1.3.0 from source with the tap's 20-patch stack plus both
+`__APPLE__` branches → `SOCK_STREAM` (see `tools/build-virglrenderer-macos.sh`)
+gets the render server to **fork and `virgl_renderer_init` to return 0**. Installs
+to `scratchpad/virgl-fixed`.
+
+**Remaining render-server macOS gaps (the wall, uncertain depth):** with the
+socket fixed, `context_create_with_flags(VENUS)` still fails (rc=12) because the
+`virgl_render_server` itself was never ported to macOS:
+- `failed to create worker jail` — the server sandboxes each context in a
+  Linux-only "jail" (seccomp/namespaces). Needs disabling on macOS (there is a
+  `render-server-worker` meson option / a no-jail path to wire).
+- `failed to set kqueue non-blocking` — macOS fd/kqueue handling.
+- `proxy: failed to receive message: truncated or incomplete` — the SOCK_STREAM
+  framing may still mis-handle a boundary, or is a downstream symptom of the
+  server bailing on the jail failure.
+
+So the venus stack *assembles* (KosmicKrisp VK1.4 ✓, virglrenderer venus init ✓,
+render server forks ✓) but serving a context needs a real macOS port of
+virglrenderer's render server. This is upstream-scale work of uncertain total
+depth — the decision point for how far to invest.
 
 ## Host components
 
