@@ -448,6 +448,10 @@ pub const Console = struct {
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
         const port = &self.ports.items[p - 1];
+        // Flow control: the guest driver discards rx data on ports it
+        // hasn't opened. Hold data in the host buffer until PORT_OPEN so
+        // nothing sent early is silently lost.
+        if (!port.guest_open) return;
 
         self.input_mutex.lockUncancelable(global.io());
         defer self.input_mutex.unlock(global.io());

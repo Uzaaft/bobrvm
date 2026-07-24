@@ -22,6 +22,7 @@ const icc = @import("../gic/icc.zig");
 const mininat = @import("../net/mininat.zig");
 const pci = @import("../pci/main.zig");
 const dtb = @import("dtb.zig");
+const agent = @import("../agent/main.zig");
 
 const log = std.log.scoped(.machine);
 const enable_debug_logs = builtin.mode == .Debug;
@@ -168,6 +169,11 @@ pub const MachineConfig = struct {
 /// Number of addressable virtio-mmio slots (console, 2 disks, gpu, spare).
 const VIRTIO_SLOT_COUNT: u64 = 8;
 
+/// Console multiport ids for the agent ports (order matches the names
+/// passed to Console.init in initVirtioDevices).
+const SPICE_PORT: u32 = 1; // com.redhat.spice.0
+const QGA_PORT: u32 = 2; // org.qemu.guest_agent.0
+
 /// Per-vCPU run state for the synchronous multi-threaded loop.
 const VcpuRunState = struct {
     pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -234,6 +240,10 @@ pub const Machine = struct {
     /// Virtio entropy device (always present; instant guest RNG seeding).
     rng: ?*virtio.Rng = null,
     rng_slot: u8 = 0,
+
+    /// qemu-guest-agent channel on console port QGA_PORT
+    /// ("org.qemu.guest_agent.0"). Talks to the stock distro agent.
+    qga: ?agent.Qga = null,
 
     /// UART device (PL011 for earlycon).
     uart: ?*virtio.Uart = null,
@@ -345,6 +355,11 @@ pub const Machine = struct {
             self.rng = null;
         }
 
+        if (self.qga) |*q| {
+            q.deinit();
+            self.qga = null;
+        }
+
         if (self.uart) |uart| {
             self.alloc.destroy(uart);
             self.uart = null;
@@ -431,6 +446,50 @@ pub const Machine = struct {
         const mouse = self.mouse orelse return;
         mouse.injectScroll(dx, dy) catch {};
         self.kickCpu(0);
+    }
+
+    /// Send bytes to the guest agent port (host→guest). Thread-safe.
+    fn qgaSendCallback(data: []const u8, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        const console = self.console orelse return;
+        console.queuePortInput(QGA_PORT, data) catch {};
+        self.kickCpu(0);
+    }
+
+    /// Guest agent port output (guest→host); runs on the vCPU thread.
+    fn qgaFeedCallback(data: []const u8, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.qga) |*q| q.feed(data);
+    }
+
+    /// Ask the guest to shut down gracefully via qemu-guest-agent
+    /// (requires the agent running in the guest). The guest then powers
+    /// off through the normal PSCI SYSTEM_OFF path. Thread-safe.
+    pub fn requestGuestShutdown(self: *Machine) void {
+        if (self.qga) |*q| q.shutdown("powerdown");
+    }
+
+    /// Host wall clock in nanoseconds (zig 0.16 moved timestamps into Io).
+    fn hostRealNs() i64 {
+        return @intCast(std.Io.Clock.real.now(global.io()).nanoseconds);
+    }
+
+    /// Probe guest-agent liveness (response visible via qga state/logs).
+    pub fn pingGuestAgent(self: *Machine) void {
+        if (self.qga) |*q| {
+            q.sync(@divTrunc(hostRealNs(), std.time.ns_per_ms));
+            q.ping();
+        }
+    }
+
+    /// Set the guest wall clock to the host's (for restore-from-disk).
+    pub fn syncGuestTime(self: *Machine) void {
+        if (self.qga) |*q| q.setTime(hostRealNs());
+    }
+
+    /// Ask the agent for guest interface IPs (lands in qga.guest_ips).
+    pub fn queryGuestIps(self: *Machine) void {
+        if (self.qga) |*q| q.queryNetworkInterfaces();
     }
 
     /// Request a live guest display resolution change (host window resized).
@@ -1443,6 +1502,10 @@ pub const Machine = struct {
         // Set up IRQ callback - virtio console is SPI 32 (intid 32)
         self.console.?.transport.setIrqCallback(consoleIrqCallback, self);
         log.debug("initialized virtio-console at 0x{x}", .{MemoryLayout.virtioBase(0)});
+
+        // qemu-guest-agent channel on the second named port.
+        self.qga = agent.Qga.init(self.alloc, qgaSendCallback, self);
+        self.console.?.setPortOutput(QGA_PORT, qgaFeedCallback, self);
 
         // Initialize primary block device (slot 1) if disk_path is set
         if (self.config.disk_path) |disk_path| {

@@ -184,6 +184,11 @@ pub export fn bobrvm_vm_pause(vm: ?*apprt.VM) void {
     v.pause();
 }
 
+pub export fn bobrvm_vm_shutdown_graceful(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.requestGracefulShutdown();
+}
+
 pub export fn bobrvm_vm_resume(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.unpause();

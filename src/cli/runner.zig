@@ -117,6 +117,16 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         }
     }
 
+    // Debug: exercise the qemu-guest-agent channel after a delay
+    // (BOBRVM_TEST_QGA=delay_s): sync + ping + interface query; parsed
+    // responses appear in the qga log scope.
+    if (std.c.getenv("BOBRVM_TEST_QGA")) |delay_ptr| {
+        if (std.fmt.parseInt(u64, std.mem.span(delay_ptr), 10)) |delay_s| {
+            const t = std.Thread.spawn(.{}, testQgaLoop, .{ hw, delay_s }) catch null;
+            if (t) |thread| thread.detach();
+        } else |_| {}
+    }
+
     // Debug: pause the machine after a delay, resume after a duration
     // (BOBRVM_TEST_PAUSE=delay_s:duration_s) — verifies real pause/resume
     // headlessly (guest execution provably freezes, then continues).
@@ -231,6 +241,14 @@ fn asciiToEvdev(char: u8) u16 {
         ';' => 39,
         else => 0,
     };
+}
+
+/// Exercise the guest-agent channel (BOBRVM_TEST_QGA debug hook).
+fn testQgaLoop(hw: *machine.Machine, delay_s: u64) void {
+    sleepNs(delay_s * std.time.ns_per_s);
+    log.info("probing guest agent (sync+ping+interfaces)", .{});
+    hw.pingGuestAgent();
+    hw.queryGuestIps();
 }
 
 /// Pause then resume the machine (BOBRVM_TEST_PAUSE debug hook).

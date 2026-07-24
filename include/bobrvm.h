@@ -216,6 +216,13 @@ void bobrvm_vm_pause(bobrvm_vm_t vm);
 void bobrvm_vm_resume(bobrvm_vm_t vm);
 
 /**
+ * Ask the guest to shut down cleanly via qemu-guest-agent (requires the
+ * agent running in the guest). The VM then stops through the normal
+ * guest-initiated poweroff path; keep bobrvm_vm_stop as force fallback.
+ */
+void bobrvm_vm_shutdown_graceful(bobrvm_vm_t vm);
+
+/**
  * Kick a specific vCPU to wake it from WFI/sleep.
  * Injects an IRQ and forces an exit from hv_vcpu_run.
  * Useful for debugging when vCPU is stuck in WFI.

@@ -455,6 +455,13 @@ pub const VM = struct {
         assert(self.state == .stopped);
     }
 
+    /// Ask the guest to shut down cleanly via qemu-guest-agent. The VM
+    /// stops through the normal guest-initiated poweroff path; callers
+    /// keep stop() as the force fallback.
+    pub fn requestGracefulShutdown(self: *VM) void {
+        if (self.hw_machine) |hw| hw.requestGuestShutdown();
+    }
+
     pub fn pause(self: *VM) void {
         if (self.state == .running) {
             // Real pause: vCPUs park, all guest state stays intact.
