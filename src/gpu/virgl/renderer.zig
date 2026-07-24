@@ -1017,6 +1017,35 @@ test "draw triangle from an uploaded vertex buffer" {
     try std.testing.expect(buf[1] < 40);
 }
 
+test "TGSI texture sampling variants (TXB/TXL/TXF) compile on Metal" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch return error.SkipZigTest;
+    defer r.deinit();
+
+    const fs_text =
+        \\FRAG
+        \\DCL IN[0], GENERIC[0]
+        \\DCL OUT[0], COLOR
+        \\DCL SAMP[0]
+        \\DCL TEMP[0]
+        \\  0: TXB TEMP[0], IN[0], SAMP[0], 2D
+        \\  1: TXL OUT[0], IN[0], SAMP[0], 2D
+        \\  2: TXF TEMP[0], IN[0], SAMP[0], 2D
+        \\  3: ADD OUT[0], OUT[0], TEMP[0]
+        \\  4: END
+    ;
+    const prog = try tgsi.parse(fs_text);
+    var msl = try tgsi.emit(alloc, &prog);
+    defer msl.deinit(alloc);
+    const z = try alloc.dupeZ(u8, msl.source);
+    defer alloc.free(z);
+    const lib = r.device.newLibraryWithSource(z) orelse {
+        std.debug.print("MSL failed to compile:\n{s}\n", .{msl.source});
+        return error.TestUnexpectedResult;
+    };
+    lib.release();
+}
+
 test "TGSI integer/bitwise opcodes compile on Metal" {
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;

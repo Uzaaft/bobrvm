@@ -448,7 +448,8 @@ fn isSupportedName(op: []const u8) bool {
     const ops = [_][]const u8{
         "MOV",   "ADD", "SUB", "MUL",   "MAD",   "DP2", "DP3", "DP4",
         "MAX",   "MIN", "RCP", "RSQ",   "FRC",   "FLR", "ABS", "SQRT",
-        "TEX",   "TXP", "CMP", "LRP",   "SLT",   "SGE", "SEQ", "SNE",
+        "TEX",   "TXP", "TXB", "TXL",   "TXF",   "CMP", "LRP", "SLT",
+        "SGE",   "SEQ", "SNE",
         "POW",   "EX2", "LG2", "SIN",   "COS",   "TRUNC", "ROUND",
         "SSG",   "DDX", "DDY", "CEIL",  "XPD",   "NRM",   "DST",   "LIT",
         "I2F",   "U2F", "F2I", "F2U",   "INEG",  "IABS",  "UADD",  "UMUL",
@@ -666,13 +667,27 @@ fn appendRhsNamed(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const
         try app(w, alloc, "tex0.sample(smp0, (", .{});
         try appendSrc(w, alloc, prog, s[0]);
         try app(w, alloc, ").xy)", .{});
-    } else if (std.mem.eql(u8, op, "TXP")) {
-        // Projective: divide coords by w before sampling.
+    } else if (std.mem.eql(u8, op, "TXB")) {
+        // LOD bias in coord.w.
         try app(w, alloc, "tex0.sample(smp0, (", .{});
         try appendSrc(w, alloc, prog, s[0]);
-        try app(w, alloc, ").xy / (", .{});
+        try app(w, alloc, ").xy, bias((", .{});
         try appendSrc(w, alloc, prog, s[0]);
-        try app(w, alloc, ").w)", .{});
+        try app(w, alloc, ").w))", .{});
+    } else if (std.mem.eql(u8, op, "TXL")) {
+        // Explicit LOD in coord.w.
+        try app(w, alloc, "tex0.sample(smp0, (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xy, level((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").w))", .{});
+    } else if (std.mem.eql(u8, op, "TXF")) {
+        // texelFetch: integer texel coords in .xy, LOD in .w; no filtering.
+        try app(w, alloc, "tex0.read(uint2(as_type<int4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xy), uint(as_type<int4>(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").w))", .{});
     } else if (std.mem.eql(u8, op, "MOV")) {
         try appendSrc(w, alloc, prog, s[0]);
     } else if (std.mem.eql(u8, op, "ADD")) {
