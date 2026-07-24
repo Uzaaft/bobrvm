@@ -105,6 +105,7 @@ pub const PipelineKey = struct {
     fs: u32,
     ve: u32,
     fmt: u32,
+    has_depth: bool,
 };
 
 pub const GpuDevice = struct {
@@ -211,6 +212,8 @@ pub const GpuDevice = struct {
             r.createBuffer(res.handle, res.width) catch {};
         } else if (res.bind & PipeBind.render_target != 0) {
             r.createRenderTarget(res.handle, res.format, res.width, if (res.height == 0) 1 else res.height) catch {};
+        } else if (res.bind & PipeBind.depth_stencil != 0) {
+            r.createDepthTarget(res.handle, res.width, if (res.height == 0) 1 else res.height) catch {};
         } else if (res.bind & PipeBind.sampler_view != 0) {
             r.createSamplerTexture(res.handle, res.format, res.width, if (res.height == 0) 1 else res.height) catch {};
         }
@@ -433,6 +436,11 @@ pub const GpuDevice = struct {
                         if (self.resolveColorTarget(ctx, 0)) |res_handle| {
                             r.clearTarget(res_handle, clear_cmd.color) catch {};
                         }
+                        if (clear_cmd.flags.depth) {
+                            if (self.resolveDepthTarget(ctx)) |dh| {
+                                r.clearDepthTarget(dh, clear_cmd.depth) catch {};
+                            }
+                        }
                     }
                 },
 
@@ -517,19 +525,37 @@ pub const GpuDevice = struct {
                             const vbo_handle = ctx.vbo_handles[0];
                             if (vbo_handle != 0 and draw_cmd.count > 0) {
                                 const prim = virgl.Renderer.mapPrimitive(draw_cmd.mode);
-                                if (self.getOrBuildPipeline(ctx, r, target)) |pso| {
-                                    // Real translated guest shaders, with the
-                                    // stages' inline constants at buffer(1).
-                                    const vs_c = ctx.constants(0);
-                                    const fs_c = ctx.constants(1);
-                                    // Fragment texture: bound sampler view 0
-                                    // (stage 1 = fragment) -> resource.
-                                    var frag_tex: ?u32 = null;
-                                    if (ctx.sampler_views_bound[1][0]) |view_h| {
-                                        if (ctx.sampler_views.get(view_h)) |view| {
-                                            frag_tex = view.resource_handle;
+                                // Per-draw state first: the pipeline needs
+                                // to know whether a depth attachment exists.
+                                var opts = virgl.renderer.DrawOpts{
+                                    .vs_consts = ctx.constants(0),
+                                    .fs_consts = ctx.constants(1),
+                                };
+                                // Fragment texture: bound sampler view 0
+                                // (stage 1 = fragment) -> resource.
+                                if (ctx.sampler_views_bound[1][0]) |view_h| {
+                                    if (ctx.sampler_views.get(view_h)) |view| {
+                                        opts.frag_tex = view.resource_handle;
+                                    }
+                                }
+                                // Depth: bound zsurf + bound DSA state.
+                                opts.depth = self.resolveDepthTarget(ctx);
+                                if (opts.depth != null) {
+                                    if (ctx.bound.dsa) |dsa_h| {
+                                        if (ctx.dsa_states.get(dsa_h)) |dsa| {
+                                            if (dsa.depth_enabled) {
+                                                opts.dss = r.ensureDss(
+                                                    mapCompareFunc(dsa.depth_func),
+                                                    dsa.depth_writemask,
+                                                );
+                                            }
                                         }
                                     }
+                                    // No depth test wanted: drop the
+                                    // attachment (PSO has no depth fmt).
+                                    if (opts.dss == null) opts.depth = null;
+                                }
+                                if (self.getOrBuildPipeline(ctx, r, target, opts.depth != null)) |pso| {
                                     if (draw_cmd.indexed and ctx.index_buffer != 0) {
                                         r.drawIndexedWithPipeline(
                                             target,
@@ -541,12 +567,10 @@ pub const GpuDevice = struct {
                                             ctx.index_size,
                                             draw_cmd.count,
                                             prim,
-                                            vs_c,
-                                            fs_c,
-                                            frag_tex,
+                                            opts,
                                         ) catch {};
                                     } else {
-                                        r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim, vs_c, fs_c, frag_tex) catch {};
+                                        r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim, opts) catch {};
                                     }
                                 } else {
                                     // Passthrough fallback (no bound shaders yet).
@@ -580,6 +604,30 @@ pub const GpuDevice = struct {
         return surface.resource_handle;
     }
 
+    /// Resolve the bound framebuffer's depth surface to its resource, if
+    /// the resource has a Metal depth texture.
+    fn resolveDepthTarget(self: *GpuDevice, ctx: *Context) ?ResourceHandle {
+        const zsurf = ctx.framebuffer.zsurf orelse return null;
+        const surface = ctx.surfaces.get(zsurf) orelse return null;
+        const r = if (self.renderer) |*rr| rr else return null;
+        if (!r.depth_targets.contains(surface.resource_handle)) return null;
+        return surface.resource_handle;
+    }
+
+    /// Gallium PIPE_FUNC_* -> Metal compare function.
+    fn mapCompareFunc(f: virgl.protocol.CompareFunc) metal.MTLCompareFunction {
+        return switch (f) {
+            .never => .never,
+            .less => .less,
+            .equal => .equal,
+            .lequal => .lessEqual,
+            .greater => .greater,
+            .notequal => .notEqual,
+            .gequal => .greaterEqual,
+            .always => .always,
+        };
+    }
+
     /// Build (or fetch from cache) a real Metal pipeline from the context's
     /// currently bound vertex/fragment shaders and vertex_elements, targeting
     /// `target_handle`'s format. Returns null if anything needed is missing or
@@ -589,13 +637,14 @@ pub const GpuDevice = struct {
         ctx: *Context,
         r: *virgl.Renderer,
         target_handle: ResourceHandle,
+        has_depth: bool,
     ) ?metal.RenderPipelineState {
         const vs_h = ctx.bound.vs orelse return null;
         const fs_h = ctx.bound.fs orelse return null;
         const ve_h = ctx.bound.vertex_elements orelse return null;
         const target = r.getTarget(target_handle) orelse return null;
 
-        const key = PipelineKey{ .vs = vs_h, .fs = fs_h, .ve = ve_h, .fmt = @intCast(@intFromEnum(target.format)) };
+        const key = PipelineKey{ .vs = vs_h, .fs = fs_h, .ve = ve_h, .fmt = @intCast(@intFromEnum(target.format)), .has_depth = has_depth };
         if (self.pipelines.get(key)) |pso| return pso;
 
         const vs = ctx.shaders.get(vs_h) orelse return null;
@@ -604,7 +653,7 @@ pub const GpuDevice = struct {
         const fs_text = fs.tgsi_text orelse return null;
         const ve = ctx.vertex_elements.get(ve_h) orelse return null;
 
-        const pso = self.buildTranslatedPipeline(r, vs_text, fs_text, ve, ctx, target.format) catch return null;
+        const pso = self.buildTranslatedPipeline(r, vs_text, fs_text, ve, ctx, target.format, has_depth) catch return null;
         self.pipelines.put(key, pso) catch {
             pso.release();
             return null;
@@ -620,6 +669,7 @@ pub const GpuDevice = struct {
         ve: virgl.state.VertexElementsState,
         ctx: *Context,
         format: metal.MTLPixelFormat,
+        has_depth: bool,
     ) !metal.RenderPipelineState {
         const tgsi = virgl.tgsi;
         const vprog = try tgsi.parse(vs_text);
@@ -645,7 +695,7 @@ pub const GpuDevice = struct {
             };
         }
         const stride = ctx.vbo_strides[0];
-        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], stride, format);
+        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], stride, format, has_depth);
     }
 
     /// Get a context by ID.
@@ -1178,6 +1228,191 @@ test "GpuDevice samples a guest texture through TEX (fragment texturing)" {
     try std.testing.expect(px[center + 2] > 200); // R
     try std.testing.expect(px[center + 1] > 120 and px[center + 1] < 210); // G ~165
     try std.testing.expect(px[center + 0] < 40); // B
+    try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
+}
+
+test "GpuDevice depth-tests draws (far fragment loses to near)" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const zres: u32 = 11;
+    const vbuf: u32 = 30;
+
+    try gpu.createResourceRecord(.{
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = zres,
+        .target = .texture_2d,
+        .format = .none,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.depth_stencil,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 72,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    // Two overlapping triangles as float3 (x, y, z):
+    // verts 0-2: NEAR (z=0.2) — drawn FIRST;
+    // verts 3-5: FAR (z=0.8) — drawn SECOND, must lose the depth test.
+    const verts = [_][3]f32{
+        .{ -0.9, -0.9, 0.2 }, .{ 0.9, -0.9, 0.2 }, .{ 0.0, 0.9, 0.2 },
+        .{ -0.9, -0.9, 0.8 }, .{ 0.9, -0.9, 0.8 }, .{ 0.0, 0.9, 0.8 },
+    };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    // Color from CONST[0] so the two draws can differ (green near, red far).
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n0: MOV OUT[0], CONST[0]\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
+        fn consts(self: *@This(), r: f32, g: f32) void {
+            self.cmd(12, 0, 6);
+            self.w(1); // fragment stage
+            self.w(0);
+            self.f(r);
+            self.f(g);
+            self.f(0.0);
+            self.f(1.0);
+        }
+        fn draw(self: *@This(), start: u32) void {
+            self.cmd(8, 0, 12);
+            self.w(start);
+            self.w(3);
+            self.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+            for (0..9) |_| self.w(0);
+        }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5); // vertex_elements: one r32g32b32_float element
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32b32_float));
+    b.w(0);
+    // DSA: depth enabled, write enabled, func LESS (bits: 1|2|(1<<2)).
+    b.cmd(1, 3, 5);
+    b.w(53);
+    b.w(1 | 2 | (1 << 2));
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.cmd(31, 0, 2); // bind vs
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2); // bind fs
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1); // bind vertex_elements
+    b.w(52);
+    b.cmd(2, 3, 1); // bind dsa
+    b.w(53);
+    b.cmd(1, 8, 3); // color surface
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(1, 8, 3); // depth surface
+    b.w(61);
+    b.w(zres);
+    b.w(0);
+    // set_framebuffer: nr_cbufs=1, zsurf=61, cbuf0=60
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(61);
+    b.w(60);
+    // set_vertex_buffers: stride 12 (float3)
+    b.cmd(6, 0, 3);
+    b.w(12);
+    b.w(0);
+    b.w(vbuf);
+    // clear color black + depth 1.0 (flags = depth|color0)
+    b.cmd(7, 0, 8);
+    b.w(1 | 4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0); // depth f64 low
+    b.w(0x3FF00000); // depth f64 high = 1.0
+    b.w(0);
+    // NEAR green first, FAR red second.
+    b.consts(0.0, 1.0);
+    b.draw(0);
+    b.consts(1.0, 0.0);
+    b.draw(3);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const center = ((32 * 64) + 32) * 4;
+    // Depth test must keep the NEAR green fragment (BGRA).
+    try std.testing.expect(px[center + 1] > 200); // G
+    try std.testing.expect(px[center + 2] < 40); // R (red lost)
     try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
 }
 

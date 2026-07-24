@@ -33,6 +33,17 @@ pub const Target = struct {
     surface: ?iosurface.IOSurface = null,
 };
 
+/// Optional per-draw state for the pipeline draw paths.
+pub const DrawOpts = struct {
+    vs_consts: []const u8 = &.{},
+    fs_consts: []const u8 = &.{},
+    frag_tex: ?ResourceHandle = null,
+    /// Depth resource to attach (loadAction=load) with this draw.
+    depth: ?ResourceHandle = null,
+    /// Depth test/write state; null = no depth testing.
+    dss: ?metal.DepthStencilState = null,
+};
+
 pub const Error = error{
     NoMetalDevice,
     NoCommandQueue,
@@ -101,6 +112,10 @@ pub const Renderer = struct {
     /// Lazily-created linear-filtering sampler shared by all sampled draws
     /// (per-guest sampler-state translation lands with GL3).
     default_sampler: ?metal.SamplerState = null,
+    /// Guest depth-stencil resources backed by depth32Float textures.
+    depth_targets: std.AutoHashMap(ResourceHandle, Target),
+    /// Cached MTLDepthStencilStates keyed by (compare func, write mask).
+    dss_cache: std.AutoHashMap(u32, metal.DepthStencilState),
     /// Guest buffer resources (vertex/index/constant) backed by MTLBuffers
     /// in shared storage, so guest uploads are a plain memcpy (no copy on
     /// the GPU side — the buffer is read in place by the vertex stage).
@@ -121,6 +136,8 @@ pub const Renderer = struct {
             .passthrough = std.AutoHashMap(NSUInteger, metal.RenderPipelineState).init(alloc),
             .passthrough_lib = null,
             .buffers = std.AutoHashMap(ResourceHandle, metal.Buffer).init(alloc),
+            .depth_targets = std.AutoHashMap(ResourceHandle, Target).init(alloc),
+            .dss_cache = std.AutoHashMap(u32, metal.DepthStencilState).init(alloc),
         };
     }
 
@@ -137,6 +154,8 @@ pub const Renderer = struct {
             .passthrough = std.AutoHashMap(NSUInteger, metal.RenderPipelineState).init(alloc),
             .passthrough_lib = null,
             .buffers = std.AutoHashMap(ResourceHandle, metal.Buffer).init(alloc),
+            .depth_targets = std.AutoHashMap(ResourceHandle, Target).init(alloc),
+            .dss_cache = std.AutoHashMap(u32, metal.DepthStencilState).init(alloc),
         };
     }
 
@@ -154,6 +173,12 @@ pub const Renderer = struct {
         var bit = self.buffers.valueIterator();
         while (bit.next()) |b| b.release();
         self.buffers.deinit();
+        var dit = self.depth_targets.valueIterator();
+        while (dit.next()) |t| t.tex.release();
+        self.depth_targets.deinit();
+        var sit = self.dss_cache.valueIterator();
+        while (sit.next()) |s| s.release();
+        self.dss_cache.deinit();
     }
 
     /// Back a guest render-target resource with an MTLTexture. Idempotent
@@ -311,6 +336,47 @@ pub const Renderer = struct {
 
     /// Back a guest buffer resource with an MTLBuffer of `size` bytes.
     /// Idempotent per handle (re-create releases the old buffer).
+    /// Back a guest depth-stencil resource with a depth32Float texture.
+    pub fn createDepthTarget(self: *Renderer, handle: ResourceHandle, width: u32, height: u32) Error!void {
+        if (width == 0 or height == 0) return Error.TextureCreateFailed;
+        const tex = self.device.newTexture2D(.depth32Float, width, height, metal.MTLTextureUsage.render_target, .private) orelse
+            return Error.TextureCreateFailed;
+        if (self.depth_targets.fetchRemove(handle)) |old| old.value.tex.release();
+        try self.depth_targets.put(handle, .{ .tex = tex, .width = width, .height = height, .format = .depth32Float });
+    }
+
+    /// Clear a depth target to `depth` (depth-only render pass).
+    pub fn clearDepthTarget(self: *Renderer, handle: ResourceHandle, depth: f64) Error!void {
+        const target = self.depth_targets.get(handle) orelse return Error.UnknownTarget;
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const att = pass.depthAttachment() orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.clear);
+        att.setStoreAction(.store);
+        att.setClearDepth(depth);
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
+    /// Cached depth-stencil state for (compare func, write enable).
+    pub fn ensureDss(self: *Renderer, func: metal.MTLCompareFunction, write: bool) ?metal.DepthStencilState {
+        const key: u32 = (@as(u32, @intCast(@intFromEnum(func))) << 1) | @intFromBool(write);
+        if (self.dss_cache.get(key)) |s| return s;
+        const desc = metal.DepthStencilDescriptor.create() orelse return null;
+        defer desc.release();
+        desc.setDepthCompareFunction(func);
+        desc.setDepthWriteEnabled(write);
+        const dss = self.device.newDepthStencilState(desc) orelse return null;
+        self.dss_cache.put(key, dss) catch {
+            dss.release();
+            return null;
+        };
+        return self.dss_cache.get(key);
+    }
+
     /// Create a texture a fragment shader can sample (guest texture
     /// resources with the sampler_view bind). Shared storage so uploads
     /// are plain replaceRegion copies.
@@ -454,6 +520,7 @@ pub const Renderer = struct {
         attrs: []const VertexAttr,
         stride: u32,
         format: metal.MTLPixelFormat,
+        has_depth: bool,
     ) Error!metal.RenderPipelineState {
         const vlib = self.device.newLibraryWithSource(vs_msl) orelse return Error.ShaderCompileFailed;
         defer vlib.release();
@@ -469,6 +536,7 @@ pub const Renderer = struct {
         desc.setVertexFunction(vfn);
         desc.setFragmentFunction(ffn);
         desc.setColorFormat0(format);
+        if (has_depth) desc.setDepthFormat(.depth32Float);
 
         if (attrs.len > 0) {
             const vd = metal.VertexDescriptor.create() orelse return Error.PipelineCreateFailed;
@@ -538,16 +606,13 @@ pub const Renderer = struct {
         vbuf_offset: u32,
         vertex_count: u32,
         prim: metal.MTLPrimitiveType,
-        vs_consts: []const u8,
-        fs_consts: []const u8,
-        frag_tex: ?ResourceHandle,
+        opts: DrawOpts,
     ) Error!void {
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
-        const pass = try self.beginLoadPass(target_handle);
+        const pass = try self.beginLoadPassOpts(target_handle, opts.depth);
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
-        bindConsts(pass.enc, vs_consts, fs_consts);
-        self.bindFragTexture(pass.enc, frag_tex);
+        self.applyOpts(pass.enc, opts);
         pass.enc.drawPrimitives(prim, 0, vertex_count);
         pass.enc.endEncoding();
         pass.cmd.commit();
@@ -567,9 +632,7 @@ pub const Renderer = struct {
         index_size: u8,
         index_count: u32,
         prim: metal.MTLPrimitiveType,
-        vs_consts: []const u8,
-        fs_consts: []const u8,
-        frag_tex: ?ResourceHandle,
+        opts: DrawOpts,
     ) Error!void {
         // Metal has no 8-bit indices; those need index-widening (deferred).
         const index_type: metal.MTLIndexType = switch (index_size) {
@@ -579,11 +642,10 @@ pub const Renderer = struct {
         };
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
         const ibuf = self.buffers.get(ibuf_handle) orelse return Error.UnknownTarget;
-        const pass = try self.beginLoadPass(target_handle);
+        const pass = try self.beginLoadPassOpts(target_handle, opts.depth);
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
-        bindConsts(pass.enc, vs_consts, fs_consts);
-        self.bindFragTexture(pass.enc, frag_tex);
+        self.applyOpts(pass.enc, opts);
         pass.enc.drawIndexedPrimitives(prim, index_count, index_type, ibuf, ibuf_offset);
         pass.enc.endEncoding();
         pass.cmd.commit();
@@ -594,6 +656,36 @@ pub const Renderer = struct {
         cmd: metal.CommandBuffer,
         enc: metal.RenderCommandEncoder,
     };
+
+    /// beginLoadPass with an optional depth attachment (loadAction=load
+    /// so depth composes across draws; cleared via clearDepthTarget).
+    fn beginLoadPassOpts(self: *Renderer, target_handle: ResourceHandle, depth: ?ResourceHandle) Error!LoadPass {
+        const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
+        const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
+        const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
+        const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
+        att.setTexture(target.tex.ptr);
+        att.setLoadAction(.load);
+        att.setStoreAction(.store);
+        if (depth) |dh| {
+            if (self.depth_targets.get(dh)) |dt| {
+                const datt = pass.depthAttachment() orelse return Error.EncoderFailed;
+                datt.setTexture(dt.tex.ptr);
+                datt.setLoadAction(.load);
+                datt.setStoreAction(.store);
+            }
+        }
+        const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
+        const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
+        return .{ .cmd = cmd, .enc = enc };
+    }
+
+    /// Bind DrawOpts state on an open encoder.
+    fn applyOpts(self: *Renderer, enc: metal.RenderCommandEncoder, opts: DrawOpts) void {
+        bindConsts(enc, opts.vs_consts, opts.fs_consts);
+        self.bindFragTexture(enc, opts.frag_tex);
+        if (opts.dss) |dss| enc.setDepthStencilState(dss);
+    }
 
     /// Open a loadAction=load render pass onto a target (composes with
     /// prior clears/draws).
@@ -955,7 +1047,7 @@ test "translated shaders build a real pipeline and draw a triangle" {
     // Vertex layout: attribute 0 = float2 at offset 0, stride 8. Metal
     // expands the float2 to (x,y,0,1) for the float4 shader input.
     const attrs = [_]Renderer.VertexAttr{.{ .format = .float2, .offset = 0, .buffer_index = 0 }};
-    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm);
+    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm, false);
     defer pso.release();
 
     const w: u32 = 64;

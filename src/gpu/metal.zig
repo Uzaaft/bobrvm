@@ -81,7 +81,20 @@ pub const MTLPixelFormat = enum(NSUInteger) {
     rgba16Float = 115,
     r8Unorm = 10,
     rg8Unorm = 30,
+    depth32Float = 252,
     _,
+};
+
+/// MTLCompareFunction.
+pub const MTLCompareFunction = enum(NSUInteger) {
+    never = 0,
+    less = 1,
+    equal = 2,
+    lessEqual = 3,
+    greater = 4,
+    notEqual = 5,
+    greaterEqual = 6,
+    always = 7,
 };
 
 /// Metal texture usage flags (bitmask).
@@ -291,6 +304,45 @@ pub const Device = struct {
         const result = msgSendId1(self.ptr, sel("newSamplerStateWithDescriptor:"), desc.ptr) orelse return null;
         return .{ .ptr = result };
     }
+
+    pub fn newDepthStencilState(self: Device, desc: DepthStencilDescriptor) ?DepthStencilState {
+        const result = msgSendId1(self.ptr, sel("newDepthStencilStateWithDescriptor:"), desc.ptr) orelse return null;
+        return .{ .ptr = result };
+    }
+};
+
+/// MTLDepthStencilDescriptor wrapper.
+pub const DepthStencilDescriptor = struct {
+    ptr: id,
+
+    pub fn create() ?DepthStencilDescriptor {
+        const class = cls("MTLDepthStencilDescriptor") orelse return null;
+        const inst = msgSendId(msgSendId(@ptrCast(class), sel("alloc")) orelse return null, sel("init")) orelse return null;
+        return .{ .ptr = inst };
+    }
+
+    pub fn setDepthCompareFunction(self: DepthStencilDescriptor, func: MTLCompareFunction) void {
+        const f: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setDepthCompareFunction:"), @intFromEnum(func));
+    }
+
+    pub fn setDepthWriteEnabled(self: DepthStencilDescriptor, enabled: bool) void {
+        const f: *const fn (id, SEL, bool) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setDepthWriteEnabled:"), enabled);
+    }
+
+    pub fn release(self: DepthStencilDescriptor) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
+};
+
+/// MTLDepthStencilState wrapper.
+pub const DepthStencilState = struct {
+    ptr: id,
+
+    pub fn release(self: DepthStencilState) void {
+        msgSendVoid(self.ptr, sel("release"));
+    }
 };
 
 pub const MTLSamplerMinMagFilter = enum(NSUInteger) {
@@ -410,6 +462,31 @@ pub const RenderPipelineState = struct {
     }
 };
 
+/// MTLRenderPassDepthAttachmentDescriptor wrapper.
+pub const DepthAttachmentDescriptor = struct {
+    ptr: id,
+
+    pub fn setTexture(self: DepthAttachmentDescriptor, texture: id) void {
+        const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setTexture:"), texture);
+    }
+
+    pub fn setLoadAction(self: DepthAttachmentDescriptor, action: MTLLoadAction) void {
+        const f: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setLoadAction:"), @intFromEnum(action));
+    }
+
+    pub fn setStoreAction(self: DepthAttachmentDescriptor, action: MTLStoreAction) void {
+        const f: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setStoreAction:"), @intFromEnum(action));
+    }
+
+    pub fn setClearDepth(self: DepthAttachmentDescriptor, depth: f64) void {
+        const f: *const fn (id, SEL, f64) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setClearDepth:"), depth);
+    }
+};
+
 /// MTLRenderPipelineDescriptor wrapper.
 pub const RenderPipelineDescriptor = struct {
     ptr: id,
@@ -447,6 +524,11 @@ pub const RenderPipelineDescriptor = struct {
         const s_fmt = sel("setPixelFormat:");
         const fmt_func: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
         fmt_func(att, s_fmt, @intFromEnum(format));
+    }
+
+    pub fn setDepthFormat(self: RenderPipelineDescriptor, format: MTLPixelFormat) void {
+        const f: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setDepthAttachmentPixelFormat:"), @intFromEnum(format));
     }
 
     /// Standard "over" alpha blending on color attachment 0 (source-alpha,
@@ -541,6 +623,12 @@ pub const RenderPassDescriptor = struct {
     }
 
     /// Get color attachments.
+    /// The pass's depth attachment descriptor.
+    pub fn depthAttachment(self: RenderPassDescriptor) ?DepthAttachmentDescriptor {
+        const result = msgSendId(self.ptr, sel("depthAttachment")) orelse return null;
+        return .{ .ptr = result };
+    }
+
     pub fn colorAttachments(self: RenderPassDescriptor) ?ColorAttachmentArray {
         const result = msgSendId(self.ptr, sel("colorAttachments"));
         return if (result) |p| ColorAttachmentArray{ .ptr = p } else null;
@@ -654,6 +742,11 @@ pub const RenderCommandEncoder = struct {
     }
 
     /// Set fragment sampler state.
+    pub fn setDepthStencilState(self: RenderCommandEncoder, dss: DepthStencilState) void {
+        const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
+        f(self.ptr, sel("setDepthStencilState:"), dss.ptr);
+    }
+
     pub fn setFragmentSamplerState(self: RenderCommandEncoder, sampler: ?SamplerState, index: NSUInteger) void {
         const s = sel("setFragmentSamplerState:atIndex:");
         const func: *const fn (id, SEL, ?id, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
