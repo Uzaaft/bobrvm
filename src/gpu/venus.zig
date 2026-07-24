@@ -266,3 +266,28 @@ pub const Host = struct {
         virgl_renderer_poll();
     }
 };
+
+// virglrenderer keeps process-global state, so a single Host per process is the
+// natural model. The virtio-gpu device uses this singleton rather than storing
+// its own instance.
+var global_host: ?Host = null;
+
+/// Initialize (once) and return the process Venus host, or null if the host
+/// stack is unavailable (wrong/missing driver, render server can't start, …).
+/// The caller should have set the render-server path first (setRenderServerPath).
+pub fn ensureHost() ?*Host {
+    if (global_host == null) {
+        global_host = Host.init() catch {
+            log.warn("venus host init failed — venus GPU path unavailable", .{});
+            return null;
+        };
+    }
+    return &global_host.?;
+}
+
+pub fn deinitHost() void {
+    if (global_host) |*h| {
+        h.deinit();
+        global_host = null;
+    }
+}

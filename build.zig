@@ -28,6 +28,31 @@ pub fn build(b: *std.Build) void {
     const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
     const emit_macos_app = b.option(bool, "emit-macos-app", "Build macOS app via xcodebuild") orelse false;
 
+    // Venus (KosmicKrisp) GPU backend — opt-in. When set, the GPU device routes
+    // 3D contexts to virglrenderer(venus); the default build never links it.
+    // Needs the macOS-patched virglrenderer (tools/build-virglrenderer-macos.sh).
+    const gpu_venus = b.option(bool, "gpu-venus", "Enable the Venus/KosmicKrisp GPU backend") orelse false;
+    const home = b.graph.environ_map.get("HOME") orelse "/tmp";
+    const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-macos", .{home});
+    const virgl_prefix = b.option([]const u8, "virgl-prefix", "virglrenderer(venus) install prefix") orelse default_virgl_prefix;
+    const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "gpu_venus", gpu_venus);
+
+    // Applies the build_options import and, when venus is enabled, the
+    // virglrenderer link, to a module that compiles the GPU device.
+    const wireVenus = struct {
+        fn apply(m: *std.Build.Module, opts: *std.Build.Step.Options, enabled: bool, libdir: []const u8) void {
+            m.addOptions("build_options", opts);
+            if (enabled) {
+                m.addLibraryPath(.{ .cwd_relative = libdir });
+                m.linkSystemLibrary("virglrenderer", .{});
+                m.addRPath(.{ .cwd_relative = libdir });
+            }
+        }
+    }.apply;
+
     // Create the root module
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main_c.zig"),
@@ -62,6 +87,8 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-std=c11"},
         });
     }
+
+    wireVenus(root_module, build_options, gpu_venus, virgl_lib);
 
     // Create the main library
     const lib = b.addLibrary(.{
@@ -111,6 +138,8 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
+
     // CLI executable
     const cli_exe = b.addExecutable(.{
         .name = "bobrvm",
@@ -122,12 +151,16 @@ pub fn build(b: *std.Build) void {
 
     // Code-sign the installed CLI with hypervisor entitlement (macOS only)
     if (target.result.os.tag == .macos and !is_nix_build) {
+        // Venus loads ad-hoc-signed third-party dylibs (virglrenderer/KosmicKrisp),
+        // so that build needs library validation disabled in addition to the
+        // hypervisor entitlement.
+        const cli_entitlements = if (gpu_venus) "cli-venus.entitlements" else "cli.entitlements";
         const codesign = b.addSystemCommand(&.{
             "codesign",
             "--sign",
             "-",
             "--entitlements",
-            "cli.entitlements",
+            cli_entitlements,
             "--force",
             "zig-out/bin/bobrvm",
         });
@@ -181,14 +214,9 @@ pub fn build(b: *std.Build) void {
     // KosmicKrisp ICD + vulkan-loader/spirv-tools/angle. See docs/gpu-venus-moltenvk.md.
     // ==========================================================================
     if (target.result.os.tag == .macos) {
-        // The Venus path needs the macOS-patched virglrenderer (SOCK_STREAM
-        // proxy + kqueue fix) built by tools/build-virglrenderer-macos.sh, which
-        // installs to ~/.local/opt/virgl-macos. Override with -Dvirgl-prefix.
-        const home = b.graph.environ_map.get("HOME") orelse "/tmp";
-        const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-macos", .{home});
-        const virgl_prefix = b.option([]const u8, "virgl-prefix", "virglrenderer(venus) install prefix") orelse default_virgl_prefix;
-        const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
-
+        // virgl_prefix / virgl_lib come from the top-level options block. The
+        // Venus path needs the macOS-patched virglrenderer built by
+        // tools/build-virglrenderer-macos.sh (installs to ~/.local/opt/virgl-macos).
         const venus_mod = b.createModule(.{
             .root_source_file = b.path("src/gpu/venus.zig"),
             .target = target,
@@ -276,6 +304,8 @@ pub fn build(b: *std.Build) void {
         test_module.linkFramework("CoreFoundation", .{});
         test_module.linkSystemLibrary("objc", .{});
     }
+
+    wireVenus(test_module, build_options, gpu_venus, virgl_lib);
 
     // Test step
     const main_tests = b.addTest(.{

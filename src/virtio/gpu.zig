@@ -20,6 +20,15 @@ const virgl = @import("../gpu/virgl/main.zig");
 const gpu_module = @import("../gpu/main.zig");
 const iosurface = @import("../gpu/iosurface.zig");
 
+/// Venus (KosmicKrisp) GPU backend, opt-in via `-Dgpu-venus`. When disabled the
+/// import resolves to a stub so nothing links virglrenderer and the default
+/// build is unchanged; all venus code below sits behind `if (comptime gpu_venus)`.
+const gpu_venus = @import("build_options").gpu_venus;
+const venus = if (gpu_venus) @import("../gpu/venus.zig") else struct {
+    pub const Host = struct { initialized: bool = false };
+    pub const CAPSET_VENUS: u32 = 4;
+};
+
 const log = std.log.scoped(.virtio_gpu);
 
 /// GPU feature bits.
@@ -348,6 +357,7 @@ pub fn buildEdid(width: u32, height: u32, out: *[128]u8) void {
 
 /// Capset ids (VIRTIO_GPU_CAPSET_*).
 pub const CAPSET_VIRGL: u32 = 1;
+pub const CAPSET_VENUS: u32 = 4;
 pub const CAPSET_VIRGL2: u32 = 2;
 
 /// Capset blob sizes (virgl_caps_v1/v2 from virglrenderer). The kernel
@@ -453,6 +463,13 @@ pub const Gpu = struct {
     /// bring-up diagnostics without flooding the log).
     submit3d_seen: u32 = 0,
 
+    /// Venus backend (opt-in, `-Dgpu-venus`). `venus_host` is the process
+    /// virglrenderer(venus) instance (null if unavailable); `venus_contexts`
+    /// tracks which guest ctx_ids were created as Venus contexts so their
+    /// submit_3d streams route to venus rather than the legacy translator.
+    venus_host: ?venus.Host = null,
+    venus_contexts: std.AutoHashMap(u32, void),
+
     /// Hardware cursor state, set via the cursor virtqueue (UPDATE_CURSOR/
     /// MOVE_CURSOR) — separate from the main scanout entirely. The guest
     /// compositor draws the mouse pointer as a cursor plane, not into the
@@ -478,16 +495,23 @@ pub const Gpu = struct {
         const virtio_version_1: u64 = 1 << 32;
         var features = virtio_version_1 | Features.EDID;
         if (enable_virgl) features |= Features.VIRGL;
+        // Venus contexts are selected via the context_init capset id, which
+        // needs VIRTIO_GPU_F_CONTEXT_INIT advertised.
+        if (gpu_venus and enable_virgl) features |= Features.CONTEXT_INIT;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
         errdefer transport.deinit();
 
         const gpu = try alloc.create(Gpu);
         errdefer alloc.destroy(gpu);
 
+        // Advertise the Venus capset (index 2, id 4) in addition to VIRGL/VIRGL2
+        // when the venus host is available.
+        const num_capsets: u32 = if (!enable_virgl) 0 else if (gpu_venus) 3 else 2;
+
         gpu.* = .{
             .alloc = alloc,
             .transport = transport,
-            .config = .{ .num_capsets = if (enable_virgl) 2 else 0 },
+            .config = .{ .num_capsets = num_capsets },
             .ctrl_last_avail = 0,
             .cursor_last_avail = 0,
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
@@ -506,11 +530,28 @@ pub const Gpu = struct {
             .scanout3d_w = 0,
             .scanout3d_h = 0,
             .submit3d_seen = 0,
+            .venus_host = null,
+            .venus_contexts = std.AutoHashMap(u32, void).init(alloc),
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
 
         assert(gpu.transport.device_id == 16);
+
+        // Bring up the Venus host (once) if the backend is compiled in. On
+        // failure we simply don't advertise a usable venus capset — the guest
+        // falls back to the legacy virgl path.
+        if (comptime gpu_venus) {
+            if (enable_virgl) {
+                if (venus.ensureHost()) |h| {
+                    gpu.venus_host = h.*;
+                    log.info("venus GPU backend active (capset {d})", .{CAPSET_VENUS});
+                } else {
+                    gpu.config.num_capsets = 2; // venus unavailable; VIRGL/VIRGL2 only
+                    log.warn("venus backend compiled in but host unavailable; using legacy virgl", .{});
+                }
+            }
+        }
 
         return gpu;
     }
@@ -526,6 +567,8 @@ pub const Gpu = struct {
         while (b3d.next()) |list| list.deinit(self.alloc);
         self.backing3d.deinit();
         if (self.scanout3d_data.len > 0) self.alloc.free(self.scanout3d_data);
+        self.venus_contexts.deinit();
+        if (comptime gpu_venus) venus.deinitHost();
         self.gpu_device.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
@@ -893,11 +936,18 @@ pub const Gpu = struct {
                 resp_type = self.cmdGetEdid(req, resp, &resp_len);
             },
             .ctx_create => {
-                resp_type = self.cmdCtxCreate(header);
+                resp_type = self.cmdCtxCreate(header, req);
             },
             .ctx_destroy => {
                 if (self.virgl_enabled) {
-                    self.gpu_device.destroyContextId(header.ctx_id);
+                    var handled = false;
+                    if (comptime gpu_venus) {
+                        if (self.venus_contexts.remove(header.ctx_id)) {
+                            if (self.venus_host) |*h| h.destroyContext(header.ctx_id);
+                            handled = true;
+                        }
+                    }
+                    if (!handled) self.gpu_device.destroyContextId(header.ctx_id);
                     resp_type = .resp_ok_nodata;
                 } else {
                     resp_type = .resp_err_unspec;
@@ -1323,6 +1373,17 @@ pub const Gpu = struct {
                 info.capset_max_version = 2;
                 info.capset_max_size = CAPS_V2_SIZE;
             },
+            2 => {
+                // Venus capset — advertised only when compiled in and the host is up.
+                if (comptime gpu_venus) {
+                    if (self.venus_host) |*h| {
+                        const cs = h.getCapset(CAPSET_VENUS);
+                        info.capset_id = CAPSET_VENUS;
+                        info.capset_max_version = cs.max_ver;
+                        info.capset_max_size = cs.max_size;
+                    } else return .resp_err_invalid_parameter;
+                } else return .resp_err_invalid_parameter;
+            },
             else => return .resp_err_invalid_parameter,
         }
         @memcpy(resp[0..@sizeOf(CapsetInfoResp)], std.mem.asBytes(&info));
@@ -1335,18 +1396,34 @@ pub const Gpu = struct {
         if (req.len < @sizeOf(GetCapset)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(GetCapset, req[0..@sizeOf(GetCapset)]);
 
+        // Venus caps come from virglrenderer itself (its size is host-defined).
+        var venus_ver: u32 = 0;
         const size: u32 = switch (cmd.capset_id) {
             CAPSET_VIRGL => CAPS_V1_SIZE,
             CAPSET_VIRGL2 => CAPS_V2_SIZE,
+            CAPSET_VENUS => blk: {
+                if (comptime gpu_venus) {
+                    if (self.venus_host) |*h| {
+                        const cs = h.getCapset(CAPSET_VENUS);
+                        venus_ver = cmd.capset_version;
+                        break :blk cs.max_size;
+                    }
+                }
+                return .resp_err_invalid_parameter;
+            },
             else => return .resp_err_invalid_parameter,
         };
         if (resp.len < @sizeOf(CtrlHeader) + size) return .resp_err_unspec;
 
-        // virgl2 gets a real GL 4.3 caps blob (glsl_level 430 + limits);
-        // v1 stays zeroed. Format masks await the Metal translator.
+        // virgl2 gets a real GL 4.3 caps blob (glsl_level 430 + limits); v1 stays
+        // zeroed; venus is filled by virglrenderer. Format masks await the translator.
         const blob = resp[@sizeOf(CtrlHeader)..][0..size];
         if (cmd.capset_id == CAPSET_VIRGL2) {
             virgl.caps.writeV2(blob);
+        } else if (comptime gpu_venus) {
+            if (cmd.capset_id == CAPSET_VENUS) {
+                if (self.venus_host) |*h| h.fillCaps(CAPSET_VENUS, venus_ver, blob);
+            } else @memset(blob, 0);
         } else {
             @memset(blob, 0);
         }
@@ -1355,9 +1432,28 @@ pub const Gpu = struct {
         return .resp_ok_capset;
     }
 
-    fn cmdCtxCreate(self: *Gpu, header: CtrlHeader) CmdType {
+    fn cmdCtxCreate(self: *Gpu, header: CtrlHeader, req: []const u8) CmdType {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (header.ctx_id == 0) return .resp_err_invalid_context_id;
+
+        // The capset id lives in the low byte of context_init (when the guest
+        // negotiated VIRTIO_GPU_F_CONTEXT_INIT). A Venus context routes to the
+        // venus host; everything else uses the legacy virgl translator.
+        if (comptime gpu_venus) {
+            if (self.venus_host) |*h| {
+                if (req.len >= @sizeOf(CtxCreate)) {
+                    const cc = std.mem.bytesToValue(CtxCreate, req[0..@sizeOf(CtxCreate)]);
+                    const capset: u32 = cc.context_init & 0xff;
+                    if (capset == CAPSET_VENUS) {
+                        h.createVenusContext(header.ctx_id) catch return .resp_err_unspec;
+                        self.venus_contexts.put(header.ctx_id, {}) catch return .resp_err_out_of_memory;
+                        log.info("venus ctx_create ctx_id={}", .{header.ctx_id});
+                        return .resp_ok_nodata;
+                    }
+                }
+            }
+        }
+
         self.gpu_device.createContextId(header.ctx_id) catch return .resp_err_out_of_memory;
         log.info("virgl ctx_create ctx_id={}", .{header.ctx_id});
         return .resp_ok_nodata;
@@ -1422,6 +1518,17 @@ pub const Gpu = struct {
             self.submit3d_seen += 1;
             const op0: u8 = if (cmd_data.len >= 4) @truncate(std.mem.readInt(u32, cmd_data[0..4], .little)) else 0xff;
             log.info("virgl submit_3d #{} ctx={} bytes={} first_op={}", .{ self.submit3d_seen, header.ctx_id, cmd_data.len, op0 });
+        }
+
+        // Route Venus contexts' command streams to virglrenderer(venus); all
+        // others go to the legacy translator.
+        if (comptime gpu_venus) {
+            if (self.venus_contexts.contains(header.ctx_id)) {
+                if (self.venus_host) |*h| {
+                    h.submit(header.ctx_id, cmd_data) catch return .resp_err_unspec;
+                    return .resp_ok_nodata;
+                }
+            }
         }
 
         self.gpu_device.submit(header.ctx_id, cmd_data) catch {

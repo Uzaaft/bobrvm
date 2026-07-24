@@ -139,16 +139,23 @@ edge on SOCK_STREAM); verify it doesn't bite real command submission.
 
 ## Remaining bridge work (bobrvm side)
 
-The host stack is proven. Remaining:
-1. Point bobrvm at the fixed virglrenderer (`scratchpad/virgl-fixed`) + KosmicKrisp
-   ICD + render-server env; update `venus.zig` `INIT_FLAGS` to add `RENDER_SERVER`
-   and wire `get_server_fd`/`RENDER_SERVER_EXEC_PATH`.
-2. Verify real command submission (not just context create) through
-   `virgl_renderer_submit_cmd` — watch the teardown framing note above.
-3. Wire `src/virtio/gpu.zig` dispatch: advertise the Venus capset, route
-   `CTX_CREATE`(venus)/`SUBMIT_3D`/blob/fences to `venus.Host`.
-4. Present: map the venus output blob → IOSurface/Metal for scanout.
-5. Guest bring-up (Zink+venus image) → `glxinfo` ≥ 4.3 — the user-machine handoff.
+The host stack is proven. Progress:
+1. ✅ `venus.zig` render-server mode (`INIT_FLAGS` += `RENDER_SERVER`,
+   `setRenderServerPath`); `build.zig` `-Dvirgl-prefix` → `~/.local/opt/virgl-macos`.
+2. ✅ `src/virtio/gpu.zig` dispatch wired behind `-Dgpu-venus` (jj pending):
+   advertises the Venus capset (index 2 / id 4, `num_capsets`→3, `F_CONTEXT_INIT`),
+   fills it via `venus.Host.fillCaps`, and routes `CTX_CREATE`(context_init capset
+   == venus) / `SUBMIT_3D` / `CTX_DESTROY` to `venus.Host` (tracking venus ctx_ids
+   in a set). All comptime-gated on `gpu_venus`; the default build is byte-identical
+   and does not link virglrenderer. Both `zig build` and `zig build -Dgpu-venus`
+   compile; the venus `-Dgpu-venus` CLI links the fixed virglrenderer and is signed
+   with `cli-venus.entitlements` (hypervisor + disable-library-validation).
+   **Not runtime-tested** — needs a guest + HVF (sandbox blocks both). The
+   `venus.Host` calls it makes are the same ones lldb-verified in `venus_smoke`.
+3. TODO: verify real command submission (`submit_cmd`) with a live guest — watch
+   the teardown framing note above.
+4. TODO: present — map the venus output blob → IOSurface/Metal for scanout.
+5. TODO: guest bring-up (Zink+venus image) → `glxinfo` ≥ 4.3 — user-machine handoff.
 
 ## Host components
 
