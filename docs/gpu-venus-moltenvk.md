@@ -72,9 +72,15 @@ workload does not lean on them and runs on native features.
 
 - `molten-vk` (Homebrew 1.4.1): `/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib`.
 - `vulkan-headers` (Homebrew): `/opt/homebrew/opt/vulkan-headers/include`.
-- `virglrenderer` **with Venus enabled** — not yet built on this machine. Must
-  be built with `-Dvenus=true` against MoltenVK (a macOS + Venus tap exists:
-  `startergo/homebrew-virglrenderer`). This is the next milestone's gating task.
+- `virglrenderer` **with Venus enabled** (Homebrew tap
+  `startergo/virglrenderer` 1.0.41, built `-Dvenus=true`; pulls
+  `startergo/angle` + `startergo/libepoxy` + `startergo/gn`):
+  `/opt/homebrew/opt/virglrenderer/{lib/libvirglrenderer.dylib,include/virgl/virglrenderer.h}`.
+- `vulkan-loader` (Homebrew): `libvulkan.dylib`. virglrenderer's Venus backend
+  `dlopen`s `libvulkan.dylib`, so the loader is required; it discovers MoltenVK
+  via the ICD manifest at `/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`.
+- ANGLE (`libEGL`/`libGLESv2`) at `/opt/homebrew/opt/angle/lib` — only the
+  legacy virgl-GL winsys uses it; the Venus path does not.
 - Guest: Mesa with the `venus` Vulkan driver + `zink` GL driver; kernel with
   `virtio-gpu` + `VIRTIO_GPU_CAPSET_VENUS`. Guest env:
   `MESA_LOADER_DRIVER_OVERRIDE=zink`, `GALLIUM_DRIVER=zink`,
@@ -84,9 +90,24 @@ workload does not lean on them and runs on native features.
 
 1. **Host Vulkan foundation** ✅ done: MoltenVK + headers installed; capability
    probe green (VkInstance, physical device, feature/extension enumeration).
-2. **virglrenderer(venus) building + linked** — get a venus-enabled
-   virglrenderer dylib on macOS/MoltenVK; link it into `build.zig`; smoke-test
-   `virgl_renderer_init` + capset enumeration reports the venus capset.
+2. **virglrenderer(venus) building + linked** ✅ done (host side proven).
+   `tools/virgl_smoke.c` calls `virgl_renderer_init` and enumerates capsets.
+   Result on M3 Max: init returns 0 and the **Venus capset (id 4, size 160)**
+   is PRESENT (VIRGL/VIRGL2 also present). Key facts for the bridge:
+   - Init flags **must** be `VIRGL_RENDERER_VENUS | VIRGL_RENDERER_NO_VIRGL`
+     (0xC0; `THREAD_SYNC` 0x02 optional). `VENUS` alone fails with "invalid
+     renderer vrend callbacks"; adding `USE_EGL` fails with "EGL is not
+     supported on this platform" (the ANGLE/vrend GL winsys, which Venus skips).
+   - Callbacks: `version = 1` with a non-NULL `write_fence` suffices to init.
+   - Runtime env: `VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`,
+     and `DYLD_LIBRARY_PATH` must include angle, vulkan-loader, molten-vk,
+     `/opt/homebrew/lib`.
+   - **Codesigning**: an unsigned binary loading these dylibs is SIGKILLed by
+     AMFI pre-`main` (runs fine under lldb via get-task-allow). The real bobrvm
+     CLI is already codesigned; add `com.apple.security.cs.disable-library-validation`
+     (and jit/unsigned-mem) to `cli.entitlements` when linking these in.
+   - Still TODO for this step: add the `build.zig` linkage
+     (`-lvirglrenderer`, include path, rpath) behind a `-Dgpu-venus` option.
 3. **virtio-gpu ↔ virglrenderer bridge** — route `CTX_CREATE` (venus capset),
    `SUBMIT_3D`, `RESOURCE_CREATE_BLOB`, `RESOURCE_MAP_BLOB`, and fences into the
    `virgl_renderer_*` C API from `src/virtio/gpu.zig` / `src/gpu/`. Keep the 2D
