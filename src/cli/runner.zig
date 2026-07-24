@@ -429,7 +429,19 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
     var buf: [1024]u8 = undefined;
     while (true) {
         const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch break;
-        if (n == 0) break; // EOF: keep VM running, stop forwarding
+        if (n == 0) {
+            // EOF. Interactive runs keep the VM alive (stdin may just be
+            // closed); scripted harnesses set BOBRVM_EXIT_ON_EOF=1 to shut
+            // the VM down when the feeder finishes — Ctrl-] can't serve
+            // that role on a pipe (it needs the raw-mode tty path), which
+            // is exactly how sleep-based feeders used to leave VMs running
+            // forever.
+            if (std.c.getenv("BOBRVM_EXIT_ON_EOF") != null) {
+                log.info("stdin EOF: shutting down (BOBRVM_EXIT_ON_EOF)", .{});
+                hw.requestStop();
+            }
+            break;
+        }
 
         if (is_tty) {
             // Ctrl-] detaches: forward everything before it, then shut down.
