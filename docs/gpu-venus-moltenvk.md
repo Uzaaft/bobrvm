@@ -118,21 +118,37 @@ virglrenderer 1.3.0 from source with the tap's 20-patch stack plus both
 gets the render server to **fork and `virgl_renderer_init` to return 0**. Installs
 to `scratchpad/virgl-fixed`.
 
-**Remaining render-server macOS gaps (the wall, uncertain depth):** with the
-socket fixed, `context_create_with_flags(VENUS)` still fails (rc=12) because the
-`virgl_render_server` itself was never ported to macOS:
-- `failed to create worker jail` — the server sandboxes each context in a
-  Linux-only "jail" (seccomp/namespaces). Needs disabling on macOS (there is a
-  `render-server-worker` meson option / a no-jail path to wire).
-- `failed to set kqueue non-blocking` — macOS fd/kqueue handling.
-- `proxy: failed to receive message: truncated or incomplete` — the SOCK_STREAM
-  framing may still mis-handle a boundary, or is a downstream symptom of the
-  server bailing on the jail failure.
+**Fix step 2 (DONE, works):** the "worker jail" failure was a red herring — its
+real cause was `create_sigchld_fd()` calling `fcntl(kq, F_SETFL, O_NONBLOCK)` on
+a **kqueue fd**, which macOS rejects (kqueue is polled via `kevent()`, not
+`read()`; reaping uses `waitid(WNOHANG)`). That -1 cascaded to "failed to create
+worker jail". Dropping the fcntl block (`server/render_worker.c`, `__APPLE__`
+path) fixes it. See `tools/build-virglrenderer-macos.sh` STAGE 3b.
 
-So the venus stack *assembles* (KosmicKrisp VK1.4 ✓, virglrenderer venus init ✓,
-render server forks ✓) but serving a context needs a real macOS port of
-virglrenderer's render server. This is upstream-scale work of uncertain total
-depth — the decision point for how far to invest.
+**✅ RESULT: Venus context creation works end-to-end on macOS.** With both fixes,
+`context_create_with_flags(VENUS)` returns 0 against the KosmicKrisp ICD in
+render-server mode: guest Venus → virglrenderer (fixed) → forked
+`virgl_render_server` (jail via kqueue) → KosmicKrisp → Metal. Init flags:
+`VENUS | NO_VIRGL | RENDER_SERVER` (0x2C0), `RENDER_SERVER_EXEC_PATH` =
+`virgl-fixed/libexec/virgl_render_server`.
+
+Known follow-up (not yet blocking context create): a teardown-time
+`virgl_render_server: failed to receive message: truncated or incomplete` log —
+appears after the context is created+destroyed (likely a disconnect/EOF framing
+edge on SOCK_STREAM); verify it doesn't bite real command submission.
+
+## Remaining bridge work (bobrvm side)
+
+The host stack is proven. Remaining:
+1. Point bobrvm at the fixed virglrenderer (`scratchpad/virgl-fixed`) + KosmicKrisp
+   ICD + render-server env; update `venus.zig` `INIT_FLAGS` to add `RENDER_SERVER`
+   and wire `get_server_fd`/`RENDER_SERVER_EXEC_PATH`.
+2. Verify real command submission (not just context create) through
+   `virgl_renderer_submit_cmd` — watch the teardown framing note above.
+3. Wire `src/virtio/gpu.zig` dispatch: advertise the Venus capset, route
+   `CTX_CREATE`(venus)/`SUBMIT_3D`/blob/fences to `venus.Host`.
+4. Present: map the venus output blob → IOSurface/Metal for scanout.
+5. Guest bring-up (Zink+venus image) → `glxinfo` ≥ 4.3 — the user-machine handoff.
 
 ## Host components
 

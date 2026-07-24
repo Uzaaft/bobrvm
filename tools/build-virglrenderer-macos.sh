@@ -45,6 +45,14 @@ for SOCKF in "$SRC/server/render_socket.c" "$SRC/src/proxy/proxy_socket.c"; do
   echo "--- $SOCKF ---"; grep -n "int type = SOCK_" "$SOCKF"
 done
 
+echo "=== STAGE 3b: FIX — kqueue fd can't take O_NONBLOCK via fcntl on macOS ==="
+# create_sigchld_fd()'s fcntl(kq, F_SETFL, O_NONBLOCK) always fails on a kqueue
+# fd, which cascades to 'failed to create worker jail' and aborts context
+# creation. kqueue is polled via kevent() (non-blocking reaping uses
+# waitid(WNOHANG)), so the fcntl is both unsupported and unnecessary — drop it.
+perl -0777 -pi -e 's{   /\* Set kqueue to non-blocking mode \*/\n   int flags = fcntl\(kq, F_GETFL\);\n   if \(flags == -1 \|\| fcntl\(kq, F_SETFL, flags \| O_NONBLOCK\) == -1\) \{\n      render_log\("failed to set kqueue non-blocking"\);\n      close\(kq\);\n      return -1;\n   \}\n}{   /* kqueue is polled via kevent(); O_NONBLOCK via fcntl is unsupported on\n    * kqueue fds on macOS (and unnecessary; reaping uses waitid(WNOHANG)). */\n}' "$SRC/server/render_worker.c"
+grep -q "O_NONBLOCK via fcntl is unsupported" "$SRC/server/render_worker.c" && echo "kqueue fix applied" || echo "!! kqueue fix NOT applied — check context"
+
 echo "=== STAGE 4: meson setup (venus + angle/epoxy) ==="
 ANGLE_INC="$(brew --prefix angle)/include"
 export PKG_CONFIG_PATH="$(brew --prefix angle)/lib/pkgconfig:$(brew --prefix libepoxy)/lib/pkgconfig:$PKG_CONFIG_PATH"
