@@ -48,6 +48,20 @@ pub const DrawOpts = struct {
     extra_color: []const ResourceHandle = &.{},
     /// Instance count (instanced draw); 1 = ordinary draw.
     instance_count: u32 = 1,
+    /// Named UBO bindings (GL 3.1). Each binds a guest buffer resource at
+    /// Metal buffer(1+index) for its stage, matching the translator's
+    /// `constant float4* cN [[buffer(1+N)]]`.
+    ubos: []const UboBind = &.{},
+};
+
+/// A single named-UBO binding for a draw.
+pub const UboBind = struct {
+    /// 0 = vertex stage, 1 = fragment stage (Gallium PIPE_SHADER order).
+    stage: u8,
+    /// UBO dim N (>=1); bound at Metal buffer(1+N).
+    index: u8,
+    handle: ResourceHandle,
+    offset: u32,
 };
 
 /// Resolved Metal blend state for a pipeline's color attachment (raw
@@ -742,6 +756,15 @@ pub const Renderer = struct {
         bindConsts(enc, opts.vs_consts, opts.fs_consts);
         self.bindFragTexture(enc, opts.frag_tex);
         if (opts.dss) |dss| enc.setDepthStencilState(dss);
+        for (opts.ubos) |u| {
+            const buf = self.buffers.get(u.handle) orelse continue;
+            const mtl_index: metal.NSUInteger = @as(metal.NSUInteger, u.index) + 1;
+            if (u.stage == 0) {
+                enc.setVertexBuffer(buf, u.offset, mtl_index);
+            } else if (u.stage == 1) {
+                enc.setFragmentBuffer(buf, u.offset, mtl_index);
+            }
+        }
     }
 
     /// Open a loadAction=load render pass onto a target (composes with

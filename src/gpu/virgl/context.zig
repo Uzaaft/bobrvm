@@ -227,6 +227,16 @@ pub const Context = struct {
         return self.const_data[stage].items;
     }
 
+    /// Bind a buffer resource as uniform-buffer `index` for a stage
+    /// (set_uniform_buffer). index 0 is the default block; named UBOs use
+    /// index >= 1. handle 0 unbinds.
+    pub fn setUniformBuffer(self: *Context, stage: usize, index: usize, handle: ResourceHandle, offset: u32, size: u32) void {
+        if (stage >= 6 or index >= 16) return;
+        self.ubo_handles[stage][index] = handle;
+        self.ubo_offsets[stage][index] = offset;
+        self.ubo_sizes[stage][index] = size;
+    }
+
     /// Record a sampler view (texture binding descriptor).
     pub fn createSamplerView(
         self: *Context,

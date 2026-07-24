@@ -494,6 +494,20 @@ pub const GpuDevice = struct {
                     } else dec.skip(header.length);
                 },
 
+                .set_uniform_buffer => {
+                    // [shader_type, index, offset, length, resource_handle]
+                    // — binds a buffer resource as a named UBO (GL 3.1 UBO).
+                    if (header.length >= 5) {
+                        const shader_type = try dec.readU32();
+                        const index = try dec.readU32();
+                        const offset = try dec.readU32();
+                        const length = try dec.readU32();
+                        const res_handle = try dec.readU32();
+                        ctx.setUniformBuffer(shader_type, index, res_handle, offset, length);
+                        if (header.length > 5) dec.skip(header.length - 5);
+                    } else dec.skip(header.length);
+                },
+
                 .set_index_buffer => {
                     // [handle] or [handle, index_size, offset].
                     const ihandle = try dec.readU32();
@@ -573,6 +587,25 @@ pub const GpuDevice = struct {
                                 }
                                 opts.extra_color = extra_ct[0..n_ct];
                                 opts.instance_count = @max(draw_cmd.instance_count, 1);
+                                // Named UBO bindings (vertex stage 0 + fragment
+                                // stage 1, dims 1..15) → buffer(1+dim).
+                                var ubo_binds: [30]virgl.renderer.UboBind = undefined;
+                                var n_ubo: usize = 0;
+                                for ([_]u8{ 0, 1 }) |stage| {
+                                    var d: usize = 1;
+                                    while (d < 16 and n_ubo < ubo_binds.len) : (d += 1) {
+                                        const h = ctx.ubo_handles[stage][d];
+                                        if (h == 0) continue;
+                                        ubo_binds[n_ubo] = .{
+                                            .stage = stage,
+                                            .index = @intCast(d),
+                                            .handle = h,
+                                            .offset = ctx.ubo_offsets[stage][d],
+                                        };
+                                        n_ubo += 1;
+                                    }
+                                }
+                                opts.ubos = ubo_binds[0..n_ubo];
                                 if (self.getOrBuildPipeline(ctx, r, target, opts.depth != null)) |pso| {
                                     if (draw_cmd.indexed and ctx.index_buffer != 0) {
                                         r.drawIndexedWithPipeline(
@@ -2004,6 +2037,88 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     try std.testing.expect(px[right + 1] > 200); // triangle B
     // Restart prevented a bridging triangle across the middle gap.
     try std.testing.expect(px[center + 1] < 40);
+}
+
+test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const vbuf: u32 = 30;
+    const ubo: u32 = 40;
+    try gpu.createResourceRecord(.{
+        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
+        .width = 64, .height = 64, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf, .target = .buffer, .format = .none,
+        .width = 24, .height = 0, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = ubo, .target = .buffer, .format = .none,
+        .width = 16, .height = 0, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.constant_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    // UBO block 1, element 0 = green (0,1,0,1).
+    const ubo_data = [_]f32{ 0.0, 1.0, 0.0, 1.0 };
+    const ubp: [*]const u8 = @ptrCast(&ubo_data);
+    try std.testing.expect(gpu.uploadToBuffer(ubo, 0, ubp[0..16]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    // Fragment reads a NAMED UBO: CONST[1][0].
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[1][0]\n0: MOV OUT[0], CONST[1][0]\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
+        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| { const ix = k * 4 + bb; if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8); }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(31, 0, 2); b.w(50); b.w(0);
+    b.cmd(31, 0, 2); b.w(51); b.w(0);
+    b.cmd(2, 5, 1); b.w(52);
+    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
+    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
+    // set_uniform_buffer: fragment stage(1), index 1, offset 0, len 16, res ubo.
+    b.cmd(27, 0, 5); b.w(1); b.w(1); b.w(0); b.w(16); b.w(ubo);
+    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
+    b.cmd(8, 0, 12); b.w(0); b.w(3); b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    for (0..9) |_| b.w(0);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const c = ((32 * 64) + 32) * 4;
+    // Green, sourced from the named UBO.
+    try std.testing.expect(px[c + 1] > 200 and px[c + 2] < 40 and px[c + 0] < 40);
 }
 
 test "GpuDevice captures shader TGSI text and binds by stage" {

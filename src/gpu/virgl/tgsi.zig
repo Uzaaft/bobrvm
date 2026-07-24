@@ -24,6 +24,10 @@ pub const Semantic = enum { position, color, generic, psize, fog, instanceid, ve
 pub const Operand = struct {
     file: RegFile,
     index: u32,
+    /// For CONST 2D addressing CONST[dim][index]: dim is the uniform-buffer
+    /// binding (0 = the default/inline block at buffer(1)); index is the
+    /// element. Non-CONST operands leave dim = 0.
+    dim: u32 = 0,
     /// Swizzle (src) or writemask (dst) as up to 4 component chars.
     swz: [4]u8 = .{ 'x', 'y', 'z', 'w' },
     swz_len: u8 = 4,
@@ -89,6 +93,9 @@ pub const Program = struct {
     uses_sampler: bool = false,
     uses_instance_id: bool = false,
     uses_vertex_id: bool = false,
+    /// Bitmask of referenced UBO dims (bit d => CONST[d][..] used, d>=1).
+    /// Dim 0 is the default inline block (uses_const).
+    ubo_used: u16 = 0,
     /// Semantic of each declared SV[n] system-value register.
     sv_semantic: [MAX_DECLS]Semantic = @splat(.other),
 };
@@ -137,13 +144,26 @@ fn parseOperand(token_in: []const u8) ?Operand {
     const rb = std.mem.indexOfScalar(u8, token, ']') orelse return null;
     if (rb <= lb + 1) return null;
     const file = parseFile(token[0..lb]);
-    const idx = std.fmt.parseInt(u32, token[lb + 1 .. rb], 10) catch return null;
+    const first = std.fmt.parseInt(u32, token[lb + 1 .. rb], 10) catch return null;
 
-    var op = Operand{ .file = file, .index = idx, .negate = negate, .abs_val = abs_val };
+    var op = Operand{ .file = file, .index = first, .negate = negate, .abs_val = abs_val };
 
-    // Optional ".swz" after the closing bracket.
-    if (rb + 1 < token.len and token[rb + 1] == '.') {
-        const swz = token[rb + 2 ..];
+    // Second bracket => 2D CONST[dim][index]: first is the buffer dim.
+    var after = rb + 1;
+    if (after < token.len and token[after] == '[') {
+        if (std.mem.indexOfScalarPos(u8, token, after, ']')) |rb2| {
+            if (rb2 > after + 1) {
+                const second = std.fmt.parseInt(u32, token[after + 1 .. rb2], 10) catch return null;
+                op.dim = first;
+                op.index = second;
+                after = rb2 + 1;
+            }
+        }
+    }
+
+    // Optional ".swz" after the (last) closing bracket.
+    if (after < token.len and token[after] == '.') {
+        const swz = token[after + 1 ..];
         var n: u8 = 0;
         for (swz) |c| {
             const norm: u8 = switch (c) {
@@ -292,7 +312,11 @@ fn trackOperand(prog: *Program, o: Operand) void {
         .temp => if (@as(i64, o.index) > prog.max_temp) {
             prog.max_temp = @intCast(o.index);
         },
-        .constant => prog.uses_const = true,
+        .constant => if (o.dim == 0) {
+            prog.uses_const = true;
+        } else if (o.dim < 16) {
+            prog.ubo_used |= (@as(u16, 1) << @intCast(o.dim));
+        },
         .sampler => prog.uses_sampler = true,
         .system => if (o.index < MAX_DECLS) {
             switch (prog.sv_semantic[o.index]) {
@@ -385,7 +409,11 @@ fn appendBase(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
         },
         .temp => try app(w, alloc, "t{d}", .{o.index}),
         .immediate => try app(w, alloc, "imm{d}", .{o.index}),
-        .constant => try app(w, alloc, "c[{d}]", .{o.index}),
+        .constant => if (o.dim == 0) {
+            try app(w, alloc, "c[{d}]", .{o.index});
+        } else {
+            try app(w, alloc, "c{d}[{d}]", .{ o.dim, o.index });
+        },
         .system => {
             const sem = if (o.index < prog.sv_semantic.len) prog.sv_semantic[o.index] else Semantic.other;
             switch (sem) {
@@ -746,6 +774,19 @@ pub fn emit(alloc: Allocator, prog: *const Program) Error!Msl {
     return Error.Malformed;
 }
 
+/// Emit a `constant float4* cN [[buffer(1+N)]]` param for each referenced
+/// UBO dim (CONST[N][..], N>=1). buffer(1) is reserved for the inline
+/// default block, so UBO dim N maps to buffer(1+N).
+fn emitUboParams(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, need_comma: *bool) !void {
+    var d: u5 = 1;
+    while (d < 16) : (d += 1) {
+        if (prog.ubo_used & (@as(u16, 1) << @intCast(d)) == 0) continue;
+        if (need_comma.*) try app(w, alloc, ", ", .{});
+        try app(w, alloc, "constant float4* c{d} [[buffer({d})]]", .{ d, d + 1 });
+        need_comma.* = true;
+    }
+}
+
 fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program) !void {
     const has_in = prog.n_in > 0;
     if (has_in) {
@@ -782,6 +823,7 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
         try app(w, alloc, "constant float4* c [[buffer(1)]]", .{});
         need_comma = true;
     }
+    try emitUboParams(w, alloc, prog, &need_comma);
     if (prog.uses_instance_id) {
         if (need_comma) try app(w, alloc, ", ", .{});
         try app(w, alloc, "uint vs_iid [[instance_id]]", .{});
@@ -835,6 +877,7 @@ fn emitFragment(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const P
         try app(w, alloc, "constant float4* c [[buffer(1)]]", .{});
         need_comma = true;
     }
+    try emitUboParams(w, alloc, prog, &need_comma);
     if (prog.uses_sampler) {
         if (need_comma) try app(w, alloc, ", ", .{});
         try app(w, alloc, "texture2d<float> tex0 [[texture(0)]], sampler smp0 [[sampler(0)]]", .{});
