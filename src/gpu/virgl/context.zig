@@ -171,6 +171,11 @@ pub const Context = struct {
     ubo_offsets: [6][16]u32,
     ubo_sizes: [6][16]u32,
 
+    // Inline constants (set_constant_buffer): raw little-endian float
+    // words per stage (0 = vertex, 1 = fragment; other stages accepted
+    // but unused by the Metal translator so far).
+    const_data: [6]std.ArrayListUnmanaged(u8),
+
     pub const Error = Allocator.Error;
 
     pub fn init(alloc: Allocator, id: u32) Error!*Context {
@@ -204,8 +209,22 @@ pub const Context = struct {
             .ubo_handles = .{.{0} ** 16} ** 6,
             .ubo_offsets = .{.{0} ** 16} ** 6,
             .ubo_sizes = .{.{0} ** 16} ** 6,
+            .const_data = .{std.ArrayListUnmanaged(u8).empty} ** 6,
         };
         return ctx;
+    }
+
+    /// Replace the inline constant block for a shader stage.
+    pub fn setConstants(self: *Context, stage: usize, data: []const u8) Error!void {
+        if (stage >= self.const_data.len) return;
+        self.const_data[stage].clearRetainingCapacity();
+        try self.const_data[stage].appendSlice(self.alloc, data);
+    }
+
+    /// Inline constants for a stage ([] if never set).
+    pub fn constants(self: *const Context, stage: usize) []const u8 {
+        if (stage >= self.const_data.len) return &.{};
+        return self.const_data[stage].items;
     }
 
     pub fn deinit(self: *Context) void {
@@ -221,6 +240,7 @@ pub const Context = struct {
         self.shaders.deinit();
         self.surfaces.deinit();
         self.sampler_views.deinit();
+        for (&self.const_data) |*cd| cd.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 

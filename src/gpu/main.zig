@@ -405,6 +405,44 @@ pub const GpuDevice = struct {
                     }
                 },
 
+                .set_constant_buffer => {
+                    // [shader_type, index, data words...] — a stage's inline
+                    // default uniform block.
+                    if (header.length >= 2) {
+                        const shader_type = try dec.readU32();
+                        const index = try dec.readU32();
+                        const nwords: u16 = header.length - 2;
+                        if (index == 0 and shader_type < 6) {
+                            var cbuf: [4096]u8 = undefined;
+                            const n = @min(@as(usize, nwords) * 4, cbuf.len);
+                            var w: usize = 0;
+                            while (w * 4 < n) : (w += 1) {
+                                std.mem.writeInt(u32, cbuf[w * 4 ..][0..4], try dec.readU32(), .little);
+                            }
+                            // Words beyond our 4KB inline cap are dropped.
+                            if (@as(usize, nwords) * 4 > n) {
+                                dec.skip(@intCast(nwords - n / 4));
+                            }
+                            ctx.setConstants(shader_type, cbuf[0..n]) catch {};
+                        } else {
+                            dec.skip(nwords);
+                        }
+                    } else dec.skip(header.length);
+                },
+
+                .set_index_buffer => {
+                    // [handle] or [handle, index_size, offset].
+                    const ihandle = try dec.readU32();
+                    var idx_size: u32 = 4;
+                    var idx_offset: u32 = 0;
+                    if (header.length >= 3) {
+                        idx_size = try dec.readU32();
+                        idx_offset = try dec.readU32();
+                        if (header.length > 3) dec.skip(header.length - 3);
+                    }
+                    ctx.setIndexBuffer(ihandle, @intCast(@min(idx_size, 4)), idx_offset);
+                },
+
                 .set_vertex_buffers => {
                     // N triples of [stride, offset, handle].
                     const n: u16 = header.length / 3;
@@ -431,8 +469,27 @@ pub const GpuDevice = struct {
                             if (vbo_handle != 0 and draw_cmd.count > 0) {
                                 const prim = virgl.Renderer.mapPrimitive(draw_cmd.mode);
                                 if (self.getOrBuildPipeline(ctx, r, target)) |pso| {
-                                    // Real translated guest shaders.
-                                    r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim) catch {};
+                                    // Real translated guest shaders, with the
+                                    // stages' inline constants at buffer(1).
+                                    const vs_c = ctx.constants(0);
+                                    const fs_c = ctx.constants(1);
+                                    if (draw_cmd.indexed and ctx.index_buffer != 0) {
+                                        r.drawIndexedWithPipeline(
+                                            target,
+                                            pso,
+                                            vbo_handle,
+                                            ctx.vbo_offsets[0],
+                                            ctx.index_buffer,
+                                            ctx.index_offset + draw_cmd.start * ctx.index_size,
+                                            ctx.index_size,
+                                            draw_cmd.count,
+                                            prim,
+                                            vs_c,
+                                            fs_c,
+                                        ) catch {};
+                                    } else {
+                                        r.drawWithPipeline(target, pso, vbo_handle, ctx.vbo_offsets[0], draw_cmd.count, prim, vs_c, fs_c) catch {};
+                                    }
                                 } else {
                                     // Passthrough fallback (no bound shaders yet).
                                     r.drawTargetFromBuffer(
@@ -726,6 +783,177 @@ test "GpuDevice renders with translated guest shaders end to end" {
     // RED (BGRA): B<40, G<40, R>200 — passthrough would be white (all >200).
     try std.testing.expect(px[center + 2] > 200); // R
     try std.testing.expect(px[center + 1] < 40); // G
+    try std.testing.expect(px[center + 0] < 40); // B
+    try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
+}
+
+test "GpuDevice draws indexed with uniform constants (buffer(1) binding)" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const vbuf: u32 = 30;
+    const ibuf: u32 = 31;
+
+    try gpu.createResourceRecord(.{
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 32,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = ibuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 12,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.index_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    // Vertex 0 is a decoy: a non-indexed draw of the first 3 vertices
+    // would use it and produce a sliver, not a center-covering triangle.
+    const verts = [_][2]f32{ .{ 10.0, 10.0 }, .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    // Indices select vertices 1,2,3 (u32).
+    const indices = [_]u32{ 1, 2, 3 };
+    const ib: [*]const u8 = @ptrCast(&indices);
+    try std.testing.expect(gpu.uploadToBuffer(ibuf, 0, ib[0..@sizeOf(@TypeOf(indices))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    // Fragment color comes from CONST[0] — proves the inline constant
+    // block reaches the shader via buffer(1).
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n0: MOV OUT[0], CONST[0]\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5); // vertex_elements
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
+    b.w(0);
+    b.cmd(31, 0, 2); // bind vs
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2); // bind fs
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1); // bind vertex_elements
+    b.w(52);
+    b.cmd(1, 8, 3); // surface
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3); // set_framebuffer
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3); // set_vertex_buffers
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
+    // set_constant_buffer: FRAGMENT stage (1), index 0, GREEN
+    b.cmd(12, 0, 6);
+    b.w(1);
+    b.w(0);
+    b.f(0.0);
+    b.f(1.0);
+    b.f(0.0);
+    b.f(1.0);
+    // set_index_buffer: [handle, index_size, offset]
+    b.cmd(11, 0, 3);
+    b.w(ibuf);
+    b.w(4);
+    b.w(0);
+    // clear black
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    // draw_vbo indexed: start=0, count=3, triangles, indexed=1
+    b.cmd(8, 0, 12);
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    b.w(1); // indexed
+    for (0..8) |_| b.w(0);
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const center = ((32 * 64) + 32) * 4;
+    // GREEN (BGRA): the uniform's color, via the indexed triangle 1-2-3.
+    try std.testing.expect(px[center + 1] > 200); // G
+    try std.testing.expect(px[center + 2] < 40); // R
     try std.testing.expect(px[center + 0] < 40); // B
     try std.testing.expect(px[0] < 40 and px[1] < 40 and px[2] < 40); // corner black
 }

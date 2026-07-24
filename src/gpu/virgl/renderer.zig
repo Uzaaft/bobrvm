@@ -465,7 +465,10 @@ pub const Renderer = struct {
 
     /// Draw a vertex buffer with a caller-supplied pipeline into a target
     /// WITHOUT clearing it (loadAction=load), so it composes after a prior
-    /// clear/draw. This is the real-shader draw_vbo path.
+    /// clear/draw. This is the real-shader draw_vbo path. `vs_consts`/
+    /// `fs_consts` are the stages' inline constant blocks, bound at
+    /// buffer(1) to match the TGSI translator's `constant float4* c
+    /// [[buffer(1)]]` (empty = stage uses no constants).
     pub fn drawWithPipeline(
         self: *Renderer,
         target_handle: ResourceHandle,
@@ -474,25 +477,80 @@ pub const Renderer = struct {
         vbuf_offset: u32,
         vertex_count: u32,
         prim: metal.MTLPrimitiveType,
+        vs_consts: []const u8,
+        fs_consts: []const u8,
     ) Error!void {
-        const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+        const pass = try self.beginLoadPass(target_handle);
+        pass.enc.setRenderPipelineState(pso.ptr);
+        pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        bindConsts(pass.enc, vs_consts, fs_consts);
+        pass.enc.drawPrimitives(prim, 0, vertex_count);
+        pass.enc.endEncoding();
+        pass.cmd.commit();
+        pass.cmd.waitUntilCompleted();
+    }
 
+    /// Indexed variant of drawWithPipeline: indices come from a
+    /// guest-uploaded MTLBuffer (set_index_buffer).
+    pub fn drawIndexedWithPipeline(
+        self: *Renderer,
+        target_handle: ResourceHandle,
+        pso: metal.RenderPipelineState,
+        vbuf_handle: ResourceHandle,
+        vbuf_offset: u32,
+        ibuf_handle: ResourceHandle,
+        ibuf_offset: u32,
+        index_size: u8,
+        index_count: u32,
+        prim: metal.MTLPrimitiveType,
+        vs_consts: []const u8,
+        fs_consts: []const u8,
+    ) Error!void {
+        // Metal has no 8-bit indices; those need index-widening (deferred).
+        const index_type: metal.MTLIndexType = switch (index_size) {
+            2 => .uint16,
+            4 => .uint32,
+            else => return Error.UnknownTarget,
+        };
+        const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+        const ibuf = self.buffers.get(ibuf_handle) orelse return Error.UnknownTarget;
+        const pass = try self.beginLoadPass(target_handle);
+        pass.enc.setRenderPipelineState(pso.ptr);
+        pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        bindConsts(pass.enc, vs_consts, fs_consts);
+        pass.enc.drawIndexedPrimitives(prim, index_count, index_type, ibuf, ibuf_offset);
+        pass.enc.endEncoding();
+        pass.cmd.commit();
+        pass.cmd.waitUntilCompleted();
+    }
+
+    const LoadPass = struct {
+        cmd: metal.CommandBuffer,
+        enc: metal.RenderCommandEncoder,
+    };
+
+    /// Open a loadAction=load render pass onto a target (composes with
+    /// prior clears/draws).
+    fn beginLoadPass(self: *Renderer, target_handle: ResourceHandle) Error!LoadPass {
+        const target = self.targets.get(target_handle) orelse return Error.UnknownTarget;
         const pass = metal.RenderPassDescriptor.create() orelse return Error.EncoderFailed;
         const attachments = pass.colorAttachments() orelse return Error.EncoderFailed;
         const att = attachments.objectAtIndex(0) orelse return Error.EncoderFailed;
         att.setTexture(target.tex.ptr);
         att.setLoadAction(.load);
         att.setStoreAction(.store);
-
         const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
         const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
-        enc.setRenderPipelineState(pso.ptr);
-        enc.setVertexBuffer(vbuf, vbuf_offset, 0);
-        enc.drawPrimitives(prim, 0, vertex_count);
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+        return .{ .cmd = cmd, .enc = enc };
+    }
+
+    /// Bind inline constant blocks at buffer(1) (both stages; Metal's
+    /// setBytes path handles blocks up to 4 KB — plenty for GL2-era
+    /// default uniform blocks).
+    fn bindConsts(enc: metal.RenderCommandEncoder, vs: []const u8, fs: []const u8) void {
+        if (vs.len > 0) enc.setVertexBytes(vs.ptr, vs.len, 1);
+        if (fs.len > 0) enc.setFragmentBytes(fs.ptr, fs.len, 1);
     }
 
     /// Map a Gallium primitive type to Metal's. Metal has no loop/fan/quad
