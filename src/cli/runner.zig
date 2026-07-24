@@ -57,6 +57,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_gpu = config.enable_gpu,
         .enable_virgl = config.enable_virgl,
         .enable_net = config.enable_net,
+        .enable_snd = config.enable_snd,
         .forwards = forwards_buf[0..config.forward_count],
         .shared_dir = config.shared_dir,
         .restore_path = restore_path,

@@ -27,6 +27,7 @@ cmdline: []const u8 = "console=hvc0 earlycon=pl011,0x09000000",
 enable_gpu: bool = false,
 enable_virgl: bool = false,
 enable_net: bool = false,
+enable_snd: bool = false,
 display_width: u32 = 1280,
 display_height: u32 = 800,
 /// Host→guest TCP port forwards (--forward host:guest, repeatable).
@@ -120,6 +121,8 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--virgl")) {
             config.enable_gpu = true;
             config.enable_virgl = true;
+        } else if (std.mem.eql(u8, arg, "--sound")) {
+            config.enable_snd = true;
         } else if (std.mem.eql(u8, arg, "--net")) {
             config.enable_net = true;
         } else if (std.mem.eql(u8, arg, "--share")) {

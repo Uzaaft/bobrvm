@@ -32,6 +32,8 @@ pub const Rng = @import("rng.zig").Rng;
 pub const rng = @import("rng.zig");
 pub const Balloon = @import("balloon.zig").Balloon;
 pub const balloon = @import("balloon.zig");
+pub const Snd = @import("snd.zig").Snd;
+pub const snd = @import("snd.zig");
 pub const P9 = @import("p9.zig").P9;
 pub const p9 = @import("p9.zig");
 // pub const Fs = @import("fs.zig");
@@ -56,6 +58,7 @@ pub const DeviceId = enum(u32) {
     input = 18,
     vsock = 19,
     crypto = 20,
+    sound = 25,
     fs = 26,
 };
 
@@ -92,6 +95,7 @@ test {
     _ = @import("gpu.zig");
     _ = @import("net.zig");
     _ = @import("balloon.zig");
+    _ = @import("snd.zig");
 }
 
 test "DeviceId values" {

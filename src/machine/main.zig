@@ -144,6 +144,11 @@ pub const MachineConfig = struct {
     /// Enable the virtio-net device (built-in NAT backend).
     enable_net: bool = false,
 
+    /// Enable the virtio-snd (sound) device. Opt-in: audio is not always
+    /// present, so both the DTB virtio count and the slot assignment gate
+    /// on this flag.
+    enable_snd: bool = false,
+
     /// Host→guest TCP port forwards (implies enable_net). The slice must
     /// stay valid until startSync() has initialized the devices.
     forwards: []const mininat.Forward = &.{},
@@ -180,7 +185,11 @@ pub const MachineConfig = struct {
 
 /// Virtual Machine instance.
 /// Number of addressable virtio-mmio slots (console, 2 disks, gpu, spare).
-const VIRTIO_SLOT_COUNT: u64 = 8;
+// Routable virtio-mmio slots. Matches MemoryLayout.VIRTIO_COUNT (the
+// reserved address space + DTB node count): a maximal device set
+// (2 disks + gpu/kbd/mouse + net + rng + p9 + balloon + snd) needs more
+// than 8, so the dispatch bound must cover the full reservation.
+const VIRTIO_SLOT_COUNT: u64 = 16;
 
 /// Console multiport ids for the agent ports (order matches the names
 /// passed to Console.init in initVirtioDevices).
@@ -270,6 +279,10 @@ pub const Machine = struct {
     /// Virtio memory balloon device (always present; reclaim via MADV_FREE).
     balloon: ?*virtio.Balloon = null,
     balloon_slot: u8 = 0,
+
+    /// Virtio sound device (opt-in, in the slot after the balloon).
+    snd: ?*virtio.Snd = null,
+    snd_slot: u8 = 0,
 
     /// Virtio 9p shared folder (present with config.shared_dir).
     p9: ?*virtio.P9 = null,
@@ -402,6 +415,11 @@ pub const Machine = struct {
         if (self.balloon) |balloon_dev| {
             balloon_dev.deinit();
             self.balloon = null;
+        }
+
+        if (self.snd) |snd_dev| {
+            snd_dev.deinit();
+            self.snd = null;
         }
 
         if (self.qga) |*q| {
@@ -1451,6 +1469,9 @@ pub const Machine = struct {
             } else if (self.p9 != null and slot == self.p9_slot) {
                 const p9_dev = self.p9.?;
                 if (is_write) p9_dev.write(offset, value) else result = p9_dev.read(offset);
+            } else if (self.snd != null and slot == self.snd_slot) {
+                const snd_dev = self.snd.?;
+                if (is_write) snd_dev.write(offset, value) else result = snd_dev.read(offset);
             } else if (self.balloon != null and slot == self.balloon_slot) {
                 const balloon_dev = self.balloon.?;
                 if (is_write) balloon_dev.write(offset, value) else result = balloon_dev.read(offset);
@@ -1891,7 +1912,8 @@ pub const Machine = struct {
         const virtio_count: u8 = 1 + self.config.blockDeviceCount() +
             (if (self.config.enable_gpu) @as(u8, 3) else 0) +
             @intFromBool(self.config.enable_net) + 1 +
-            @intFromBool(self.config.shared_dir != null) + 1;
+            @intFromBool(self.config.shared_dir != null) + 1 +
+            @intFromBool(self.config.enable_snd);
 
         const config = dtb.DtbConfig{
             .ram_base = MemoryLayout.RAM_BASE,
@@ -2086,6 +2108,15 @@ pub const Machine = struct {
         self.balloon.?.setGuestMemory(getGuestMemoryWrapper);
         self.balloon.?.transport.setIrqCallback(balloonIrqCallback, self);
         log.debug("initialized virtio-balloon at slot {}", .{self.balloon_slot});
+
+        // Sound device (opt-in), in the slot after the balloon.
+        if (self.config.enable_snd) {
+            self.snd_slot = self.balloon_slot + 1;
+            self.snd = try virtio.Snd.init(self.alloc);
+            self.snd.?.setGuestMemory(getGuestMemoryWrapper);
+            self.snd.?.transport.setIrqCallback(sndIrqCallback, self);
+            log.debug("initialized virtio-snd at slot {}", .{self.snd_slot});
+        }
 
         // Initialize PCIe ECAM host bridge for UEFI boot
         if (self.config.isFirmwareBoot()) {
@@ -2522,6 +2553,13 @@ pub const Machine = struct {
         const self: *Machine = @ptrCast(@alignCast(userdata));
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.balloon_slot), level);
+        }
+    }
+
+    fn sndIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.snd_slot), level);
         }
     }
 
