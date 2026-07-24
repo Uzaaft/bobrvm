@@ -46,6 +46,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_virgl = config.enable_virgl,
         .enable_net = config.enable_net,
         .forwards = forwards_buf[0..config.forward_count],
+        .shared_dir = config.shared_dir,
         .display_width = config.display_width,
         .display_height = config.display_height,
     };

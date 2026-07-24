@@ -32,6 +32,8 @@ display_height: u32 = 800,
 /// Host→guest TCP port forwards (--forward host:guest, repeatable).
 forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
 forward_count: u8 = 0,
+/// Host directory shared with the guest via 9p (--share).
+shared_dir: ?[]const u8 = null,
 
 pub const MAX_FORWARDS = 8;
 
@@ -118,6 +120,11 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
             config.enable_virgl = true;
         } else if (std.mem.eql(u8, arg, "--net")) {
             config.enable_net = true;
+        } else if (std.mem.eql(u8, arg, "--share")) {
+            config.shared_dir = args.next() orelse {
+                log.err("--share requires a directory path", .{});
+                return ParseError.InvalidArgument;
+            };
         } else if (std.mem.eql(u8, arg, "--forward")) {
             const val = args.next() orelse {
                 log.err("--forward requires a value (host_port:guest_port)", .{});

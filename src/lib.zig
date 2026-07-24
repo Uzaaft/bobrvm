@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 
 pub const agent = @import("agent/main.zig");
 pub const apprt = @import("apprt/main.zig");
+pub const fs = @import("fs/main.zig");
 pub const global = @import("global.zig");
 pub const hypervisor = @import("hypervisor/main.zig");
 pub const machine = @import("machine/main.zig");
@@ -28,6 +29,7 @@ test {
     // Test all submodules
     _ = agent;
     _ = apprt;
+    _ = fs;
     _ = global;
     _ = hypervisor;
     _ = machine;
