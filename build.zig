@@ -173,6 +173,71 @@ pub fn build(b: *std.Build) void {
         gui_step.dependOn(&gui_run.step);
     }
 
+    // ==========================================================================
+    // Venus GPU backend smoke test (macOS): prove the Zig↔virglrenderer(venus)
+    // FFI links and initializes. Opt-in via `zig build venus-smoke`; needs the
+    // Homebrew GPU stack (molten-vk, vulkan-loader, virglrenderer w/ venus).
+    // See docs/gpu-venus-moltenvk.md.
+    // ==========================================================================
+    if (target.result.os.tag == .macos) {
+        const virgl_prefix = "/opt/homebrew/opt/virglrenderer";
+
+        const venus_mod = b.createModule(.{
+            .root_source_file = b.path("src/gpu/venus.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+
+        const venus_smoke_mod = b.createModule(.{
+            .root_source_file = b.path("tools/venus_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        venus_smoke_mod.addImport("venus", venus_mod);
+        venus_smoke_mod.addLibraryPath(.{ .cwd_relative = virgl_prefix ++ "/lib" });
+        venus_smoke_mod.linkSystemLibrary("virglrenderer", .{});
+        // virglrenderer's transitive deps have absolute install names, but its
+        // own dylib is resolved via this rpath.
+        venus_smoke_mod.addRPath(.{ .cwd_relative = virgl_prefix ++ "/lib" });
+
+        const venus_smoke_exe = b.addExecutable(.{
+            .name = "venus_smoke",
+            .root_module = venus_smoke_mod,
+        });
+
+        const install_venus_smoke = b.addInstallArtifact(venus_smoke_exe, .{});
+
+        // Codesign with the Venus entitlements (library validation must be off
+        // to load the ad-hoc-signed third-party GPU dylibs).
+        const sign_venus_smoke = b.addSystemCommand(&.{
+            "codesign", "--sign", "-", "--entitlements", "venus.entitlements",
+            "--force",  "zig-out/bin/venus_smoke",
+        });
+        sign_venus_smoke.step.dependOn(&install_venus_smoke.step);
+
+        // Run it. The build step wires the runtime library + ICD env.
+        const run_venus_smoke = b.addSystemCommand(&.{"zig-out/bin/venus_smoke"});
+        run_venus_smoke.setEnvironmentVariable(
+            "VK_ICD_FILENAMES",
+            "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
+        );
+        run_venus_smoke.setEnvironmentVariable(
+            "DYLD_LIBRARY_PATH",
+            "/opt/homebrew/opt/angle/lib:/opt/homebrew/opt/vulkan-loader/lib:" ++
+                "/opt/homebrew/opt/molten-vk/lib:/opt/homebrew/lib",
+        );
+        run_venus_smoke.step.dependOn(&sign_venus_smoke.step);
+
+        const venus_smoke_step = b.step("venus-smoke", "Build+run the Venus host backend smoke test");
+        venus_smoke_step.dependOn(&run_venus_smoke.step);
+
+        // Build-and-sign only (no run) — useful where the sandbox blocks the run.
+        const venus_smoke_build_step = b.step("venus-smoke-build", "Build+sign the Venus smoke test (no run)");
+        venus_smoke_build_step.dependOn(&sign_venus_smoke.step);
+    }
+
     // Test module
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),

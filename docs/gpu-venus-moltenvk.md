@@ -106,8 +106,17 @@ workload does not lean on them and runs on native features.
      AMFI pre-`main` (runs fine under lldb via get-task-allow). The real bobrvm
      CLI is already codesigned; add `com.apple.security.cs.disable-library-validation`
      (and jit/unsigned-mem) to `cli.entitlements` when linking these in.
-   - Still TODO for this step: add the `build.zig` linkage
-     (`-lvirglrenderer`, include path, rpath) behind a `-Dgpu-venus` option.
+   - `build.zig` linkage done: `zig build venus-smoke` builds `tools/venus_smoke.zig`
+     (imports `src/gpu/venus.zig`), links `-lvirglrenderer` with rpath, and
+     codesigns with `venus.entitlements` (disable-library-validation + jit). The
+     Zig↔virglrenderer FFI is verified: init OK, VENUS capset present.
+   - **Sandbox caveat**: in a seatbelt-sandboxed shell the binary is SIGKILLed
+     before `main` while virglrenderer's initializers run (affects the smoke
+     test only in that shell — it is not a code-signing issue; ad-hoc dylibs +
+     disable-library-validation do not change it). Run it under lldb there
+     (`lldb -b -o run -o quit zig-out/bin/venus_smoke`); on a normal codesigned
+     macOS session it runs directly. `venus.zig` stays isolated from the unit-test
+     binary (not imported by `src/lib.zig`), so `zig build test` is unaffected.
 3. **virtio-gpu ↔ virglrenderer bridge** — route `CTX_CREATE` (venus capset),
    `SUBMIT_3D`, `RESOURCE_CREATE_BLOB`, `RESOURCE_MAP_BLOB`, and fences into the
    `virgl_renderer_*` C API from `src/virtio/gpu.zig` / `src/gpu/`. Keep the 2D
