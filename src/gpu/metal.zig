@@ -791,6 +791,18 @@ pub const RenderCommandEncoder = struct {
     }
 
     /// Draw primitives.
+    pub fn drawPrimitivesInstanced(self: RenderCommandEncoder, ptype: MTLPrimitiveType, start: NSUInteger, count: NSUInteger, instances: NSUInteger) void {
+        const s = sel("drawPrimitives:vertexStart:vertexCount:instanceCount:");
+        const func: *const fn (id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(ptype), start, count, instances);
+    }
+
+    pub fn drawIndexedPrimitivesInstanced(self: RenderCommandEncoder, ptype: MTLPrimitiveType, count: NSUInteger, indexType: MTLIndexType, indexBuffer: Buffer, indexOffset: NSUInteger, instances: NSUInteger) void {
+        const s = sel("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:");
+        const func: *const fn (id, SEL, NSUInteger, NSUInteger, NSUInteger, id, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        func(self.ptr, s, @intFromEnum(ptype), count, @intFromEnum(indexType), indexBuffer.ptr, indexOffset, instances);
+    }
+
     pub fn drawPrimitives(self: RenderCommandEncoder, ptype: MTLPrimitiveType, start: NSUInteger, count: NSUInteger) void {
         const s = sel("drawPrimitives:vertexStart:vertexCount:");
         const func: *const fn (id, SEL, NSUInteger, NSUInteger, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);

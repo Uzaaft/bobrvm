@@ -46,6 +46,8 @@ pub const DrawOpts = struct {
     /// bound at color attachments 1..N. Empty for the common single-target
     /// case (in which the pass is byte-identical to before MRT).
     extra_color: []const ResourceHandle = &.{},
+    /// Instance count (instanced draw); 1 = ordinary draw.
+    instance_count: u32 = 1,
 };
 
 /// Resolved Metal blend state for a pipeline's color attachment (raw
@@ -643,7 +645,11 @@ pub const Renderer = struct {
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
         self.applyOpts(pass.enc, opts);
-        pass.enc.drawPrimitives(prim, 0, vertex_count);
+        if (opts.instance_count > 1) {
+            pass.enc.drawPrimitivesInstanced(prim, 0, vertex_count, opts.instance_count);
+        } else {
+            pass.enc.drawPrimitives(prim, 0, vertex_count);
+        }
         pass.enc.endEncoding();
         pass.cmd.commit();
         pass.cmd.waitUntilCompleted();
@@ -676,7 +682,11 @@ pub const Renderer = struct {
         pass.enc.setRenderPipelineState(pso.ptr);
         pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
         self.applyOpts(pass.enc, opts);
-        pass.enc.drawIndexedPrimitives(prim, index_count, index_type, ibuf, ibuf_offset);
+        if (opts.instance_count > 1) {
+            pass.enc.drawIndexedPrimitivesInstanced(prim, index_count, index_type, ibuf, ibuf_offset, opts.instance_count);
+        } else {
+            pass.enc.drawIndexedPrimitives(prim, index_count, index_type, ibuf, ibuf_offset);
+        }
         pass.enc.endEncoding();
         pass.cmd.commit();
         pass.cmd.waitUntilCompleted();

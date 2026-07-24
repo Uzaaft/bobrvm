@@ -17,9 +17,9 @@ const Allocator = std.mem.Allocator;
 
 pub const Stage = enum { vertex, fragment, geometry, tess_ctrl, tess_eval, compute };
 
-pub const RegFile = enum { in, out, temp, constant, immediate, sampler, unknown };
+pub const RegFile = enum { in, out, temp, constant, immediate, sampler, system, unknown };
 
-pub const Semantic = enum { position, color, generic, psize, fog, other };
+pub const Semantic = enum { position, color, generic, psize, fog, instanceid, vertexid, other };
 
 pub const Operand = struct {
     file: RegFile,
@@ -87,6 +87,10 @@ pub const Program = struct {
     /// Whether any CONST[] was referenced (needs a uniform buffer binding).
     uses_const: bool = false,
     uses_sampler: bool = false,
+    uses_instance_id: bool = false,
+    uses_vertex_id: bool = false,
+    /// Semantic of each declared SV[n] system-value register.
+    sv_semantic: [MAX_DECLS]Semantic = @splat(.other),
 };
 
 pub const MAX_IMM = 64;
@@ -98,6 +102,7 @@ fn parseFile(s: []const u8) RegFile {
     if (std.mem.eql(u8, s, "CONST")) return .constant;
     if (std.mem.eql(u8, s, "IMM")) return .immediate;
     if (std.mem.eql(u8, s, "SAMP")) return .sampler;
+    if (std.mem.eql(u8, s, "SV")) return .system;
     return .unknown;
 }
 
@@ -107,6 +112,8 @@ fn parseSemantic(s: []const u8) Semantic {
     if (std.mem.startsWith(u8, s, "GENERIC")) return .generic;
     if (std.mem.startsWith(u8, s, "PSIZE")) return .psize;
     if (std.mem.startsWith(u8, s, "FOG")) return .fog;
+    if (std.mem.startsWith(u8, s, "INSTANCEID")) return .instanceid;
+    if (std.mem.startsWith(u8, s, "VERTEXID")) return .vertexid;
     return .other;
 }
 
@@ -248,6 +255,11 @@ fn parseDecl(prog: *Program, rest: []const u8) Error!void {
             prog.out_decls[prog.n_out] = decl;
             prog.n_out += 1;
         },
+        .system => {
+            if (operand.index < MAX_DECLS) prog.sv_semantic[operand.index] = decl.semantic;
+            if (decl.semantic == .instanceid) prog.uses_instance_id = true;
+            if (decl.semantic == .vertexid) prog.uses_vertex_id = true;
+        },
         else => {},
     }
 }
@@ -282,6 +294,13 @@ fn trackOperand(prog: *Program, o: Operand) void {
         },
         .constant => prog.uses_const = true,
         .sampler => prog.uses_sampler = true,
+        .system => if (o.index < MAX_DECLS) {
+            switch (prog.sv_semantic[o.index]) {
+                .instanceid => prog.uses_instance_id = true,
+                .vertexid => prog.uses_vertex_id = true,
+                else => {},
+            }
+        },
         else => {},
     }
 }
@@ -367,6 +386,14 @@ fn appendBase(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
         .temp => try app(w, alloc, "t{d}", .{o.index}),
         .immediate => try app(w, alloc, "imm{d}", .{o.index}),
         .constant => try app(w, alloc, "c[{d}]", .{o.index}),
+        .system => {
+            const sem = if (o.index < prog.sv_semantic.len) prog.sv_semantic[o.index] else Semantic.other;
+            switch (sem) {
+                .instanceid => try app(w, alloc, "float4(float(vs_iid))", .{}),
+                .vertexid => try app(w, alloc, "float4(float(vs_vid))", .{}),
+                else => try app(w, alloc, "float4(0.0)", .{}),
+            }
+        },
         else => try app(w, alloc, "float4(0.0)", .{}),
     }
 }
@@ -753,6 +780,17 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
     if (prog.uses_const) {
         if (need_comma) try app(w, alloc, ", ", .{});
         try app(w, alloc, "constant float4* c [[buffer(1)]]", .{});
+        need_comma = true;
+    }
+    if (prog.uses_instance_id) {
+        if (need_comma) try app(w, alloc, ", ", .{});
+        try app(w, alloc, "uint vs_iid [[instance_id]]", .{});
+        need_comma = true;
+    }
+    if (prog.uses_vertex_id) {
+        if (need_comma) try app(w, alloc, ", ", .{});
+        try app(w, alloc, "uint vs_vid [[vertex_id]]", .{});
+        need_comma = true;
     }
     try app(w, alloc, ") {{\n    VSOut out;\n", .{});
     if (!has_position) try app(w, alloc, "    out.position = float4(0.0,0.0,0.0,1.0);\n", .{});
