@@ -150,8 +150,8 @@ The host stack is proven. Progress:
    and does not link virglrenderer. Both `zig build` and `zig build -Dgpu-venus`
    compile; the venus `-Dgpu-venus` CLI links the fixed virglrenderer and is signed
    with `cli-venus.entitlements` (hypervisor + disable-library-validation).
-   **Not runtime-tested** — needs a guest + HVF (sandbox blocks both). The
-   `venus.Host` calls it makes are the same ones lldb-verified in `venus_smoke`.
+   **Not runtime-tested** — needs a guest + HVF. The `venus.Host` calls it makes
+   are the same ones verified standalone in `venus_smoke`.
 3. ✅ Runtime env self-config: `venus.ensureHost()` sets `RENDER_SERVER_EXEC_PATH`
    + `VK_ICD_FILENAMES` from the build prefix (user env still wins). Only
    `DYLD_LIBRARY_PATH` must be set pre-launch (dyld reads it at exec).
@@ -217,21 +217,23 @@ image on hand, and the CI sandbox blocks HVF.
    - Runtime env: `VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`,
      and `DYLD_LIBRARY_PATH` must include angle, vulkan-loader, molten-vk,
      `/opt/homebrew/lib`.
-   - **Codesigning**: an unsigned binary loading these dylibs is SIGKILLed by
-     AMFI pre-`main` (runs fine under lldb via get-task-allow). The real bobrvm
-     CLI is already codesigned; add `com.apple.security.cs.disable-library-validation`
-     (and jit/unsigned-mem) to `cli.entitlements` when linking these in.
    - `build.zig` linkage done: `zig build venus-smoke` builds `tools/venus_smoke.zig`
      (imports `src/gpu/venus.zig`), links `-lvirglrenderer` with rpath, and
-     codesigns with `venus.entitlements` (disable-library-validation + jit). The
-     Zig↔virglrenderer FFI is verified: init OK, VENUS capset present.
-   - **Sandbox caveat**: in a seatbelt-sandboxed shell the binary is SIGKILLed
-     before `main` while virglrenderer's initializers run (affects the smoke
-     test only in that shell — it is not a code-signing issue; ad-hoc dylibs +
-     disable-library-validation do not change it). Run it under lldb there
-     (`lldb -b -o run -o quit zig-out/bin/venus_smoke`); on a normal codesigned
-     macOS session it runs directly. `venus.zig` stays isolated from the unit-test
-     binary (not imported by `src/lib.zig`), so `zig build test` is unaffected.
+     codesigns with `venus.entitlements` (disable-library-validation + jit).
+     **Runs standalone** (no lldb): init OK, VENUS capset present, context
+     create+destroy OK.
+   - ⚠ **THE SIGKILL GOTCHA (resolved):** for a long time the venus binaries were
+     SIGKILLed before `main`, only running under lldb — I misattributed this to
+     the shell sandbox. The real cause: **`libepoxy.0.dylib` had an invalid code
+     signature.** The startergo libepoxy formula runs `install_name_tool -add_rpath`
+     *after* codesigning, invalidating the ad-hoc signature; AMFI then silently
+     SIGKILLs (no log entry) any process that faults in its pages — and
+     virglrenderer links libepoxy. Fix: `codesign --force --sign - libepoxy.0.dylib`
+     (now done automatically in STAGE 6 of `tools/build-virglrenderer-macos.sh`,
+     which re-signs any load-chain dylib failing `codesign --verify --strict`).
+     Diagnose with `codesign --verify --strict <dylib>`. `venus.zig` stays isolated
+     from the unit-test binary (not imported by `src/lib.zig`), so `zig build test`
+     is unaffected.
 3. **virtio-gpu ↔ virglrenderer bridge** — route `CTX_CREATE` (venus capset),
    `SUBMIT_3D`, `RESOURCE_CREATE_BLOB`, `RESOURCE_MAP_BLOB`, and fences into the
    `virgl_renderer_*` C API from `src/virtio/gpu.zig` / `src/gpu/`. Keep the 2D

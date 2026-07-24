@@ -67,6 +67,25 @@ echo "=== STAGE 5: compile + install ==="
 meson compile -C build 2>&1 | tail -12
 echo "compile exit: $?"
 meson install -C build 2>&1 | tail -4
+
+echo "=== STAGE 6: re-sign dylibs whose signature brew invalidated ==="
+# The startergo libepoxy formula runs `install_name_tool -add_rpath` AFTER
+# codesigning, invalidating libepoxy's ad-hoc signature. AMFI then SIGKILLs
+# (before main, silently) any process that loads it — e.g. anything linking
+# virglrenderer. Re-sign every dylib in the venus load chain that fails strict
+# verification so the venus binaries run standalone (no lldb needed).
+for d in \
+  /opt/homebrew/opt/libepoxy/lib/libepoxy*.dylib \
+  /opt/homebrew/opt/angle/lib/*.dylib \
+  "$PREFIX/lib/"libvirglrenderer*.dylib \
+  /opt/homebrew/lib/libvulkan_kosmickrisp.dylib; do
+  [ -f "$d" ] || continue
+  if ! codesign --verify --strict "$d" 2>/dev/null; then
+    echo "  re-signing $(basename "$d")"
+    codesign --force --sign - "$d" 2>&1 | sed 's/^/    /'
+  fi
+done
+
 echo "=== RESULT ==="
 ls -l "$PREFIX/lib/"libvirglrenderer*.dylib 2>/dev/null
 ls "$PREFIX/libexec/"virgl_render_server 2>/dev/null
