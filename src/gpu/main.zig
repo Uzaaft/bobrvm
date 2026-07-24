@@ -1907,6 +1907,105 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
     try std.testing.expect(px[right + 1] > 200); // instance 1 present (shifted by gl_InstanceID)
 }
 
+test "GpuDevice honors primitive restart in indexed triangle strips" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const vbuf: u32 = 30;
+    const ibuf: u32 = 31;
+    try gpu.createResourceRecord(.{
+        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
+        .width = 64, .height = 64, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf, .target = .buffer, .format = .none,
+        .width = 48, .height = 0, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = ibuf, .target = .buffer, .format = .none,
+        .width = 16, .height = 0, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.index_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    // Triangle A (left half) and triangle B (right half), a clear gap in
+    // the middle. As a triangle strip [0,1,2,RESTART,3,4,5] the restart
+    // breaks the strip so no bridging triangles fill the center; without
+    // restart the strip would connect them across the middle.
+    const verts = [_][2]f32{
+        .{ -0.9, -0.6 }, .{ -0.5, -0.6 }, .{ -0.7, 0.6 }, // A (left)
+        .{ 0.5, -0.6 },  .{ 0.9, -0.6 },  .{ 0.7, 0.6 },  // B (right)
+    };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    const idx = [_]u16{ 0, 1, 2, 0xFFFF, 3, 4, 5 };
+    const ib: [*]const u8 = @ptrCast(&idx);
+    try std.testing.expect(gpu.uploadToBuffer(ibuf, 0, ib[0..@sizeOf(@TypeOf(idx))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}\n0: MOV OUT[0], IMM[0]\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
+        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| { const ix = k * 4 + bb; if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8); }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(31, 0, 2); b.w(50); b.w(0);
+    b.cmd(31, 0, 2); b.w(51); b.w(0);
+    b.cmd(2, 5, 1); b.w(52);
+    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
+    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
+    // set_index_buffer: handle, index_size=2, offset=0
+    b.cmd(11, 0, 3); b.w(ibuf); b.w(2); b.w(0);
+    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
+    // draw_vbo indexed triangle_strip, count=7, restart on.
+    b.cmd(8, 0, 12);
+    b.w(0); b.w(7); b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangle_strip));
+    b.w(1); // indexed
+    b.w(1); // instance_count
+    b.w(0); // index_bias
+    b.w(0); // start_instance
+    b.w(1); // primitive_restart
+    b.w(0xFFFF); // restart_index
+    for (0..3) |_| b.w(0); // min_index, max_index, cso
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const left = ((32 * 64) + 12) * 4;
+    const center = ((32 * 64) + 32) * 4;
+    const right = ((32 * 64) + 52) * 4;
+    try std.testing.expect(px[left + 1] > 200); // triangle A
+    try std.testing.expect(px[right + 1] > 200); // triangle B
+    // Restart prevented a bridging triangle across the middle gap.
+    try std.testing.expect(px[center + 1] < 40);
+}
+
 test "GpuDevice captures shader TGSI text and binds by stage" {
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
