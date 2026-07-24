@@ -44,6 +44,19 @@ pub const DrawOpts = struct {
     dss: ?metal.DepthStencilState = null,
 };
 
+/// Resolved Metal blend state for a pipeline's color attachment (raw
+/// MTLBlendFactor/MTLBlendOperation/write-mask integers).
+pub const BlendDesc = struct {
+    enabled: bool,
+    rgb_op: metal.NSUInteger,
+    alpha_op: metal.NSUInteger,
+    src_rgb: metal.NSUInteger,
+    dst_rgb: metal.NSUInteger,
+    src_alpha: metal.NSUInteger,
+    dst_alpha: metal.NSUInteger,
+    write_mask: metal.NSUInteger,
+};
+
 pub const Error = error{
     NoMetalDevice,
     NoCommandQueue,
@@ -521,6 +534,7 @@ pub const Renderer = struct {
         stride: u32,
         format: metal.MTLPixelFormat,
         has_depth: bool,
+        blend: ?BlendDesc,
     ) Error!metal.RenderPipelineState {
         const vlib = self.device.newLibraryWithSource(vs_msl) orelse return Error.ShaderCompileFailed;
         defer vlib.release();
@@ -537,6 +551,16 @@ pub const Renderer = struct {
         desc.setFragmentFunction(ffn);
         desc.setColorFormat0(format);
         if (has_depth) desc.setDepthFormat(.depth32Float);
+        if (blend) |b| desc.setColorBlend(
+            b.enabled,
+            b.rgb_op,
+            b.alpha_op,
+            b.src_rgb,
+            b.dst_rgb,
+            b.src_alpha,
+            b.dst_alpha,
+            b.write_mask,
+        );
 
         if (attrs.len > 0) {
             const vd = metal.VertexDescriptor.create() orelse return Error.PipelineCreateFailed;
@@ -1087,7 +1111,7 @@ test "translated shaders build a real pipeline and draw a triangle" {
     // Vertex layout: attribute 0 = float2 at offset 0, stride 8. Metal
     // expands the float2 to (x,y,0,1) for the float4 shader input.
     const attrs = [_]Renderer.VertexAttr{.{ .format = .float2, .offset = 0, .buffer_index = 0 }};
-    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm, false);
+    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm, false, null);
     defer pso.release();
 
     const w: u32 = 64;

@@ -106,6 +106,7 @@ pub const PipelineKey = struct {
     ve: u32,
     fmt: u32,
     has_depth: bool,
+    blend: u32, // bound blend-state handle (0 = none)
 };
 
 pub const GpuDevice = struct {
@@ -628,6 +629,61 @@ pub const GpuDevice = struct {
         };
     }
 
+    /// Gallium PIPE_BLENDFACTOR_* -> MTLBlendFactor integer.
+    fn mapBlendFactor(f: virgl.protocol.BlendFactor) metal.NSUInteger {
+        return switch (f) {
+            .zero => 0,
+            .one => 1,
+            .src_color => 2,
+            .inv_src_color => 3,
+            .src_alpha => 4,
+            .inv_src_alpha => 5,
+            .dst_alpha => 6,
+            .inv_dst_alpha => 7,
+            .dst_color => 8,
+            .inv_dst_color => 9,
+            .src_alpha_saturate => 10,
+            .const_color => 11,
+            .inv_const_color => 12,
+            .const_alpha => 13,
+            .inv_const_alpha => 14,
+            .src1_color => 15,
+            .inv_src1_color => 16,
+            .src1_alpha => 17,
+            .inv_src1_alpha => 18,
+            else => 1, // unknown -> one
+        };
+    }
+
+    /// Gallium PIPE_BLEND_* -> MTLBlendOperation integer.
+    fn mapBlendOp(f: virgl.protocol.BlendFunc) metal.NSUInteger {
+        return switch (f) {
+            .add => 0,
+            .subtract => 1,
+            .reverse_subtract => 2,
+            .min => 3,
+            .max => 4,
+            else => 0,
+        };
+    }
+
+    /// Resolve the context's bound blend state (RT0) to a BlendDesc.
+    fn resolveBlend(ctx: *Context) ?virgl.renderer.BlendDesc {
+        const bh = ctx.bound.blend orelse return null;
+        const bs = ctx.blend_states.get(bh) orelse return null;
+        const rt = bs.rt[0];
+        return .{
+            .enabled = rt.blend_enable,
+            .rgb_op = mapBlendOp(rt.rgb_func),
+            .alpha_op = mapBlendOp(rt.alpha_func),
+            .src_rgb = mapBlendFactor(rt.rgb_src_factor),
+            .dst_rgb = mapBlendFactor(rt.rgb_dst_factor),
+            .src_alpha = mapBlendFactor(rt.alpha_src_factor),
+            .dst_alpha = mapBlendFactor(rt.alpha_dst_factor),
+            .write_mask = rt.color_mask,
+        };
+    }
+
     /// Build (or fetch from cache) a real Metal pipeline from the context's
     /// currently bound vertex/fragment shaders and vertex_elements, targeting
     /// `target_handle`'s format. Returns null if anything needed is missing or
@@ -644,7 +700,14 @@ pub const GpuDevice = struct {
         const ve_h = ctx.bound.vertex_elements orelse return null;
         const target = r.getTarget(target_handle) orelse return null;
 
-        const key = PipelineKey{ .vs = vs_h, .fs = fs_h, .ve = ve_h, .fmt = @intCast(@intFromEnum(target.format)), .has_depth = has_depth };
+        const key = PipelineKey{
+            .vs = vs_h,
+            .fs = fs_h,
+            .ve = ve_h,
+            .fmt = @intCast(@intFromEnum(target.format)),
+            .has_depth = has_depth,
+            .blend = ctx.bound.blend orelse 0,
+        };
         if (self.pipelines.get(key)) |pso| return pso;
 
         const vs = ctx.shaders.get(vs_h) orelse return null;
@@ -695,7 +758,7 @@ pub const GpuDevice = struct {
             };
         }
         const stride = ctx.vbo_strides[0];
-        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], stride, format, has_depth);
+        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], stride, format, has_depth, resolveBlend(ctx));
     }
 
     /// Get a context by ID.
@@ -1553,6 +1616,108 @@ test "GpuDevice executes TGSI control flow (IF on a uniform)" {
     // Green branch taken (BGRA).
     try std.testing.expect(px[center + 1] > 200); // G
     try std.testing.expect(px[center + 2] < 40); // R
+}
+
+test "GpuDevice applies guest blend state (additive over)" {
+    const alloc = std.testing.allocator;
+    var gpu = GpuDevice.init(alloc);
+    defer gpu.deinit();
+
+    const rt: u32 = 10;
+    const vbuf: u32 = 30;
+    try gpu.createResourceRecord(.{
+        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
+        .width = 64, .height = 64, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+    });
+    try gpu.createResourceRecord(.{
+        .handle = vbuf, .target = .buffer, .format = .none,
+        .width = 24, .height = 0, .depth = 1, .array_size = 1,
+        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+    });
+    if (gpu.renderer == null) return error.SkipZigTest;
+
+    const verts = [_][2]f32{ .{ -0.9, -0.9 }, .{ 0.9, -0.9 }, .{ 0.0, 0.9 } };
+    const vb: [*]const u8 = @ptrCast(&verts);
+    try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
+    try gpu.createContextId(1);
+
+    const vs_text = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n0: MOV OUT[0], CONST[0]\n1: END\n";
+
+    var storage: [512]u32 = undefined;
+    const B = struct {
+        buf: []u32,
+        i: usize = 0,
+        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
+        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn consts(self: *@This(), r: f32, g: f32, bl: f32) void {
+            self.cmd(12, 0, 6); self.w(1); self.w(0); self.f(r); self.f(g); self.f(bl); self.f(1.0);
+        }
+        fn draw(self: *@This()) void {
+            self.cmd(8, 0, 12); self.w(0); self.w(3);
+            self.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+            for (0..9) |_| self.w(0);
+        }
+        fn shader(self: *@This(), handle: u32, text: []const u8) void {
+            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
+            self.cmd(1, 4, 1 + 4 + nwords);
+            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            var k: usize = 0;
+            while (k < nwords) : (k += 1) {
+                var word: u32 = 0;
+                inline for (0..4) |bb| { const idx = k * 4 + bb; if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8); }
+                self.w(word);
+            }
+        }
+    };
+    var b = B{ .buf = &storage };
+    b.shader(50, vs_text);
+    b.shader(51, fs_text);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    // Blend state: RT0 blend_enable, ADD, src=ONE, dst=ONE (additive).
+    // Word layout (state.zig BlendState.parse): s0 flags at [0]; RT states
+    // begin at data[1], one u32 each. RtBlendState bit layout (protocol
+    // BlendState helpers): bit0 blend_enable, then rgb_func<<1,
+    // rgb_src<<4, rgb_dst<<9, alpha_func<<14, alpha_src<<17, alpha_dst<<22,
+    // color_mask<<27.
+    const one_factor: u32 = 0x01; // BlendFactor.one
+    const add_func: u32 = 0; // BlendFunc.add
+    const rt0: u32 = 1 | (add_func << 1) | (one_factor << 4) | (one_factor << 9) |
+        (add_func << 14) | (one_factor << 17) | (one_factor << 22) | (0xf << 27);
+    // create_object BLEND (type 1): handle + [s0, logicop, rt0]; the
+    // parser reads rt[i] from data[2+i], so RT0 is the 3rd payload word.
+    b.cmd(1, 1, 4);
+    b.w(70);
+    b.w(0); // s0 flags
+    b.w(0); // logicop func
+    b.w(rt0);
+    b.cmd(2, 1, 1); // bind_object BLEND
+    b.w(70);
+    b.cmd(31, 0, 2); b.w(50); b.w(0);
+    b.cmd(31, 0, 2); b.w(51); b.w(0);
+    b.cmd(2, 5, 1); b.w(52);
+    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
+    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
+    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
+    // Two additive draws: red then green -> yellow.
+    b.consts(1.0, 0.0, 0.0);
+    b.draw();
+    b.consts(0.0, 1.0, 0.0);
+    b.draw();
+
+    try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
+
+    var px: [64 * 64 * 4]u8 = undefined;
+    try std.testing.expect(gpu.readbackResource(rt, &px));
+    const center = ((32 * 64) + 32) * 4;
+    // Additive: R and G both ~full (yellow), not just the last (green).
+    try std.testing.expect(px[center + 2] > 200); // R survived the 2nd draw
+    try std.testing.expect(px[center + 1] > 200); // G
+    try std.testing.expect(px[center + 0] < 40); // B
 }
 
 test "GpuDevice captures shader TGSI text and binds by stage" {

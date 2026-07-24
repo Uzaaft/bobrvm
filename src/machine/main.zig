@@ -267,6 +267,10 @@ pub const Machine = struct {
     rng: ?*virtio.Rng = null,
     rng_slot: u8 = 0,
 
+    /// Virtio memory balloon device (always present; reclaim via MADV_FREE).
+    balloon: ?*virtio.Balloon = null,
+    balloon_slot: u8 = 0,
+
     /// Virtio 9p shared folder (present with config.shared_dir).
     p9: ?*virtio.P9 = null,
     p9_slot: u8 = 0,
@@ -393,6 +397,11 @@ pub const Machine = struct {
         if (self.p9) |p9_dev| {
             p9_dev.deinit();
             self.p9 = null;
+        }
+
+        if (self.balloon) |balloon_dev| {
+            balloon_dev.deinit();
+            self.balloon = null;
         }
 
         if (self.qga) |*q| {
@@ -1442,6 +1451,9 @@ pub const Machine = struct {
             } else if (self.p9 != null and slot == self.p9_slot) {
                 const p9_dev = self.p9.?;
                 if (is_write) p9_dev.write(offset, value) else result = p9_dev.read(offset);
+            } else if (self.balloon != null and slot == self.balloon_slot) {
+                const balloon_dev = self.balloon.?;
+                if (is_write) balloon_dev.write(offset, value) else result = balloon_dev.read(offset);
             } else if (slot == 0 and self.console != null) {
                 const console = self.console.?;
                 if (is_write) console.write(offset, value) else result = console.read(offset);
@@ -1875,11 +1887,11 @@ pub const Machine = struct {
 
         // Count virtio devices: console (slot 0) + block devices + gpu
         // + keyboard + mouse (input accompanies the display) + net + rng
-        // (always present) + 9p (with shared_dir)
+        // (always present) + 9p (with shared_dir) + balloon (always present)
         const virtio_count: u8 = 1 + self.config.blockDeviceCount() +
             (if (self.config.enable_gpu) @as(u8, 3) else 0) +
             @intFromBool(self.config.enable_net) + 1 +
-            @intFromBool(self.config.shared_dir != null);
+            @intFromBool(self.config.shared_dir != null) + 1;
 
         const config = dtb.DtbConfig{
             .ram_base = MemoryLayout.RAM_BASE,
@@ -2066,6 +2078,14 @@ pub const Machine = struct {
             self.p9.?.transport.setIrqCallback(p9IrqCallback, self);
             log.debug("initialized virtio-9p at slot {} sharing {s}", .{ self.p9_slot, dir });
         }
+
+        // Memory balloon: always present, in the slot after the rng (and
+        // after the 9p device when a shared folder is configured).
+        self.balloon_slot = self.rng_slot + 1 + @intFromBool(self.config.shared_dir != null);
+        self.balloon = try virtio.Balloon.init(self.alloc);
+        self.balloon.?.setGuestMemory(getGuestMemoryWrapper);
+        self.balloon.?.transport.setIrqCallback(balloonIrqCallback, self);
+        log.debug("initialized virtio-balloon at slot {}", .{self.balloon_slot});
 
         // Initialize PCIe ECAM host bridge for UEFI boot
         if (self.config.isFirmwareBoot()) {
@@ -2495,6 +2515,13 @@ pub const Machine = struct {
         const self: *Machine = @ptrCast(@alignCast(userdata));
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.p9_slot), level);
+        }
+    }
+
+    fn balloonIrqCallback(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(64 + @as(u32, self.balloon_slot), level);
         }
     }
 

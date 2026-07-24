@@ -550,10 +550,44 @@ pub const RenderPipelineDescriptor = struct {
         set_n(att, sel("setDestinationAlphaBlendFactor:"), 5);
     }
 
+    /// Configure color-attachment-0 blending with explicit Metal factors
+    /// and operations (translated from the guest's Gallium blend state).
+    /// Values are raw MTLBlendFactor / MTLBlendOperation / color-write-mask
+    /// enum integers.
+    pub fn setColorBlend(
+        self: RenderPipelineDescriptor,
+        enabled: bool,
+        rgb_op: NSUInteger,
+        alpha_op: NSUInteger,
+        src_rgb: NSUInteger,
+        dst_rgb: NSUInteger,
+        src_alpha: NSUInteger,
+        dst_alpha: NSUInteger,
+        write_mask: NSUInteger,
+    ) void {
+        const arr = msgSendId(self.ptr, sel("colorAttachments")) orelse return;
+        const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const att = idx_func(arr, sel("objectAtIndexedSubscript:"), 0) orelse return;
+        const set_bool: *const fn (id, SEL, BOOL) callconv(.c) void = @ptrCast(&objc_msgSend);
+        const set_n: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_n(att, sel("setWriteMask:"), write_mask);
+        set_bool(att, sel("setBlendingEnabled:"), enabled);
+        if (!enabled) return;
+        set_n(att, sel("setRgbBlendOperation:"), rgb_op);
+        set_n(att, sel("setAlphaBlendOperation:"), alpha_op);
+        set_n(att, sel("setSourceRGBBlendFactor:"), src_rgb);
+        set_n(att, sel("setSourceAlphaBlendFactor:"), src_alpha);
+        set_n(att, sel("setDestinationRGBBlendFactor:"), dst_rgb);
+        set_n(att, sel("setDestinationAlphaBlendFactor:"), dst_alpha);
+    }
+
     pub fn release(self: RenderPipelineDescriptor) void {
         msgSendVoid(self.ptr, sel("release"));
     }
 };
+
+/// MTLColorWriteMask.all (R|G|B|A).
+pub const MTLColorWriteMaskAll: NSUInteger = 0xf;
 
 /// MTLCommandQueue wrapper.
 pub const CommandQueue = struct {
