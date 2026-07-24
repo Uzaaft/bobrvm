@@ -395,7 +395,7 @@ fn isSupportedName(op: []const u8) bool {
         "MAX",   "MIN", "RCP", "RSQ",   "FRC",   "FLR", "ABS", "SQRT",
         "TEX",   "TXP", "CMP", "LRP",   "SLT",   "SGE", "SEQ", "SNE",
         "POW",   "EX2", "LG2", "SIN",   "COS",   "TRUNC", "ROUND",
-        "SSG",   "DDX", "DDY",
+        "SSG",   "DDX", "DDY", "CEIL",  "XPD",   "NRM",   "DST",   "LIT",
     };
     for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
     return false;
@@ -404,7 +404,46 @@ fn isSupportedName(op: []const u8) bool {
 /// Emit the float4 right-hand-side expression for a supported opcode.
 fn appendRhsNamed(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Program, instr: *const Instr, op: []const u8) !void {
     const s = instr.srcs;
-    if (std.mem.eql(u8, op, "CMP")) {
+    if (std.mem.eql(u8, op, "CEIL")) {
+        try app(w, alloc, "ceil(", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ")", .{});
+    } else if (std.mem.eql(u8, op, "XPD")) {
+        // 3-component cross product; w = 1 (TGSI convention).
+        try app(w, alloc, "float4(cross((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xyz, (", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ").xyz), 1.0)", .{});
+    } else if (std.mem.eql(u8, op, "NRM")) {
+        // Normalize the xyz of src0; w = 1.
+        try app(w, alloc, "float4(normalize((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").xyz), 1.0)", .{});
+    } else if (std.mem.eql(u8, op, "DST")) {
+        // Distance vector: dst = (1, src0.y*src1.y, src0.z, src1.w).
+        try app(w, alloc, "float4(1.0, (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").y * (", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ").y, (", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").z, (", .{});
+        try appendSrc(w, alloc, prog, s[1]);
+        try app(w, alloc, ").w)", .{});
+    } else if (std.mem.eql(u8, op, "LIT")) {
+        // Fixed-function lighting coefficients.
+        // dst = (1, max(src.x,0), (src.x>0 ? pow(max(src.y,0), clamp(src.w)) : 0), 1)
+        try app(w, alloc, "float4(1.0, max((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x, 0.0), ((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").x > 0.0 ? pow(max((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").y, 0.0), clamp((", .{});
+        try appendSrc(w, alloc, prog, s[0]);
+        try app(w, alloc, ").w, -128.0, 128.0)) : 0.0), 1.0)", .{});
+    } else if (std.mem.eql(u8, op, "CMP")) {
         // dst = (src0 < 0) ? src1 : src2, per component.
         try app(w, alloc, "select(", .{});
         try appendSrc(w, alloc, prog, s[2]);

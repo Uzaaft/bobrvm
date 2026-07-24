@@ -961,6 +961,37 @@ test "draw triangle from an uploaded vertex buffer" {
     try std.testing.expect(buf[1] < 40);
 }
 
+test "TGSI ALU opcodes (XPD/NRM/DST/LIT/CEIL) compile on Metal" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch return error.SkipZigTest;
+    defer r.deinit();
+
+    const vs_text =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL OUT[0], POSITION
+        \\DCL TEMP[0]
+        \\DCL TEMP[1]
+        \\  0: XPD TEMP[0], IN[0], IN[0]
+        \\  1: NRM TEMP[1], TEMP[0]
+        \\  2: DST TEMP[0], TEMP[1], IN[0]
+        \\  3: LIT TEMP[1], TEMP[0]
+        \\  4: CEIL TEMP[0], TEMP[1]
+        \\  5: MOV OUT[0], TEMP[0]
+        \\  6: END
+    ;
+    const prog = try tgsi.parse(vs_text);
+    var msl = try tgsi.emit(alloc, &prog);
+    defer msl.deinit(alloc);
+    const z = try alloc.dupeZ(u8, msl.source);
+    defer alloc.free(z);
+    const lib = r.device.newLibraryWithSource(z) orelse {
+        std.debug.print("MSL failed to compile:\n{s}\n", .{msl.source});
+        return error.TestUnexpectedResult;
+    };
+    lib.release();
+}
+
 test "TGSI control flow and extended opcodes compile on Metal" {
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;
