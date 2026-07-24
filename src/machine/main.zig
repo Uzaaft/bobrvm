@@ -23,6 +23,7 @@ const mininat = @import("../net/mininat.zig");
 const pci = @import("../pci/main.zig");
 const dtb = @import("dtb.zig");
 const agent = @import("../agent/main.zig");
+pub const snapshot = @import("snapshot.zig");
 
 const log = std.log.scoped(.machine);
 const enable_debug_logs = builtin.mode == .Debug;
@@ -178,6 +179,17 @@ const VIRTIO_SLOT_COUNT: u64 = 8;
 const SPICE_PORT: u32 = 1; // com.redhat.spice.0
 const QGA_PORT: u32 = 2; // org.qemu.guest_agent.0
 
+/// A register capture/restore request executed ON the vCPU's owning
+/// thread (HVF rejects cross-thread register access). The requester
+/// parks the machine, posts the request, kicks the vCPU, and polls
+/// `done`; the pause gate in runVcpuLoop performs the operation.
+const VcpuSnapRequest = struct {
+    kind: enum { capture, restore },
+    state: *snapshot.VcpuState,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 /// Per-vCPU run state for the synchronous multi-threaded loop.
 const VcpuRunState = struct {
     pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -187,6 +199,8 @@ const VcpuRunState = struct {
     context_id: u64 = 0,
     thread: ?std.Thread = null,
     vcpu: ?*hypervisor.Vcpu = null,
+    /// Pending snapshot register operation (see VcpuSnapRequest).
+    snap_request: std.atomic.Value(?*VcpuSnapRequest) = std.atomic.Value(?*VcpuSnapRequest).init(null),
 
     /// WFI wait: the vCPU thread blocks here when the guest halts with no
     /// deliverable interrupt; kickCpu signals it so device IRQs from
@@ -729,6 +743,145 @@ pub const Machine = struct {
         }
     }
 
+    /// Run one register capture/restore on a vCPU's owning thread (the
+    /// machine must be paused so the thread is parked at the gate).
+    fn runVcpuSnapOp(self: *Machine, cpu_id: u8, req: *VcpuSnapRequest) !void {
+        const state = &self.cpu_states[cpu_id];
+        if (state.vcpu == null) return error.VcpuNotRunning;
+        state.snap_request.store(req, .release);
+        state.wake_mutex.lockUncancelable(global.io());
+        state.wake_cond.signal(global.io());
+        state.wake_mutex.unlock(global.io());
+        // Poll for completion (bounded: the gate services within 50ms).
+        var waited_ms: u32 = 0;
+        while (!req.done.load(.acquire)) {
+            if (waited_ms > 2000) return error.Timeout;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 2 * std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+            waited_ms += 2;
+        }
+        if (req.failed.load(.acquire)) return error.SnapshotOpFailed;
+    }
+
+    /// Serialize all machine state except guest RAM. The machine must be
+    /// paused. Caller owns the returned bytes.
+    pub fn captureState(self: *Machine, alloc: Allocator) ![]u8 {
+        if (!self.paused.load(.acquire)) return error.NotPaused;
+
+        var builder = try snapshot.Builder.init(alloc);
+        defer builder.deinit();
+
+        // vCPUs (only started ones; secondary CPUs may be offline).
+        for (self.cpu_states, 0..) |*state, i| {
+            if (state.vcpu == null or !state.started.load(.acquire)) continue;
+            var vstate = snapshot.VcpuState{};
+            var req = VcpuSnapRequest{ .kind = .capture, .state = &vstate };
+            try self.runVcpuSnapOp(@intCast(i), &req);
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "vcpu{d}", .{i}) catch unreachable;
+            try builder.section(name, std.mem.asBytes(&vstate));
+        }
+
+        if (self.gic_device) |gic_dev| {
+            const data = try snapshot.serializeGic(alloc, gic_dev);
+            defer alloc.free(data);
+            try builder.section("gic", data);
+        }
+        if (self.console) |con| {
+            const data = try snapshot.serializeConsole(alloc, con);
+            defer alloc.free(data);
+            try builder.section("console", data);
+        }
+        if (self.block) |blk| {
+            const data = try snapshot.serializeBlock(alloc, blk);
+            defer alloc.free(data);
+            try builder.section("blk1", data);
+        }
+        if (self.block2) |blk| {
+            const data = try snapshot.serializeBlock(alloc, blk);
+            defer alloc.free(data);
+            try builder.section("blk2", data);
+        }
+        if (self.rng) |rng_dev| {
+            const data = try snapshot.serializeRng(alloc, rng_dev);
+            defer alloc.free(data);
+            try builder.section("rng", data);
+        }
+        if (self.net) |net| {
+            const data = try snapshot.serializeNet(alloc, net);
+            defer alloc.free(data);
+            try builder.section("net", data);
+        }
+        if (self.keyboard) |kbd| {
+            const data = try snapshot.serializeInput(alloc, kbd);
+            defer alloc.free(data);
+            try builder.section("kbd", data);
+        }
+        if (self.mouse) |mouse| {
+            const data = try snapshot.serializeInput(alloc, mouse);
+            defer alloc.free(data);
+            try builder.section("mouse", data);
+        }
+        if (self.p9) |p9_dev| {
+            const data = try snapshot.serializeP9(alloc, p9_dev);
+            defer alloc.free(data);
+            try builder.section("p9", data);
+        }
+
+        return try builder.finish();
+    }
+
+    /// Apply a captured state to a freshly-initialized, paused machine
+    /// whose vCPU threads are parked at the gate (RAM is restored
+    /// separately by the suspend layer before this).
+    pub fn applyState(self: *Machine, alloc: Allocator, bytes: []const u8) !void {
+        if (!self.paused.load(.acquire)) return error.NotPaused;
+        const reader = try snapshot.Reader.init(bytes);
+
+        for (self.cpu_states, 0..) |*state, i| {
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "vcpu{d}", .{i}) catch unreachable;
+            const data = reader.section(name) orelse continue;
+            if (data.len != @sizeOf(snapshot.VcpuState)) return error.Corrupt;
+            if (state.vcpu == null) return error.VcpuNotRunning;
+            var vstate: snapshot.VcpuState = undefined;
+            @memcpy(std.mem.asBytes(&vstate), data);
+            var req = VcpuSnapRequest{ .kind = .restore, .state = &vstate };
+            try self.runVcpuSnapOp(@intCast(i), &req);
+        }
+
+        if (reader.section("gic")) |data| {
+            if (self.gic_device) |gic_dev| try snapshot.deserializeGic(gic_dev, data);
+        }
+        if (reader.section("console")) |data| {
+            if (self.console) |con| try snapshot.deserializeConsole(self.alloc, con, data);
+        }
+        if (reader.section("blk1")) |data| {
+            if (self.block) |blk| try snapshot.deserializeBlock(blk, data);
+        }
+        if (reader.section("blk2")) |data| {
+            if (self.block2) |blk| try snapshot.deserializeBlock(blk, data);
+        }
+        if (reader.section("rng")) |data| {
+            if (self.rng) |rng_dev| try snapshot.deserializeRng(rng_dev, data);
+        }
+        if (reader.section("net")) |data| {
+            if (self.net) |net| try snapshot.deserializeNet(net, data);
+        }
+        if (reader.section("kbd")) |data| {
+            if (self.keyboard) |kbd| try snapshot.deserializeInput(kbd, data);
+        }
+        if (reader.section("mouse")) |data| {
+            if (self.mouse) |mouse| try snapshot.deserializeInput(mouse, data);
+        }
+        if (reader.section("p9")) |data| {
+            if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
+        }
+        _ = alloc;
+    }
+
     /// Kick a specific vCPU to wake it from WFI/sleep.
     /// Injects an IRQ and forces an exit from hv_vcpu_run.
     pub fn kickVcpu(self: *Machine, vcpu_id: u32) void {
@@ -828,8 +981,21 @@ pub const Machine = struct {
         while (self.running.load(.acquire)) {
             // Pause gate: park until unpaused (or stopping). The 50ms
             // timeout is only a missed-wakeup backstop — unpause()/stop()
-            // signal the condvar for prompt wakeups.
+            // signal the condvar for prompt wakeups. Snapshot register
+            // ops are serviced here: this is the vCPU's owning thread.
             while (self.paused.load(.acquire) and self.running.load(.acquire)) {
+                if (state.snap_request.swap(null, .acq_rel)) |req| {
+                    const result = switch (req.kind) {
+                        .capture => snapshot.captureVcpu(vcpu, req.state),
+                        .restore => snapshot.restoreVcpu(vcpu, req.state),
+                    };
+                    if (result) |_| {} else |err| {
+                        log.err("vCPU {} snapshot op failed: {}", .{ cpu_id, err });
+                        req.failed.store(true, .release);
+                    }
+                    req.done.store(true, .release);
+                    continue;
+                }
                 state.wake_mutex.lockUncancelable(global.io());
                 thread_compat.waitTimeout(&state.wake_cond, global.io(), &state.wake_mutex, .{
                     .duration = .{ .raw = .{ .nanoseconds = 50_000_000 }, .clock = .awake },

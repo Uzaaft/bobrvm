@@ -1,0 +1,507 @@
+//! Machine state serialization (suspend/snapshot substrate).
+//!
+//! A snapshot is a sequence of named sections:
+//!   magic "BBRSNAP1" + version u32 + sections:
+//!   { name_len u8, name bytes, size u64, data }
+//! Guest RAM is NOT a section here — the suspend-to-disk layer streams
+//! it separately (it dwarfs everything else).
+//!
+//! What is captured: vCPU registers (GP + sysregs + SIMD; capture must
+//! run on the vCPU's owning thread — HVF rejects cross-thread register
+//! access, so the machine hops the request over to the parked thread),
+//! the fully-emulated GIC, every virtio transport (status/features/
+//! queues), and per-device cursors/state. Deliberately NOT captured:
+//! mininat flows (host sockets can't survive a suspend; the guest's TCP
+//! retransmits/reconnects, same story as any laptop sleep) and virgl 3D
+//! contexts (reset on restore, QEMU's policy too).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const hypervisor = @import("../hypervisor/main.zig");
+const virtio = @import("../virtio/main.zig");
+const gic_mod = @import("../gic/main.zig");
+const mmio = @import("../virtio/mmio.zig");
+
+const log = std.log.scoped(.snapshot);
+
+pub const MAGIC = "BBRSNAP1";
+pub const VERSION: u32 = 1;
+
+// =============================================================================
+// vCPU state
+// =============================================================================
+
+/// Everything needed to freeze/thaw one vCPU. Extern struct: serialized
+/// by memcpy, so field order is ABI (bump VERSION on change).
+pub const VcpuState = extern struct {
+    /// x0..x28, fp(x29), lr(x30).
+    gp: [31]u64 = @splat(0),
+    pc: u64 = 0,
+    cpsr: u64 = 0,
+    fpcr: u64 = 0,
+    fpsr: u64 = 0,
+    sys: [25]u64 = @splat(0),
+    simd: [32][16]u8 = @splat(@splat(0)),
+};
+
+/// Writable system registers, in VcpuState.sys order.
+pub const sys_regs = [_]hypervisor.SystemRegister{
+    .sctlr_el1,   .ttbr0_el1, .ttbr1_el1,      .tcr_el1,    .mair_el1,
+    .vbar_el1,    .esr_el1,   .far_el1,        .elr_el1,    .spsr_el1,
+    .sp_el0,      .sp_el1,    .tpidr_el0,      .tpidr_el1,  .tpidrro_el0,
+    .cpacr_el1,   .cntv_ctl_el0, .cntv_cval_el0, .cntkctl_el1, .mdscr_el1,
+    .contextidr_el1, .par_el1, .afsr0_el1,     .afsr1_el1,  .amair_el1,
+};
+
+const gp_regs = [_]hypervisor.Register{
+    .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
+    .x8,  .x9,  .x10, .x11, .x12, .x13, .x14, .x15,
+    .x16, .x17, .x18, .x19, .x20, .x21, .x22, .x23,
+    .x24, .x25, .x26, .x27, .x28, .fp,  .lr,
+};
+
+/// Capture registers. MUST run on the vCPU's owning thread.
+pub fn captureVcpu(vcpu: *hypervisor.Vcpu, out: *VcpuState) !void {
+    for (gp_regs, 0..) |reg, i| out.gp[i] = try vcpu.getReg(reg);
+    out.pc = try vcpu.getReg(.pc);
+    out.cpsr = try vcpu.getReg(.cpsr);
+    out.fpcr = try vcpu.getReg(.fpcr);
+    out.fpsr = try vcpu.getReg(.fpsr);
+    for (sys_regs, 0..) |reg, i| out.sys[i] = try vcpu.getSysReg(reg);
+    inline for (0..32) |q| {
+        out.simd[q] = try vcpu.getSimdFpReg(@enumFromInt(q));
+    }
+}
+
+/// Restore registers. MUST run on the vCPU's owning thread.
+pub fn restoreVcpu(vcpu: *hypervisor.Vcpu, state: *const VcpuState) !void {
+    for (gp_regs, 0..) |reg, i| try vcpu.setReg(reg, state.gp[i]);
+    try vcpu.setReg(.pc, state.pc);
+    try vcpu.setReg(.cpsr, state.cpsr);
+    try vcpu.setReg(.fpcr, state.fpcr);
+    try vcpu.setReg(.fpsr, state.fpsr);
+    for (sys_regs, 0..) |reg, i| try vcpu.setSysReg(reg, state.sys[i]);
+    inline for (0..32) |q| {
+        try vcpu.setSimdFpReg(@enumFromInt(q), state.simd[q]);
+    }
+}
+
+// =============================================================================
+// Container
+// =============================================================================
+
+pub const Builder = struct {
+    alloc: Allocator,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    pub fn init(alloc: Allocator) !Builder {
+        var b = Builder{ .alloc = alloc };
+        try b.buf.appendSlice(alloc, MAGIC);
+        try b.appendInt(u32, VERSION);
+        return b;
+    }
+
+    pub fn deinit(self: *Builder) void {
+        self.buf.deinit(self.alloc);
+    }
+
+    pub fn appendInt(self: *Builder, comptime T: type, v: T) !void {
+        var tmp: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &tmp, v, .little);
+        try self.buf.appendSlice(self.alloc, &tmp);
+    }
+
+    pub fn section(self: *Builder, name: []const u8, data: []const u8) !void {
+        try self.buf.append(self.alloc, @intCast(name.len));
+        try self.buf.appendSlice(self.alloc, name);
+        try self.appendInt(u64, data.len);
+        try self.buf.appendSlice(self.alloc, data);
+    }
+
+    /// Take ownership of the finished snapshot bytes.
+    pub fn finish(self: *Builder) ![]u8 {
+        return self.buf.toOwnedSlice(self.alloc);
+    }
+};
+
+pub const Reader = struct {
+    bytes: []const u8,
+
+    pub fn init(bytes: []const u8) !Reader {
+        if (bytes.len < MAGIC.len + 4) return error.Truncated;
+        if (!std.mem.eql(u8, bytes[0..MAGIC.len], MAGIC)) return error.BadMagic;
+        const version = std.mem.readInt(u32, bytes[MAGIC.len..][0..4], .little);
+        if (version != VERSION) return error.BadVersion;
+        return .{ .bytes = bytes };
+    }
+
+    /// Find a section by name.
+    pub fn section(self: Reader, name: []const u8) ?[]const u8 {
+        var off: usize = MAGIC.len + 4;
+        while (off + 1 <= self.bytes.len) {
+            const name_len = self.bytes[off];
+            off += 1;
+            if (off + name_len + 8 > self.bytes.len) return null;
+            const sec_name = self.bytes[off..][0..name_len];
+            off += name_len;
+            const size = std.mem.readInt(u64, self.bytes[off..][0..8], .little);
+            off += 8;
+            if (off + size > self.bytes.len) return null;
+            if (std.mem.eql(u8, sec_name, name)) return self.bytes[off..][0..size];
+            off += @intCast(size);
+        }
+        return null;
+    }
+};
+
+// =============================================================================
+// Field-wise value serialization helpers
+// =============================================================================
+
+const Cursor = struct {
+    buf: []const u8,
+    off: usize = 0,
+
+    fn int(self: *Cursor, comptime T: type) !T {
+        if (self.off + @sizeOf(T) > self.buf.len) return error.Truncated;
+        defer self.off += @sizeOf(T);
+        return std.mem.readInt(T, self.buf[self.off..][0..@sizeOf(T)], .little);
+    }
+    fn bytes(self: *Cursor, len: usize) ![]const u8 {
+        if (self.off + len > self.buf.len) return error.Truncated;
+        defer self.off += len;
+        return self.buf[self.off..][0..len];
+    }
+    fn blob(self: *Cursor) ![]const u8 {
+        const len = try self.int(u64);
+        return self.bytes(@intCast(len));
+    }
+};
+
+const Out = struct {
+    alloc: Allocator,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn int(self: *Out, comptime T: type, v: T) !void {
+        var tmp: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &tmp, v, .little);
+        try self.buf.appendSlice(self.alloc, &tmp);
+    }
+    fn bytes(self: *Out, data: []const u8) !void {
+        try self.buf.appendSlice(self.alloc, data);
+    }
+    fn blob(self: *Out, data: []const u8) !void {
+        try self.int(u64, data.len);
+        try self.bytes(data);
+    }
+};
+
+// =============================================================================
+// GIC
+// =============================================================================
+
+fn putIrqState(out: *Out, s: anytype) !void {
+    const flags: u8 = @as(u8, @intFromBool(s.enabled)) |
+        (@as(u8, @intFromBool(s.pending)) << 1) |
+        (@as(u8, @intFromBool(s.active)) << 2) |
+        (@as(u8, s.config) << 3) |
+        (@as(u8, s.group) << 5);
+    try out.int(u8, flags);
+    try out.int(u8, s.priority);
+    try out.int(u8, s.target_cpu);
+}
+
+fn getIrqState(cur: *Cursor, s: anytype) !void {
+    const flags = try cur.int(u8);
+    s.enabled = flags & 1 != 0;
+    s.pending = flags & 2 != 0;
+    s.active = flags & 4 != 0;
+    s.config = @truncate(flags >> 3);
+    s.group = @truncate(flags >> 5);
+    s.priority = try cur.int(u8);
+    s.target_cpu = try cur.int(u8);
+}
+
+pub fn serializeGic(alloc: Allocator, gic: *const gic_mod.Gic) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.int(u32, gic.ctlr);
+    try out.int(u32, @intCast(gic.spis.len));
+    for (gic.spis) |spi| try putIrqState(&out, spi);
+    try out.int(u8, gic.num_cpus);
+    for (gic.redists) |redist| {
+        try out.int(u32, redist.waker);
+        for (redist.sgi_ppi) |irq| try putIrqState(&out, irq);
+    }
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeGic(gic: *gic_mod.Gic, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    gic.ctlr = try cur.int(u32);
+    const nspis = try cur.int(u32);
+    if (nspis != gic.spis.len) return error.Mismatch;
+    for (gic.spis) |*spi| try getIrqState(&cur, spi);
+    const ncpus = try cur.int(u8);
+    if (ncpus != gic.num_cpus) return error.Mismatch;
+    for (gic.redists) |*redist| {
+        redist.waker = try cur.int(u32);
+        for (&redist.sgi_ppi) |*irq| try getIrqState(&cur, irq);
+    }
+}
+
+// =============================================================================
+// Virtio transport
+// =============================================================================
+
+pub fn serializeTransport(out: *Out, t: *const mmio.Transport) !void {
+    try out.int(u64, t.driver_features);
+    try out.int(u32, t.device_features_sel);
+    try out.int(u32, t.driver_features_sel);
+    try out.int(u8, @bitCast(t.status));
+    try out.int(u32, t.queue_sel);
+    try out.int(u32, @bitCast(t.interrupt_status));
+    try out.int(u32, t.config_generation);
+    try out.int(u8, @intCast(t.queues.len));
+    for (t.queues) |q| {
+        try out.int(u16, q.num);
+        try out.int(u8, @intFromBool(q.ready));
+        try out.int(u64, q.desc_addr);
+        try out.int(u64, q.driver_addr);
+        try out.int(u64, q.device_addr);
+    }
+}
+
+pub fn deserializeTransport(cur: *Cursor, t: *mmio.Transport) !void {
+    t.driver_features = try cur.int(u64);
+    t.device_features_sel = try cur.int(u32);
+    t.driver_features_sel = try cur.int(u32);
+    t.status = @bitCast(try cur.int(u8));
+    t.queue_sel = try cur.int(u32);
+    t.interrupt_status = @bitCast(try cur.int(u32));
+    t.config_generation = try cur.int(u32);
+    const nq = try cur.int(u8);
+    if (nq != t.queues.len) return error.Mismatch;
+    for (t.queues) |*q| {
+        q.num = try cur.int(u16);
+        q.ready = (try cur.int(u8)) != 0;
+        q.desc_addr = try cur.int(u64);
+        q.driver_addr = try cur.int(u64);
+        q.device_addr = try cur.int(u64);
+    }
+}
+
+// =============================================================================
+// Devices
+// =============================================================================
+
+pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, con.transport);
+    try out.int(u16, con.receive_queue.last_avail_idx);
+    try out.int(u16, con.transmit_queue.last_avail_idx);
+    try out.blob(con.input_buffer.items);
+    for (con.mp_last_avail) |cursor| try out.int(u16, cursor);
+    try out.int(u8, @intCast(con.ports.items.len));
+    for (con.ports.items) |port| {
+        try out.int(u8, @intFromBool(port.guest_open));
+        try out.blob(port.input_buffer.items);
+    }
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeConsole(alloc: Allocator, con: *virtio.Console, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, con.transport);
+    con.receive_queue.last_avail_idx = try cur.int(u16);
+    con.transmit_queue.last_avail_idx = try cur.int(u16);
+    const input = try cur.blob();
+    con.input_buffer.clearRetainingCapacity();
+    try con.input_buffer.appendSlice(alloc, input);
+    for (&con.mp_last_avail) |*cursor| cursor.* = try cur.int(u16);
+    const nports = try cur.int(u8);
+    if (nports != con.ports.items.len) return error.Mismatch;
+    for (con.ports.items) |*port| {
+        port.guest_open = (try cur.int(u8)) != 0;
+        const pbuf = try cur.blob();
+        port.input_buffer.clearRetainingCapacity();
+        try port.input_buffer.appendSlice(alloc, pbuf);
+    }
+}
+
+pub fn serializeBlock(alloc: Allocator, blk: *const virtio.Block) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, blk.transport);
+    try out.int(u16, blk.request_queue.last_avail_idx);
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, blk.transport);
+    blk.request_queue.last_avail_idx = try cur.int(u16);
+}
+
+pub fn serializeRng(alloc: Allocator, rng: *const virtio.Rng) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, rng.transport);
+    try out.int(u16, rng.last_avail);
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, rng.transport);
+    rng.last_avail = try cur.int(u16);
+}
+
+pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, net.transport);
+    try out.int(u16, net.rx_last_avail);
+    try out.int(u16, net.tx_last_avail);
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeNet(net: *virtio.Net, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, net.transport);
+    net.rx_last_avail = try cur.int(u16);
+    net.tx_last_avail = try cur.int(u16);
+}
+
+pub fn serializeInput(alloc: Allocator, input: *const virtio.Input) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, input.transport);
+    try out.int(u16, input.event_last_avail);
+    try out.int(u16, input.status_last_avail);
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeInput(input: *virtio.Input, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, input.transport);
+    input.event_last_avail = try cur.int(u16);
+    input.status_last_avail = try cur.int(u16);
+}
+
+pub fn serializeP9(alloc: Allocator, dev: *const virtio.P9) ![]u8 {
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try serializeTransport(&out, dev.transport);
+    try out.int(u16, dev.last_avail);
+    try out.int(u32, dev.server.msize);
+    try out.int(u32, dev.server.fids.count());
+    var iter = dev.server.fids.iterator();
+    while (iter.next()) |entry| {
+        try out.int(u32, entry.key_ptr.*);
+        try out.blob(entry.value_ptr.rel);
+        try out.int(u32, entry.value_ptr.open_linux_flags orelse 0xFFFF_FFFF);
+    }
+    return out.buf.toOwnedSlice(alloc);
+}
+
+pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, dev.transport);
+    dev.last_avail = try cur.int(u16);
+    dev.server.msize = try cur.int(u32);
+    const nfids = try cur.int(u32);
+    var i: u32 = 0;
+    while (i < nfids) : (i += 1) {
+        const fid = try cur.int(u32);
+        const rel = try cur.blob();
+        const flags = try cur.int(u32);
+        try dev.server.restoreFid(
+            alloc,
+            fid,
+            rel,
+            if (flags == 0xFFFF_FFFF) null else flags,
+        );
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "snapshot: container roundtrip and unknown sections" {
+    var b = try Builder.init(testing.allocator);
+    defer b.deinit();
+    try b.section("alpha", "aaa");
+    try b.section("beta", "bb-bb");
+    const bytes = try b.finish();
+    defer testing.allocator.free(bytes);
+
+    const r = try Reader.init(bytes);
+    try testing.expectEqualStrings("aaa", r.section("alpha").?);
+    try testing.expectEqualStrings("bb-bb", r.section("beta").?);
+    try testing.expect(r.section("gamma") == null);
+
+    try testing.expectError(error.BadMagic, Reader.init("XXXXXXXX\x01\x00\x00\x00"));
+}
+
+test "snapshot: gic state roundtrip" {
+    const gic = try gic_mod.Gic.init(testing.allocator, 2);
+    defer gic.deinit();
+    gic.ctlr = 0x33;
+    gic.spis[10].enabled = true;
+    gic.spis[10].pending = true;
+    gic.spis[10].priority = 0x40;
+    gic.spis[10].target_cpu = 1;
+    gic.redists[1].waker = 7;
+    gic.redists[1].sgi_ppi[27].pending = true;
+
+    const data = try serializeGic(testing.allocator, gic);
+    defer testing.allocator.free(data);
+
+    const gic2 = try gic_mod.Gic.init(testing.allocator, 2);
+    defer gic2.deinit();
+    try deserializeGic(gic2, data);
+    try testing.expectEqual(@as(u32, 0x33), gic2.ctlr);
+    try testing.expect(gic2.spis[10].enabled and gic2.spis[10].pending);
+    try testing.expectEqual(@as(u8, 0x40), gic2.spis[10].priority);
+    try testing.expectEqual(@as(u8, 1), gic2.spis[10].target_cpu);
+    try testing.expectEqual(@as(u32, 7), gic2.redists[1].waker);
+    try testing.expect(gic2.redists[1].sgi_ppi[27].pending);
+}
+
+test "snapshot: console device roundtrip (multiport)" {
+    const con = try virtio.Console.init(testing.allocator, &.{"org.qemu.guest_agent.0"});
+    defer con.deinit();
+    con.transport.status = @bitCast(@as(u8, 0x0F));
+    con.transport.driver_features = 0xdead_beef;
+    con.transport.queues[0].ready = true;
+    con.transport.queues[0].desc_addr = 0x4000_0000;
+    con.receive_queue.last_avail_idx = 17;
+    try con.queueInput("pending host input");
+    try con.queuePortInput(1, "agent bytes");
+    con.ports.items[0].guest_open = true;
+
+    const data = try serializeConsole(testing.allocator, con);
+    defer testing.allocator.free(data);
+
+    const con2 = try virtio.Console.init(testing.allocator, &.{"org.qemu.guest_agent.0"});
+    defer con2.deinit();
+    try deserializeConsole(testing.allocator, con2, data);
+    try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(con2.transport.status)));
+    try testing.expectEqual(@as(u64, 0xdead_beef), con2.transport.driver_features);
+    try testing.expect(con2.transport.queues[0].ready);
+    try testing.expectEqual(@as(u64, 0x4000_0000), con2.transport.queues[0].desc_addr);
+    try testing.expectEqual(@as(u16, 17), con2.receive_queue.last_avail_idx);
+    try testing.expectEqualStrings("pending host input", con2.input_buffer.items);
+    try testing.expectEqualStrings("agent bytes", con2.ports.items[0].input_buffer.items);
+    try testing.expect(con2.ports.items[0].guest_open);
+}
+
+test "snapshot: VcpuState is a stable extern layout" {
+    // 31 GP + pc + cpsr + fpcr + fpsr + 25 sys = 60 u64s + 512 SIMD bytes.
+    try testing.expectEqual(@as(usize, 60 * 8 + 512), @sizeOf(VcpuState));
+}

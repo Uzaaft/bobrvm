@@ -78,6 +78,9 @@ const Fid = struct {
     rel: []u8,
     /// Open host file descriptor (set by lopen/lcreate).
     fd: ?std.c.fd_t = null,
+    /// Linux open flags recorded at lopen/lcreate so a snapshot restore
+    /// can re-open the file the same way (null = never opened).
+    open_linux_flags: ?u32 = null,
 };
 
 pub const P9Server = struct {
@@ -105,6 +108,34 @@ pub const P9Server = struct {
     fn dropFid(self: *P9Server, fid: *Fid) void {
         if (fid.fd) |fd| _ = std.c.close(fd);
         self.alloc.free(fid.rel);
+    }
+
+    /// Recreate a fid from snapshot state, re-opening the file when it
+    /// had been opened (best effort: a vanished file leaves the fid
+    /// unopened and later ops on it return EBADF, matching a file
+    /// deleted underneath a live mount).
+    pub fn restoreFid(
+        self: *P9Server,
+        alloc: Allocator,
+        id: u32,
+        rel: []const u8,
+        open_flags: ?u32,
+    ) !void {
+        _ = alloc;
+        const owned = try self.alloc.dupe(u8, rel);
+        errdefer self.alloc.free(owned);
+        var fid = Fid{ .rel = owned, .open_linux_flags = open_flags };
+        if (open_flags) |flags| {
+            const path = try self.hostPath(owned);
+            defer self.alloc.free(path);
+            const fd = std.c.open(path.ptr, linuxFlagsToDarwin(flags));
+            if (fd >= 0) fid.fd = fd;
+        }
+        if (self.fids.fetchRemove(id)) |old| {
+            var v = old.value;
+            self.dropFid(&v);
+        }
+        try self.fids.put(id, fid);
     }
 
     // =========================================================================
@@ -374,6 +405,7 @@ pub const P9Server = struct {
                 if (fd < 0) return error.Errno;
                 if (fid.fd) |old| _ = std.c.close(old);
                 fid.fd = fd;
+                fid.open_linux_flags = flags;
 
                 var st: std.c.Stat = undefined;
                 if (std.c.fstat(fd, &st) != 0) return error.Errno;
@@ -410,6 +442,8 @@ pub const P9Server = struct {
                 self.alloc.free(fid.rel);
                 fid.rel = rel;
                 fid.fd = fd;
+                // On restore, re-open WITHOUT re-creating/truncating.
+                fid.open_linux_flags = flags & ~@as(u32, L_O_CREAT | L_O_EXCL | L_O_TRUNC);
 
                 var st: std.c.Stat = undefined;
                 if (std.c.fstat(fd, &st) != 0) return error.Errno;
