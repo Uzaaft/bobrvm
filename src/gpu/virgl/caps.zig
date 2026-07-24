@@ -102,10 +102,17 @@ pub fn writeV2(buf: []u8) void {
     const vtx = [_]u32{ 28, 29, 30, 31, 67 }; // R32F, RG32F, RGB32F, RGBA32F, RGBA8
     for (vtx) |v| setFmt.f(buf, Off.vertexbuffer_mask, v);
 
-    // bset (boolean feature set) intentionally left zero: advertising a
-    // feature the translator does not implement would make the guest emit
-    // commands we cannot honor. Format masks alone are what a basic context
-    // needs; features get enabled as the translator grows.
+    // bset (boolean feature set, struct virgl_caps_bool_set1, LSB-first
+    // bitfields). Advertise ONLY features the Metal translator actually
+    // backs — advertising an unbacked one makes the guest emit commands we
+    // cannot honor. Enabled so far:
+    //   bit 6  primitive_restart  (Metal restarts strips on canonical index)
+    //   bit 8  instanceid         (gl_InstanceID via [[instance_id]])
+    //   bit 18 ubo                (named uniform buffers)
+    const BSET_PRIMITIVE_RESTART: u32 = 1 << 6;
+    const BSET_INSTANCEID: u32 = 1 << 8;
+    const BSET_UBO: u32 = 1 << 18;
+    put.set(buf, Off.bset, BSET_PRIMITIVE_RESTART | BSET_INSTANCEID | BSET_UBO);
 }
 
 // =============================================================================
