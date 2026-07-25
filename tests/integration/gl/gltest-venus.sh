@@ -68,7 +68,7 @@ feed() {
   wait_for "VK_END" 120 || return 1
   # The proof: RAW eglinfo (no grep) with full zink/venus/mesa debug so any
   # failure reason is captured in the host log.
-  printf 'echo EGLINFO_""START; EGL_LOG_LEVEL=debug LIBGL_DEBUG=verbose MESA_DEBUG=1 VN_DEBUG=init VK_LOADER_DEBUG=error %s/bin/eglinfo 2>&1 | head -140; echo EGLINFO_""END\n' "$DEMOS"
+  printf 'echo EGLINFO_""START; EGL_LOG_LEVEL=debug LIBGL_DEBUG=verbose MESA_DEBUG=1 VN_DEBUG=init,result VK_LOADER_DEBUG=error %s/bin/eglinfo 2>&1 | head -140; echo EGLINFO_""END\n' "$DEMOS"
   wait_for "EGLINFO_END" 180 || return 1
 }
 
