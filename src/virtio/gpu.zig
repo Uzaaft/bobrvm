@@ -56,6 +56,11 @@ pub const CmdType = enum(u32) {
     get_capset_info = 0x0108,
     get_capset = 0x0109,
     get_edid = 0x010a,
+    resource_assign_uuid = 0x010b,
+    // Blob resources (VIRTIO_GPU_F_RESOURCE_BLOB) — required by Venus. Note the
+    // create/set-scanout blob commands live in the 2D opcode range.
+    resource_create_blob = 0x010c,
+    set_scanout_blob = 0x010d,
 
     // 3D commands
     ctx_create = 0x0200,
@@ -66,11 +71,8 @@ pub const CmdType = enum(u32) {
     transfer_to_host_3d = 0x0205,
     transfer_from_host_3d = 0x0206,
     submit_3d = 0x0207,
-    // Blob resources (VIRTIO_GPU_F_RESOURCE_BLOB) — required by Venus.
-    set_scanout_blob = 0x0211,
-    resource_create_blob = 0x0212,
-    resource_map_blob = 0x0213,
-    resource_unmap_blob = 0x0214,
+    resource_map_blob = 0x0208,
+    resource_unmap_blob = 0x0209,
 
     // Cursor commands
     update_cursor = 0x0300,
@@ -1601,12 +1603,17 @@ pub const Gpu = struct {
             // the driver-chosen offset.
             const mapping = vh.mapResource(cmd.resource_id) catch return .resp_err_unspec;
             const guest_pa = self.host_visible_base +% cmd.offset;
-            if (cmd.offset +% mapping.size > self.host_visible_size) return .resp_err_invalid_parameter;
-            if (!map_fn(self.host_visible_userdata, mapping.ptr, guest_pa, @intCast(mapping.size))) {
+            // hv_vm_map needs a host-page (16 KiB on Apple Silicon) multiple;
+            // blob sizes are only 4 KiB-aligned. Round up — virgl backs blobs
+            // with mmap'd (host-page) memory, so the rounded tail is in-bounds.
+            const HOST_PAGE: usize = 0x4000;
+            const map_size = std.mem.alignForward(usize, @intCast(mapping.size), HOST_PAGE);
+            if (cmd.offset +% map_size > self.host_visible_size) return .resp_err_invalid_parameter;
+            if (!map_fn(self.host_visible_userdata, mapping.ptr, guest_pa, map_size)) {
                 vh.unmapResource(cmd.resource_id);
                 return .resp_err_unspec;
             }
-            self.venus_mappings.put(cmd.resource_id, .{ .pa = guest_pa, .size = @intCast(mapping.size) }) catch {};
+            self.venus_mappings.put(cmd.resource_id, .{ .pa = guest_pa, .size = map_size }) catch {};
 
             var info = MapInfoResp{ .header = .{ .type = @intFromEnum(CmdType.resp_ok_map_info) }, .map_info = 1 }; // 1 = VIRTIO_GPU_MAP_CACHE_CACHED
             @memcpy(resp[0..@sizeOf(MapInfoResp)], std.mem.asBytes(&info));
