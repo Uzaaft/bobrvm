@@ -45,6 +45,16 @@ for SOCKF in "$SRC/server/render_socket.c" "$SRC/src/proxy/proxy_socket.c"; do
   echo "--- $SOCKF ---"; grep -n "int type = SOCK_" "$SOCKF"
 done
 
+echo "=== STAGE 3a2: FIX — SOCK_STREAM partial-read framing precedence bug ==="
+# The macos-unified framing check '(is_seqpacket && (msg_flags & MSG_TRUNC) ||
+# iov_len != s)' mis-parenthesizes: && binds tighter than ||, so the full-read
+# test 'iov_len != s' applies to STREAM too, flagging every normal partial read
+# as "truncated or incomplete". Wrap it so the truncation test is seqpacket-only.
+for RS in "$SRC/src/proxy/proxy_socket.c" "$SRC/server/render_socket.c"; do
+  perl -0777 -pi -e 's/(is_seqpacket &&\s*\n\s*)\(_msg\.msg_flags & MSG_TRUNC\) \|\|(\s*\n\s*_msg\.msg_iov\[0\]\.iov_len != \(size_t\)s)\)/${1}((_msg.msg_flags & MSG_TRUNC) ||${2}))/g' "$RS"
+  grep -q "((_msg.msg_flags & MSG_TRUNC)" "$RS" && echo "  framing fix applied: $(basename "$RS")" || echo "  !! framing fix NOT applied: $(basename "$RS")"
+done
+
 echo "=== STAGE 3b: FIX — kqueue fd can't take O_NONBLOCK via fcntl on macOS ==="
 # create_sigchld_fd()'s fcntl(kq, F_SETFL, O_NONBLOCK) always fails on a kqueue
 # fd, which cascades to 'failed to create worker jail' and aborts context
