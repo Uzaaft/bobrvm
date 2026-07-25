@@ -137,6 +137,34 @@ Known follow-up (not yet blocking context create): a teardown-time
 appears after the context is created+destroyed (likely a disconnect/EOF framing
 edge on SOCK_STREAM); verify it doesn't bite real command submission.
 
+## ⛔ CURRENT BLOCKER: KosmicKrisp can't export external memory (upstream gap)
+
+The full stack now runs end to end — bobrvm's virtio-gpu is **complete and correct**
+(Venus capset, `ctx_create`, blob create/map/unmap, the HOST_VISIBLE memory window,
+16 KiB alignment, fences, and the render-server SOCK_STREAM framing all deliver the
+Venus protocol faithfully). Verified by booting a NixOS guest with Mesa venus+zink:
+the guest negotiates `VK_MESA_venus_protocol`, `vkCreateInstance` succeeds, and it
+reaches `vkEnumeratePhysicalDevices` — which fails `VK_ERROR_INITIALIZATION_FAILED`.
+
+**Root cause (definitive, `tools/kk_extbuf.c`):** Venus requires the host physical
+device to *export* device memory (dma-buf, opaque-fd, or Metal heap) — that's how it
+shares GPU memory with the guest. On this KosmicKrisp build the M3 Max reports:
+- `VK_EXT_external_memory_metal`: **present** (advertised),
+- but `vkGetPhysicalDeviceExternalBufferProperties(MTLHEAP)` → `features=0x0,
+  exportTypes=0x0` (**not actually exportable**),
+- `VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`: **missing**.
+
+So venus's per-device export check (`vkr_physical_device.c` `is_metal_export_supported`)
+is false for every handle type, the guest venus driver rejects the device, and no GL
+context is possible. This is a **KosmicKrisp limitation** (it advertises the metal
+external-memory extension but doesn't implement exportable external buffers) — Jan-2026
+bleeding edge. bobrvm can't work around it; it needs a KosmicKrisp that implements
+`VK_EXT_external_memory_metal` export (a newer Mesa, or upstream KosmicKrisp work).
+
+**Options:** (a) build/track a newer Mesa KosmicKrisp that implements exportable
+external memory; (b) file/track the gap upstream; (c) bank the (complete) bobrvm-side
+Venus stack and revisit when KosmicKrisp matures.
+
 ## Remaining bridge work (bobrvm side)
 
 The host stack is proven. Progress:
