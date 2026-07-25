@@ -129,8 +129,24 @@ pub const Transport = struct {
     irq_callback: ?*const fn (level: bool, userdata: ?*anyopaque) void,
     irq_userdata: ?*anyopaque,
 
+    /// Shared-memory region (VIRTIO_MMIO_SHM_*), selected by shm_sel. Only
+    /// region 0 is used (virtio-gpu host-visible window for Venus blobs). A
+    /// zero-length region reads back as "does not exist" (all-ones length).
+    shm_sel: u32 = 0,
+    shm_region_id: u32 = 0xffff_ffff,
+    shm_region_base: u64 = 0,
+    shm_region_len: u64 = 0,
+
     pub const Error = Allocator.Error;
     pub const MAX_QUEUES = 16;
+
+    /// Advertise a shared-memory region to the guest. `index` is the shmid the
+    /// guest selects via shm_sel (VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1).
+    pub fn setShmRegion(self: *Transport, index: u32, base: u64, len: u64) void {
+        self.shm_region_id = index;
+        self.shm_region_base = base;
+        self.shm_region_len = len;
+    }
 
     pub fn init(
         alloc: Allocator,
@@ -218,9 +234,12 @@ pub const Transport = struct {
                 (@as(u32, @intFromBool(self.status.device_needs_reset)) << 4) |
                 (@as(u32, @intFromBool(self.status.failed)) << 5),
             .config_generation => self.config_generation,
-            // No shared-memory regions: length reads must be all-ones
-            // (the spec's "region does not exist" marker).
-            .shm_len_low, .shm_len_high => 0xFFFF_FFFF,
+            // Shared-memory region query (selected by shm_sel). Only region 0
+            // exists; a length of all-ones means "region does not exist".
+            .shm_len_low => if (self.shm_sel == self.shm_region_id and self.shm_region_len != 0) @truncate(self.shm_region_len) else 0xFFFF_FFFF,
+            .shm_len_high => if (self.shm_sel == self.shm_region_id and self.shm_region_len != 0) @truncate(self.shm_region_len >> 32) else 0xFFFF_FFFF,
+            .shm_base_low => if (self.shm_sel == self.shm_region_id and self.shm_region_len != 0) @truncate(self.shm_region_base) else 0,
+            .shm_base_high => if (self.shm_sel == self.shm_region_id and self.shm_region_len != 0) @truncate(self.shm_region_base >> 32) else 0,
             else => 0, // Write-only registers return 0
         };
     }
@@ -257,6 +276,7 @@ pub const Transport = struct {
                 }
             },
             .status => self.handleStatusWrite(@truncate(value)),
+            .shm_sel => self.shm_sel = value,
             .queue_desc_low => {
                 if (self.currentQueue()) |q| {
                     q.desc_addr = (q.desc_addr & 0xFFFFFFFF00000000) | value;

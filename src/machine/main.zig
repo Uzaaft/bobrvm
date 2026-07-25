@@ -2044,6 +2044,17 @@ pub const Machine = struct {
             self.gpu_slot = 1 + self.config.blockDeviceCount();
             self.gpu = try virtio.Gpu.init(self.alloc, self.config.enable_virgl);
             self.gpu.?.setGuestMemory(getGuestMemoryWrapper);
+            // Venus host-visible memory window: a guest-PA range above RAM that
+            // host blob memory is hv_vm_map'd into on RESOURCE_MAP_BLOB. Its
+            // presence makes the guest kernel set VIRTGPU_PARAM_HOST_VISIBLE.
+            if (self.config.enable_virgl) {
+                if (self.hv_vm) |vm| {
+                    const gb: u64 = 1 << 30;
+                    const hv_base = std.mem.alignForward(u64, MemoryLayout.RAM_BASE + self.config.ram_size + gb, gb);
+                    self.gpu.?.setHostVisible(hv_base, gb, hostVisibleMapFn, hostVisibleUnmapFn, vm);
+                    log.debug("virtio-gpu host-visible window: 0x{x} + {}MB", .{ hv_base, gb / (1024 * 1024) });
+                }
+            }
             self.gpu.?.setDisplaySize(self.config.display_width, self.config.display_height);
             self.gpu.?.transport.setIrqCallback(gpuIrqCallback, self);
             if (self.frame_callback) |cb| {
@@ -2544,6 +2555,28 @@ pub const Machine = struct {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.gpu_slot), level);
         }
+    }
+
+    /// Map host blob memory into the guest host-visible window (Venus). Returns
+    /// false on any alignment/HVF error so the guest gets a clean map failure.
+    fn hostVisibleMapFn(userdata: ?*anyopaque, host_ptr: [*]u8, guest_pa: u64, size: usize) bool {
+        const vm: *hypervisor.VM = @ptrCast(@alignCast(userdata orelse return false));
+        const PS: usize = 0x4000; // Apple Silicon host page (16 KiB); hv_vm_map needs this alignment.
+        if (@intFromPtr(host_ptr) % PS != 0 or guest_pa % PS != 0 or size % PS != 0) {
+            log.warn("host-visible map unaligned: ptr=0x{x} pa=0x{x} size=0x{x}", .{ @intFromPtr(host_ptr), guest_pa, size });
+            return false;
+        }
+        const aligned: []align(4096) u8 = @alignCast(host_ptr[0..size]);
+        vm.mapExisting(aligned, guest_pa, .{ .read = true, .write = true }) catch |e| {
+            log.warn("host-visible hv_vm_map failed (pa=0x{x} size=0x{x}): {}", .{ guest_pa, size, e });
+            return false;
+        };
+        return true;
+    }
+
+    fn hostVisibleUnmapFn(userdata: ?*anyopaque, guest_pa: u64, size: usize) void {
+        const vm: *hypervisor.VM = @ptrCast(@alignCast(userdata orelse return));
+        vm.unmap(guest_pa, size) catch {};
     }
 
     fn rngIrqCallback(level: bool, userdata: ?*anyopaque) void {

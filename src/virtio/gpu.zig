@@ -224,6 +224,9 @@ pub const MapInfoResp = extern struct {
     _padding: u32 = 0,
 };
 
+/// A live blob→guest-PA mapping in the host-visible window.
+pub const MapRecord = struct { pa: u64, size: usize };
+
 pub const ResourceDetachBacking = extern struct {
     header: CtrlHeader,
     resource_id: u32,
@@ -508,6 +511,17 @@ pub const Gpu = struct {
     /// array must outlive create_blob and is freed on unref.
     venus_blobs: std.AutoHashMap(u32, []venus.iovec),
 
+    /// Host-visible memory window (VIRTIO_GPU_SHM_ID_HOST_VISIBLE). Guest maps
+    /// host blob memory into [base, base+size) at driver-chosen offsets via
+    /// RESOURCE_MAP_BLOB; the machine wires map_fn/unmap_fn to HVF hv_vm_map.
+    host_visible_base: u64 = 0,
+    host_visible_size: u64 = 0,
+    host_visible_map: ?*const fn (userdata: ?*anyopaque, host_ptr: [*]u8, guest_pa: u64, size: usize) bool = null,
+    host_visible_unmap: ?*const fn (userdata: ?*anyopaque, guest_pa: u64, size: usize) void = null,
+    host_visible_userdata: ?*anyopaque = null,
+    /// Active blob→guest-PA mappings (for unmap), keyed by resource id.
+    venus_mappings: std.AutoHashMap(u32, MapRecord),
+
     /// Hardware cursor state, set via the cursor virtqueue (UPDATE_CURSOR/
     /// MOVE_CURSOR) — separate from the main scanout entirely. The guest
     /// compositor draws the mouse pointer as a cursor plane, not into the
@@ -572,6 +586,7 @@ pub const Gpu = struct {
             .venus_host = null,
             .venus_contexts = std.AutoHashMap(u32, void).init(alloc),
             .venus_blobs = std.AutoHashMap(u32, []venus.iovec).init(alloc),
+            .venus_mappings = std.AutoHashMap(u32, MapRecord).init(alloc),
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -613,6 +628,7 @@ pub const Gpu = struct {
             while (it.next()) |iov| self.alloc.free(iov.*);
             self.venus_blobs.deinit();
         }
+        self.venus_mappings.deinit();
         if (comptime gpu_venus) venus.deinitHost();
         self.gpu_device.deinit();
         self.transport.deinit();
@@ -689,6 +705,26 @@ pub const Gpu = struct {
     /// Set guest memory accessor.
     pub fn setGuestMemory(self: *Gpu, accessor: ring.GetMemFn) void {
         self.guest_memory = accessor;
+    }
+
+    /// Wire the host-visible memory window (Venus). `map`/`unmap` bridge host
+    /// blob memory into the guest window via HVF; this also advertises the
+    /// virtio shm region so the guest kernel sets VIRTGPU_PARAM_HOST_VISIBLE.
+    pub fn setHostVisible(
+        self: *Gpu,
+        base: u64,
+        size: u64,
+        map_fn: *const fn (userdata: ?*anyopaque, host_ptr: [*]u8, guest_pa: u64, size: usize) bool,
+        unmap_fn: *const fn (userdata: ?*anyopaque, guest_pa: u64, size: usize) void,
+        userdata: ?*anyopaque,
+    ) void {
+        self.host_visible_base = base;
+        self.host_visible_size = size;
+        self.host_visible_map = map_fn;
+        self.host_visible_unmap = unmap_fn;
+        self.host_visible_userdata = userdata;
+        // VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1 (shmid 0 is "undefined").
+        self.transport.setShmRegion(1, base, size);
     }
 
     /// Set frame ready callback.
@@ -1557,14 +1593,22 @@ pub const Gpu = struct {
             const vh = if (self.venus_host) |*h| h else return .resp_err_unspec;
             if (req.len < @sizeOf(ResourceMapBlob)) return .resp_err_invalid_parameter;
             if (resp.len < @sizeOf(MapInfoResp)) return .resp_err_unspec;
+            const map_fn = self.host_visible_map orelse return .resp_err_unspec;
             const cmd = std.mem.bytesToValue(ResourceMapBlob, req[0..@sizeOf(ResourceMapBlob)]);
-            // Host-visible mapping into guest PA is not wired yet (needs an HVF
-            // memory window). Report the mapping cache type so the guest at least
-            // gets a well-formed response; if a workload actually maps blob data
-            // this must become a real hv_vm_map.
-            _ = vh;
-            var info = MapInfoResp{ .header = .{ .type = @intFromEnum(CmdType.resp_ok_map_info) }, .map_info = 1 }; // 1 = CACHED
-            _ = cmd;
+
+            // Ask virglrenderer for the host pointer + size of the resource's
+            // (device) memory, then map it into the guest host-visible window at
+            // the driver-chosen offset.
+            const mapping = vh.mapResource(cmd.resource_id) catch return .resp_err_unspec;
+            const guest_pa = self.host_visible_base +% cmd.offset;
+            if (cmd.offset +% mapping.size > self.host_visible_size) return .resp_err_invalid_parameter;
+            if (!map_fn(self.host_visible_userdata, mapping.ptr, guest_pa, @intCast(mapping.size))) {
+                vh.unmapResource(cmd.resource_id);
+                return .resp_err_unspec;
+            }
+            self.venus_mappings.put(cmd.resource_id, .{ .pa = guest_pa, .size = @intCast(mapping.size) }) catch {};
+
+            var info = MapInfoResp{ .header = .{ .type = @intFromEnum(CmdType.resp_ok_map_info) }, .map_info = 1 }; // 1 = VIRTIO_GPU_MAP_CACHE_CACHED
             @memcpy(resp[0..@sizeOf(MapInfoResp)], std.mem.asBytes(&info));
             resp_len.* = @sizeOf(MapInfoResp);
             return .resp_ok_map_info;
@@ -1573,9 +1617,20 @@ pub const Gpu = struct {
     }
 
     fn cmdResourceUnmapBlob(self: *Gpu, req: []const u8) CmdType {
-        _ = self;
-        _ = req;
-        return .resp_ok_nodata;
+        if (comptime gpu_venus) {
+            const vh = if (self.venus_host) |*h| h else return .resp_err_unspec;
+            // virtio_gpu_resource_unmap_blob = { header, resource_id, padding }.
+            if (req.len < @sizeOf(ResourceUnref)) return .resp_err_invalid_parameter;
+            const cmd = std.mem.bytesToValue(ResourceUnref, req[0..@sizeOf(ResourceUnref)]);
+            if (self.venus_mappings.fetchRemove(cmd.resource_id)) |kv| {
+                if (self.host_visible_unmap) |unmap_fn| {
+                    unmap_fn(self.host_visible_userdata, kv.value.pa, kv.value.size);
+                }
+                vh.unmapResource(cmd.resource_id);
+            }
+            return .resp_ok_nodata;
+        }
+        return .resp_err_unspec;
     }
 
     fn cmdCtxCreate(self: *Gpu, header: CtrlHeader, req: []const u8) CmdType {
