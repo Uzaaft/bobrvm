@@ -55,10 +55,18 @@ feed() {
   printf 'ls /dev/dri 2>&1; dmesg | grep -iE "virtio_gpu|drm" | tail -4; echo DRI_""DONE\n'
   wait_for "DRI_DONE" || return 1
   # ZINK over VENUS: zink as the GL gallium driver, virtio_icd (venus) as Vulkan.
-  printf 'export VK_ICD_FILENAMES=%s/share/vulkan/icd.d/virtio_icd.aarch64.json; export MESA_LOADER_DRIVER_OVERRIDE=zink; export GALLIUM_DRIVER=zink; export __EGL_VENDOR_LIBRARY_DIRS=%s/share/glvnd/egl_vendor.d; export EGL_PLATFORM=surfaceless; export ZINK_DEBUG=validation; echo ENV_""SET\n' "$MESA" "$MESA"
+  printf 'export VK_ICD_FILENAMES=%s/share/vulkan/icd.d/virtio_icd.aarch64.json; export MESA_LOADER_DRIVER_OVERRIDE=zink; export GALLIUM_DRIVER=zink; export __EGL_VENDOR_LIBRARY_DIRS=%s/share/glvnd/egl_vendor.d; export EGL_PLATFORM=surfaceless; echo ENV_""SET\n' "$MESA" "$MESA"
   wait_for "ENV_SET" || return 1
-  # The proof: eglinfo (surfaceless) reports the OpenGL version zink negotiates.
-  printf 'echo EGLINFO_""START; %s/bin/eglinfo 2>&1 | grep -iE "Device|Vendor|Renderer|OpenGL (core|compat).*version|Version" | head -30; echo EGLINFO_""END\n' "$DEMOS"
+  # Sanity: are the zink/venus drivers actually reachable in the guest?
+  printf 'echo SANITY_""START; ls /run/opengl-driver/lib/dri/ | grep -iE "zink|virtio"; echo "--icd--"; cat $VK_ICD_FILENAMES; echo; ls -l /run/opengl-driver/lib/libvulkan_virtio.so; echo SANITY_""END\n'
+  wait_for "SANITY_END" || return 1
+  # Does VENUS create a Vulkan device on its own (before involving zink)? vkgears
+  # exercises the venus path directly; --help/-info still initializes Vulkan.
+  printf 'echo VK_""START; VK_LOADER_DEBUG=error VN_DEBUG=init timeout 8 %s/bin/vkgears -info 2>&1 | head -25; echo VK_""END\n' "$DEMOS"
+  wait_for "VK_END" 120 || return 1
+  # The proof: RAW eglinfo (no grep) with full zink/venus/mesa debug so any
+  # failure reason is captured in the host log.
+  printf 'echo EGLINFO_""START; EGL_LOG_LEVEL=debug LIBGL_DEBUG=verbose MESA_DEBUG=1 ZINK_DEBUG=validation VN_DEBUG=init VK_LOADER_DEBUG=error %s/bin/eglinfo 2>&1 | head -140; echo EGLINFO_""END\n' "$DEMOS"
   wait_for "EGLINFO_END" 180 || return 1
 }
 
