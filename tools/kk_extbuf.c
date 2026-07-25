@@ -7,7 +7,7 @@
 #include <stdlib.h>
 
 #ifndef VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT
-#define VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT 0x00001000
+#define VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT 0x00040000
 #endif
 
 static int has_ext(VkExtensionProperties *e, uint32_t n, const char *s){for(uint32_t i=0;i<n;i++)if(!strcmp(e[i].extensionName,s))return 1;return 0;}

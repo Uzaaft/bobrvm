@@ -137,33 +137,42 @@ Known follow-up (not yet blocking context create): a teardown-time
 appears after the context is created+destroyed (likely a disconnect/EOF framing
 edge on SOCK_STREAM); verify it doesn't bite real command submission.
 
-## ⛔ CURRENT BLOCKER: KosmicKrisp can't export external memory (upstream gap)
+## ⛔ CURRENT BLOCKER: opaque render-server Venus enumeration failure
 
-The full stack now runs end to end — bobrvm's virtio-gpu is **complete and correct**
+The full stack runs end to end — bobrvm's virtio-gpu is **complete and correct**
 (Venus capset, `ctx_create`, blob create/map/unmap, the HOST_VISIBLE memory window,
 16 KiB alignment, fences, and the render-server SOCK_STREAM framing all deliver the
 Venus protocol faithfully). Verified by booting a NixOS guest with Mesa venus+zink:
-the guest negotiates `VK_MESA_venus_protocol`, `vkCreateInstance` succeeds, and it
-reaches `vkEnumeratePhysicalDevices` — which fails `VK_ERROR_INITIALIZATION_FAILED`.
+the guest negotiates `VK_MESA_venus_protocol`, `vkCreateInstance` succeeds, and reaches
+`vkEnumeratePhysicalDevices` — which fails `VK_ERROR_INITIALIZATION_FAILED`.
 
-**Root cause (definitive, `tools/kk_extbuf.c`):** Venus requires the host physical
-device to *export* device memory (dma-buf, opaque-fd, or Metal heap) — that's how it
-shares GPU memory with the guest. On this KosmicKrisp build the M3 Max reports:
-- `VK_EXT_external_memory_metal`: **present** (advertised),
-- but `vkGetPhysicalDeviceExternalBufferProperties(MTLHEAP)` → `features=0x0,
-  exportTypes=0x0` (**not actually exportable**),
-- `VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`: **missing**.
+**⚠ Correction:** an earlier version of this doc claimed KosmicKrisp can't export
+external memory. That was **wrong — a bug in the probe** (`tools/kk_extbuf.c` used
+`0x1000` for `VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT`; the real value is
+`0x40000`, gated behind `VK_ENABLE_BETA_EXTENSIONS`). With the correct value the M3
+Max reports **MTLHEAP `features=0x6, exportTypes=0x40000 → EXPORTABLE`** (confirmed by
+instrumenting KosmicKrisp's own `kk_GetPhysicalDeviceExternalBufferProperties`).
 
-So venus's per-device export check (`vkr_physical_device.c` `is_metal_export_supported`)
-is false for every handle type, the guest venus driver rejects the device, and no GL
-context is possible. This is a **KosmicKrisp limitation** (it advertises the metal
-external-memory extension but doesn't implement exportable external buffers) — Jan-2026
-bleeding edge. bobrvm can't work around it; it needs a KosmicKrisp that implements
-`VK_EXT_external_memory_metal` export (a newer Mesa, or upstream KosmicKrisp work).
+So the host stack is capable: KosmicKrisp exports Metal-heap memory, and vkr
+(`vkr_physical_device.c`) has dma-buf **emulation** for exactly this case —
+`is_dma_buf_emulated = !EXT_dma_buf && EXT_metal` (true here) translates the guest's
+dma-buf queries ↔ KosmicKrisp's MTLHEAP. In principle the guest should accept the
+device. Yet it still fails at enumeration.
 
-**Options:** (a) build/track a newer Mesa KosmicKrisp that implements exportable
-external memory; (b) file/track the gap upstream; (c) bank the (complete) bobrvm-side
-Venus stack and revisit when KosmicKrisp matures.
+**Where it's stuck now:** the failure is *inside the forked `virgl_render_server`*,
+and that process is **opaque in this headless/captured setup** — its logs go via
+`vsyslog`/`os_log` (only mirrors to stderr under a TTY), and instrumenting
+`vkr_log`/`render_log`/`vkr_physical_device` init to write a file produced **nothing**
+(the vkr physical-device init path apparently isn't reached, suggesting the render
+server errors before enumeration, or can't `fopen` in its context). Without
+render-server observability the exact venus-internal failure can't be pinned.
+
+**Next step (best done interactively):** get render-server visibility — run bobrvm in
+a real terminal so `os_log` mirrors, `log stream` the render server while it runs, or
+attach lldb to the forked `virgl_render_server`. Likely suspects once visible: the
+render server can't create a Metal device in its forked context, or a venus
+device-init step (features/formats) fails against KosmicKrisp. bobrvm's side needs no
+further work.
 
 ## Remaining bridge work (bobrvm side)
 
