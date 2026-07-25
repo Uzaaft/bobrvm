@@ -40,6 +40,10 @@ pub const MemoryRegion = struct {
     guest_addr: u64,
     size: usize,
     flags: MemoryFlags,
+    /// True if this VM allocated host_addr (via map) and must free it on unmap.
+    /// False for mapExisting regions where the host memory is caller-owned
+    /// (e.g. Venus blob memory owned by virglrenderer) — freeing it is invalid.
+    owned: bool = true,
 };
 
 /// Virtual Machine instance.
@@ -182,6 +186,7 @@ pub const VM = struct {
             .guest_addr = guest_addr,
             .size = host_addr.len,
             .flags = flags,
+            .owned = false,
         });
     }
 
@@ -199,8 +204,10 @@ pub const VM = struct {
         while (i < self.regions.items.len) {
             if (self.regions.items[i].guest_addr == guest_addr) {
                 const region = self.regions.swapRemove(i);
-                // Free if we allocated it
-                self.alloc.free(region.host_addr[0..region.size]);
+                // Only free memory this VM allocated; mapExisting regions are
+                // caller-owned (freeing them would be an invalid free).
+                if (region.owned)
+                    self.alloc.free(region.host_addr[0..region.size]);
             } else {
                 i += 1;
             }

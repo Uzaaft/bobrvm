@@ -1580,7 +1580,9 @@ pub const Gpu = struct {
                 .iovecs = if (iovs.len > 0) iovs.ptr else null,
                 .num_iovs = cmd.nr_entries,
             };
+            log.info("create_blob res={} ctx={} mem={} flags=0x{x} id={} size={} nr_ent={}", .{ cmd.resource_id, header.ctx_id, cmd.blob_mem, cmd.blob_flags, cmd.blob_id, cmd.size, cmd.nr_entries });
             vh.createBlob(&args) catch {
+                log.warn("create_blob FAILED res={} mem={} size={}", .{ cmd.resource_id, cmd.blob_mem, cmd.size });
                 if (iovs.len > 0) self.alloc.free(iovs);
                 return .resp_err_unspec;
             };
@@ -1601,7 +1603,11 @@ pub const Gpu = struct {
             // Ask virglrenderer for the host pointer + size of the resource's
             // (device) memory, then map it into the guest host-visible window at
             // the driver-chosen offset.
-            const mapping = vh.mapResource(cmd.resource_id) catch return .resp_err_unspec;
+            const mapping = vh.mapResource(cmd.resource_id) catch {
+                log.warn("map_blob res={} mapResource FAILED (offset=0x{x})", .{ cmd.resource_id, cmd.offset });
+                return .resp_err_unspec;
+            };
+            log.info("map_blob res={} ptr=0x{x} size={} -> guest_pa offset=0x{x}", .{ cmd.resource_id, @intFromPtr(mapping.ptr), mapping.size, cmd.offset });
             const guest_pa = self.host_visible_base +% cmd.offset;
             // hv_vm_map needs a host-page (16 KiB on Apple Silicon) multiple;
             // blob sizes are only 4 KiB-aligned. Round up — virgl backs blobs

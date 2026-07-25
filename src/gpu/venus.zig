@@ -28,11 +28,14 @@ pub const RENDERER_RENDER_SERVER: c_int = 1 << 9;
 ///  - NO_VIRGL: skip the virgl-GL (vrend) winsys — it needs an EGL/ANGLE display
 ///    that doesn't init on macOS, and without it init fails "invalid vrend
 ///    callbacks".
-///  - RENDER_SERVER: Venus runs in a `virgl_render_server` subprocess. This is
-///    required — in-process venus returns EINVAL at context create in this
-///    build. The server path comes from the RENDER_SERVER_EXEC_PATH env
-///    (set via setRenderServerPath before init).
-pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL | RENDERER_RENDER_SERVER;
+///  - (in-process) We run Venus in-process via our virglrenderer patch
+///    (src/venus_inproc.c) rather than RENDER_SERVER. The render-server model
+///    forks a worker per context, and Metal does not survive fork() — so the
+///    forked KosmicKrisp can't create a Metal device (0 GPUs → guest
+///    INITIALIZATION_FAILED). In-process keeps KosmicKrisp's Metal device in
+///    bobrvm's own process (works), drops the socket overhead, and is
+///    observable (its logs reach us).
+pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL;
 
 /// Point virglrenderer at the `virgl_render_server` binary. Must be called
 /// before init(); virglrenderer reads RENDER_SERVER_EXEC_PATH from the env when
@@ -112,6 +115,7 @@ extern "c" fn virgl_renderer_resource_map(res_handle: u32, map: *?*anyopaque, ou
 extern "c" fn virgl_renderer_resource_unmap(res_handle: u32) callconv(.c) c_int;
 extern "c" fn virgl_renderer_resource_unref(res_handle: u32) callconv(.c) void;
 extern "c" fn virgl_renderer_poll() callconv(.c) void;
+extern "c" fn virgl_set_log_callback(cb: *const fn (level: u32, msg: [*:0]const u8, user_data: ?*anyopaque) callconv(.c) void, user_data: ?*anyopaque, free_cb: ?*anyopaque) callconv(.c) void;
 
 pub const Capset = struct {
     max_ver: u32,
@@ -149,7 +153,17 @@ pub const Host = struct {
         // later milestone; for now the host stack runs synchronously.
     }
 
+    fn logCallback(level: u32, msg: [*:0]const u8, user_data: ?*anyopaque) callconv(.c) void {
+        _ = user_data;
+        _ = level;
+        log.info("[virgl] {s}", .{msg});
+    }
+
     pub fn init() error{VirglInitFailed}!Host {
+        // Route virglrenderer/vkr logs through our logger — with in-process
+        // venus, this surfaces host-side Vulkan errors that were invisible in
+        // the render-server model.
+        virgl_set_log_callback(logCallback, null, null);
         callbacks = .{
             .version = CALLBACKS_VERSION,
             .write_fence = writeFence,
