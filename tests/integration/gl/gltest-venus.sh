@@ -31,6 +31,8 @@ BOBRVM="${BOBRVM:-./zig-out/bin/bobrvm}"
 # render-server paths from its build prefix, so those two need no export here.
 VIRGL_PREFIX="${VIRGL_PREFIX:-$HOME/.local/opt/virgl-macos}"
 export DYLD_LIBRARY_PATH="$VIRGL_PREFIX/lib:/opt/homebrew/opt/vulkan-loader/lib:/opt/homebrew/opt/spirv-tools/lib:/opt/homebrew/opt/angle/lib:/opt/homebrew/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+# Debug env inherited by the forked virgl_render_server (host venus renderer).
+export ${VENUS_DEBUG_ENV:-VKR_DEBUG=result VN_DEBUG=init MESA_DEBUG=1}
 
 : > "$LOG"
 
