@@ -27,6 +27,8 @@ const gpu_venus = @import("build_options").gpu_venus;
 const venus = if (gpu_venus) @import("../gpu/venus.zig") else struct {
     pub const Host = struct { initialized: bool = false };
     pub const CAPSET_VENUS: u32 = 4;
+    pub const iovec = extern struct { base: ?[*]u8, len: usize };
+    pub const BLOB_MEM_GUEST: u32 = 1;
 };
 
 const log = std.log.scoped(.virtio_gpu);
@@ -64,6 +66,11 @@ pub const CmdType = enum(u32) {
     transfer_to_host_3d = 0x0205,
     transfer_from_host_3d = 0x0206,
     submit_3d = 0x0207,
+    // Blob resources (VIRTIO_GPU_F_RESOURCE_BLOB) — required by Venus.
+    set_scanout_blob = 0x0211,
+    resource_create_blob = 0x0212,
+    resource_map_blob = 0x0213,
+    resource_unmap_blob = 0x0214,
 
     // Cursor commands
     update_cursor = 0x0300,
@@ -75,6 +82,7 @@ pub const CmdType = enum(u32) {
     resp_ok_capset_info = 0x1102,
     resp_ok_capset = 0x1103,
     resp_ok_edid = 0x1104,
+    resp_ok_map_info = 0x1105,
 
     // Response types (error)
     resp_err_unspec = 0x1200,
@@ -188,6 +196,32 @@ pub const ResourceAttachBacking = extern struct {
     header: CtrlHeader,
     resource_id: u32,
     nr_entries: u32,
+};
+
+/// virtio_gpu_resource_create_blob (followed by nr_entries × MemEntry).
+pub const ResourceCreateBlob = extern struct {
+    header: CtrlHeader,
+    resource_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    nr_entries: u32,
+    blob_id: u64,
+    size: u64,
+};
+
+/// virtio_gpu_resource_map_blob.
+pub const ResourceMapBlob = extern struct {
+    header: CtrlHeader,
+    resource_id: u32,
+    _padding: u32 = 0,
+    offset: u64,
+};
+
+/// virtio_gpu_resp_map_info.
+pub const MapInfoResp = extern struct {
+    header: CtrlHeader,
+    map_info: u32,
+    _padding: u32 = 0,
 };
 
 pub const ResourceDetachBacking = extern struct {
@@ -469,6 +503,10 @@ pub const Gpu = struct {
     /// submit_3d streams route to venus rather than the legacy translator.
     venus_host: ?venus.Host = null,
     venus_contexts: std.AutoHashMap(u32, void),
+    /// Guest-backing iovec arrays for Venus blob resources, keyed by resource
+    /// id. virglrenderer holds the pointer for the resource's lifetime, so the
+    /// array must outlive create_blob and is freed on unref.
+    venus_blobs: std.AutoHashMap(u32, []venus.iovec),
 
     /// Hardware cursor state, set via the cursor virtqueue (UPDATE_CURSOR/
     /// MOVE_CURSOR) — separate from the main scanout entirely. The guest
@@ -496,8 +534,9 @@ pub const Gpu = struct {
         var features = virtio_version_1 | Features.EDID;
         if (enable_virgl) features |= Features.VIRGL;
         // Venus contexts are selected via the context_init capset id, which
-        // needs VIRTIO_GPU_F_CONTEXT_INIT advertised.
-        if (gpu_venus and enable_virgl) features |= Features.CONTEXT_INIT;
+        // needs VIRTIO_GPU_F_CONTEXT_INIT; venus also *requires* blob resources
+        // (guest kernel VIRTGPU_PARAM_RESOURCE_BLOB — "kernel param 3").
+        if (gpu_venus and enable_virgl) features |= Features.CONTEXT_INIT | Features.RESOURCE_BLOB;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
         errdefer transport.deinit();
 
@@ -532,6 +571,7 @@ pub const Gpu = struct {
             .submit3d_seen = 0,
             .venus_host = null,
             .venus_contexts = std.AutoHashMap(u32, void).init(alloc),
+            .venus_blobs = std.AutoHashMap(u32, []venus.iovec).init(alloc),
         };
 
         transport.setNotifyCallback(handleNotify, gpu);
@@ -568,6 +608,11 @@ pub const Gpu = struct {
         self.backing3d.deinit();
         if (self.scanout3d_data.len > 0) self.alloc.free(self.scanout3d_data);
         self.venus_contexts.deinit();
+        {
+            var it = self.venus_blobs.valueIterator();
+            while (it.next()) |iov| self.alloc.free(iov.*);
+            self.venus_blobs.deinit();
+        }
         if (comptime gpu_venus) venus.deinitHost();
         self.gpu_device.deinit();
         self.transport.deinit();
@@ -969,6 +1014,15 @@ pub const Gpu = struct {
             },
             .submit_3d => {
                 resp_type = self.cmdSubmit3D(header, req, &chain, get_mem);
+            },
+            .resource_create_blob => {
+                resp_type = self.cmdResourceCreateBlob(header, req, &chain, get_mem);
+            },
+            .resource_map_blob => {
+                resp_type = self.cmdResourceMapBlob(req, resp, &resp_len);
+            },
+            .resource_unmap_blob => {
+                resp_type = self.cmdResourceUnmapBlob(req);
             },
             else => {
                 log.warn("unhandled GPU command: 0x{x}", .{header.type});
@@ -1430,6 +1484,98 @@ pub const Gpu = struct {
         resp_len.* = @sizeOf(CtrlHeader) + size;
         log.info("virgl get_capset id={} size={}", .{ cmd.capset_id, size });
         return .resp_ok_capset;
+    }
+
+    fn cmdResourceCreateBlob(
+        self: *Gpu,
+        header: CtrlHeader,
+        req: []const u8,
+        chain: *const ring.Chain,
+        get_mem: ring.GetMemFn,
+    ) CmdType {
+        if (comptime gpu_venus) {
+            const vh = if (self.venus_host) |*h| h else return .resp_err_unspec;
+            if (req.len < @sizeOf(ResourceCreateBlob)) return .resp_err_invalid_parameter;
+            const cmd = std.mem.bytesToValue(ResourceCreateBlob, req[0..@sizeOf(ResourceCreateBlob)]);
+            if (cmd.resource_id == 0) return .resp_err_invalid_resource_id;
+            if (cmd.nr_entries > MAX_BACKING_ENTRIES) return .resp_err_invalid_parameter;
+
+            // Gather guest backing pages into iovecs (host pointers into guest
+            // RAM). Host-only blobs (nr_entries == 0) carry no guest backing.
+            var iovs: []venus.iovec = &.{};
+            if (cmd.nr_entries > 0) {
+                const entries_bytes = @as(usize, cmd.nr_entries) * @sizeOf(MemEntry);
+                const inline_entries = req[@sizeOf(ResourceCreateBlob)..];
+                const entries_mem: []const u8 = if (inline_entries.len >= entries_bytes)
+                    inline_entries
+                else blk: {
+                    var readable_idx: u32 = 0;
+                    for (chain.slice()) |d| {
+                        if (d.isWrite()) continue;
+                        readable_idx += 1;
+                        if (readable_idx == 2) break :blk get_mem(d.addr, d.len) orelse
+                            return .resp_err_invalid_parameter;
+                    }
+                    return .resp_err_invalid_parameter;
+                };
+                if (entries_mem.len < entries_bytes) return .resp_err_invalid_parameter;
+
+                iovs = self.alloc.alloc(venus.iovec, cmd.nr_entries) catch return .resp_err_out_of_memory;
+                var i: u32 = 0;
+                while (i < cmd.nr_entries) : (i += 1) {
+                    const e = std.mem.bytesToValue(MemEntry, entries_mem[i * @sizeOf(MemEntry) ..][0..@sizeOf(MemEntry)]);
+                    const host = get_mem(e.addr, e.length) orelse {
+                        self.alloc.free(iovs);
+                        return .resp_err_invalid_parameter;
+                    };
+                    iovs[i] = .{ .base = host.ptr, .len = e.length };
+                }
+            }
+
+            var args = venus.BlobArgs{
+                .res_handle = cmd.resource_id,
+                .ctx_id = header.ctx_id,
+                .blob_mem = cmd.blob_mem,
+                .blob_flags = cmd.blob_flags,
+                .blob_id = cmd.blob_id,
+                .size = cmd.size,
+                .iovecs = if (iovs.len > 0) iovs.ptr else null,
+                .num_iovs = cmd.nr_entries,
+            };
+            vh.createBlob(&args) catch {
+                if (iovs.len > 0) self.alloc.free(iovs);
+                return .resp_err_unspec;
+            };
+            self.venus_blobs.put(cmd.resource_id, iovs) catch {};
+            return .resp_ok_nodata;
+        }
+        return .resp_err_unspec;
+    }
+
+    fn cmdResourceMapBlob(self: *Gpu, req: []const u8, resp: []u8, resp_len: *u32) CmdType {
+        if (comptime gpu_venus) {
+            const vh = if (self.venus_host) |*h| h else return .resp_err_unspec;
+            if (req.len < @sizeOf(ResourceMapBlob)) return .resp_err_invalid_parameter;
+            if (resp.len < @sizeOf(MapInfoResp)) return .resp_err_unspec;
+            const cmd = std.mem.bytesToValue(ResourceMapBlob, req[0..@sizeOf(ResourceMapBlob)]);
+            // Host-visible mapping into guest PA is not wired yet (needs an HVF
+            // memory window). Report the mapping cache type so the guest at least
+            // gets a well-formed response; if a workload actually maps blob data
+            // this must become a real hv_vm_map.
+            _ = vh;
+            var info = MapInfoResp{ .header = .{ .type = @intFromEnum(CmdType.resp_ok_map_info) }, .map_info = 1 }; // 1 = CACHED
+            _ = cmd;
+            @memcpy(resp[0..@sizeOf(MapInfoResp)], std.mem.asBytes(&info));
+            resp_len.* = @sizeOf(MapInfoResp);
+            return .resp_ok_map_info;
+        }
+        return .resp_err_unspec;
+    }
+
+    fn cmdResourceUnmapBlob(self: *Gpu, req: []const u8) CmdType {
+        _ = self;
+        _ = req;
+        return .resp_ok_nodata;
     }
 
     fn cmdCtxCreate(self: *Gpu, header: CtrlHeader, req: []const u8) CmdType {
