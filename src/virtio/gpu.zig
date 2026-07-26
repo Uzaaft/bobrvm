@@ -84,7 +84,12 @@ pub const CmdType = enum(u32) {
     resp_ok_capset_info = 0x1102,
     resp_ok_capset = 0x1103,
     resp_ok_edid = 0x1104,
-    resp_ok_map_info = 0x1105,
+    resp_ok_resource_uuid = 0x1105,
+    // MUST be 0x1106: the spec inserts OK_RESOURCE_UUID at 0x1105 between EDID
+    // and MAP_INFO. Getting this wrong makes the guest's RESOURCE_MAP_BLOB
+    // callback set map_state=STATE_ERR → virtio_gpu_vram_mmap returns -EINVAL →
+    // Venus "failed to allocate/map ring shmem". (The long-hunted mmap bug.)
+    resp_ok_map_info = 0x1106,
 
     // Response types (error)
     resp_err_unspec = 0x1200,
@@ -1169,6 +1174,25 @@ pub const Gpu = struct {
             }
             return .resp_ok_nodata;
         }
+
+        // Venus blob resources live inside virglrenderer, not the 2D table; the
+        // guest unrefs them (e.g. tearing down a ring/shmem). Route to the venus
+        // host so we don't wrongly answer RESP_ERR_INVALID_RESOURCE_ID.
+        if (comptime gpu_venus) {
+            if (self.venus_host) |*h| {
+                if (self.venus_blobs.fetchRemove(cmd.resource_id)) |kv| {
+                    if (self.venus_mappings.fetchRemove(cmd.resource_id)) |m| {
+                        if (self.host_visible_unmap) |unmap_fn|
+                            unmap_fn(self.host_visible_userdata, m.value.pa, m.value.size);
+                        h.unmapResource(cmd.resource_id);
+                    }
+                    if (kv.value.len > 0) self.alloc.free(kv.value);
+                    h.unrefResource(cmd.resource_id);
+                    return .resp_ok_nodata;
+                }
+            }
+        }
+
         return .resp_err_invalid_resource_id;
     }
 
