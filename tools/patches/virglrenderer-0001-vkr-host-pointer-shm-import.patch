@@ -1,0 +1,188 @@
+From c6ce327634811e58d11a0d14546c0488ea79b9b6 Mon Sep 17 00:00:00 2001
+From: Uzair Aftab <git@uzaaft.me>
+Date: Tue, 28 Jul 2026 16:35:12 +0200
+Subject: [PATCH] vkr: host-pointer shm import fallback for drivers without
+ VK_EXT_metal_objects (KosmicKrisp)
+
+---
+ src/venus/vkr_device.c          |  3 +++
+ src/venus/vkr_device_memory.c   | 24 +++++++++++++++++++++++-
+ src/venus/vkr_metal_helpers.h   | 15 +++++++++++++++
+ src/venus/vkr_metal_helpers.m   | 31 +++++++++++++++++++++++++++++++
+ src/venus/vkr_physical_device.c |  2 ++
+ src/venus/vkr_physical_device.h |  1 +
+ 6 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 3e943bf..128c6d3 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -133,6 +133,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+    ext_count += physical_dev->EXT_external_memory_metal;
+    ext_count += physical_dev->EXT_metal_objects;
++   ext_count += physical_dev->EXT_external_memory_host;
+    ext_count += physical_dev->KHR_portability_subset;
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+@@ -152,6 +153,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          exts[ext_count++] = "VK_EXT_external_memory_metal";
+       if (physical_dev->EXT_metal_objects)
+          exts[ext_count++] = "VK_EXT_metal_objects";
++      if (physical_dev->EXT_external_memory_host)
++         exts[ext_count++] = "VK_EXT_external_memory_host";
+       if (physical_dev->KHR_portability_subset)
+          exts[ext_count++] = "VK_KHR_portability_subset";
+       if (physical_dev->KHR_external_memory_fd)
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 57a108d..76aa4dd 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -300,6 +300,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    struct vkr_mtl_shm *mtl_shm = NULL;
+    VkExportMemoryAllocateInfo local_export_info;
+    VkImportMemoryMetalHandleInfoEXT local_metal_import;
++   VkImportMemoryHostPointerInfoEXT local_host_ptr_import;
+ 
+    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+@@ -349,7 +350,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                   align(alloc_info->allocationSize, getpagesize());
+             }
+          }
+-      } else if (physical_dev->EXT_external_memory_metal) {
++      } else if (physical_dev->EXT_external_memory_metal && dev->mtl_device) {
+          /* Allocate shm and wrap as a MTLBuffer for import. */
+          mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
+          if (!mtl_shm) {
+@@ -366,6 +367,27 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+          alloc_info->pNext = &local_metal_import;
+          alloc_info->allocationSize = mtl_shm->shm_size;
+          valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
++      } else if (physical_dev->EXT_external_memory_host) {
++         /* No VK_EXT_metal_objects (e.g. KosmicKrisp): allocate shm and
++          * import the host pointer via VK_EXT_external_memory_host.  The
++          * mapping is the shm pages themselves, so VIRGL_RESOURCE_FD_SHM
++          * export stays coherent.
++          */
++         mtl_shm = vkr_host_shm_alloc(alloc_info->allocationSize);
++         if (!mtl_shm) {
++            args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++            return;
++         }
++
++         local_host_ptr_import = (VkImportMemoryHostPointerInfoEXT){
++            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++            .pNext = alloc_info->pNext,
++            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++            .pHostPointer = mtl_shm->shm_ptr,
++         };
++         alloc_info->pNext = &local_host_ptr_import;
++         alloc_info->allocationSize = mtl_shm->shm_size;
++         valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+       } else if (physical_dev->EXT_external_memory_dma_buf) {
+          /* Allocate dma_buf externally and force to import. */
+          if (export_info) {
+diff --git a/src/venus/vkr_metal_helpers.h b/src/venus/vkr_metal_helpers.h
+index 4f5208b..e2d3e95 100644
+--- a/src/venus/vkr_metal_helpers.h
++++ b/src/venus/vkr_metal_helpers.h
+@@ -43,6 +43,14 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size);
+ void
+ vkr_mtl_shm_free(struct vkr_mtl_shm *shm);
+ 
++/* Allocate page-aligned anonymous shared memory WITHOUT a Metal buffer, for
++ * import via VK_EXT_external_memory_host (VkImportMemoryHostPointerInfoEXT).
++ * Used when the driver (e.g. KosmicKrisp) lacks VK_EXT_metal_objects /
++ * MTLBUFFER import but supports host-pointer import.  mtl_buffer is NULL.
++ */
++struct vkr_mtl_shm *
++vkr_host_shm_alloc(uint64_t size);
++
+ #else /* !__APPLE__ */
+ 
+ static inline void *
+@@ -67,6 +75,13 @@ vkr_mtl_shm_free(struct vkr_mtl_shm *shm)
+    (void)shm;
+ }
+ 
++static inline struct vkr_mtl_shm *
++vkr_host_shm_alloc(uint64_t size)
++{
++   (void)size;
++   return NULL;
++}
++
+ #endif /* __APPLE__ */
+ 
+ #endif /* VKR_METAL_HELPERS_H */
+diff --git a/src/venus/vkr_metal_helpers.m b/src/venus/vkr_metal_helpers.m
+index f0373ed..68a4717 100644
+--- a/src/venus/vkr_metal_helpers.m
++++ b/src/venus/vkr_metal_helpers.m
+@@ -82,6 +82,37 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
+    return shm;
+ }
+ 
++struct vkr_mtl_shm *
++vkr_host_shm_alloc(uint64_t size)
++{
++   const size_t page_size = getpagesize();
++   const size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
++
++   int shm_fd = os_create_anonymous_file(aligned_size, "vkr-host-mem");
++   if (shm_fd < 0)
++      return NULL;
++
++   void *shm_ptr =
++      mmap(NULL, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++   if (shm_ptr == MAP_FAILED) {
++      close(shm_fd);
++      return NULL;
++   }
++
++   struct vkr_mtl_shm *shm = calloc(1, sizeof(*shm));
++   if (!shm) {
++      munmap(shm_ptr, aligned_size);
++      close(shm_fd);
++      return NULL;
++   }
++
++   shm->shm_fd = shm_fd;
++   shm->shm_ptr = shm_ptr;
++   shm->shm_size = aligned_size;
++   shm->mtl_buffer = NULL;
++   return shm;
++}
++
+ void
+ vkr_mtl_shm_free(struct vkr_mtl_shm *shm)
+ {
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 65fdf4c..da85690 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -286,6 +286,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          physical_dev->EXT_external_memory_metal = true;
+       else if (!strcmp(props->extensionName, "VK_EXT_metal_objects"))
+          physical_dev->EXT_metal_objects = true;
++      else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
++         physical_dev->EXT_external_memory_host = true;
+       else if (!strcmp(props->extensionName, "VK_KHR_portability_subset"))
+          physical_dev->KHR_portability_subset = true;
+ 
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index 139b11a..226ffaa 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -30,6 +30,7 @@ struct vkr_physical_device {
+ 
+    bool EXT_external_memory_metal;
+    bool EXT_metal_objects;
++   bool EXT_external_memory_host;
+ 
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    VkPhysicalDeviceIDProperties id_properties;
+-- 
+2.54.0
+

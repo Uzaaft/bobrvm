@@ -14,6 +14,18 @@ trap 'rm -rf "$WORK"' EXIT
 (cd "$WORK" && ar -x "$REPO/zig-out/lib/libbobrvm.a" && chmod +r ./*.o &&
     libtool -static -o libbobrvm-repacked.a ./*.o 2>/dev/null)
 
+# Venus GPU backend: the -Dgpu-venus libbobrvm.a references virgl_renderer_*;
+# link the upstream virglrenderer dylib and sign with the entitlements that
+# allow loading ad-hoc-signed third-party GPU dylibs.
+VENUS_LINK=()
+ENTITLEMENTS="$REPO/cli.entitlements"
+if [ "${BOBRVM_GUI_VENUS:-0}" = "1" ]; then
+    VIRGL_PREFIX="${VIRGL_PREFIX:-$HOME/.local/opt/virgl-upstream}"
+    VENUS_LINK=(-L"$VIRGL_PREFIX/lib" -lvirglrenderer
+        -Xlinker -rpath -Xlinker "$VIRGL_PREFIX/lib")
+    ENTITLEMENTS="$REPO/cli-venus.entitlements"
+fi
+
 swiftc -O \
     -import-objc-header "$REPO/include/bobrvm.h" \
     "$REPO/macos/MinimalApp/main.swift" \
@@ -23,7 +35,8 @@ swiftc -O \
     -framework QuartzCore \
     -framework Hypervisor \
     -framework IOSurface \
+    "${VENUS_LINK[@]}" \
     -o "$OUT"
 
-codesign --sign - --entitlements "$REPO/cli.entitlements" --force "$OUT"
+codesign --sign - --entitlements "$ENTITLEMENTS" --force "$OUT"
 echo "built: $OUT"

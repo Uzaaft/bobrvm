@@ -198,8 +198,21 @@ pub fn build(b: *std.Build) void {
         if (b.graph.environ_map.get("PATH")) |path| {
             gui_build.setEnvironmentVariable("PATH", b.fmt("/usr/bin:/bin:{s}", .{path}));
         }
+        if (gpu_venus) {
+            // libbobrvm.a references virgl_renderer_*; build.sh links the
+            // upstream virglrenderer dylib + venus entitlements when set.
+            gui_build.setEnvironmentVariable("BOBRVM_GUI_VENUS", "1");
+            gui_build.setEnvironmentVariable("VIRGL_PREFIX", virgl_prefix);
+        }
 
         const gui_run = b.addSystemCommand(&.{"zig-out/bin/BobrvmDisplay"});
+        if (gpu_venus) {
+            // virglrenderer dlopens the Vulkan loader by name at runtime.
+            gui_run.setEnvironmentVariable(
+                "DYLD_LIBRARY_PATH",
+                b.fmt("{s}/lib:/opt/homebrew/opt/vulkan-loader/lib:/opt/homebrew/opt/spirv-tools/lib:/opt/homebrew/lib", .{virgl_prefix}),
+            );
+        }
         gui_run.step.dependOn(&gui_build.step);
         if (b.args) |args| {
             gui_run.addArgs(args);

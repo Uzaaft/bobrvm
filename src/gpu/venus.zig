@@ -296,6 +296,12 @@ fn configureEnv() void {
         _ = setenv("RENDER_SERVER_EXEC_PATH", p.ptr, 1);
     }
     if (getenv("VK_ICD_FILENAMES") == null) {
+        // KosmicKrisp: the only Vulkan-on-Metal driver with the zink
+        // requirements (robustness2 nullDescriptor — MoltenVK reports 0), i.e.
+        // the route to high guest GL. Its missing VK_EXT_metal_objects is
+        // covered by our virglrenderer host-pointer-import patch
+        // (tools/patches/virglrenderer-0001-vkr-host-pointer-shm-import.patch;
+        // probes: tools/host_vk_mem_probe.m, /tmp/hostptr_probe).
         const p = std.fmt.bufPrintZ(&buf, "{s}/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json", .{build_options.virgl_prefix}) catch return;
         _ = setenv("VK_ICD_FILENAMES", p.ptr, 1);
     }
