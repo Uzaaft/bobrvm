@@ -82,14 +82,29 @@ Two host-side blockers were root-caused with probe binaries
    KosmicKrisp imports the shm zero-copy (vkMapMemory returns the shm
    pointer itself). Upstream-worthy.
 
-**Version ceiling today: GL 2.1 (compat).** zink gates GL ≥ 3.0 on
-`VK_EXT_transform_feedback`, which no Vulkan-on-Metal driver implements yet.
-Mesa main has KosmicKrisp's TF *properties* staged but `kk_shader.c` still
-drops `xfb_info` — when LunarG lands the implementation, rebuild KosmicKrisp
-(`~/.claude` job script or tools/build-kosmickrisp.sh against Mesa main) and
-the reported GL version rises with no bobrvm changes. Also missing for zink
-niceties: `EXT_custom_border_color`, `EXT_provoking_vertex` (warnings only).
-Do NOT force-enable table bits — capability-faking breaks real apps.
+**Version achieved (2026-07-28, vendored fork): GL 4.6 Core + Compat,
+GLSL 4.60, OpenGL ES 3.2** — `VENUS-GLTEST: PASS (GL 4.6 >= 4.3)`. The four
+zink gates were implemented in the vendored KosmicKrisp fork
+(`third_party/patches/mesa/0001..0004`), each with real render/readback
+tests, no capability-faking:
+
+1. `VK_EXT_depth_clip_enable` (0001) — Metal single clip-or-clamp mapping.
+2. `geometryShader` (0002) — Mesa's `poly` compute-geometry library wired
+   into KK (honeykrisp pattern): 4-variant GS compile, sw-VS + GS compute
+   prepasses, heap indirect draws, adjacency. Proof: GS-amplified triangle,
+   4096/4096 pixels exact.
+3. `VK_EXT_transform_feedback` (0003) — passthrough-GS synthesis for
+   VS-only pipelines (the GL TF path), Bind/Begin/End + DrawIndirectByteCount
+   + TF queries. Proof: exact-float capture readback.
+4. RGB32 uniform texel buffers (0004) — NIR raw-load lowering (Metal lacks
+   96-bit formats). Proof: exact texelFetch values + OOB robustness.
+
+Drop these patches as LunarG lands equivalents upstream (their geometry
+pipeline is visibly in flight — see README MR list). Known gaps documented
+in the patch series: no XFB on tessellation pipelines, pipeline-statistics
+queries unsupported, multistream >0 untested, no storage texel
+buffers/atomics for RGB32. Correctness breadth beyond the targeted tests
+(CTS/piglit sweeps) is future work.
 
 `tests/integration/gl/gltest-venus.sh` gates on `VENUS_GLTEST_MIN`
 (default 4.3 = the goal; 2.1 = today's stack-works regression floor).

@@ -20,9 +20,9 @@ Working and verified against a NixOS 25.05 aarch64 guest:
 | virtio-gpu 2D → Metal |  fbcon renders in the app window |
 | virtio-input (keyboard/mouse) |  evdev in guest |
 | virtio-net + built-in NAT |  DHCP, DNS, TCP/UDP internet (no root) |
-| Vulkan 1.4 in guests (Venus → KosmicKrisp → Metal) |  guest enumerates the host GPU |
-| OpenGL via Zink over Venus |  GL 2.1 today; 4.3 gated on KosmicKrisp TF/GS (see below) |
-| OpenGL 4.3 (legacy virgl→Metal translator) | 🗄️ fallback path (GL 2.x honest) |
+| Vulkan 1.4 in guests (Venus → KosmicKrisp → Metal) | ✅ guest enumerates the host GPU |
+| **OpenGL 4.6 + ES 3.2 in guests** (Zink over Venus) | ✅ `VENUS-GLTEST: PASS` — needs the vendored KosmicKrisp fork (`third_party/`), which adds geometry shaders, transform feedback, depth-clip-enable, and RGB32 texel buffers on top of Mesa main |
+| OpenGL (legacy virgl→Metal translator) | 🗄️ fallback path (GL 2.x honest) |
 
 ### Upstream MRs of interest (GPU stack)
 

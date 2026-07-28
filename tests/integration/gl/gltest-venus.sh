@@ -28,6 +28,8 @@ MESA="${MESA:-/nix/store/hsskp45iwicbfd381zm2vwpxpglhhfky-mesa-26.1.5}"
 DEMOS="${DEMOS:-/nix/store/lgq51q6dqgjl2p4nq3lsgddrkhmhg9bf-mesa-demos-9.0.0}"
 VKLOADER="${VKLOADER:-/nix/store/2hhbx1hva0li3iacaya7p9mz091w77ri-vulkan-loader-1.4.350.0}"
 VKTOOLS="${VKTOOLS:-/nix/store/ch4h64rxgjqmis8hyk6yaz35fvhpc03i-vulkan-tools-1.4.350.0}"
+GLIBC="${GLIBC:-/nix/store/cj4jysawj8cc6yv2cwdgzxhdhq7dnf05-glibc-2.42-67}"
+GLVND="${GLVND:-/nix/store/fp8vln3ar6gskhjbzbj7mcigb5y1y6z1-libglvnd-1.7.0}"
 GL_SQUASHFS="${GL_SQUASHFS:-gl-mesa26.squashfs}"
 # 16KiB blob-align shim, baked into the squashfs (visible at /mnt/gl once
 # mounted). Required on Apple Silicon: see tools/venus_align_shim.c.
@@ -88,6 +90,15 @@ feed() {
   # failure reason is captured in the host log.
   printf 'echo EGLINFO_""START; %s VN_DEBUG=init VK_LOADER_DEBUG=error %s/bin/eglinfo 2>&1 | head -400; echo EGLINFO_""END\n' "$SHIM" "$DEMOS"
   wait_for "EGLINFO_END" 180 || return 1
+  # Real-rendering proof: 4.6 core context + geometry-shader-amplified
+  # triangle + glReadPixels, from a cross-compiled probe shipped in the
+  # squashfs. NixOS has no /lib/ld-linux, so invoke the nix-store glibc
+  # loader explicitly.
+  # The probe has the 16KiB align interposers compiled in (--export-dynamic)
+  # so it runs via the explicit nix-store loader with NO LD_PRELOAD.
+  printf 'echo GLPROBE_""START; LD_LIBRARY_PATH=%s/lib:%s/lib:%s/lib:%s/lib %s/lib/ld-linux-aarch64.so.1 /mnt/gl/shim/guest_gl_probe 2>&1; echo probe_""rc=$?; echo GLPROBE_""END\n' \
+    "$MESA" "$GLVND" "$VKLOADER" "$GLIBC" "$GLIBC"
+  wait_for "GLPROBE_END" 120 || return 1
 }
 
 feed | BOBRVM_EXIT_ON_EOF=1 "$BOBRVM" run \
