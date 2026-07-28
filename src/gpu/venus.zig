@@ -23,19 +23,16 @@ pub const RENDERER_VENUS: c_int = 1 << 6;
 pub const RENDERER_NO_VIRGL: c_int = 1 << 7;
 pub const RENDERER_RENDER_SERVER: c_int = 1 << 9;
 
-/// Init flags proven on macOS (see docs/gpu-venus-moltenvk.md):
+/// Init flags for macOS (see docs/gpu-venus-moltenvk.md):
 ///  - VENUS: enable the Vulkan transport.
 ///  - NO_VIRGL: skip the virgl-GL (vrend) winsys — it needs an EGL/ANGLE display
 ///    that doesn't init on macOS, and without it init fails "invalid vrend
 ///    callbacks".
-///  - (in-process) We run Venus in-process via our virglrenderer patch
-///    (src/venus_inproc.c) rather than RENDER_SERVER. The render-server model
-///    forks a worker per context, and Metal does not survive fork() — so the
-///    forked KosmicKrisp can't create a Metal device (0 GPUs → guest
-///    INITIALIZATION_FAILED). In-process keeps KosmicKrisp's Metal device in
-///    bobrvm's own process (works), drops the socket overhead, and is
-///    observable (its logs reach us).
-pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL;
+///  - RENDER_SERVER: upstream virglrenderer (>= the 2026 macOS support MRs)
+///    spawns per-context workers via posix_spawn() on macOS, not fork() —
+///    Metal survives that, so the forked-KosmicKrisp-sees-0-GPUs problem the
+///    old in-process patch (src/venus_inproc.c) worked around is gone.
+pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL | RENDERER_RENDER_SERVER;
 
 /// Point virglrenderer at the `virgl_render_server` binary. Must be called
 /// before init(); virglrenderer reads RENDER_SERVER_EXEC_PATH from the env when

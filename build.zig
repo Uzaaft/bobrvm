@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     // Needs the macOS-patched virglrenderer (tools/build-virglrenderer-macos.sh).
     const gpu_venus = b.option(bool, "gpu-venus", "Enable the Venus/KosmicKrisp GPU backend") orelse false;
     const home = b.graph.environ_map.get("HOME") orelse "/tmp";
-    const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-macos", .{home});
+    const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-upstream", .{home});
     const virgl_prefix = b.option([]const u8, "virgl-prefix", "virglrenderer(venus) install prefix") orelse default_virgl_prefix;
     const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
 
