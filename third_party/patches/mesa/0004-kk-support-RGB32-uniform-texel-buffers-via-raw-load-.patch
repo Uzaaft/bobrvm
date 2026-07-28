@@ -1,0 +1,283 @@
+From 3a47d6e3e3bcdac5c7991a8e5502b25ff0dd577e Mon Sep 17 00:00:00 2001
+From: Uzair Aftab <git@uzaaft.me>
+Date: Tue, 28 Jul 2026 22:35:16 +0200
+Subject: [PATCH 4/4] kk: support RGB32 uniform texel buffers via raw-load
+ lowering
+
+Metal has no 96-bit (3x32) pixel formats, so VK_FORMAT_R32G32B32_{SFLOAT,
+SINT,UINT} buffer views cannot be Metal texture_buffers. Carry the raw
+buffer address + element count in a widened texel-buffer descriptor
+(gpu id stays at offset 0 for the storage-image path) and lower txf/txs
+on buffer-dim textures to a branch: RGB32 views do three raw 32-bit
+loads (clamped address, zeroed result when out of bounds; alpha = 1),
+other views keep the real texture op in the else arm so it never
+executes against an absent Metal texture.
+
+Uniform (read) access only; storage texel buffers stay unsupported for
+these formats. Gates zink GL 4.0 (ARB_texture_buffer_object_rgb32).
+---
+ src/kosmickrisp/vulkan/kk_buffer_view.c       | 34 +++++++-
+ src/kosmickrisp/vulkan/kk_buffer_view.h       |  8 ++
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    | 15 +++-
+ .../vulkan/kk_descriptor_set_layout.c         |  3 +
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  | 17 ++++
+ .../vulkan/kk_nir_lower_descriptors.c         | 78 +++++++++++++++++++
+ 6 files changed, 150 insertions(+), 5 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index c67ac82ed1..ac48d1ddfb 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -20,6 +20,14 @@
+ 
+ #include "vk_format.h"
+ 
++bool
++kk_vk_format_is_rgb32(VkFormat format)
++{
++   return format == VK_FORMAT_R32G32B32_SFLOAT ||
++          format == VK_FORMAT_R32G32B32_SINT ||
++          format == VK_FORMAT_R32G32B32_UINT;
++}
++
+ VkFormatFeatureFlags2
+ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+                               VkFormat vk_format)
+@@ -30,6 +38,12 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+    if (p_format == PIPE_FORMAT_NONE)
+       return 0;
+ 
++   /* 96-bit RGB32 has no Metal pixel format; uniform texel buffer reads are
++    * emulated with raw loads (see kk_nir_lower_descriptors.c). Read-only.
++    */
++   if (kk_vk_format_is_rgb32(vk_format))
++      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
++
+    const struct kk_va_format *format = kk_get_va_format(p_format);
+    if (format) {
+       if (format->texel_buffer.read)
+@@ -64,6 +78,23 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    enum pipe_format p_format = vk_format_to_pipe_format(view->vk.format);
++
++   /* RGB32: no Metal pixel format. Record the raw address range; texel
++    * fetches lower to raw loads and no Metal texture is created.
++    */
++   if (kk_vk_format_is_rgb32(view->vk.format)) {
++      struct kk_buffer *buffer =
++         container_of(view->vk.buffer, struct kk_buffer, vk);
++      view->is_rgb32 = true;
++      view->base_addr = buffer->vk.device_address + view->vk.offset;
++      view->element_count = view->vk.elements;
++      view->mtl_texel_buffer_handle = NULL;
++      view->texel_buffer_gpu_id = 0;
++
++      *pBufferView = kk_buffer_view_to_handle(view);
++      return VK_SUCCESS;
++   }
++
+    const struct kk_va_format *supported_format = kk_get_va_format(p_format);
+ 
+    /* If we reached here, we support reading at least */
+@@ -123,6 +154,7 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
+    if (!view)
+       return;
+ 
+-   mtl_release(view->mtl_texel_buffer_handle);
++   if (view->mtl_texel_buffer_handle)
++      mtl_release(view->mtl_texel_buffer_handle);
+    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.h b/src/kosmickrisp/vulkan/kk_buffer_view.h
+index 8525e50b76..0f6e590136 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.h
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.h
+@@ -23,8 +23,16 @@ struct kk_buffer_view {
+    struct vk_buffer_view vk;
+    mtl_texture *mtl_texel_buffer_handle;
+    uint64_t texel_buffer_gpu_id;
++   /* RGB32 (R32G32B32_*) views: no Metal pixel format exists, so texel
++    * fetches lower to raw loads from the buffer address instead.
++    */
++   uint64_t base_addr;
++   uint32_t element_count;
++   bool is_rgb32;
+ };
+ 
++bool kk_vk_format_is_rgb32(VkFormat format);
++
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,
+                                VK_OBJECT_TYPE_BUFFER_VIEW)
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 570d4eeb85..83269217e4 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -205,14 +205,21 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+                        const VkBufferView bufferView, uint32_t binding,
+                        uint32_t elem)
+ {
+-   struct kk_storage_image_descriptor desc = {};
++   struct kk_texel_buffer_descriptor desc = {};
+    if (bufferView != VK_NULL_HANDLE) {
+       VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
+ 
+-      assert(view->mtl_texel_buffer_handle);
+-      assert(view->texel_buffer_gpu_id);
++      if (view->is_rgb32) {
++         /* Raw-load emulation: no Metal texture (see kk_buffer_view.c). */
++         desc.base_addr = view->base_addr;
++         desc.element_count = view->element_count;
++         desc.is_rgb32 = 1;
++      } else {
++         assert(view->mtl_texel_buffer_handle);
++         assert(view->texel_buffer_gpu_id);
+ 
+-      desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
++         desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
++      }
+    }
+    write_desc(set, binding, elem, &desc, sizeof(desc));
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+index 6e6db1a949..828830d07b 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+@@ -44,6 +44,9 @@ kk_descriptor_stride_align_for_type(
+ 
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++      *stride = *alignment = sizeof(struct kk_texel_buffer_descriptor);
++      break;
++
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+       *stride = *alignment = sizeof(struct kk_storage_image_descriptor);
+       break;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 5296366c8c..a1c562835b 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -32,6 +32,23 @@ struct kk_storage_image_descriptor {
+ static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+               "kk_storage_image_descriptor has no holes");
+ 
++/* Texel buffer views (uniform + storage). image_gpu_resource_id stays at
++ * offset 0 so the storage-image intrinsic path can read either layout.
++ * RGB32 (R32G32B32_*) views have no Metal pixel format; they carry the raw
++ * buffer address instead and texel fetches lower to raw loads
++ * (is_rgb32 != 0, image_gpu_resource_id == 0).
++ */
++struct kk_texel_buffer_descriptor {
++   uint64_t image_gpu_resource_id;
++   uint64_t base_addr;
++   uint32_t element_count;
++   uint32_t is_rgb32;
++   uint64_t pad_to_power_2;
++};
++
++static_assert(sizeof(struct kk_texel_buffer_descriptor) == 32,
++              "kk_texel_buffer_descriptor has no holes");
++
+ /* This has to match nir_address_format_64bit_bounded_global */
+ struct kk_buffer_address {
+    uint64_t base_addr;
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 47c41ccc2c..2a8f255d57 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -466,6 +466,77 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+    }
+ }
+ 
++/* Texel buffers whose format has no Metal equivalent (96-bit RGB32) carry a
++ * raw buffer address in the descriptor instead of a texture handle
++ * (kk_texel_buffer_descriptor.is_rgb32). Lower txf to three raw 32-bit loads
++ * and txs to the element count, keeping the real texture op in the other arm
++ * of a branch so it never executes against the absent Metal texture.
++ */
++static bool
++lower_buf_tex(nir_builder *b, nir_tex_instr *tex, nir_def *texture,
++              const struct lower_descriptors_ctx *ctx)
++{
++   nir_deref_instr *deref = nir_src_as_deref(nir_src_for_ssa(texture));
++
++   nir_def *is_rgb32 = nir_ine_imm(
++      b,
++      load_resource_deref_desc(
++         b, 1, 32, deref,
++         offsetof(struct kk_texel_buffer_descriptor, is_rgb32), ctx),
++      0);
++   nir_def *count = load_resource_deref_desc(
++      b, 1, 32, deref,
++      offsetof(struct kk_texel_buffer_descriptor, element_count), ctx);
++   nir_def *base = load_resource_deref_desc(
++      b, 1, 64, deref,
++      offsetof(struct kk_texel_buffer_descriptor, base_addr), ctx);
++   nir_def *resource_addr = load_resource_addr(
++      b, 1, 64, deref,
++      offsetof(struct kk_texel_buffer_descriptor, image_gpu_resource_id), ctx);
++
++   nir_def *rgb32_res;
++   nir_if *nif = nir_push_if(b, is_rgb32);
++   if (tex->op == nir_texop_txs) {
++      rgb32_res = count;
++   } else {
++      const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++      assert(coord_idx >= 0);
++      nir_def *idx = nir_channel(b, tex->src[coord_idx].src.ssa, 0);
++
++      /* Robustness: clamp the load address, zero the result when OOB. */
++      nir_def *last = nir_iadd_imm(b, nir_umax_imm(b, count, 1), -1);
++      nir_def *safe_idx = nir_umin(b, idx, last);
++      nir_def *addr =
++         nir_iadd(b, base, nir_u2u64(b, nir_imul_imm(b, safe_idx, 12)));
++      nir_def *rgb = nir_load_global(b, 3, 32, addr);
++
++      const bool is_float =
++         nir_alu_type_get_base_type(tex->dest_type) == nir_type_float;
++      nir_def *one =
++         is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
++      nir_def *texel =
++         nir_vec4(b, nir_channel(b, rgb, 0), nir_channel(b, rgb, 1),
++                  nir_channel(b, rgb, 2), one);
++      nir_def *zero = nir_imm_zero(b, 4, 32);
++      rgb32_res = nir_bcsel(b, nir_ult(b, idx, count), texel, zero);
++   }
++   nir_push_else(b, nif);
++   {
++      nir_def *handle = nir_load_texture_handle_kk(
++         b, 1, 64, resource_addr, .dest_type = tex->dest_type,
++         .image_dim = tex->sampler_dim, .image_array = tex->is_array);
++      nir_instr_move(b->cursor, &tex->instr);
++      b->cursor = nir_after_instr(&tex->instr);
++      nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
++   }
++   nir_pop_if(b, nif);
++
++   nir_def *res = nir_if_phi(b, rgb32_res, &tex->def);
++   nir_def_rewrite_uses_after(&tex->def, res);
++
++   return true;
++}
++
+ static bool
+ lower_tex(nir_builder *b, nir_tex_instr *tex,
+           const struct lower_descriptors_ctx *ctx)
+@@ -485,6 +556,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+    const uint64_t plane_offset_B =
+       plane * sizeof(struct kk_sampled_image_descriptor);
+ 
++   /* Texel buffers use kk_texel_buffer_descriptor; RGB32 views lower to raw
++    * loads because Metal has no 96-bit pixel formats.
++    */
++   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF &&
++       (tex->op == nir_texop_txf || tex->op == nir_texop_txs))
++      return lower_buf_tex(b, tex, texture, ctx);
++
+    /* LOD bias is passed in the descriptor set, rather than embedded into
+     * the sampler descriptor. There's no spot in the hardware descriptor,
+     * plus this saves on precious sampler heap spots.
+-- 
+2.54.0
+

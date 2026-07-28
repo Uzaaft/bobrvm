@@ -42,6 +42,15 @@ export DYLD_LIBRARY_PATH="$VIRGL_PREFIX/lib:/opt/homebrew/opt/vulkan-loader/lib:
 # Debug env inherited by the forked virgl_render_server (host venus renderer).
 export ${VENUS_DEBUG_ENV:-VKR_DEBUG=result VN_DEBUG=init MESA_DEBUG=1}
 
+# Footgun guard: a plain `zig build` installs a venus-OFF binary over
+# zig-out/bin/bobrvm and this test then fails mysteriously (guest sees only
+# legacy virgl). Refuse to run a binary without the venus backend.
+if ! otool -L "$BOBRVM" 2>/dev/null | grep -q libvirglrenderer; then
+  echo "FATAL: $BOBRVM was not built with -Dgpu-venus (no virglrenderer link)." >&2
+  echo "Run: zig build -Dgpu-venus" >&2
+  exit 2
+fi
+
 : > "$LOG"
 
 wait_for() {
