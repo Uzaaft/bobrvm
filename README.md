@@ -13,15 +13,44 @@ Working and verified against a NixOS 25.05 aarch64 guest:
 
 | Area | State |
 |------|-------|
-| Boot (Apple Hypervisor.framework, arm64) | ✅ NixOS to login, ~15s (1 vCPU) |
-| Serial console (virtio-console + PL011) | ✅ interactive shell |
-| SMP (PSCI CPU_ON) | ✅ 4 vCPUs online |
-| virtio-blk | ✅ read/write, durable across restarts |
-| virtio-gpu 2D → Metal | ✅ fbcon renders in the app window |
-| virtio-input (keyboard/mouse) | ✅ evdev in guest |
-| virtio-net + built-in NAT | ✅ DHCP, DNS, TCP/UDP internet (no root) |
-| OpenGL 4.3 (virgl) | ⚠️ capset advertised (glsl 430); Metal execution WIP |
-| Vulkan (Venus) | ⏳ planned |
+| Boot (Apple Hypervisor.framework, arm64) |  NixOS to login, ~15s (1 vCPU) |
+| Serial console (virtio-console + PL011) |  interactive shell |
+| SMP (PSCI CPU_ON) |  4 vCPUs online |
+| virtio-blk |  read/write, durable across restarts |
+| virtio-gpu 2D → Metal |  fbcon renders in the app window |
+| virtio-input (keyboard/mouse) |  evdev in guest |
+| virtio-net + built-in NAT |  DHCP, DNS, TCP/UDP internet (no root) |
+| Vulkan 1.4 in guests (Venus → KosmicKrisp → Metal) |  guest enumerates the host GPU |
+| OpenGL via Zink over Venus |  GL 2.1 today; 4.3 gated on KosmicKrisp TF/GS (see below) |
+| OpenGL 4.3 (legacy virgl→Metal translator) | 🗄️ fallback path (GL 2.x honest) |
+
+### Upstream MRs of interest (GPU stack)
+
+The guest GL/Vulkan stack is `zink → venus → bobrvm virtio-gpu → virglrenderer
+→ KosmicKrisp → Metal`. What we track/carry:
+
+- **virglrenderer macOS support** (merged upstream 2026): build
+  ([!1600](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1600)),
+  posix_spawn render workers
+  ([!1601](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1601)),
+  Metal shared memory / `KHR_external_memory_fd` emulation toward the guest
+  ([!1602](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1602)),
+  Metal device export at instance creation
+  ([!1635](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1635)).
+- **Our virglrenderer patch (to upstream):** host-pointer shm import via
+  `VK_EXT_external_memory_host` for drivers without `VK_EXT_metal_objects`
+  (i.e. KosmicKrisp) — `third_party/patches/virglrenderer/`.
+- **KosmicKrisp geometry pipeline (Mesa, in flight at LunarG)** — gates zink
+  GL ≥ 3.0/3.2 and therefore 4.3:
+  poly geometry-unroll sharing
+  ([mesa!41568](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/41568), merged 2026-05),
+  hardware-stage vertex lowerings
+  ([mesa!42020](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42020), merged 2026-06),
+  adjacency-topology CTS workaround
+  ([mesa!43091](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43091), 2026-07);
+  `VK_EXT_transform_feedback` properties are staged in `kk_physical_device.c`
+  on Mesa main. Until TF + `geometryShader` land, our vendored fork
+  (`third_party/`) carries the gap — see `docs/gpu-direction-decision.md`.
 
 ## Requirements
 
