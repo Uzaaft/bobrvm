@@ -30,6 +30,7 @@ VKLOADER="${VKLOADER:-/nix/store/2hhbx1hva0li3iacaya7p9mz091w77ri-vulkan-loader-
 VKTOOLS="${VKTOOLS:-/nix/store/ch4h64rxgjqmis8hyk6yaz35fvhpc03i-vulkan-tools-1.4.350.0}"
 GLIBC="${GLIBC:-/nix/store/cj4jysawj8cc6yv2cwdgzxhdhq7dnf05-glibc-2.42-67}"
 GLVND="${GLVND:-/nix/store/fp8vln3ar6gskhjbzbj7mcigb5y1y6z1-libglvnd-1.7.0}"
+GLMARK2="${GLMARK2:-/nix/store/0bz8jd97ppqkymqrb9qkmnr1j235r6lk-glmark2-2023.01}"
 GL_SQUASHFS="${GL_SQUASHFS:-gl-mesa26.squashfs}"
 # 16KiB blob-align shim, baked into the squashfs (visible at /mnt/gl once
 # mounted). Required on Apple Silicon: see tools/venus_align_shim.c.
@@ -99,6 +100,14 @@ feed() {
   printf 'echo GLPROBE_""START; LD_LIBRARY_PATH=%s/lib:%s/lib:%s/lib:%s/lib %s/lib/ld-linux-aarch64.so.1 /mnt/gl/shim/guest_gl_probe 2>&1; echo probe_""rc=$?; echo GLPROBE_""END\n' \
     "$MESA" "$GLVND" "$VKLOADER" "$GLIBC" "$GLIBC"
   wait_for "GLPROBE_END" 120 || return 1
+  # Real-app breadth + first perf numbers: glmark2 on a GBM surface via the
+  # render node (fully headless), desktop GL over zink/venus. Score line:
+  # "glmark2 Score: N". GLMARK_ARGS can narrow the scene list.
+  if [ "${GLMARK:-1}" = 1 ]; then
+    printf 'echo GLMARK_""START; %s timeout 480 %s/bin/glmark2-gbm --data-path %s/share/glmark2 %s 2>&1 | tail -60; echo GLMARK_""END\n' \
+      "$SHIM" "$GLMARK2" "$GLMARK2" "${GLMARK_ARGS:-}"
+    wait_for "GLMARK_END" 540 || return 1
+  fi
 }
 
 feed | BOBRVM_EXIT_ON_EOF=1 "$BOBRVM" run \
