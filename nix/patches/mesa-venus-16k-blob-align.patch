@@ -1,0 +1,39 @@
+Align venus virtgpu blob sizes to 16KiB for Apple Silicon hosts.
+
+macOS hosts map host-visible blobs into the guest address window with
+hv_vm_map(), which works on 16KiB (Apple page size) granularity. The guest
+drm_mm packs blobs at their size alignment, so 4KiB-aligned sizes land
+blobs at offsets the host cannot map and venus fails with
+VK_ERROR_OUT_OF_HOST_MEMORY. Rounding the size up before creation makes
+every blob offset 16KiB-aligned (same approach as UTM's guest Mesa
+packages); the mmap length uses the same rounded size, keeping the guest
+kernel's vm_size == vram_node.size check happy.
+
+Equivalent to the runtime LD_PRELOAD shim in bobrvm's
+tools/venus_align_shim.c, done properly at the source level.
+
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c	2026-07-30 12:17:21
++++ src/virtio/vulkan/vn_renderer_virtgpu.c	2026-07-30 12:17:21
+@@ -1313,6 +1313,12 @@
+    VkExternalMemoryHandleTypeFlags external_handles,
+    struct vn_renderer_bo **out_bo)
+ {
++   /* Apple Silicon hosts (bobrvm/UTM) map host-visible blobs with 16KiB
++    * granularity; round sizes up so drm_mm places every blob at a
++    * host-mappable offset. Harmless over-allocation elsewhere.
++    */
++   size = align64(size, 16384);
++
+    struct virtgpu *gpu = (struct virtgpu *)renderer;
+    const uint32_t blob_flags =
+       virtgpu_bo_blob_flags(gpu, flags, external_handles);
+@@ -1392,6 +1398,9 @@
+ static struct vn_renderer_shmem *
+ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+ {
++   /* See virtgpu_bo_create_from_device_memory: 16KiB host pages. */
++   size = align64(size, 16384);
++
+    struct virtgpu *gpu = (struct virtgpu *)renderer;
+ 
+    struct vn_renderer_shmem *cached_shmem =

@@ -21,7 +21,7 @@ Working and verified against a NixOS 25.05 aarch64 guest:
 | virtio-input (keyboard/mouse) |  evdev in guest |
 | virtio-net + built-in NAT |  DHCP, DNS, TCP/UDP internet (no root) |
 | Vulkan 1.4 in guests (Venus → KosmicKrisp → Metal) | ✅ guest enumerates the host GPU |
-| **OpenGL 4.6 + ES 3.2 in guests** (Zink over Venus) | ✅ `VENUS-GLTEST: PASS` — needs the vendored KosmicKrisp fork (`third_party/`), which adds geometry shaders, transform feedback, depth-clip-enable, and RGB32 texel buffers on top of Mesa main |
+| **OpenGL 4.6 + ES 3.2 in guests** (Zink over Venus) | ✅ `VENUS-GLTEST: PASS`; in-guest GS render probe pixel-verified; **glmark2 full suite passes, Score 1221** (~1500–1600 FPS on most scenes, M3 Max). Needs the vendored KosmicKrisp fork (`third_party/`): geometry shaders, transform feedback, depth-clip-enable, RGB32 texel buffers, split memory types |
 | OpenGL (legacy virgl→Metal translator) | 🗄️ fallback path (GL 2.x honest) |
 
 ### Upstream MRs of interest (GPU stack)
@@ -51,6 +51,37 @@ The guest GL/Vulkan stack is `zink → venus → bobrvm virtio-gpu → virglrend
   `VK_EXT_transform_feedback` properties are staged in `kk_physical_device.c`
   on Mesa main. Until TF + `geometryShader` land, our vendored fork
   (`third_party/`) carries the gap — see `docs/gpu-direction-decision.md`.
+
+### Guest setup (NixOS module)
+
+The flake exports a guest-side NixOS module that sets up everything a
+bobrvm guest needs for OpenGL 4.6 / Vulkan 1.4: a Mesa overlay with the
+16KiB venus blob-alignment patch (`nix/patches/`), graphics enablement,
+zink as the default GL driver, and verification tools
+(eglinfo/vulkaninfo/glmark2).
+
+```nix
+# in your aarch64-linux NixOS configuration
+{
+  imports = [ bobrvm.nixosModules.guest ];   # or nix/guest-module.nix by path
+  virtualisation.bobrvm.guest.enable = true;
+}
+```
+
+The overlaid Mesa must be *built* for aarch64-linux — a macOS host can't do
+that alone. Two ways:
+
+- **Inside the guest** (zero host setup): boot your existing NixOS guest in
+  bobrvm with `--net`, add the module, `nixos-rebuild switch`. The VM
+  builds Mesa itself (~30–60 min at 4 vCPUs, once).
+- **Linux builder on the Mac**: nix-darwin's `nix.linux-builder.enable`, or
+  any remote aarch64-linux builder; then build a full disk image with
+  nixos-generators and boot it with `bobrvm run --disk`.
+
+Host side: `third_party/sync.sh && third_party/build.sh` (vendored
+virglrenderer + KosmicKrisp), then `zig build -Dgpu-venus`. Verify in the
+guest with `vulkaninfo --summary` (expect "Virtio-GPU Venus (Apple M3
+Max)") and `eglinfo` (expect `OpenGL core profile version: 4.6`).
 
 ## Requirements
 

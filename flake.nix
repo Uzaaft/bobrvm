@@ -135,5 +135,15 @@
             pkgs.alejandra
           ];
       };
-    });
+    })
+    // {
+      # Guest-side NixOS module: OpenGL 4.6 / Vulkan 1.4 over Venus
+      # (16KiB-aligned Mesa overlay + zink default + verification tools).
+      # Import into an aarch64-linux NixOS config and set
+      # `virtualisation.bobrvm.guest.enable = true;`.
+      nixosModules = {
+        guest = import ./nix/guest-module.nix;
+        default = import ./nix/guest-module.nix;
+      };
+    };
 }
