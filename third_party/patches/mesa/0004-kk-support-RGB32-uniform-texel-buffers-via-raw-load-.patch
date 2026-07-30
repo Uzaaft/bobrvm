@@ -1,7 +1,7 @@
 From 3a47d6e3e3bcdac5c7991a8e5502b25ff0dd577e Mon Sep 17 00:00:00 2001
 From: Uzair Aftab <git@uzaaft.me>
 Date: Tue, 28 Jul 2026 22:35:16 +0200
-Subject: [PATCH 4/4] kk: support RGB32 uniform texel buffers via raw-load
+Subject: [PATCH 4/5] kk: support RGB32 uniform texel buffers via raw-load
  lowering
 
 Metal has no 96-bit (3x32) pixel formats, so VK_FORMAT_R32G32B32_{SFLOAT,

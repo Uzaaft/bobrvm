@@ -1,7 +1,7 @@
 From 644a84e4ec611236a8056172ae10fcf45f57b1cf Mon Sep 17 00:00:00 2001
 From: Uzair Aftab <git@uzaaft.me>
 Date: Tue, 28 Jul 2026 21:41:16 +0200
-Subject: [PATCH 2/4] kk: wire poly geometry shader emulation (geometryShader
+Subject: [PATCH 2/5] kk: wire poly geometry shader emulation (geometryShader
  feature)
 
 Port honeykrisp's poly-based GS wiring: poly_nir_lower_gs produces the

@@ -21,7 +21,9 @@
  * symbol resolution for the dlopened Mesa stack, so no LD_PRELOAD is needed
  * (preloading the shim under an explicit-ld.so invocation dies pre-main).
  */
+#ifndef __APPLE__
 #include "../../../tools/venus_align_shim.c"
+#endif
 
 typedef int EGLint;
 typedef unsigned EGLBoolean;
@@ -133,11 +135,18 @@ int main(void)
     * progress still leaves the step log visible. */
    setvbuf(stdout, NULL, _IONBF, 0);
    printf("GLPROBE: start\n");
+#ifdef __APPLE__
+   /* Host-side repro against the build-zink Mesa: everything resolves via
+    * eglGetProcAddress (no desktop-GL dispatch dylib on macOS). */
+   egl = dlopen("libEGL.1.dylib", RTLD_NOW);
+   gl = egl;
+#else
    egl = dlopen("libEGL.so.1", RTLD_NOW);
    /* Desktop GL entrypoints: glvnd's libOpenGL, else legacy libGL. */
    gl = dlopen("libOpenGL.so.0", RTLD_NOW);
    if (!gl)
       gl = dlopen("libGL.so.1", RTLD_NOW);
+#endif
    if (!egl || !gl) {
       printf("GLPROBE: dlopen failed egl=%p gl=%p (%s)\n", egl, gl, dlerror());
       return 1;

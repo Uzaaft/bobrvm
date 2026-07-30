@@ -1,7 +1,7 @@
 From 66b855ff85c99bc92261c1d4a239f31a8862bcc9 Mon Sep 17 00:00:00 2001
 From: Uzair Aftab <git@uzaaft.me>
 Date: Tue, 28 Jul 2026 22:16:35 +0200
-Subject: [PATCH 3/4] kk: implement VK_EXT_transform_feedback
+Subject: [PATCH 3/5] kk: implement VK_EXT_transform_feedback
 
 XFB rides the poly geometry-shader emulation:
 

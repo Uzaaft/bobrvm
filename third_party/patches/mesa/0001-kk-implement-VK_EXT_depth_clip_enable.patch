@@ -1,7 +1,7 @@
 From 560392e4d08d2ddbe974d864db9afd1c052721b2 Mon Sep 17 00:00:00 2001
 From: Uzair Aftab <git@uzaaft.me>
 Date: Tue, 28 Jul 2026 21:15:48 +0200
-Subject: [PATCH 1/4] kk: implement VK_EXT_depth_clip_enable
+Subject: [PATCH 1/5] kk: implement VK_EXT_depth_clip_enable
 
 Metal has a single clip-or-clamp switch (MTLDepthClipMode), so clamp
 whenever depth clamping is enabled or clipping is disabled; the

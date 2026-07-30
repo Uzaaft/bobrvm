@@ -1,0 +1,168 @@
+From 4c9d7814cafc5565138d731cc339db020186790b Mon Sep 17 00:00:00 2001
+From: Uzair Aftab <git@uzaaft.me>
+Date: Thu, 30 Jul 2026 08:33:25 +0200
+Subject: [PATCH 5/5] kk: split memory types: device-local-only + host-visible
+ (fix vkr render-target imports)
+
+virglrenderer's venus renderer (vkr) force-imports every host-visible
+allocation as external memory; host-pointer imports are MTLBuffer-backed
+(no MTLHeap), and non-linear textures placed on buffers abort the AGX
+compiler inside mtl_new_render_command_encoder (BackgroundObjectProgram
+compile SIGABRT in the render worker).
+
+Three changes:
+- Expose two memory types on the unified heap, device-local-only first,
+  so mappable allocations pick the host-visible type and image
+  allocations have a never-imported type to land on.
+- Restrict optimal-tiling images to non-host-visible memory types. The
+  old VK_IMAGE_USAGE_HOST_TRANSFER_BIT host-visible-only filter forced
+  render targets onto imported memory under vkr (zink sets HOST_TRANSFER
+  on everything when VK_EXT_host_image_copy is exposed); host image copy
+  works through the MTLTexture API regardless of memory type, so the
+  filter is unnecessary.
+- Restrict GetMemoryHostPointerPropertiesEXT memoryTypeBits to
+  host-visible types.
+
+Also adds an env-gated (KK_DUMP_RENDERPASS) render-pass dump used to
+diagnose this: the crashing venus pass differed from a passing direct
+one only in heap_backed=0 on the color attachment.
+---
+ src/kosmickrisp/vulkan/kk_cmd_draw.c        | 32 +++++++++++++++++++++
+ src/kosmickrisp/vulkan/kk_device_memory.c   | 13 +++++++--
+ src/kosmickrisp/vulkan/kk_image.c           | 23 +++++++++++----
+ src/kosmickrisp/vulkan/kk_physical_device.c | 14 +++++++++
+ 4 files changed, 75 insertions(+), 7 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index e0a989bfcf..8bf59a169d 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -411,6 +411,38 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    /* Rendering with no attachments requires pushing the start of the render
+     * pass to first pipeline binding to know sample count. */
+    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
++
++   if (getenv("KK_DUMP_RENDERPASS")) {
++      fprintf(stderr,
++              "KKRP: colors=%u area=%ux%u+%d+%d layers=%u(l%u) view=0x%x "
++              "samples=%u whole=%d nofb=%d depth=%d stencil=%d\n",
++              render->color_att_count, render->area.extent.width,
++              render->area.extent.height, render->area.offset.x,
++              render->area.offset.y, layer_count, render->layer_count,
++              render->view_mask, render->samples, is_whole_framebuffer,
++              no_framebuffer, render->depth_att.iview != NULL,
++              render->stencil_att.iview != NULL);
++      for (uint32_t i = 0; i < render->color_att_count; i++) {
++         const struct kk_image_view *iview = render->color_att[i].iview;
++         if (!iview) {
++            fprintf(stderr, "KKRP: color[%u] NULL iview\n", i);
++            continue;
++         }
++         const struct kk_image *image =
++            container_of(iview->vk.image, struct kk_image, vk);
++         fprintf(stderr,
++                 "KKRP: color[%u] fmt=%u samples=%u extent=%ux%u layers=%u "
++                 "levels=%u usage=0x%llx linear=%d heap_backed=%d\n",
++                 i, iview->vk.format, image->vk.samples,
++                 image->vk.extent.width, image->vk.extent.height,
++                 image->vk.array_layers, image->vk.mip_levels,
++                 (unsigned long long)image->vk.usage,
++                 image->planes[0].layout.linear,
++                 image->planes[0].mem && image->planes[0].mem->bo &&
++                    image->planes[0].mem->bo->mtl_handle != NULL);
++      }
++   }
++
+    if (!no_framebuffer)
+       cs_start_render(cmd);
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index 0e11cc2479..f742893b7b 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -79,8 +79,17 @@ kk_GetMemoryHostPointerPropertiesEXT(
+    default:
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+-   pMemoryHostPointerProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
++   /* Host-pointer imports are MTLBuffer-backed (no MTLHeap) and only usable
++    * for buffers/linear layouts; restrict them to the host-visible type so
++    * device-local-only (image/render-target) allocations never import.
++    */
++   uint32_t host_visible_types = 0;
++   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
++      if (pdev->mem_types[i].propertyFlags &
++          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++         host_visible_types |= BITFIELD_BIT(i);
++   }
++   pMemoryHostPointerProperties->memoryTypeBits = host_visible_types;
+ 
+    return VK_SUCCESS;
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index be22420730..06ea619f19 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -669,15 +669,28 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+    uint32_t memory_types = (1 << pdev->mem_type_count) - 1;
+ 
+-   /* Remove non host visible heaps from the types for host image copy in case
+-    * of potential issues. This should be removed when we get ReBAR.
++   /* Non-linear images need MTLHeap placement: memory imported via
++    * VK_EXT_external_memory_host is MTLBuffer-backed (no heap — see
++    * kk_AllocateMemory), and buffer-placed color attachments abort the AGX
++    * compiler at render-encoder creation. Restrict optimal-tiling images to
++    * the device-local-only (never-imported) types. Host image copy is
++    * unaffected: it copies through the MTLTexture API
++    * (mtl_texture_memory_copy), which works regardless of the backing
++    * memory type, so the old host-visible-only filter for
++    * VK_IMAGE_USAGE_HOST_TRANSFER_BIT is not needed.
+     */
+-   if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
++   bool all_planes_linear = true;
++   for (unsigned plane = 0; plane < image->plane_count; plane++)
++      all_planes_linear &= image->planes[plane].layout.linear;
++   if (!all_planes_linear) {
+       for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+-         if (!(pdev->mem_types[i].propertyFlags &
+-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++         if (pdev->mem_types[i].propertyFlags &
++             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+             memory_types &= ~BITFIELD_BIT(i);
+       }
++      /* Never return an empty mask (single-unified-type builds). */
++      if (!memory_types)
++         memory_types = (1 << pdev->mem_type_count) - 1;
+    }
+ 
+    // TODO hope for the best?
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 079409af8f..d034455cb8 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1134,6 +1134,20 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+       .used = kk_get_sysmem_heap_used,
+    };
+ 
++   /* Two types on the one unified heap, device-local-only FIRST.
++    *
++    * A renderer driving us through virglrenderer's venus (vkr) force-imports
++    * every host-visible allocation as external memory; host-pointer imports
++    * are MTLBuffer-backed (no MTLHeap), and buffer-placement color
++    * attachments abort the AGX compiler inside
++    * mtl_new_render_command_encoder. Keeping a non-host-visible type first
++    * steers image/render-target allocations to heap-backed memory while
++    * buffers/staging pick the host-visible type and stay guest-mappable.
++    */
++   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
+    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+-- 
+2.54.0
+
