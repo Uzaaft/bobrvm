@@ -28,6 +28,12 @@ fn nowSeconds() i64 {
     return @intCast(@divTrunc(ns, std.time.ns_per_s));
 }
 
+/// Monotonic-ish nanoseconds for retransmit-timer bookkeeping. Only used
+/// for relative deadline comparisons within a single flow.
+fn nowNanos() i64 {
+    return @intCast(std.Io.Clock.real.now(global.io()).nanoseconds);
+}
+
 pub const GUEST_IP = [4]u8{ 10, 0, 2, 15 };
 pub const GATEWAY_IP = [4]u8{ 10, 0, 2, 2 };
 pub const DNS_IP = [4]u8{ 1, 1, 1, 1 };
@@ -98,15 +104,55 @@ const Listener = struct {
     host_port: u16,
 };
 
+/// Max host→guest bytes buffered unacked per flow — caps the sliding send
+/// window. The guest can't advertise more than 65535 anyway (our SYN-ACK
+/// carries no options, so no window scaling is negotiated).
+const SND_BUF_MAX: usize = 65535;
+/// Guest window assumed before its first ACK arrives (its true window never
+/// exceeds this without scaling, so we can never overshoot).
+const DEFAULT_SND_WND: u32 = 65535;
+/// Initial host→guest retransmit timeout and its exponential-backoff ceiling.
+const INITIAL_RTO_NS: i64 = 250 * std.time.ns_per_ms;
+const MAX_RTO_NS: i64 = 4 * std.time.ns_per_s;
+
 /// A forwarded TCP connection (guest ↔ host socket).
 const TcpFlow = struct {
     socket: std.posix.socket_t,
     state: TcpState,
-    /// Our (gateway-side) sequence number = bytes we've sent to the guest.
+    /// Our (gateway-side) next sequence to send to the guest.
     snd_nxt: u32,
+    /// Oldest unacknowledged byte we've sent to the guest. Bytes in
+    /// [snd_una, snd_nxt) live in snd_buf awaiting the guest's ACK; this
+    /// is what makes host→guest delivery reliable (retransmittable).
+    snd_una: u32 = 0,
+    /// Guest's advertised receive window (bytes). We never let the amount
+    /// in flight exceed this — ignoring it is what silently overran the
+    /// guest and stalled bulk downloads. No window scaling is negotiated
+    /// (our SYN-ACK carries no options) so this is a plain 16-bit value.
+    snd_wnd: u32 = DEFAULT_SND_WND,
+    /// Unacked host→guest payload = the bytes [snd_una, snd_nxt). Kept so
+    /// a lost segment can be retransmitted (the source bytes are already
+    /// gone from the host socket by the time we send them).
+    snd_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Absolute nanosecond deadline for retransmitting the oldest unacked
+    /// segment; 0 = no data outstanding / timer disarmed.
+    rt_deadline_ns: i64 = 0,
+    /// Current retransmit timeout (ns), doubled on each timeout, reset on
+    /// forward progress.
+    rto_ns: i64 = INITIAL_RTO_NS,
+    /// Duplicate-ACK counter for fast retransmit.
+    dup_acks: u8 = 0,
+    /// The host socket hit EOF; drain snd_buf, then FIN. Deferring the FIN
+    /// until everything is acked keeps the tail of a download from being
+    /// dropped along with the flow.
+    host_eof: bool = false,
     /// Next sequence we expect from the guest = bytes acked to it.
     rcv_nxt: u32,
     last_used: i64,
+
+    fn deinit(self: *TcpFlow, alloc: std.mem.Allocator) void {
+        self.snd_buf.deinit(alloc);
+    }
 };
 
 pub const MiniNat = struct {
@@ -204,7 +250,10 @@ pub const MiniNat = struct {
         while (iter.next()) |flow| net_compat.socketClose(flow.socket);
         self.udp_flows.deinit();
         var titer = self.tcp_flows.valueIterator();
-        while (titer.next()) |flow| net_compat.socketClose(flow.socket);
+        while (titer.next()) |flow| {
+            net_compat.socketClose(flow.socket);
+            flow.deinit(self.alloc);
+        }
         self.tcp_flows.deinit();
         var iiter = self.icmp_flows.valueIterator();
         while (iiter.next()) |flow| net_compat.socketClose(flow.socket);
@@ -491,6 +540,7 @@ pub const MiniNat = struct {
     fn pumpTcp(self: *MiniNat, buf: []u8) bool {
         var work = false;
         const now = nowSeconds();
+        const now_ns = nowNanos();
         var remove_key: ?TcpKey = null;
 
         // Back-pressure: if the guest RX queue is backed up, don't pull
@@ -537,31 +587,64 @@ pub const MiniNat = struct {
             // SYN-ACK arrives (handleTcp flips the state to established).
             if (flow.state == .syn_to_guest) continue;
 
-            // Relay available host data to the guest — unless the guest RX
-            // side is backed up, in which case defer (no drop).
-            if (!rx_ok) continue;
-            const n = net_compat.recv(flow.socket, buf[0..TCP_MSS], 0) catch |e| {
-                if (e == error.WouldBlock) continue;
-                self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_RST | TCP_ACK, &.{});
-                remove_key = key;
-                continue;
-            };
-            if (n == 0) {
-                // Host closed: send FIN.
+            // (1) Retransmit the oldest unacked segment if its timer fired.
+            // A single frame, well under the hard RX cap, so it goes even
+            // when rx_ok is false — retransmission must always make progress.
+            if (flow.snd_buf.items.len > 0 and flow.rt_deadline_ns != 0 and now_ns >= flow.rt_deadline_ns) {
+                const seg_len = @min(TCP_MSS, flow.snd_buf.items.len);
+                self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, flow.snd_buf.items[0..seg_len]);
+                flow.rto_ns = @min(flow.rto_ns * 2, MAX_RTO_NS);
+                flow.rt_deadline_ns = now_ns + flow.rto_ns;
+                flow.last_used = now;
+                work = true;
+            }
+
+            // (2) Send new host data, bounded by the guest's advertised
+            // receive window AND our send buffer — this is the flow control
+            // whose absence let bulk downloads overrun the guest and stall.
+            // Skip when the RX ring is backed up (no drop: the data stays in
+            // the host socket, so the real sender is throttled).
+            const in_flight = flow.snd_nxt -% flow.snd_una;
+            const eff_wnd: u32 = @min(@max(flow.snd_wnd, @as(u32, 1)), @as(u32, SND_BUF_MAX));
+            const buffered: u32 = @intCast(flow.snd_buf.items.len);
+            if (rx_ok and !flow.host_eof and in_flight < eff_wnd and buffered < SND_BUF_MAX) {
+                const window_room = eff_wnd - in_flight;
+                const buf_room: u32 = @intCast(SND_BUF_MAX - flow.snd_buf.items.len);
+                const want: usize = @min(@min(@as(u32, TCP_MSS), window_room), buf_room);
+                const n = net_compat.recv(flow.socket, buf[0..want], 0) catch |e| {
+                    if (e != error.WouldBlock) {
+                        self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_RST | TCP_ACK, &.{});
+                        remove_key = key;
+                    }
+                    continue;
+                };
+                if (n == 0) {
+                    // Host EOF: stop reading, drain snd_buf, then FIN below.
+                    flow.host_eof = true;
+                } else {
+                    flow.snd_buf.appendSlice(self.alloc, buf[0..n]) catch continue;
+                    self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_PSH | TCP_ACK, buf[0..n]);
+                    flow.snd_nxt +%= @intCast(n);
+                    if (flow.rt_deadline_ns == 0) flow.rt_deadline_ns = now_ns + flow.rto_ns;
+                    flow.last_used = now;
+                    work = true;
+                }
+            }
+
+            // (3) Host closed and everything acked → FIN, then drop the flow.
+            if (flow.host_eof and flow.snd_buf.items.len == 0 and flow.snd_una == flow.snd_nxt) {
                 self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_FIN | TCP_ACK, &.{});
                 flow.snd_nxt +%= 1;
                 remove_key = key;
                 continue;
             }
-            self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_PSH | TCP_ACK, buf[0..n]);
-            flow.snd_nxt +%= @intCast(n);
-            flow.last_used = now;
-            work = true;
         }
 
         if (remove_key) |key| {
             if (self.tcp_flows.fetchRemove(key)) |entry| {
-                net_compat.socketClose(entry.value.socket);
+                var v = entry.value;
+                net_compat.socketClose(v.socket);
+                v.deinit(self.alloc);
             }
         }
         return work;
@@ -587,6 +670,7 @@ pub const MiniNat = struct {
                     .socket = sock,
                     .state = .syn_to_guest,
                     .snd_nxt = 0x2000,
+                    .snd_una = 0x2000,
                     .rcv_nxt = 0, // learned from the guest's SYN-ACK
                     .last_used = nowSeconds(),
                 };
@@ -725,8 +809,10 @@ pub const MiniNat = struct {
         const src_port = std.mem.readInt(u16, tcp[0..2], .big);
         const dst_port = std.mem.readInt(u16, tcp[2..4], .big);
         const seq = std.mem.readInt(u32, tcp[4..8], .big);
+        const ack = std.mem.readInt(u32, tcp[8..12], .big);
         const data_off: usize = @as(usize, (tcp[12] >> 4)) * 4;
         const flags = tcp[13];
+        const wnd: u32 = std.mem.readInt(u16, tcp[14..16], .big);
         if (tcp_off + data_off > frame.len) return;
         const payload = frame[tcp_off + data_off ..];
 
@@ -757,7 +843,10 @@ pub const MiniNat = struct {
 
         if (flags & TCP_RST != 0) {
             net_compat.socketClose(flow.socket);
-            _ = self.tcp_flows.remove(key);
+            if (self.tcp_flows.fetchRemove(key)) |entry| {
+                var v = entry.value;
+                v.deinit(self.alloc);
+            }
             return;
         }
 
@@ -765,11 +854,17 @@ pub const MiniNat = struct {
         if (flow.state == .syn_to_guest) {
             if (flags & TCP_SYN != 0 and flags & TCP_ACK != 0) {
                 flow.rcv_nxt = seq +% 1; // guest SYN consumes a seq
+                flow.snd_wnd = @max(wnd, 1);
                 flow.state = .established;
                 self.tcpSendAck(key, flow);
             }
             return;
         }
+
+        // Process the guest's acknowledgement of host→guest data: free
+        // acked bytes from the retransmit buffer and track the guest's
+        // advertised receive window (the flow control we must honor).
+        if (flags & TCP_ACK != 0) self.processGuestAck(key, flow, ack, wnd);
 
         // Relay any guest payload to the host socket (only new bytes, and
         // only once the host side is connected). One non-blocking send;
@@ -795,6 +890,44 @@ pub const MiniNat = struct {
             self.tcpSendAck(key, flow);
             flow.state = .fin_wait;
         }
+    }
+
+    /// Apply a guest ACK to a flow's host→guest send state: retire acked
+    /// bytes from the retransmit buffer, track the advertised window, and
+    /// fast-retransmit on the third duplicate ACK. Caller holds flows_mutex.
+    fn processGuestAck(self: *MiniNat, key: TcpKey, flow: *TcpFlow, ack: u32, wnd: u32) void {
+        flow.snd_wnd = @max(wnd, 1);
+        const outstanding = flow.snd_nxt -% flow.snd_una;
+        const acked = ack -% flow.snd_una;
+
+        if (acked == 0) {
+            // Duplicate ACK: three in a row ⇒ retransmit immediately rather
+            // than waiting for the RTO (fast retransmit).
+            if (outstanding > 0) {
+                flow.dup_acks +%= 1;
+                if (flow.dup_acks >= 3 and flow.snd_buf.items.len > 0) {
+                    const seg_len = @min(TCP_MSS, flow.snd_buf.items.len);
+                    self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, flow.snd_buf.items[0..seg_len]);
+                    flow.rt_deadline_ns = nowNanos() + flow.rto_ns;
+                    flow.dup_acks = 0;
+                }
+            }
+            return;
+        }
+        // Ignore acks for data we never sent (stale or wrapped).
+        if (acked > outstanding) return;
+
+        // New data acknowledged — drop it from the front of the buffer.
+        const drop = @min(@as(usize, acked), flow.snd_buf.items.len);
+        if (drop > 0) {
+            const remaining = flow.snd_buf.items.len - drop;
+            std.mem.copyForwards(u8, flow.snd_buf.items[0..remaining], flow.snd_buf.items[drop..]);
+            flow.snd_buf.shrinkRetainingCapacity(remaining);
+        }
+        flow.snd_una = ack;
+        flow.dup_acks = 0;
+        flow.rto_ns = INITIAL_RTO_NS; // forward progress resets the backoff
+        flow.rt_deadline_ns = if (flow.snd_una == flow.snd_nxt) 0 else nowNanos() + flow.rto_ns;
     }
 
     /// One non-blocking send; returns bytes accepted by the socket (0 on
@@ -837,6 +970,7 @@ pub const MiniNat = struct {
             .socket = sock,
             .state = .connecting,
             .snd_nxt = 0x1000,
+            .snd_una = 0x1000,
             .rcv_nxt = guest_seq +% 1, // SYN consumes a sequence number
             .last_used = nowSeconds(),
         };
@@ -1349,7 +1483,10 @@ test "mininat: port forward — accept, handshake, and guest->host relay" {
     var nat = MiniNat.init(testing.allocator, testReply, null);
     defer {
         var titer = nat.tcp_flows.valueIterator();
-        while (titer.next()) |flow| net_compat.socketClose(flow.socket);
+        while (titer.next()) |flow| {
+            net_compat.socketClose(flow.socket);
+            flow.deinit(testing.allocator);
+        }
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
         nat.icmp_flows.deinit();
@@ -1415,4 +1552,62 @@ test "mininat: port forward — accept, handshake, and guest->host relay" {
     var rx: [16]u8 = undefined;
     const n = try net_compat.recv(client, &rx, 0);
     try testing.expectEqualStrings("hello", rx[0..n]);
+}
+
+test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmits" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+        nat.listeners.deinit(testing.allocator);
+    }
+
+    const key = TcpKey{ .guest_port = 1234, .remote_ip = .{ 93, 184, 216, 34 }, .remote_port = 80 };
+    var flow = TcpFlow{
+        .socket = @as(std.posix.socket_t, -1), // never touched: we don't recv here
+        .state = .established,
+        .snd_nxt = 1000,
+        .snd_una = 1000,
+        .rcv_nxt = 5000,
+        .last_used = 0,
+    };
+    defer flow.deinit(testing.allocator);
+
+    // Pretend we've sent 3000 unacked bytes to the guest.
+    try flow.snd_buf.appendNTimes(testing.allocator, 0xAB, 3000);
+    flow.snd_nxt = 1000 + 3000;
+    flow.rt_deadline_ns = 1;
+
+    // Partial ACK of 1000 bytes: buffer trims, snd_una advances, window tracked,
+    // timer stays armed (data still outstanding).
+    nat.processGuestAck(key, &flow, 2000, 32768);
+    try testing.expectEqual(@as(u32, 2000), flow.snd_una);
+    try testing.expectEqual(@as(usize, 2000), flow.snd_buf.items.len);
+    try testing.expectEqual(@as(u32, 32768), flow.snd_wnd);
+    try testing.expect(flow.rt_deadline_ns != 0);
+
+    // Full ACK: buffer empties and the retransmit timer disarms.
+    nat.processGuestAck(key, &flow, 4000, 65535);
+    try testing.expectEqual(@as(u32, 4000), flow.snd_una);
+    try testing.expectEqual(@as(usize, 0), flow.snd_buf.items.len);
+    try testing.expectEqual(@as(i64, 0), flow.rt_deadline_ns);
+
+    // Send a fresh segment, then three duplicate ACKs ⇒ one fast retransmit
+    // of the oldest unacked byte (seq == snd_una), without waiting for the RTO.
+    try flow.snd_buf.appendNTimes(testing.allocator, 0xCD, 1400);
+    flow.snd_nxt = 4000 + 1400;
+    flow.rt_deadline_ns = std.math.maxInt(i64); // far future: only a dup-ack can trigger
+    clearReplies();
+    nat.processGuestAck(key, &flow, 4000, 65535); // dup 1
+    nat.processGuestAck(key, &flow, 4000, 65535); // dup 2
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len); // not yet
+    nat.processGuestAck(key, &flow, 4000, 65535); // dup 3 ⇒ retransmit
+    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
+    const seg = test_replies.items[0];
+    try testing.expectEqual(@as(u32, 4000), std.mem.readInt(u32, seg[38..42], .big)); // seq
+    try testing.expectEqual(MiniNat.TCP_PSH | MiniNat.TCP_ACK, seg[47]); // flags
+    try testing.expectEqual(@as(u8, 0), flow.dup_acks); // counter reset after retransmit
 }
