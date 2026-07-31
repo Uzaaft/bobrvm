@@ -69,34 +69,75 @@ final class MetalView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
-    private func sendKey(_ event: NSEvent, pressed: Bool) {
+    private func sendKeyCode(_ keyCode: UInt16, pressed: Bool, modifiers: UInt = 0) {
         guard let surface else { return }
         var key = bobrvm_key_event_s()
-        key.keycode = UInt32(event.keyCode)
-        key.modifiers = UInt32(event.modifierFlags.rawValue & 0xFFFF_FFFF)
+        key.keycode = UInt32(keyCode)
+        key.modifiers = UInt32(modifiers & 0xFFFF_FFFF)
         key.pressed = pressed
         bobrvm_surface_key(surface, key)
+    }
+
+    private func sendKey(_ event: NSEvent, pressed: Bool) {
+        sendKeyCode(event.keyCode, pressed: pressed, modifiers: event.modifierFlags.rawValue)
     }
 
     override func keyDown(with event: NSEvent) { sendKey(event, pressed: true) }
     override func keyUp(with event: NSEvent) { sendKey(event, pressed: false) }
 
+    // ⌘-modified keys never reach keyDown — AppKit routes them to the
+    // key-equivalent/menu chain, so without this override every ⌘-combo is
+    // silently swallowed. Forward them to the guest as a press+release
+    // pulse (the matching keyUp is also suppressed while ⌘ is held).
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.modifierFlags.contains(.command) else { return false }
+        sendKey(event, pressed: true)
+        sendKey(event, pressed: false)
+        return true
+    }
+
     override func flagsChanged(with event: NSEvent) {
-        // Modifier keys: derive press/release from the flag transition.
-        let flagFor: [UInt16: NSEvent.ModifierFlags] = [
-            0x37: .command, 0x36: .command,
-            0x38: .shift, 0x3C: .shift,
-            0x3A: .option, 0x3D: .option,
-            0x3B: .control, 0x3E: .control,
-            0x39: .capsLock,
+        // Modifier keys: derive press/release from the DEVICE-dependent
+        // flag bits (NX_DEVICE*KEYMASK) so left and right variants track
+        // independently — the generic flags (.shift & co) stay set while
+        // the *other* side is still held, which turned "release left
+        // shift" into a re-press and left the guest with a stuck modifier.
+        let deviceBitFor: [UInt16: UInt] = [
+            0x37: 0x0008, // Command -> NX_DEVICELCMDKEYMASK
+            0x36: 0x0010, // Right Command -> NX_DEVICERCMDKEYMASK
+            0x38: 0x0002, // Shift -> NX_DEVICELSHIFTKEYMASK
+            0x3C: 0x0004, // Right Shift -> NX_DEVICERSHIFTKEYMASK
+            0x3A: 0x0020, // Option -> NX_DEVICELALTKEYMASK
+            0x3D: 0x0040, // Right Option -> NX_DEVICERALTKEYMASK
+            0x3B: 0x0001, // Control -> NX_DEVICELCTLKEYMASK
+            0x3E: 0x2000, // Right Control -> NX_DEVICERCTLKEYMASK
         ]
-        if let flag = flagFor[event.keyCode] {
-            sendKey(event, pressed: event.modifierFlags.contains(flag))
+        if event.keyCode == 0x39 {
+            // CapsLock is a toggle on the Mac side but a momentary key to
+            // the guest, which toggles its own caps state on PRESS edges.
+            // Pulse press+release on every host flip; press-only/release-
+            // only left the guest's caps lock stuck on.
+            sendKey(event, pressed: true)
+            sendKey(event, pressed: false)
+        } else if let bit = deviceBitFor[event.keyCode] {
+            sendKey(event, pressed: (event.modifierFlags.rawValue & bit) != 0)
         }
         if mouseCaptured, event.modifierFlags.contains(.control), event.modifierFlags.contains(.option) {
             releaseMouse()
         }
         lastFlags = event.modifierFlags
+    }
+
+    /// Release every modifier in the guest. Called when the app/window
+    /// loses key status: a release that happens while unfocused (⌘Tab is
+    /// the classic case — the ⌘ press reaches us, the release goes to the
+    /// app switcher) otherwise leaves the guest with a modifier held
+    /// forever, making every later keystroke look modified.
+    func releaseAllModifiers() {
+        for code: UInt16 in [0x37, 0x36, 0x38, 0x3C, 0x3A, 0x3D, 0x3B, 0x3E] {
+            sendKeyCode(code, pressed: false)
+        }
+        lastFlags = NSEvent.ModifierFlags()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -349,12 +390,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.makeFirstResponder(view)
         window.acceptsMouseMovedEvents = true
 
-        // Safety net: don't leave the host cursor hidden/ungrabbed if the
-        // user switches away from the app some other way than ⌃⌥.
+        // Safety net: don't leave the host cursor hidden/ungrabbed — or
+        // guest modifiers stuck down — if the user switches away from the
+        // app some other way than ⌃⌥ (⌘Tab being the classic case).
         NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
             object: nil, queue: .main
-        ) { [weak self] _ in self?.view.releaseMouse() }
+        ) { [weak self] _ in
+            self?.view.releaseMouse()
+            self?.view.releaseAllModifiers()
+        }
 
         // Drive frames at 60 Hz. (CVDisplayLink integration comes with
         // the full app; a timer is enough to verify the pipeline.)
