@@ -104,6 +104,25 @@ pub const stats = struct {
 
     pub var submit_aborts: u64 = 0;
     var consts_logged: u32 = 0;
+    var draws_traced: u32 = 0;
+
+    /// Per-draw geometry trace (BOBRVM_GL_TRACE=1): everything needed to
+    /// hand-check where a draw's vertices land. This is how wedge-shaped
+    /// artifacts get attributed to a specific draw instead of guessed at.
+    pub fn traceDraw(cmd: anytype, stride0: u32, offset0: u32, sc: anytype) void {
+        if (std.c.getenv("BOBRVM_GL_TRACE") == null or draws_traced >= 60) return;
+        draws_traced += 1;
+        log.info("draw[{d}] mode={s} indexed={} start={} count={} inst={} bias={} restart={}/{x} stride0={} off0={} scissor={},{}..{},{}", .{
+            draws_traced,        @tagName(cmd.mode),
+            cmd.indexed,         cmd.start,
+            cmd.count,           cmd.instance_count,
+            cmd.index_bias,      cmd.primitive_restart,
+            cmd.restart_index,   stride0,
+            offset0,             sc.minx,
+            sc.miny,             sc.maxx,
+            sc.maxy,
+        });
+    }
     var draw_consts_logged: u32 = 0;
 
     pub fn noteConsts(stage: u32, index: u32, nwords: u16) void {
@@ -802,6 +821,7 @@ pub const GpuDevice = struct {
                                     }
                                 }
                                 stats.noteDraw(opts.frag_tex != null);
+                                stats.traceDraw(draw_cmd, ctx.vbo_strides[0], ctx.vbo_offsets[0], ctx.scissors[0]);
                                 stats.noteDrawConsts(opts.vs_consts.len, opts.fs_consts.len);
                                 // Depth: bound zsurf + bound DSA state.
                                 opts.depth = self.resolveDepthTarget(ctx);
@@ -1140,6 +1160,12 @@ pub const GpuDevice = struct {
         for (0..n) |i| {
             const el = ve.elements[i];
             const slot: u32 = el.vertex_buffer_index;
+            // Metal hard-caps buffer indices at 30 and ABORTS the process on
+            // violation; with our base of 17 that allows guest slots 0..13.
+            // Fail the pipeline (visible fallback) instead of crashing.
+            if (virgl.renderer.vertexBufferIndex(slot) > 30) {
+                return error.PipelineCreateFailed;
+            }
             attrs[i] = .{
                 .format = virgl.Renderer.mapVertexFormat(el.src_format),
                 .offset = el.src_offset,
@@ -1306,8 +1332,8 @@ test "GpuDevice renders with translated guest shaders end to end" {
     b.w(52);
     b.w(0);
     b.w(0);
+    b.w(0); // buffer index 0 (real wire order: offset, divisor, buffer, format)
     b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
-    b.w(0);
     // bind_shader vs, fs
     b.cmd(31, 0, 2);
     b.w(50);
@@ -1468,8 +1494,8 @@ test "GpuDevice draws indexed with uniform constants (buffer(1) binding)" {
     b.w(52);
     b.w(0);
     b.w(0);
+    b.w(0); // buffer index 0 (real wire order: offset, divisor, buffer, format)
     b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
-    b.w(0);
     b.cmd(31, 0, 2); // bind vs
     b.w(50);
     b.w(0);
@@ -1636,8 +1662,8 @@ test "GpuDevice samples a guest texture through TEX (fragment texturing)" {
     b.w(52);
     b.w(0);
     b.w(0);
+    b.w(0); // buffer index 0 (real wire order: offset, divisor, buffer, format)
     b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
-    b.w(0);
     b.cmd(31, 0, 2); // bind vs
     b.w(50);
     b.w(0);
@@ -1819,8 +1845,8 @@ test "GpuDevice depth-tests draws (far fragment loses to near)" {
     b.w(52);
     b.w(0);
     b.w(0);
+    b.w(0); // buffer index 0 (real wire order: offset, divisor, buffer, format)
     b.w(@intFromEnum(virgl.protocol.Format.r32g32b32_float));
-    b.w(0);
     // DSA: depth enabled, write enabled, func LESS (bits: 1|2|(1<<2)).
     b.cmd(1, 3, 5);
     b.w(53);
@@ -1967,8 +1993,8 @@ test "GpuDevice executes TGSI control flow (IF on a uniform)" {
     b.w(52);
     b.w(0);
     b.w(0);
+    b.w(0); // buffer index 0 (real wire order: offset, divisor, buffer, format)
     b.w(@intFromEnum(virgl.protocol.Format.r32g32_float));
-    b.w(0);
     b.cmd(31, 0, 2);
     b.w(50);
     b.w(0);
@@ -2079,8 +2105,8 @@ test "GpuDevice applies guest blend state (additive over)" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0);
-    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
     // Blend state: RT0 blend_enable, ADD, src=ONE, dst=ONE (additive).
     // Word layout (state.zig BlendState.parse): s0 flags at [0]; RT states
     // begin at data[1], one u32 each. RtBlendState bit layout (protocol
@@ -2177,7 +2203,7 @@ test "GpuDevice renders to two color attachments (MRT)" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
     b.cmd(31, 0, 2); b.w(50); b.w(0);
     b.cmd(31, 0, 2); b.w(51); b.w(0);
     b.cmd(2, 5, 1); b.w(52);
@@ -2255,7 +2281,7 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
     b.cmd(31, 0, 2); b.w(50); b.w(0);
     b.cmd(31, 0, 2); b.w(51); b.w(0);
     b.cmd(2, 5, 1); b.w(52);
@@ -2346,7 +2372,7 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
     b.cmd(31, 0, 2); b.w(50); b.w(0);
     b.cmd(31, 0, 2); b.w(51); b.w(0);
     b.cmd(2, 5, 1); b.w(52);
@@ -2440,7 +2466,7 @@ test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); b.w(0);
+    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
     b.cmd(31, 0, 2); b.w(50); b.w(0);
     b.cmd(31, 0, 2); b.w(51); b.w(0);
     b.cmd(2, 5, 1); b.w(52);

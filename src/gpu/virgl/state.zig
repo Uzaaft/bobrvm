@@ -405,11 +405,19 @@ pub const VertexElementsState = struct {
 
         for (0..elem_count) |i| {
             const base = i * 4;
+            // Per virgl_protocol.h, each element is FOUR separate dwords:
+            // SRC_OFFSET, INSTANCE_DIVISOR, VERTEX_BUFFER_INDEX, SRC_FORMAT.
+            // The old decode packed offset+divisor into dword 0 and shifted
+            // the rest down one — so the divisor was always 0 (per-instance
+            // attributes stepped per VERTEX, warping every instanced quad
+            // into wedges), the divisor was read as the buffer index (which
+            // only coincidentally matched for smithay's layout), and the
+            // buffer index was read as the format.
             state.elements[i] = .{
                 .src_offset = @truncate(data[base]),
-                .instance_divisor = @truncate(data[base] >> 16),
-                .vertex_buffer_index = @truncate(data[base + 1]),
-                .src_format = @enumFromInt(data[base + 2]),
+                .instance_divisor = @truncate(data[base + 1]),
+                .vertex_buffer_index = @truncate(data[base + 2]),
+                .src_format = @enumFromInt(data[base + 3]),
             };
         }
 
@@ -452,4 +460,23 @@ test "RasterizerState parse" {
     try std.testing.expect(state.scissor);
     try std.testing.expectEqual(CullMode.back, state.cull_face);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), state.point_size, 0.001);
+}
+
+test "vertex elements parse the four per-element dwords per virgl_protocol.h" {
+    // Two elements, exactly as smithay/niri sends them: a per-vertex vec2 in
+    // buffer 0 and a per-INSTANCE vec4 in buffer 1 (divisor 1). The old
+    // decode read the divisor as the buffer index (coincidentally equal
+    // here) and left the real divisor 0, which warped every instanced quad.
+    const words = [_]u32{
+        0, 0, 0, 29, // el0: offset 0, divisor 0, buffer 0, R32G32_FLOAT
+        0, 1, 1, 31, // el1: offset 0, divisor 1, buffer 1, R32G32B32A32_FLOAT
+    };
+    const st = VertexElementsState.parse(7, &words);
+    try std.testing.expectEqual(@as(u8, 2), st.count);
+    try std.testing.expectEqual(@as(u16, 0), st.elements[0].instance_divisor);
+    try std.testing.expectEqual(@as(u8, 0), st.elements[0].vertex_buffer_index);
+    try std.testing.expectEqual(@as(u16, 1), st.elements[1].instance_divisor);
+    try std.testing.expectEqual(@as(u8, 1), st.elements[1].vertex_buffer_index);
+    try std.testing.expectEqual(@as(u32, 29), @intFromEnum(st.elements[0].src_format));
+    try std.testing.expectEqual(@as(u32, 31), @intFromEnum(st.elements[1].src_format));
 }
