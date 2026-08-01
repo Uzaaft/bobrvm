@@ -260,6 +260,9 @@ pub const MapInfoResp = extern struct {
 /// A live blob→guest-PA mapping in the host-visible window.
 pub const MapRecord = struct { pa: u64, size: usize };
 
+/// Count of traced partial transfer_to_host_3d commands (see cmdTransferToHost3D).
+var transfer_traces: u32 = 0;
+
 pub const ResourceDetachBacking = extern struct {
     header: CtrlHeader,
     resource_id: u32,
@@ -1481,10 +1484,35 @@ pub const Gpu = struct {
             // texturing); stride 0 means tightly packed.
             const list = self.backing3d.getPtr(cmd.resource_id) orelse return .resp_err_unspec;
             if (list.items.len == 0) return .resp_err_unspec;
+            // Partial-upload trace (BOBRVM_GL_STATS=1): sub-rect texture
+            // updates are how damage-tracked clients (terminals) push typed
+            // glyphs; log the box/offset/stride so a wrong source-offset
+            // convention shows up as a violated offset invariant.
+            if (gpu_module.stats.on() and transfer_traces < 24 and (cmd.box.x != 0 or cmd.box.y != 0)) {
+                transfer_traces += 1;
+                const expect: u64 = @as(u64, cmd.box.y) * cmd.stride + @as(u64, cmd.box.x) * 4;
+                log.info("xfer3d res={} lvl={} box={},{} {}x{} stride={} layer_stride={} offset={} expect_if_folded={} delta={}", .{
+                    cmd.resource_id, cmd.level,
+                    cmd.box.x,       cmd.box.y,
+                    cmd.box.w,       cmd.box.h,
+                    cmd.stride,      cmd.layer_stride,
+                    cmd.offset,      expect,
+                    @as(i64, @intCast(cmd.offset)) - @as(i64, @intCast(expect)),
+                });
+            }
             const bpp: u64 = 4;
             const row_bytes: u64 = @as(u64, cmd.box.w) * bpp;
             if (row_bytes == 0 or cmd.box.h == 0) return .resp_ok_nodata;
-            const stride: u64 = if (cmd.stride != 0) cmd.stride else row_bytes;
+            // stride 0 means "the resource's own row pitch", NOT the box
+            // width: the guest folds the box origin into `offset` as
+            // y*pitch + x*4 (verified against live traffic — a 6x13 box at
+            // (132,13) on a 612-wide texture arrives with offset 32352 =
+            // 13*2448 + 132*4). Defaulting to the box width made every
+            // partial upload read a box-narrow column of the wrong bytes,
+            // so damage-tracked clients (terminals) rendered typed glyphs
+            // as fragments while full-width uploads happened to work.
+            const res_pitch: u64 = @as(u64, res.width) * bpp;
+            const stride: u64 = if (cmd.stride != 0) cmd.stride else res_pitch;
             const total_u64 = row_bytes * cmd.box.h;
             if (total_u64 > 512 * 1024 * 1024) return .resp_err_invalid_parameter;
             const total: usize = @intCast(total_u64);
