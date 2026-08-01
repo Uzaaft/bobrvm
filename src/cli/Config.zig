@@ -7,14 +7,15 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const global = @import("../global.zig");
 const file_compat = @import("../compat/file.zig");
+const config_policy = @import("../config.zig");
 
 const Config = @This();
 
 const log = std.log.scoped(.cli);
 
 name: []const u8 = "",
-memory_mb: u64 = 512,
-vcpu_count: u8 = 2,
+memory_mb: u64 = config_policy.memory_bytes_default / (1024 * 1024),
+vcpu_count: u8 = config_policy.vcpu_count_default,
 firmware_path: ?[]const u8 = null,
 vars_path: ?[]const u8 = null,
 disk_path: ?[]const u8 = null,
@@ -28,8 +29,9 @@ enable_gpu: bool = false,
 enable_virgl: bool = false,
 enable_net: bool = false,
 enable_snd: bool = false,
-display_width: u32 = 1280,
-display_height: u32 = 800,
+display_width: u32 = config_policy.display_width_default,
+display_height: u32 = config_policy.display_height_default,
+gpu_memory_mb: u64 = config_policy.gpu_memory_bytes_default / (1024 * 1024),
 /// Host→guest TCP port forwards (--forward host:guest, repeatable).
 forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
 forward_count: u8 = 0,
@@ -175,6 +177,15 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
                 log.err("invalid display height", .{});
                 return ParseError.InvalidArgument;
             };
+        } else if (std.mem.eql(u8, arg, "--gpu-memory")) {
+            const val = args.next() orelse {
+                log.err("--gpu-memory requires a value in MB", .{});
+                return ParseError.InvalidArgument;
+            };
+            config.gpu_memory_mb = std.fmt.parseInt(u64, val, 10) catch {
+                log.err("invalid GPU memory value: {s}", .{val});
+                return ParseError.InvalidArgument;
+            };
         } else {
             log.warn("unknown argument: {s}", .{arg});
         }
@@ -185,19 +196,24 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
 }
 
 pub fn validate(self: *const Config) ParseError!void {
-    if (self.disk_path) |disk_path| {
-        if (std.mem.endsWith(u8, disk_path, ".iso") and !self.disk_read_only) {
-            log.err("ISO images must be opened read-only (use --disk-readonly)", .{});
+    const memory_bytes = std.math.mul(u64, self.memory_mb, 1024 * 1024) catch {
+        return ParseError.InvalidArgument;
+    };
+    config_policy.validate(.{
+        .memory_bytes = memory_bytes,
+        .vcpu_count = self.vcpu_count,
+        .display_width = self.display_width,
+        .display_height = self.display_height,
+        .gpu_memory_bytes = std.math.mul(u64, self.gpu_memory_mb, 1024 * 1024) catch {
             return ParseError.InvalidArgument;
-        }
-    }
-
-    if (self.disk2_path) |disk2_path| {
-        if (std.mem.endsWith(u8, disk2_path, ".iso") and !self.disk2_read_only) {
-            log.err("ISO images must be opened read-only (use --disk2-readonly)", .{});
-            return ParseError.InvalidArgument;
-        }
-    }
+        },
+        .disk_path = self.disk_path,
+        .disk_read_only = self.disk_read_only,
+        .disk2_path = self.disk2_path,
+        .disk2_read_only = self.disk2_read_only,
+    }) catch {
+        return ParseError.InvalidArgument;
+    };
 }
 
 pub fn getConfigDir(alloc: Allocator) ![]const u8 {
@@ -284,6 +300,7 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
 
     var config = parsed.value;
     config.name = try arena.allocator().dupe(u8, name);
+    try config.validate();
 
     return .{
         .config = config,
@@ -348,7 +365,17 @@ pub fn printOptions() void {
         \\  -k, --kernel <path>   Kernel image (direct boot)
         \\  -i, --initrd <path>   Initrd image
         \\  --cmdline <str>       Kernel command line
+        \\  --display <WxH>       Initial display resolution (default: 1280x800)
+        \\  --gpu-memory <MB>    Graphics memory budget (default: 512)
         \\
     ;
     _ = std.c.write(std.posix.STDOUT_FILENO, help.ptr, help.len);
+}
+
+test "persisted config uses shared GPU memory validation" {
+    const too_small = Config{ .gpu_memory_mb = 32 };
+    try std.testing.expectError(error.InvalidArgument, too_small.validate());
+
+    const valid = Config{ .gpu_memory_mb = 2048 };
+    try valid.validate();
 }

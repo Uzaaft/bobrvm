@@ -8,8 +8,10 @@
 //! Pattern follows Ghostty's apprt/embedded.zig.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
 const machine = @import("../machine/main.zig");
 const keymap = @import("keymap.zig");
@@ -56,8 +58,8 @@ pub const RuntimeConfig = extern struct {
 
 /// VM configuration (C API struct - pointers are temporary).
 pub const VMConfig = extern struct {
-    memory_bytes: u64,
-    vcpu_count: u8,
+    memory_bytes: u64 = config_policy.memory_bytes_default,
+    vcpu_count: u8 = config_policy.vcpu_count_default,
     /// UEFI firmware path (e.g., QEMU_EFI.fd). If set, boots via firmware.
     firmware_path: ?[*:0]const u8 = null,
     /// UEFI variables file path. Created if doesn't exist.
@@ -74,8 +76,10 @@ pub const VMConfig = extern struct {
     /// Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP).
     enable_net: bool = false,
     /// Initial guest display size in pixels (0 = machine default).
-    display_width: u32 = 0,
-    display_height: u32 = 0,
+    display_width: u32 = config_policy.display_width_default,
+    display_height: u32 = config_policy.display_height_default,
+    /// Host graphics-memory budget for 2D resources and the Venus window.
+    gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
     /// Enable 3D acceleration on the GUI's virtio-gpu (virgl capset, and the
     /// venus capset when built with -Dgpu-venus). Off by default: a 2D-only
     /// scanout is the safe path, and 3D needs the venus host stack present.
@@ -83,9 +87,28 @@ pub const VMConfig = extern struct {
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
-        if (self.memory_bytes == 0) return false;
-        if (self.vcpu_count == 0) return false;
+        assert(config_policy.memory_bytes_default > 0);
+        assert(config_policy.vcpu_count_default > 0);
+        config_policy.validate(.{
+            .memory_bytes = self.memory_bytes,
+            .vcpu_count = self.vcpu_count,
+            .display_width = self.display_width,
+            .display_height = self.display_height,
+            .gpu_memory_bytes = self.gpu_memory_bytes,
+            .disk_path = optionalString(self.disk_path),
+            .disk_read_only = self.disk_read_only,
+            .disk2_path = optionalString(self.disk2_path),
+            .disk2_read_only = self.disk2_read_only,
+        }) catch return false;
         return true;
+    }
+
+    fn optionalString(ptr: ?[*:0]const u8) ?[]const u8 {
+        assert(@sizeOf(?[*:0]const u8) == @sizeOf(?*const anyopaque));
+        assert(@sizeOf(u8) == 1);
+        const value = ptr orelse return null;
+        const slice = std.mem.span(value);
+        return if (slice.len == 0) null else slice;
     }
 
     /// Dupe a C string to owned slice.
@@ -115,6 +138,7 @@ pub const VMConfig = extern struct {
             .enable_net = self.enable_net,
             .display_width = self.display_width,
             .display_height = self.display_height,
+            .gpu_memory_bytes = self.gpu_memory_bytes,
             .enable_gpu3d = self.enable_gpu3d,
         };
     }
@@ -136,6 +160,7 @@ pub const OwnedVMConfig = struct {
     enable_net: bool = false,
     display_width: u32 = 0,
     display_height: u32 = 0,
+    gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
     enable_gpu3d: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
@@ -176,23 +201,29 @@ pub const App = struct {
     alloc: Allocator,
     runtime: RuntimeConfig,
     vms: std.ArrayListUnmanaged(*VM),
+    debug_allocator: if (builtin.mode == .Debug) std.heap.DebugAllocator(.{}) else void,
 
     pub const CreateError = Allocator.Error;
 
     pub fn create(runtime: *const RuntimeConfig) CreateError!*App {
         // Pre-condition: runtime must be valid pointer (guaranteed by caller)
-        const alloc = std.heap.c_allocator;
+        const app_alloc = std.heap.c_allocator;
 
         log.debug("creating app instance", .{});
 
-        const app = try alloc.create(App);
-        errdefer alloc.destroy(app);
+        const app = try app_alloc.create(App);
+        errdefer app_alloc.destroy(app);
 
         app.* = .{
-            .alloc = alloc,
+            .alloc = undefined,
             .runtime = runtime.*,
             .vms = .empty,
+            .debug_allocator = if (builtin.mode == .Debug) .init else {},
         };
+        app.alloc = if (builtin.mode == .Debug)
+            app.debug_allocator.allocator()
+        else
+            std.heap.c_allocator;
 
         // Post-condition: app is initialized
         assert(app.vms.items.len == 0);
@@ -217,7 +248,8 @@ pub const App = struct {
             vm.destroy();
         }
         self.vms.deinit(self.alloc);
-        self.alloc.destroy(self);
+        if (builtin.mode == .Debug) _ = self.debug_allocator.deinit();
+        std.heap.c_allocator.destroy(self);
 
         log.info("app destroyed", .{});
     }
@@ -357,10 +389,10 @@ pub const VM = struct {
         while (self.surfaces.items.len > 0) {
             self.surfaces.items[self.surfaces.items.len - 1].destroy();
         }
-        self.surfaces.deinit(self.alloc);
 
         // Then stop and destroy the machine (joins the vCPU thread)
         self.stop();
+        self.surfaces.deinit(self.alloc);
 
         // Free owned config strings
         self.config.deinit(self.alloc);
@@ -412,6 +444,10 @@ pub const VM = struct {
                 .enable_net = self.config.enable_net,
                 .display_width = if (self.config.display_width != 0) self.config.display_width else 1280,
                 .display_height = if (self.config.display_height != 0) self.config.display_height else 800,
+                .gpu_memory_bytes = if (self.config.gpu_memory_bytes != 0)
+                    self.config.gpu_memory_bytes
+                else
+                    config_policy.gpu_memory_bytes_default,
             };
 
             self.hw_machine = machine.Machine.init(self.alloc, machine_config) catch |err| {
@@ -453,6 +489,12 @@ pub const VM = struct {
 
     pub fn stop(self: *VM) void {
         log.info("stopping VM", .{});
+
+        // Renderer threads read the machine's virtio-gpu scanout. Join them
+        // before destroying the machine so no surface can retain a pointer to
+        // GPU memory during teardown. The surfaces themselves remain alive and
+        // restart their renderers on the next draw after a VM restart.
+        for (self.surfaces.items) |surface| surface.stopRenderer();
 
         if (self.hw_machine) |hw| {
             hw.stop();
@@ -661,6 +703,11 @@ pub const Surface = struct {
         // Remove from VM's surface list
         self.vm.removeSurface(self);
         self.alloc.destroy(self);
+    }
+
+    fn stopRenderer(self: *Surface) void {
+        self.render.stop();
+        self.render_started = false;
     }
 
     pub fn setSize(self: *Surface, width: u32, height: u32) void {

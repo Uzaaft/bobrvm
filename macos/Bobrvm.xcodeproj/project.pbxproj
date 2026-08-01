@@ -13,16 +13,18 @@
 		2D542ACE334845D3AF20CC3E /* CreateVMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 696CE6917C14425EB2E8448C /* CreateVMView.swift */; };
 		CD90210F6B3A466388014E3A /* EditVMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C32412F2F9AB4F54828570C1 /* EditVMView.swift */; };
 		4C471C776EA0410496018A2E /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4B19DFF60E047A291BD2726 /* SettingsView.swift */; };
-		C3F4A6D2B1CC4E2893A3E0A4 /* GhosttyInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D1B1CC4E2893A3E0A3 /* GhosttyInput.swift */; };
-		C3F4A6D4B1CC4E2893A3E0A6 /* GhosttyRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */; };
-		C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */; };
 		E7DE4622B79F487381A5E9D7 /* VMManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2E99685B82E41398008A70C /* VMManager.swift */; };
 		E59A61D5A7ED4A43B2965238 /* VMSurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 016570CA1164450690E721F4 /* VMSurfaceView.swift */; };
+		B0B000000000000000000005 /* VMLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000006 /* VMLibraryView.swift */; };
 		763CCC85691B452497100414 /* BobrvmKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = F676F6AC49154476B8CBB58B /* BobrvmKit.swift */; };
 		08FEA81F40114C27A1A9251A /* BobrvmKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 27F916698DB04C12B429214A /* BobrvmKit.xcframework */; };
 		A1B2C3D4E5F60718293A4B5C /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* GhosttyKit.xcframework */; };
+		C3F4A6D2B1CC4E2893A3E0A4 /* GhosttyInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D1B1CC4E2893A3E0A3 /* GhosttyInput.swift */; };
+		C3F4A6D4B1CC4E2893A3E0A6 /* GhosttyRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */; };
+		C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */; };
 		1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */; };
 		UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000002 /* QEMU_EFI.fd */; };
+		B0B000000000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000002 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +40,7 @@
 		C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttySurfaceView.swift; sourceTree = "<group>"; };
 		B2E99685B82E41398008A70C /* VMManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMManager.swift; sourceTree = "<group>"; };
 		016570CA1164450690E721F4 /* VMSurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMSurfaceView.swift; sourceTree = "<group>"; };
+		B0B000000000000000000006 /* VMLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMLibraryView.swift; sourceTree = "<group>"; };
 		F676F6AC49154476B8CBB58B /* BobrvmKit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmKit.swift; sourceTree = "<group>"; };
 		27F916698DB04C12B429214A /* BobrvmKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = BobrvmKit.xcframework; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4B5D /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = GhosttyKit.xcframework; path = "../zig-out/GhosttyKit.xcframework"; sourceTree = SOURCE_ROOT; };
@@ -45,6 +48,9 @@
 		8260A68E8A704D57966124E6 /* Bobrvm-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Bobrvm-Bridging-Header.h"; sourceTree = "<group>"; };
 		0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
 		UEFI00000000000000000002 /* QEMU_EFI.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_EFI.fd; sourceTree = "<group>"; };
+		B0B000000000000000000002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B0B000000000000000000003 /* Bobrvm-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Bobrvm-Info.plist"; sourceTree = "<group>"; };
+		B0B000000000000000000004 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -89,6 +95,7 @@
 				C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */,
 				B4B19DFF60E047A291BD2726 /* SettingsView.swift */,
 				B2E99685B82E41398008A70C /* VMManager.swift */,
+				B0B000000000000000000006 /* VMLibraryView.swift */,
 				016570CA1164450690E721F4 /* VMSurfaceView.swift */,
 			);
 			path = Sources/Bobrvm;
@@ -116,6 +123,9 @@
 		4D5A3144674A4C2388663FDF /* Bobrvm */ = {
 			isa = PBXGroup;
 			children = (
+				B0B000000000000000000002 /* Assets.xcassets */,
+				B0B000000000000000000003 /* Bobrvm-Info.plist */,
+				B0B000000000000000000004 /* README.md */,
 				63E960C4E6BD4DE7951B6BFB /* App */,
 				A257CCA5C31F4DC891F20FED /* Bobrvm */,
 				E19FE60B32494F0D9397F0B4 /* BobrvmKit */,
@@ -192,6 +202,7 @@
 			buildActionMask = 2147483647;
 			runOnlyForDeploymentPostprocessing = 0;
 			files = (
+				B0B000000000000000000001 /* Assets.xcassets in Resources */,
 				UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */,
 			);
 		};
@@ -213,6 +224,7 @@
 				C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */,
 				4C471C776EA0410496018A2E /* SettingsView.swift in Sources */,
 				E7DE4622B79F487381A5E9D7 /* VMManager.swift in Sources */,
+				B0B000000000000000000005 /* VMLibraryView.swift in Sources */,
 				E59A61D5A7ED4A43B2965238 /* VMSurfaceView.swift in Sources */,
 				763CCC85691B452497100414 /* BobrvmKit.swift in Sources */,
 			);
@@ -224,19 +236,22 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Bobrvm.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GENERATE_INFOPLIST_FILE = NO;
 				ONLY_ACTIVE_ARCH = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(PROJECT_DIR)",
 					"$(PROJECT_DIR)/../zig-out",
 				);
-				INFOPLIST_FILE = "";
+				INFOPLIST_FILE = "Bobrvm-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -251,6 +266,7 @@
 					"$(PROJECT_DIR)",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.bobrvm.app";
 				PRODUCT_NAME = "Bobrvm";
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/BobrvmKit/Bobrvm-Bridging-Header.h";
@@ -263,18 +279,21 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Bobrvm.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GENERATE_INFOPLIST_FILE = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(PROJECT_DIR)",
 					"$(PROJECT_DIR)/../zig-out",
 				);
-				INFOPLIST_FILE = "";
+				INFOPLIST_FILE = "Bobrvm-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -289,6 +308,7 @@
 					"$(PROJECT_DIR)",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.bobrvm.app";
 				PRODUCT_NAME = "Bobrvm";
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/BobrvmKit/Bobrvm-Bridging-Header.h";

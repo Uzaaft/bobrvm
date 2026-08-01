@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
 const thread_compat = @import("../compat/thread.zig");
 
@@ -165,6 +166,9 @@ pub const MachineConfig = struct {
     /// Display size for the virtio-gpu scanout.
     display_width: u32 = 1280,
     display_height: u32 = 800,
+
+    /// Host graphics-memory budget for 2D resources and the Venus window.
+    gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
 
     /// Count how many block devices are configured.
     pub fn blockDeviceCount(self: MachineConfig) u8 {
@@ -2043,7 +2047,11 @@ pub const Machine = struct {
         // Initialize GPU (slot after the block devices) if enabled
         if (self.config.enable_gpu) {
             self.gpu_slot = 1 + self.config.blockDeviceCount();
-            self.gpu = try virtio.Gpu.init(self.alloc, self.config.enable_virgl);
+            self.gpu = try virtio.Gpu.initWithMemoryLimit(
+                self.alloc,
+                self.config.enable_virgl,
+                self.config.gpu_memory_bytes,
+            );
             self.gpu.?.setGuestMemory(getGuestMemoryWrapper);
             // Venus host-visible memory window: a guest-PA range above RAM that
             // host blob memory is hv_vm_map'd into on RESOURCE_MAP_BLOB. Its
@@ -2052,8 +2060,17 @@ pub const Machine = struct {
                 if (self.hv_vm) |vm| {
                     const gb: u64 = 1 << 30;
                     const hv_base = std.mem.alignForward(u64, MemoryLayout.RAM_BASE + self.config.ram_size + gb, gb);
-                    self.gpu.?.setHostVisible(hv_base, gb, hostVisibleMapFn, hostVisibleUnmapFn, vm);
-                    log.debug("virtio-gpu host-visible window: 0x{x} + {}MB", .{ hv_base, gb / (1024 * 1024) });
+                    self.gpu.?.setHostVisible(
+                        hv_base,
+                        self.config.gpu_memory_bytes,
+                        hostVisibleMapFn,
+                        hostVisibleUnmapFn,
+                        vm,
+                    );
+                    log.debug("virtio-gpu host-visible window: 0x{x} + {}MB", .{
+                        hv_base,
+                        self.config.gpu_memory_bytes / (1024 * 1024),
+                    });
                 }
             }
             self.gpu.?.setDisplaySize(self.config.display_width, self.config.display_height);

@@ -35,5 +35,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         _ = notification
+        vmManager.stopAllVMs()
     }
 }

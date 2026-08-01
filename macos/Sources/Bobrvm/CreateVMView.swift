@@ -2,415 +2,657 @@
 //  CreateVMView.swift
 //  Bobrvm
 //
-//  VM creation wizard - simplified VMware-style flow.
+//  Guided virtual machine creation assistant.
 //
 
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct CreateVMView: View {
-    @EnvironmentObject var vmManager: VMManager
-    @Environment(\.dismiss) var dismiss
-    
-    @State private var name = "New VM"
-    @State private var diskMode: DiskMode = .createNew
-    @State private var existingDiskPath = ""
-    @State private var newDiskSizeGB: Double = 64
+    @EnvironmentObject private var vmManager: VMManager
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var step = CreationStep.installation
+    @State private var source = VMSource.installFromISO
+    @State private var name = "Linux"
     @State private var isoPath = ""
-    @State private var memoryGB: Double = 4
-    @State private var vcpuCount: Double = 2
-    @State private var vramMB: Double = 256
-    @State private var showingError = false
-    @State private var errorMessage = ""
+    @State private var existingDiskPath = ""
+    @State private var memoryGB = 4.0
+    @State private var vcpuCount = 2.0
+    @State private var vramMB = 512.0
+    @State private var resolution = DisplayResolution.defaultValue
+    @State private var retinaEnabled = true
+    @State private var diskSizeGB = 64.0
     @State private var isCreating = false
-    
+    @State private var errorMessage: String?
+
     private let systemInfo = SystemInfo()
-    
-    enum DiskMode: String, CaseIterable {
-        case createNew = "Create new disk"
-        case useExisting = "Use existing disk"
-    }
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                // Step 1: General
-                Section("General") {
-                    TextField("Name", text: $name)
-                }
-                
-                // Step 2: Storage
-                Section {
-                    Picker("Disk", selection: $diskMode) {
-                        ForEach(DiskMode.allCases, id: \.self) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    
-                    if diskMode == .createNew {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Disk Size")
-                                Spacer()
-                                Text("\(Int(newDiskSizeGB)) GB")
-                                    .foregroundColor(.secondary)
-                            }
-                            Slider(value: $newDiskSizeGB, in: 8...512, step: 8)
-                            Text("Disk will be created as a sparse file (only uses space as needed)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    } else {
-                        FilePickerField(
-                            label: "Disk Image",
-                            path: $existingDiskPath,
-                            types: [.diskImage, .rawDisk, .qcow2]
-                        )
-                    }
-                    
-                    FilePickerField(
-                        label: "Installation ISO",
-                        path: $isoPath,
-                        types: [.iso]
-                    )
-                } header: {
-                    Text("Storage")
-                } footer: {
-                    if diskMode == .createNew {
-                        Text("A new disk image will be created in ~/Library/Application Support/Bobrvm/")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                
-                // Step 3: CPU & Memory
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Memory")
-                            Spacer()
-                            Text("\(Int(memoryGB)) GB")
-                                .foregroundColor(.secondary)
-                        }
-                        Slider(value: $memoryGB, in: 1...Double(systemInfo.maxMemoryGB), step: 1)
-                        Text("\(systemInfo.totalMemoryGB) GB total on this Mac")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("CPU Cores")
-                            Spacer()
-                            Text("\(Int(vcpuCount))")
-                                .foregroundColor(.secondary)
-                        }
-                        Slider(value: $vcpuCount, in: 1...Double(systemInfo.cpuCount), step: 1)
-                        Text("\(systemInfo.cpuCount) cores available")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                } header: {
-                    Text("CPU & Memory")
-                }
-                
-                // Step 4: GPU
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Shared Graphics Memory")
-                            Spacer()
-                            Text("\(Int(vramMB)) MB")
-                                .foregroundColor(.secondary)
-                        }
-                        Slider(value: $vramMB, in: 64...2048, step: 64)
-                    }
-                } header: {
-                    Text("Graphics")
-                } footer: {
-                    Text("Amount of system memory shared with the virtual GPU.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+            HStack(spacing: 0) {
+                CreationStepSidebar(step: step)
+                    .frame(width: 180)
+                Divider()
+                stepContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .formStyle(.grouped)
-            .disabled(isCreating)
-            
             Divider()
-            
-            HStack {
-                Button("Cancel") {
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
-                .disabled(isCreating)
-                
-                Spacer()
-                
-                if isCreating {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                        .padding(.trailing, 8)
-                }
-                
-                Button("Create") {
-                    createVM()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!isValid || isCreating)
-            }
-            .padding()
+            footer
         }
-        .frame(width: 480, height: 560)
-        .alert("Error", isPresented: $showingError) {
-            Button("OK") {}
+        .frame(width: 720, height: 540)
+        .disabled(isCreating)
+        .alert(
+            "Couldn’t Create Virtual Machine",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
+            Button("OK") { errorMessage = nil }
         } message: {
-            Text(errorMessage)
+            Text(errorMessage ?? "An unknown error occurred.")
         }
     }
-    
-    private var isValid: Bool {
-        guard !name.isEmpty else { return false }
-        if diskMode == .useExisting && existingDiskPath.isEmpty {
-            return false
+
+    @ViewBuilder
+    private var stepContent: some View {
+        switch step {
+        case .installation:
+            InstallationStepView(
+                source: $source,
+                isoPath: $isoPath,
+                existingDiskPath: $existingDiskPath
+            )
+        case .hardware:
+            HardwareStepView(
+                memoryGB: $memoryGB,
+                vcpuCount: $vcpuCount,
+                vramMB: $vramMB,
+                resolution: $resolution,
+                retinaEnabled: $retinaEnabled,
+                systemInfo: systemInfo
+            )
+        case .storage:
+            StorageStepView(
+                source: source,
+                existingDiskPath: existingDiskPath,
+                diskSizeGB: $diskSizeGB
+            )
+        case .summary:
+            SummaryStepView(
+                name: $name,
+                source: source,
+                isoPath: isoPath,
+                existingDiskPath: existingDiskPath,
+                memoryGB: Int(memoryGB),
+                vcpuCount: Int(vcpuCount),
+                vramMB: Int(vramMB),
+                resolution: resolution,
+                retinaEnabled: retinaEnabled,
+                diskSizeGB: Int(diskSizeGB)
+            )
         }
-        return true
     }
-    
+
+    private var footer: some View {
+        HStack {
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+            Spacer()
+            if step != .installation {
+                Button("Back") { step = step.previous }
+            }
+            if isCreating {
+                ProgressView().controlSize(.small)
+            }
+            Button(step == .summary ? "Create" : "Continue") {
+                if step == .summary {
+                    createVM()
+                } else {
+                    step = step.next
+                }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canContinue)
+        }
+        .padding(16)
+    }
+
+    private var canContinue: Bool {
+        if isCreating { return false }
+        switch step {
+        case .installation:
+            return source == .installFromISO ? !isoPath.isEmpty : !existingDiskPath.isEmpty
+        case .hardware, .storage:
+            return true
+        case .summary:
+            return !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
     private func createVM() {
         isCreating = true
-        
-        Task {
-            var createdDiskPath: String?
-            do {
-                let diskPath: String
-                
-                if diskMode == .createNew {
-                    diskPath = try await DiskManager.createSparseDisk(
-                        name: name,
-                        sizeGB: Int(newDiskSizeGB)
-                    )
-                    createdDiskPath = diskPath
-                } else {
-                    diskPath = existingDiskPath
-                }
-                
-                // UEFI firmware path - bundled with app
-                let firmwarePath = Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd")
-                
-                // UEFI variables file - per-VM persistent storage (sanitize name for filename)
-                let safeName = name
-                    .replacingOccurrences(of: "/", with: "-")
-                    .replacingOccurrences(of: ":", with: "-")
-                    .replacingOccurrences(of: " ", with: "_")
-                let varsPath = DiskManager.appSupportDir
-                    .appendingPathComponent("\(safeName)_vars.fd")
-                    .path
-                
-                let config = VMConfig(
-                    memoryBytes: UInt64(memoryGB * 1024 * 1024 * 1024),
-                    vcpuCount: UInt8(vcpuCount),
-                    firmwarePath: firmwarePath,
-                    varsPath: varsPath,
-                    kernelPath: nil,
-                    initrdPath: nil,
-                    cmdline: nil,
-                    diskPath: diskPath,
-                    diskReadOnly: false,
-                    isoPath: isoPath.isEmpty ? nil : isoPath,
-                    isoReadOnly: true
-                )
-                
-                try vmManager.createVM(
+        var createdDiskPath: String?
+        do {
+            let diskPath: String
+            if source == .installFromISO {
+                diskPath = try DiskManager.createSparseDisk(
                     name: name,
-                    config: config,
-                    isoPath: isoPath.isEmpty ? nil : isoPath,
-                    vramMB: Int(vramMB)
+                    sizeGB: Int(diskSizeGB)
                 )
-                
-                await MainActor.run {
-                    dismiss()
+                createdDiskPath = diskPath
+            } else {
+                diskPath = existingDiskPath
+            }
+
+            let config = makeConfig(diskPath: diskPath)
+            try vmManager.createVM(
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                config: config,
+                isoPath: source == .installFromISO ? isoPath : nil,
+                retinaEnabled: retinaEnabled
+            )
+            dismiss()
+        } catch {
+            if let createdDiskPath {
+                try? FileManager.default.removeItem(atPath: createdDiskPath)
+            }
+            errorMessage = error.localizedDescription
+            isCreating = false
+        }
+    }
+
+    private func makeConfig(diskPath: String) -> VMConfig {
+        let safeName = DiskManager.safeFilename(name)
+        let varsPath = DiskManager.appSupportDir
+            .appendingPathComponent("\(safeName)_vars.fd")
+            .path
+        return VMConfig(
+            memoryBytes: UInt64(memoryGB * 1024 * 1024 * 1024),
+            vcpuCount: UInt8(vcpuCount),
+            displayWidth: resolution.width,
+            displayHeight: resolution.height,
+            gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+            firmwarePath: Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd"),
+            varsPath: varsPath,
+            diskPath: diskPath,
+            diskReadOnly: false,
+            isoPath: source == .installFromISO ? isoPath : nil,
+            isoReadOnly: true
+        )
+    }
+}
+
+private enum CreationStep: Int, CaseIterable {
+    case installation
+    case hardware
+    case storage
+    case summary
+
+    var title: String {
+        switch self {
+        case .installation: return "Installation"
+        case .hardware: return "Hardware"
+        case .storage: return "Storage"
+        case .summary: return "Finish"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .installation: return "opticaldisc"
+        case .hardware: return "cpu"
+        case .storage: return "internaldrive"
+        case .summary: return "checkmark.circle"
+        }
+    }
+
+    var previous: CreationStep {
+        CreationStep(rawValue: max(0, rawValue - 1)) ?? self
+    }
+
+    var next: CreationStep {
+        CreationStep(rawValue: min(Self.allCases.count - 1, rawValue + 1)) ?? self
+    }
+}
+
+private enum VMSource: String, CaseIterable, Identifiable {
+    case installFromISO
+    case existingDisk
+
+    var id: Self { self }
+}
+
+struct DisplayResolution: Hashable, Identifiable {
+    let width: UInt32
+    let height: UInt32
+
+    var id: String { "\(width)x\(height)" }
+    var label: String { "\(width) × \(height)" }
+
+    static let defaultValue = DisplayResolution(width: 1920, height: 1080)
+    static let presets = [
+        DisplayResolution(width: 1280, height: 800),
+        DisplayResolution(width: 1440, height: 900),
+        defaultValue,
+        DisplayResolution(width: 2560, height: 1440),
+        DisplayResolution(width: 2560, height: 1600),
+        DisplayResolution(width: 3840, height: 2160),
+    ]
+}
+
+private struct CreationStepSidebar: View {
+    let step: CreationStep
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("New Virtual Machine")
+                .font(.headline)
+                .padding(.bottom, 16)
+            ForEach(CreationStep.allCases, id: \.rawValue) { item in
+                HStack(spacing: 10) {
+                    Image(systemName: item.icon)
+                        .frame(width: 20)
+                    Text(item.title)
+                    Spacer()
                 }
-            } catch {
-                if let diskPath = createdDiskPath {
-                    try? FileManager.default.removeItem(atPath: diskPath)
-                }
-                await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    showingError = true
-                    isCreating = false
-                }
+                .foregroundStyle(item.rawValue <= step.rawValue ? .primary : .secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(item == step ? Color.accentColor.opacity(0.14) : .clear)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            Spacer()
+        }
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+}
+
+private struct InstallationStepView: View {
+    @Binding var source: VMSource
+    @Binding var isoPath: String
+    @Binding var existingDiskPath: String
+
+    var body: some View {
+        WizardPage(
+            title: "Choose an installation method",
+            subtitle: "Install Linux from an ISO image or use an existing virtual disk."
+        ) {
+            SourceCard(
+                title: "Install from ISO image",
+                detail: "Create a new disk and boot from installation media.",
+                icon: "opticaldisc",
+                selected: source == .installFromISO
+            ) { source = .installFromISO }
+            if source == .installFromISO {
+                FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
+                    .padding(.leading, 44)
+            }
+            SourceCard(
+                title: "Use an existing virtual disk",
+                detail: "Boot a raw or QCOW2 disk that already contains an operating system.",
+                icon: "externaldrive",
+                selected: source == .existingDisk
+            ) { source = .existingDisk }
+            if source == .existingDisk {
+                FilePickerField(
+                    label: "Virtual Disk",
+                    path: $existingDiskPath,
+                    types: [.rawDisk, .qcow2, .diskImage]
+                )
+                .padding(.leading, 44)
             }
         }
     }
 }
 
-// MARK: - Disk Manager
+private struct HardwareStepView: View {
+    @Binding var memoryGB: Double
+    @Binding var vcpuCount: Double
+    @Binding var vramMB: Double
+    @Binding var resolution: DisplayResolution
+    @Binding var retinaEnabled: Bool
+    let systemInfo: SystemInfo
+
+    var body: some View {
+        WizardPage(
+            title: "Configure virtual hardware",
+            subtitle: "These settings can be changed later while the virtual machine is stopped."
+        ) {
+            SettingSlider(
+                title: "Processor cores",
+                valueText: "\(Int(vcpuCount))",
+                value: $vcpuCount,
+                range: 1...Double(systemInfo.cpuCount),
+                step: 1,
+                footer: "\(systemInfo.cpuCount) cores available"
+            )
+            SettingSlider(
+                title: "Memory",
+                valueText: "\(Int(memoryGB)) GB",
+                value: $memoryGB,
+                range: 1...Double(systemInfo.maxMemoryGB),
+                step: 1,
+                footer: "\(systemInfo.totalMemoryGB) GB installed on this Mac"
+            )
+            SettingSlider(
+                title: "Shared graphics memory",
+                valueText: "\(Int(vramMB)) MB",
+                value: $vramMB,
+                range: 128...2048,
+                step: 128,
+                footer: "Reserved from host memory for the virtual GPU"
+            )
+            Divider()
+            HStack {
+                Text("Guest resolution")
+                Spacer()
+                Picker("Guest resolution", selection: $resolution) {
+                    ForEach(DisplayResolution.presets) { preset in
+                        Text(preset.label).tag(preset)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 160)
+            }
+            Toggle("Use full resolution for Retina display", isOn: $retinaEnabled)
+            Text(
+                retinaEnabled
+                    ? "Renders one guest pixel per Retina pixel for sharper output."
+                    : "Renders at standard scale to reduce GPU and memory use."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct StorageStepView: View {
+    let source: VMSource
+    let existingDiskPath: String
+    @Binding var diskSizeGB: Double
+
+    var body: some View {
+        WizardPage(
+            title: "Configure storage",
+            subtitle: source == .installFromISO
+                ? "The disk is sparse and consumes space only as data is written."
+                : "Bobrvm will attach the selected disk without changing its contents."
+        ) {
+            if source == .installFromISO {
+                SettingSlider(
+                    title: "Maximum disk size",
+                    valueText: "\(Int(diskSizeGB)) GB",
+                    value: $diskSizeGB,
+                    range: 8...512,
+                    step: 1,
+                    footer: "You can grow this disk later, but it cannot be shrunk safely."
+                )
+                Label(
+                    "A sparse raw disk will be stored in Bobrvm’s Application Support folder.",
+                    systemImage: "internaldrive"
+                )
+                .foregroundStyle(.secondary)
+            } else {
+                SummaryRow(
+                    label: "Virtual disk",
+                    value: URL(fileURLWithPath: existingDiskPath).lastPathComponent
+                )
+                Text(existingDiskPath)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+private struct SummaryStepView: View {
+    @Binding var name: String
+    let source: VMSource
+    let isoPath: String
+    let existingDiskPath: String
+    let memoryGB: Int
+    let vcpuCount: Int
+    let vramMB: Int
+    let resolution: DisplayResolution
+    let retinaEnabled: Bool
+    let diskSizeGB: Int
+
+    var body: some View {
+        WizardPage(
+            title: "Ready to create",
+            subtitle: "Review the configuration, then create the virtual machine."
+        ) {
+            LabeledContent("Name") {
+                TextField("Virtual machine name", text: $name)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 240)
+            }
+            Divider()
+            SummaryRow(label: "Processors & Memory", value: "\(vcpuCount) cores, \(memoryGB) GB")
+            SummaryRow(label: "Graphics", value: "\(vramMB) MB, \(resolution.label)")
+            SummaryRow(label: "Retina", value: retinaEnabled ? "Full resolution" : "Standard scale")
+            SummaryRow(
+                label: "Disk",
+                value: source == .installFromISO
+                    ? "\(diskSizeGB) GB sparse disk"
+                    : URL(fileURLWithPath: existingDiskPath).lastPathComponent
+            )
+            SummaryRow(
+                label: "CD/DVD",
+                value: source == .installFromISO
+                    ? URL(fileURLWithPath: isoPath).lastPathComponent
+                    : "Empty"
+            )
+        }
+    }
+}
+
+private struct WizardPage<Content: View>: View {
+    let title: String
+    let subtitle: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                Text(title).font(.title2.bold())
+                Text(subtitle).foregroundStyle(.secondary)
+                content
+                Spacer(minLength: 0)
+            }
+            .padding(28)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct SourceCard: View {
+    let title: String
+    let detail: String
+    let icon: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                Image(systemName: icon).font(.title2).frame(width: 30)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).fontWeight(.medium)
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+            }
+            .contentShape(Rectangle())
+            .padding(12)
+            .background(selected ? Color.accentColor.opacity(0.08) : .clear)
+            .overlay(
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(selected ? Color.accentColor : Color.secondary.opacity(0.25))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct SettingSlider: View {
+    let title: String
+    let valueText: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let footer: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(valueText).monospacedDigit().foregroundStyle(.secondary)
+            }
+            Slider(value: $value, in: range, step: step)
+            Text(footer).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct SummaryRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        LabeledContent(label) {
+            Text(value).foregroundStyle(.secondary)
+        }
+    }
+}
 
 enum DiskManager {
     static let appSupportDir: URL = {
-        let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("Bobrvm", isDirectory: true)
+        let root = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        return root.appendingPathComponent("Bobrvm", isDirectory: true)
     }()
-    
+
     enum DiskError: LocalizedError {
         case directoryCreationFailed
-        case diskCreationFailed(String)
-        case diskAlreadyExists
-        
+
         var errorDescription: String? {
             switch self {
             case .directoryCreationFailed:
-                return "Failed to create application support directory"
-            case .diskCreationFailed(let reason):
-                return "Failed to create disk: \(reason)"
-            case .diskAlreadyExists:
-                return "A disk with this name already exists"
+                return "Failed to create the Bobrvm application support directory."
             }
         }
     }
-    
-    /// Creates a sparse disk image (like Lima/Fusion).
-    /// Only allocates space as data is written.
-    static func createSparseDisk(name: String, sizeGB: Int) async throws -> String {
-        let fm = FileManager.default
-        
-        // Create directory if needed
-        if !fm.fileExists(atPath: appSupportDir.path) {
-            do {
-                try fm.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
-            } catch {
-                throw DiskError.directoryCreationFailed
-            }
-        }
-        
-        // Sanitize name for filename
-        let safeName = name
-            .replacingOccurrences(of: "/", with: "-")
-            .replacingOccurrences(of: ":", with: "-")
-            .replacingOccurrences(of: " ", with: "_")
-        
-        let diskPath = appSupportDir
-            .appendingPathComponent("\(safeName).raw")
-            .path
-        
-        // Check if already exists
-        if fm.fileExists(atPath: diskPath) {
-            throw DiskError.diskAlreadyExists
-        }
-        
-        // Create sparse file using truncate (like Lima)
-        let sizeBytes = Int64(sizeGB) * 1024 * 1024 * 1024
-        
-        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    // Create empty file
-                    fm.createFile(atPath: diskPath, contents: nil)
-                    
-                    // Open and truncate to desired size (sparse)
-                    let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: diskPath))
-                    try handle.truncate(atOffset: UInt64(sizeBytes))
-                    try handle.close()
-                    
-                    continuation.resume(returning: diskPath)
-                } catch {
-                    // Clean up on failure
-                    try? fm.removeItem(atPath: diskPath)
-                    continuation.resume(throwing: DiskError.diskCreationFailed(error.localizedDescription))
-                }
-            }
-        }
-        
-        return result
-    }
-    
-    /// Get actual disk usage of a sparse file
-    static func actualDiskUsage(path: String) -> Int64? {
-        let fm = FileManager.default
-        guard let attrs = try? fm.attributesOfItem(atPath: path),
-              let size = attrs[.size] as? Int64 else {
-            return nil
-        }
-        return size
-    }
-}
 
-// MARK: - System Info
+    static func safeFilename(_ name: String) -> String {
+        VMFilename.sanitize(name)
+    }
+
+    static func createSparseDisk(name: String, sizeGB: Int) throws -> String {
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+        } catch {
+            throw DiskError.directoryCreationFailed
+        }
+
+        let path = appSupportDir.appendingPathComponent("\(safeFilename(name)).raw").path
+        try VirtualDisk.createSparse(path: path, sizeBytes: bytes(forGB: sizeGB))
+        return path
+    }
+
+    static func growRawDisk(path: String, sizeGB: Int) throws {
+        try VirtualDisk.growRaw(path: path, sizeBytes: bytes(forGB: sizeGB))
+    }
+
+    static func logicalSize(path: String) -> Int64? {
+        (try? VirtualDisk.logicalSize(path: path)).flatMap(Int64.init(exactly:))
+    }
+
+    static func allocatedSize(path: String) -> Int64? {
+        let values = try? URL(fileURLWithPath: path).resourceValues(
+            forKeys: [.totalFileAllocatedSizeKey]
+        )
+        return values?.totalFileAllocatedSize.map(Int64.init)
+    }
+
+    static func sizeGB(path: String) -> Int? {
+        guard let size = logicalSize(path: path) else { return nil }
+        let gib = Int64(1024 * 1024 * 1024)
+        return Int((size + gib - 1) / gib)
+    }
+
+    private static func bytes(forGB sizeGB: Int) -> UInt64 {
+        UInt64(sizeGB) * 1024 * 1024 * 1024
+    }
+
+}
 
 struct SystemInfo {
     let totalMemoryGB: Int
     let maxMemoryGB: Int
     let cpuCount: Int
-    
+
     init() {
-        let physicalMemory = ProcessInfo.processInfo.physicalMemory
-        totalMemoryGB = Int(physicalMemory / (1024 * 1024 * 1024))
-        // Reserve 4GB for macOS, minimum 1GB for VM
+        let processInfo = ProcessInfo.processInfo
+        totalMemoryGB = Int(processInfo.physicalMemory / (1024 * 1024 * 1024))
         maxMemoryGB = max(1, totalMemoryGB - 4)
-        cpuCount = ProcessInfo.processInfo.processorCount
+        cpuCount = max(1, processInfo.processorCount)
     }
 }
-
-// MARK: - File Picker Field
 
 struct FilePickerField: View {
     let label: String
     @Binding var path: String
     let types: [UTType]
-    
+
     var body: some View {
         LabeledContent(label) {
             HStack {
-                Text(path.isEmpty ? "None" : URL(fileURLWithPath: path).lastPathComponent)
-                    .foregroundColor(path.isEmpty ? .secondary : .primary)
+                Text(path.isEmpty ? "None selected" : URL(fileURLWithPath: path).lastPathComponent)
+                    .foregroundStyle(path.isEmpty ? .secondary : .primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                
-                Spacer()
-                
-                Button("Choose...") {
-                    selectFile()
+                if !path.isEmpty {
+                    Button {
+                        path = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Clear selection")
                 }
-                .buttonStyle(.bordered)
+                Button("Choose…", action: selectFile)
             }
         }
     }
-    
+
     private func selectFile() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        if !types.isEmpty {
-            panel.allowedContentTypes = types
-        }
-        
-        if panel.runModal() == .OK, let url = panel.url {
-            path = url.path
-        }
+        panel.allowedContentTypes = types
+        if panel.runModal() == .OK, let url = panel.url { path = url.path }
     }
 }
 
-// MARK: - UTType Extensions
-
 extension UTType {
-    static var iso: UTType {
-        UTType(filenameExtension: "iso") ?? .diskImage
-    }
-    
-    static var rawDisk: UTType {
-        UTType(filenameExtension: "raw") ?? .data
-    }
-    
-    static var qcow2: UTType {
-        UTType(filenameExtension: "qcow2") ?? .data
-    }
+    static var iso: UTType { UTType(filenameExtension: "iso") ?? .diskImage }
+    static var rawDisk: UTType { UTType(filenameExtension: "raw") ?? .data }
+    static var qcow2: UTType { UTType(filenameExtension: "qcow2") ?? .data }
 }
 
 #Preview {
-    CreateVMView()
-        .environmentObject(VMManager())
+    CreateVMView().environmentObject(VMManager())
 }

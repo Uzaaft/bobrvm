@@ -79,7 +79,9 @@ final class GhosttyRuntime: ObservableObject {
             _, target, action in
             switch action.tag {
             case GHOSTTY_ACTION_SET_TITLE:
-                guard let surfaceView = GhosttyRuntime.surfaceView(from: target) else { return false }
+                guard let surfaceView = GhosttyRuntime.surfaceView(from: target) else {
+                    return false
+                }
                 guard let titlePtr = action.action.set_title.title else { return false }
                 let title = String(cString: titlePtr)
                 DispatchQueue.main.async {
@@ -87,7 +89,9 @@ final class GhosttyRuntime: ObservableObject {
                 }
                 return true
             case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
-                guard let surfaceView = GhosttyRuntime.surfaceView(from: target) else { return false }
+                guard let surfaceView = GhosttyRuntime.surfaceView(from: target) else {
+                    return false
+                }
                 DispatchQueue.main.async {
                     surfaceView.requestClose()
                 }
@@ -98,8 +102,10 @@ final class GhosttyRuntime: ObservableObject {
         }
 
     private static let readClipboardCallback:
-        @convention(c) (UnsafeMutableRawPointer?, ghostty_clipboard_e, UnsafeMutableRawPointer?) -> Void =
+        @convention(c) (UnsafeMutableRawPointer?, ghostty_clipboard_e, UnsafeMutableRawPointer?) ->
+            Bool =
             { _, _, _ in
+                false
             }
 
     private static let confirmReadClipboardCallback:
@@ -111,14 +117,16 @@ final class GhosttyRuntime: ObservableObject {
 
     private static let writeClipboardCallback:
         @convention(c) (
-            UnsafeMutableRawPointer?, ghostty_clipboard_e, UnsafePointer<ghostty_clipboard_content_s>?,
+            UnsafeMutableRawPointer?, ghostty_clipboard_e,
+            UnsafePointer<ghostty_clipboard_content_s>?,
             Int, Bool
         ) -> Void = { _, _, _, _, _ in
         }
 
-    private static let closeSurfaceCallback: @convention(c) (UnsafeMutableRawPointer?, Bool) -> Void =
-        { _, _ in
-        }
+    private static let closeSurfaceCallback:
+        @convention(c) (UnsafeMutableRawPointer?, Bool) -> Void =
+            { _, _ in
+            }
 
     private static func surfaceView(from target: ghostty_target_s) -> GhosttySurfaceView? {
         guard target.tag == GHOSTTY_TARGET_SURFACE else { return nil }

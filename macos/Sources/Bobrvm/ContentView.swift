@@ -5,21 +5,21 @@
 //  Main content view with VM list and display area.
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
 // MARK: - Debug Build Warning
 
 struct DebugBuildWarningView: View {
     @State private var isPopover = false
-    
+
     var body: some View {
         HStack {
             Spacer()
-            
+
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.yellow)
-            
+
             Text("Debug build – performance may be degraded")
                 .font(.callout)
                 .padding(.vertical, 8)
@@ -27,14 +27,15 @@ struct DebugBuildWarningView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Debug Build")
                             .font(.headline)
-                        
-                        Text("""
+
+                        Text(
+                            """
                             Debug builds of Bobrvm include additional safety \
                             checks and logging that may impact performance.
-                            
+
                             For production use, build with:
                             """)
-                        
+
                         Text("zig build -Doptimize=ReleaseFast")
                             .font(.system(.body, design: .monospaced))
                             .padding(8)
@@ -44,7 +45,7 @@ struct DebugBuildWarningView: View {
                     .padding()
                     .frame(width: 320)
                 }
-            
+
             Spacer()
         }
         .background(Color(.windowBackgroundColor).opacity(0.95))
@@ -64,14 +65,14 @@ struct DebugBuildWarningView: View {
 struct ContentView: View {
     @EnvironmentObject var vmManager: VMManager
     @StateObject private var ghosttyRuntime = GhosttyRuntime()
-    
+
     var body: some View {
         VStack(spacing: 0) {
             // Debug build warning banner
             if bobrvm_is_debug() {
                 DebugBuildWarningView()
             }
-            
+
             NavigationSplitView {
                 VMListView()
                     .frame(minWidth: 200)
@@ -79,7 +80,7 @@ struct ContentView: View {
                 if let vm = vmManager.selectedVM {
                     VMDetailView(vmInstance: vm, ghosttyRuntime: ghosttyRuntime)
                 } else {
-                    EmptyStateView()
+                    VMLibraryHomeView()
                 }
             }
             .toolbar {
@@ -104,7 +105,7 @@ struct VMListView: View {
     @State private var vmToEdit: VMInstance?
     @State private var showDeleteConfirmation = false
     @State private var showEditSheet = false
-    
+
     var body: some View {
         List(vmManager.vms, selection: $vmManager.selectedVM) { vm in
             VMListRow(vmInstance: vm)
@@ -149,7 +150,8 @@ struct VMListView: View {
             }
         } message: {
             if let vm = vmToDelete {
-                Text("Are you sure you want to delete \"\(vm.name)\"? This action cannot be undone.")
+                Text(
+                    "Are you sure you want to delete \"\(vm.name)\"? This action cannot be undone.")
             }
         }
         .sheet(isPresented: $showEditSheet) {
@@ -167,7 +169,7 @@ struct VMContextMenu: View {
     @EnvironmentObject var vmManager: VMManager
     let onEdit: () -> Void
     let onDelete: () -> Void
-    
+
     var body: some View {
         Group {
             // Power controls
@@ -180,37 +182,37 @@ struct VMContextMenu: View {
                         Label("Start", systemImage: "play.fill")
                     }
                     .keyboardShortcut("r", modifiers: .command)
-                    
+
                 case .running:
                     Button {
                         vmInstance.pause()
                     } label: {
                         Label("Pause", systemImage: "pause.fill")
                     }
-                    
+
                     Button {
                         vmInstance.stop()
                     } label: {
                         Label("Stop", systemImage: "stop.fill")
                     }
                     .keyboardShortcut(".", modifiers: .command)
-                    
+
                     Divider()
-                    
+
                     Button {
                         vmInstance.stop()
                         try? vmInstance.start()
                     } label: {
                         Label("Restart", systemImage: "arrow.clockwise")
                     }
-                    
+
                 case .paused:
                     Button {
                         vmInstance.resume()
                     } label: {
                         Label("Resume", systemImage: "play.fill")
                     }
-                    
+
                     Button {
                         vmInstance.stop()
                     } label: {
@@ -218,9 +220,9 @@ struct VMContextMenu: View {
                     }
                 }
             }
-            
+
             Divider()
-            
+
             // VM management
             Section {
                 Button {
@@ -229,7 +231,7 @@ struct VMContextMenu: View {
                     Label("Settings…", systemImage: "gearshape")
                 }
                 .keyboardShortcut(",", modifiers: .command)
-                
+
                 Button {
                     duplicateVM()
                 } label: {
@@ -237,9 +239,9 @@ struct VMContextMenu: View {
                 }
                 .disabled(vmInstance.state == .running)
             }
-            
+
             Divider()
-            
+
             // File operations
             Section {
                 if let diskPath = vmInstance.config.diskPath {
@@ -249,16 +251,16 @@ struct VMContextMenu: View {
                         Label("Show Disk in Finder", systemImage: "folder")
                     }
                 }
-                
+
                 Button {
                     showConfigInFinder()
                 } label: {
                     Label("Show Config in Finder", systemImage: "doc.text")
                 }
             }
-            
+
             Divider()
-            
+
             // Danger zone
             Section {
                 Button(role: .destructive) {
@@ -270,27 +272,29 @@ struct VMContextMenu: View {
             }
         }
     }
-    
+
     private func duplicateVM() {
         let newName = "\(vmInstance.name) (Copy)"
         try? vmManager.createVM(
             name: newName,
             config: vmInstance.config,
             isoPath: vmInstance.isoPath,
-            vramMB: vmInstance.vramMB
+            retinaEnabled: vmInstance.retinaEnabled
         )
     }
-    
+
     private func showInFinder(path: String) {
         let url = URL(fileURLWithPath: path)
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
-    
+
     private func showConfigInFinder() {
-        let configDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("Bobrvm")
-            .appendingPathComponent("configs")
-        
+        let configDir = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first?
+        .appendingPathComponent("Bobrvm")
+        .appendingPathComponent("configs")
+
         if let configDir = configDir {
             let configFile = configDir.appendingPathComponent("\(vmInstance.id.uuidString).json")
             if FileManager.default.fileExists(atPath: configFile.path) {
@@ -304,16 +308,16 @@ struct VMContextMenu: View {
 
 struct VMListRow: View {
     @ObservedObject var vmInstance: VMInstance
-    
+
     var body: some View {
         HStack {
             Image(systemName: "desktopcomputer")
                 .foregroundColor(stateColor)
-            
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(vmInstance.name)
                     .font(.headline)
-                
+
                 Text(stateText)
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -321,7 +325,7 @@ struct VMListRow: View {
         }
         .padding(.vertical, 4)
     }
-    
+
     private var stateColor: Color {
         switch vmInstance.state {
         case .running: return .green
@@ -329,7 +333,7 @@ struct VMListRow: View {
         case .stopped: return .gray
         }
     }
-    
+
     private var stateText: String {
         switch vmInstance.state {
         case .running: return "Running"
@@ -346,14 +350,14 @@ struct VMDetailView: View {
     @ObservedObject var ghosttyRuntime: GhosttyRuntime
     @EnvironmentObject var vmManager: VMManager
     @State private var showingConsole = true
-    
+
     var body: some View {
         VStack(spacing: 0) {
             if vmInstance.state == .running || vmInstance.state == .paused {
                 VSplitView {
                     VMSurfaceRepresentable(vmInstance: vmInstance)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    
+
                     if showingConsole {
                         if let app = ghosttyRuntime.app {
                             GhosttySurfaceViewRepresentable(
@@ -374,13 +378,13 @@ struct VMDetailView: View {
                     Image(systemName: "desktopcomputer")
                         .font(.system(size: 64))
                         .foregroundColor(.secondary)
-                    
+
                     Text(vmInstance.name)
                         .font(.title)
-                    
+
                     Text("Click Start to boot the VM")
                         .foregroundColor(.secondary)
-                    
+
                     Button("Start") {
                         try? vmInstance.start()
                     }
@@ -406,19 +410,19 @@ struct VMDetailView: View {
 struct ConsoleView: View {
     @EnvironmentObject var vmManager: VMManager
     @State private var autoScroll = true
-    
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text("Console")
                     .font(.headline)
-                
+
                 Spacer()
-                
+
                 Toggle("Auto-scroll", isOn: $autoScroll)
                     .toggleStyle(.checkbox)
                     .controlSize(.small)
-                
+
                 Button(action: { vmManager.clearConsoleOutput() }) {
                     Image(systemName: "trash")
                 }
@@ -428,7 +432,7 @@ struct ConsoleView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(Color(.windowBackgroundColor))
-            
+
             ScrollViewReader { proxy in
                 ScrollView {
                     Text(vmManager.consoleOutput)
@@ -453,7 +457,7 @@ struct ConsoleView: View {
 
 struct VMToolbar: View {
     @ObservedObject var vmInstance: VMInstance
-    
+
     var body: some View {
         HStack {
             switch vmInstance.state {
@@ -462,24 +466,24 @@ struct VMToolbar: View {
                     Label("Start", systemImage: "play.fill")
                 }
                 .help("Start VM")
-                
+
             case .running:
                 Button(action: { vmInstance.pause() }) {
                     Label("Pause", systemImage: "pause.fill")
                 }
                 .help("Pause VM")
-                
+
                 Button(action: { vmInstance.stop() }) {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .help("Stop VM")
-                
+
             case .paused:
                 Button(action: { vmInstance.resume() }) {
                     Label("Resume", systemImage: "play.fill")
                 }
                 .help("Resume VM")
-                
+
                 Button(action: { vmInstance.stop() }) {
                     Label("Stop", systemImage: "stop.fill")
                 }
@@ -493,20 +497,20 @@ struct VMToolbar: View {
 
 struct EmptyStateView: View {
     @EnvironmentObject var vmManager: VMManager
-    
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "desktopcomputer")
                 .font(.system(size: 64))
                 .foregroundColor(.secondary)
-            
+
             Text("No VM Selected")
                 .font(.title2)
-            
+
             Text("Create a new virtual machine or select one from the sidebar")
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
-            
+
             Button("Create VM") {
                 vmManager.showingCreateVM = true
             }

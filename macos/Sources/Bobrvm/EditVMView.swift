@@ -11,54 +11,68 @@ import UniformTypeIdentifiers
 struct EditVMView: View {
     @EnvironmentObject var vmManager: VMManager
     @Environment(\.dismiss) var dismiss
-    
+
     let vmInstance: VMInstance
-    
+
     @State private var name: String
     @State private var isoPath: String
     @State private var memoryGB: Double
     @State private var vcpuCount: Double
     @State private var vramMB: Double
+    @State private var resolution: DisplayResolution
+    @State private var retinaEnabled: Bool
+    @State private var diskSizeGB: Double
     @State private var showingError = false
     @State private var errorMessage = ""
     @State private var isSaving = false
     @State private var hasChanges = false
-    
+
     private let systemInfo = SystemInfo()
-    
+
     private var isRunning: Bool {
         vmInstance.state != .stopped
     }
-    
+
     init(vmInstance: VMInstance) {
         self.vmInstance = vmInstance
         _name = State(initialValue: vmInstance.name)
         _isoPath = State(initialValue: vmInstance.isoPath ?? "")
-        _memoryGB = State(initialValue: Double(vmInstance.config.memoryBytes) / (1024 * 1024 * 1024))
+        _memoryGB = State(
+            initialValue: Double(vmInstance.config.memoryBytes) / (1024 * 1024 * 1024))
         _vcpuCount = State(initialValue: Double(vmInstance.config.vcpuCount))
         _vramMB = State(initialValue: Double(vmInstance.vramMB))
+        _resolution = State(
+            initialValue: DisplayResolution(
+                width: vmInstance.config.displayWidth,
+                height: vmInstance.config.displayHeight
+            ))
+        _retinaEnabled = State(initialValue: vmInstance.retinaEnabled)
+        _diskSizeGB = State(
+            initialValue: Double(
+                vmInstance.config.diskPath.flatMap(DiskManager.sizeGB(path:)) ?? 8
+            ))
     }
-    
+
     var body: some View {
         VStack(spacing: 0) {
             // Running VM banner
             if isRunning {
                 RunningVMBanner(state: vmInstance.state)
             }
-            
+
             Form {
                 // General - always editable
                 Section("General") {
                     TextField("Name", text: $name)
                         .onChange(of: name) { _ in hasChanges = true }
-                    
+
                     LabeledContent("Status") {
                         HStack(spacing: 6) {
                             Circle()
                                 .fill(stateColor)
                                 .frame(width: 8, height: 8)
                             Text(stateText)
-                            
+
                             if isRunning {
                                 Text("•")
                                     .foregroundColor(.secondary)
@@ -69,7 +83,7 @@ struct EditVMView: View {
                         }
                     }
                 }
-                
+
                 // Storage
                 Section {
                     if let diskPath = vmInstance.config.diskPath {
@@ -78,18 +92,35 @@ struct EditVMView: View {
                                 Text(URL(fileURLWithPath: diskPath).lastPathComponent)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                
-                                if let usage = DiskManager.actualDiskUsage(path: diskPath) {
-                                    Text(ByteCountFormatter.string(fromByteCount: usage, countStyle: .file))
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+
+                                if let capacity = DiskManager.logicalSize(path: diskPath) {
+                                    let allocated =
+                                        DiskManager.allocatedSize(path: diskPath) ?? capacity
+                                    Text(
+                                        "\(formatBytes(allocated)) used of \(formatBytes(capacity))"
+                                    )
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                                 }
                             }
                         }
+
+                        if canGrowDisk && !isRunning {
+                            SettingSlider(
+                                title: "Maximum disk size",
+                                valueText: "\(Int(diskSizeGB)) GB",
+                                value: $diskSizeGB,
+                                range: Double(
+                                    currentDiskSizeGB)...Double(max(1024, currentDiskSizeGB)),
+                                step: 1,
+                                footer: "The disk can grow, but cannot be safely shrunk."
+                            )
+                            .onChange(of: diskSizeGB) { _ in hasChanges = true }
+                        }
                     }
-                    
+
                     FilePickerField(
-                        label: "Installation ISO",
+                        label: "CD/DVD Image",
                         path: $isoPath,
                         types: [.iso]
                     )
@@ -97,11 +128,15 @@ struct EditVMView: View {
                 } header: {
                     Text("Storage")
                 } footer: {
-                    Text("Disk image cannot be changed after creation.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    Text(
+                        canGrowDisk
+                            ? "Raw disk capacity may only be increased while the VM is stopped."
+                            : "This disk format cannot be resized by Bobrvm."
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                 }
-                
+
                 // CPU & Memory - show read-only when running
                 if isRunning {
                     Section {
@@ -110,7 +145,7 @@ struct EditVMView: View {
                             value: "\(Int(memoryGB)) GB",
                             icon: "memorychip"
                         )
-                        
+
                         ReadOnlyConfigRow(
                             label: "CPU Cores",
                             value: "\(Int(vcpuCount))",
@@ -132,13 +167,15 @@ struct EditVMView: View {
                                 Text("\(Int(memoryGB)) GB")
                                     .foregroundColor(.secondary)
                             }
-                            Slider(value: $memoryGB, in: 1...Double(systemInfo.maxMemoryGB), step: 1)
-                                .onChange(of: memoryGB) { _ in hasChanges = true }
+                            Slider(
+                                value: $memoryGB, in: 1...Double(systemInfo.maxMemoryGB), step: 1
+                            )
+                            .onChange(of: memoryGB) { _ in hasChanges = true }
                             Text("\(systemInfo.totalMemoryGB) GB total on this Mac")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                        
+
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Text("CPU Cores")
@@ -156,7 +193,7 @@ struct EditVMView: View {
                         Text("CPU & Memory")
                     }
                 }
-                
+
                 // GPU - show read-only when running
                 if isRunning {
                     Section {
@@ -164,6 +201,11 @@ struct EditVMView: View {
                             label: "Shared Graphics Memory",
                             value: "\(Int(vramMB)) MB",
                             icon: "gpu"
+                        )
+                        ReadOnlyConfigRow(
+                            label: "Resolution",
+                            value: resolution.label,
+                            icon: "display"
                         )
                     } header: {
                         HStack {
@@ -184,11 +226,21 @@ struct EditVMView: View {
                             Slider(value: $vramMB, in: 64...2048, step: 64)
                                 .onChange(of: vramMB) { _ in hasChanges = true }
                         }
+
+                        Picker("Guest Resolution", selection: $resolution) {
+                            ForEach(DisplayResolution.presets) { preset in
+                                Text(preset.label).tag(preset)
+                            }
+                        }
+                        .onChange(of: resolution) { _ in hasChanges = true }
+
+                        Toggle("Use full resolution for Retina display", isOn: $retinaEnabled)
+                            .onChange(of: retinaEnabled) { _ in hasChanges = true }
                     } header: {
                         Text("Graphics")
                     }
                 }
-                
+
                 // Info
                 Section("Information") {
                     LabeledContent("VM ID") {
@@ -197,7 +249,7 @@ struct EditVMView: View {
                             .textSelection(.enabled)
                             .foregroundColor(.secondary)
                     }
-                    
+
                     if let diskPath = vmInstance.config.diskPath {
                         LabeledContent("Disk Path") {
                             Text(diskPath)
@@ -211,9 +263,9 @@ struct EditVMView: View {
             }
             .formStyle(.grouped)
             .disabled(isSaving)
-            
+
             Divider()
-            
+
             // Footer
             HStack {
                 Button("Cancel") {
@@ -221,15 +273,15 @@ struct EditVMView: View {
                 }
                 .keyboardShortcut(.cancelAction)
                 .disabled(isSaving)
-                
+
                 Spacer()
-                
+
                 if isSaving {
                     ProgressView()
                         .scaleEffect(0.7)
                         .padding(.trailing, 8)
                 }
-                
+
                 if isRunning {
                     Button("Done") {
                         if hasChanges {
@@ -250,14 +302,14 @@ struct EditVMView: View {
             }
             .padding()
         }
-        .frame(width: 500, height: isRunning ? 580 : 620)
+        .frame(width: 520, height: isRunning ? 640 : 720)
         .alert("Error", isPresented: $showingError) {
             Button("OK") {}
         } message: {
             Text(errorMessage)
         }
     }
-    
+
     private var stateColor: Color {
         switch vmInstance.state {
         case .running: return .green
@@ -265,7 +317,7 @@ struct EditVMView: View {
         case .stopped: return .gray
         }
     }
-    
+
     private var stateText: String {
         switch vmInstance.state {
         case .running: return "Running"
@@ -273,40 +325,51 @@ struct EditVMView: View {
         case .stopped: return "Stopped"
         }
     }
-    
+
     private var uptimeText: String {
         // Placeholder - would need actual uptime tracking
         "since launch"
     }
-    
+
     private var isValid: Bool {
         !name.trimmingCharacters(in: .whitespaces).isEmpty
     }
-    
+
+    private var currentDiskSizeGB: Int {
+        vmInstance.config.diskPath.flatMap(DiskManager.sizeGB(path:)) ?? 8
+    }
+
+    private var canGrowDisk: Bool {
+        vmInstance.config.diskPath.map {
+            URL(fileURLWithPath: $0).pathExtension.lowercased() == "raw"
+        } ?? false
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
     private func saveChanges() {
         isSaving = true
-        
-        Task {
-            do {
-                try await vmManager.updateVM(
-                    vmInstance,
-                    name: name,
-                    memoryGB: Int(memoryGB),
-                    vcpuCount: Int(vcpuCount),
-                    vramMB: Int(vramMB),
-                    isoPath: isoPath.isEmpty ? nil : isoPath
-                )
-                
-                await MainActor.run {
-                    dismiss()
-                }
-            } catch {
-                await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    showingError = true
-                    isSaving = false
-                }
-            }
+
+        do {
+            try vmManager.updateVM(
+                vmInstance,
+                name: name,
+                memoryGB: Int(memoryGB),
+                vcpuCount: Int(vcpuCount),
+                vramMB: Int(vramMB),
+                isoPath: isoPath.isEmpty ? nil : isoPath,
+                displayWidth: Int(resolution.width),
+                displayHeight: Int(resolution.height),
+                retinaEnabled: retinaEnabled,
+                diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil
+            )
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+            isSaving = false
         }
     }
 }
@@ -315,24 +378,24 @@ struct EditVMView: View {
 
 struct RunningVMBanner: View {
     let state: VMState
-    
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: state == .paused ? "pause.circle.fill" : "play.circle.fill")
                 .font(.title2)
                 .foregroundColor(state == .paused ? .orange : .green)
-            
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(state == .paused ? "VM is Paused" : "VM is Running")
                     .font(.headline)
-                
+
                 Text("Stop the VM to change hardware settings")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            
+
             Spacer()
-            
+
             Image(systemName: "lock.fill")
                 .foregroundColor(.secondary)
         }
@@ -343,7 +406,9 @@ struct RunningVMBanner: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(state == .paused ? Color.orange.opacity(0.3) : Color.green.opacity(0.3), lineWidth: 1)
+                .strokeBorder(
+                    state == .paused ? Color.orange.opacity(0.3) : Color.green.opacity(0.3),
+                    lineWidth: 1)
         )
         .padding()
     }
@@ -355,7 +420,7 @@ struct ReadOnlyConfigRow: View {
     let label: String
     let value: String
     let icon: String
-    
+
     var body: some View {
         LabeledContent {
             Text(value)

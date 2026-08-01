@@ -462,15 +462,15 @@ fn appendMask(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, o: Operand) !voi
 
 fn isSupportedName(op: []const u8) bool {
     const ops = [_][]const u8{
-        "MOV",   "ADD", "SUB", "MUL",   "MAD",   "DP2", "DP3", "DP4",
-        "MAX",   "MIN", "RCP", "RSQ",   "FRC",   "FLR", "ABS", "SQRT",
-        "TEX",   "TXP", "TXB", "TXL",   "TXF",   "CMP", "LRP", "SLT",
-        "SGE",   "SEQ", "SNE",
-        "POW",   "EX2", "LG2", "SIN",   "COS",   "TRUNC", "ROUND",
-        "SSG",   "DDX", "DDY", "CEIL",  "XPD",   "NRM",   "DST",   "LIT",
-        "I2F",   "U2F", "F2I", "F2U",   "INEG",  "IABS",  "UADD",  "UMUL",
-        "UMAD",  "IMUL_HI", "ISHR", "USHR", "SHL", "AND",  "OR",    "XOR",
-        "NOT",   "ISLT", "ISGE", "USLT", "USGE", "IMAX",  "IMIN",  "UMAX", "UMIN",
+        "MOV",   "ADD",   "SUB",  "MUL",     "MAD",  "DP2",  "DP3",  "DP4",
+        "MAX",   "MIN",   "RCP",  "RSQ",     "FRC",  "FLR",  "ABS",  "SQRT",
+        "TEX",   "TXP",   "TXB",  "TXL",     "TXF",  "CMP",  "LRP",  "SLT",
+        "SGE",   "SEQ",   "SNE",  "POW",     "EX2",  "LG2",  "SIN",  "COS",
+        "TRUNC", "ROUND", "SSG",  "DDX",     "DDY",  "CEIL", "XPD",  "NRM",
+        "DST",   "LIT",   "I2F",  "U2F",     "F2I",  "F2U",  "INEG", "IABS",
+        "UADD",  "UMUL",  "UMAD", "IMUL_HI", "ISHR", "USHR", "SHL",  "AND",
+        "OR",    "XOR",   "NOT",  "ISLT",    "ISGE", "USLT", "USGE", "IMAX",
+        "IMIN",  "UMAX",  "UMIN",
     };
     for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
     return false;

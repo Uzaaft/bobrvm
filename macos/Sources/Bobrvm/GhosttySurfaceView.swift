@@ -133,7 +133,8 @@ final class GhosttySurfaceView: NSView {
             return
         }
         let mods = GhosttyInput.ghosttyMods(event.modifierFlags)
-        if !ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT, mods) {
+        if !ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT, mods)
+        {
             super.rightMouseUp(with: event)
         }
     }
@@ -357,11 +358,13 @@ final class GhosttySurfaceView: NSView {
     ) -> Bool {
         guard let surface else { return false }
 
-        var keyEvent = event.ghosttyKeyEvent(action, translationMods: translationEvent?.modifierFlags)
+        var keyEvent = event.ghosttyKeyEvent(
+            action, translationMods: translationEvent?.modifierFlags)
         keyEvent.composing = composing
 
         if let text, text.count > 0,
-           let codepoint = text.utf8.first, codepoint >= 0x20 {
+            let codepoint = text.utf8.first, codepoint >= 0x20
+        {
             return text.withCString { ptr in
                 keyEvent.text = ptr
                 return ghostty_surface_key(surface, keyEvent)

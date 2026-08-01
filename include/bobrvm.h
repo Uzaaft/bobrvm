@@ -51,6 +51,9 @@ typedef enum {
     BOBRVM_ERROR_SURFACE_CREATE = 7,
     BOBRVM_ERROR_METAL = 8,
     BOBRVM_ERROR_IO = 9,
+    BOBRVM_ERROR_ALREADY_EXISTS = 10,
+    BOBRVM_ERROR_CANNOT_SHRINK = 11,
+    BOBRVM_ERROR_UNSUPPORTED_FORMAT = 12,
 } bobrvm_error_e;
 
 /* -------------------------------------------------------------------------- */
@@ -100,6 +103,8 @@ typedef struct {
     uint32_t display_width;
     /** Initial guest display height in pixels (0 = default 800). */
     uint32_t display_height;
+    /** Host graphics-memory budget for 2D resources and the Venus window. */
+    uint64_t gpu_memory_bytes;
     /**
      * Enable 3D acceleration on the virtio-gpu: the virgl capset, plus the
      * venus capset when the library was built with -Dgpu-venus. Off by
@@ -108,6 +113,29 @@ typedef struct {
      */
     bool enable_gpu3d;
 } bobrvm_vm_config_s;
+
+/** Return the shared VM configuration defaults used by every frontend. */
+bobrvm_vm_config_s bobrvm_vm_config_defaults(void);
+
+/** Validate a VM configuration against shared safety policy. */
+bobrvm_error_e bobrvm_vm_config_validate(const bobrvm_vm_config_s* cfg);
+
+/** Create a new sparse disk at exactly size_bytes logical bytes. */
+bobrvm_error_e bobrvm_disk_create_sparse(const char* path, uint64_t size_bytes);
+
+/** Grow an existing raw disk. Shrinking and non-raw formats are rejected. */
+bobrvm_error_e bobrvm_disk_grow_raw(const char* path, uint64_t size_bytes);
+
+/** Read a disk's logical size. */
+bobrvm_error_e bobrvm_disk_logical_size(const char* path, uint64_t* out_size_bytes);
+
+/** Sanitize a VM name for use as a filename without allocating. */
+bobrvm_error_e bobrvm_filename_sanitize(
+    const char* input,
+    char* output,
+    size_t output_capacity,
+    size_t* out_length
+);
 
 /* -------------------------------------------------------------------------- */
 /* Runtime Callbacks (Zig → Swift)                                            */

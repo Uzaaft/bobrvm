@@ -22,8 +22,11 @@ public enum BobrvmError: Error, LocalizedError {
     case surfaceCreateFailed
     case metalFailed
     case ioError
+    case alreadyExists
+    case cannotShrink
+    case unsupportedFormat
     case unknown(Int32)
-    
+
     init(code: Int32) {
         switch code {
         case 0: self = .invalidArgument
@@ -36,10 +39,13 @@ public enum BobrvmError: Error, LocalizedError {
         case 7: self = .surfaceCreateFailed
         case 8: self = .metalFailed
         case 9: self = .ioError
+        case 10: self = .alreadyExists
+        case 11: self = .cannotShrink
+        case 12: self = .unsupportedFormat
         default: self = .unknown(code)
         }
     }
-    
+
     public var errorDescription: String? {
         switch self {
         case .invalidArgument: return "Invalid argument"
@@ -52,6 +58,9 @@ public enum BobrvmError: Error, LocalizedError {
         case .surfaceCreateFailed: return "Failed to create surface"
         case .metalFailed: return "Metal error"
         case .ioError: return "I/O error"
+        case .alreadyExists: return "The file already exists"
+        case .cannotShrink: return "Virtual disks cannot be safely shrunk"
+        case .unsupportedFormat: return "The disk format is unsupported"
         case .unknown(let code): return "Unknown error (\(code))"
         }
     }
@@ -63,13 +72,13 @@ public struct KeyEvent {
     public let keycode: UInt32
     public let modifiers: UInt32
     public let pressed: Bool
-    
+
     public init(keycode: UInt32, modifiers: UInt32, pressed: Bool) {
         self.keycode = keycode
         self.modifiers = modifiers
         self.pressed = pressed
     }
-    
+
     func toCStruct() -> bobrvm_key_event_s {
         return bobrvm_key_event_s(
             keycode: keycode,
@@ -90,6 +99,9 @@ public enum MouseButton: Int32 {
 public struct VMConfig {
     public var memoryBytes: UInt64
     public var vcpuCount: UInt8
+    public var displayWidth: UInt32
+    public var displayHeight: UInt32
+    public var gpuMemoryBytes: UInt64
     /// UEFI firmware path (e.g., QEMU_EFI.fd). If set, boots via firmware.
     public var firmwarePath: String?
     /// UEFI variables file path. Created if doesn't exist.
@@ -103,10 +115,13 @@ public struct VMConfig {
     public var isoPath: String?
     /// Whether ISO is read-only (default: true).
     public var isoReadOnly: Bool
-    
+
     public init(
-        memoryBytes: UInt64 = 512 * 1024 * 1024,
-        vcpuCount: UInt8 = 2,
+        memoryBytes: UInt64? = nil,
+        vcpuCount: UInt8? = nil,
+        displayWidth: UInt32? = nil,
+        displayHeight: UInt32? = nil,
+        gpuMemoryBytes: UInt64? = nil,
         firmwarePath: String? = nil,
         varsPath: String? = nil,
         kernelPath: String? = nil,
@@ -117,8 +132,12 @@ public struct VMConfig {
         isoPath: String? = nil,
         isoReadOnly: Bool = true
     ) {
-        self.memoryBytes = memoryBytes
-        self.vcpuCount = vcpuCount
+        let defaults = bobrvm_vm_config_defaults()
+        self.memoryBytes = memoryBytes ?? defaults.memory_bytes
+        self.vcpuCount = vcpuCount ?? defaults.vcpu_count
+        self.displayWidth = displayWidth ?? defaults.display_width
+        self.displayHeight = displayHeight ?? defaults.display_height
+        self.gpuMemoryBytes = gpuMemoryBytes ?? defaults.gpu_memory_bytes
         self.firmwarePath = firmwarePath
         self.varsPath = varsPath
         self.kernelPath = kernelPath
@@ -129,14 +148,17 @@ public struct VMConfig {
         self.isoPath = isoPath
         self.isoReadOnly = isoReadOnly
     }
-    
+
     func withCConfig<T>(_ body: (UnsafePointer<bobrvm_vm_config_s>) throws -> T) rethrows -> T {
         var config = bobrvm_vm_config_s()
         config.memory_bytes = memoryBytes
         config.vcpu_count = vcpuCount
+        config.display_width = displayWidth
+        config.display_height = displayHeight
+        config.gpu_memory_bytes = gpuMemoryBytes
         config.disk_read_only = diskReadOnly
         config.disk2_read_only = isoReadOnly
-        
+
         func withOptionalCString<R>(
             _ string: String?,
             _ body: (UnsafePointer<CChar>?) throws -> R
@@ -147,7 +169,7 @@ public struct VMConfig {
                 return try body(nil)
             }
         }
-        
+
         return try withOptionalCString(firmwarePath) { firmwarePtr in
             config.firmware_path = firmwarePtr
             return try withOptionalCString(varsPath) { varsPtr in
@@ -173,6 +195,50 @@ public struct VMConfig {
     }
 }
 
+// MARK: - Virtual Disks
+
+public enum VirtualDisk {
+    public static func createSparse(path: String, sizeBytes: UInt64) throws {
+        let code = path.withCString { bobrvm_disk_create_sparse($0, sizeBytes) }
+        if code.rawValue != BOBRVM_OK.rawValue {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+    }
+
+    public static func growRaw(path: String, sizeBytes: UInt64) throws {
+        let code = path.withCString { bobrvm_disk_grow_raw($0, sizeBytes) }
+        if code.rawValue != BOBRVM_OK.rawValue {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+    }
+
+    public static func logicalSize(path: String) throws -> UInt64 {
+        var sizeBytes: UInt64 = 0
+        let code = path.withCString { bobrvm_disk_logical_size($0, &sizeBytes) }
+        if code.rawValue != BOBRVM_OK.rawValue {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+        return sizeBytes
+    }
+}
+
+public enum VMFilename {
+    public static func sanitize(_ name: String) -> String {
+        name.withCString { input in
+            var output = [CChar](repeating: 0, count: Int(strlen(input)) + 1)
+            var outputLength = 0
+            let code = bobrvm_filename_sanitize(
+                input,
+                &output,
+                output.count - 1,
+                &outputLength
+            )
+            precondition(code.rawValue == BOBRVM_OK.rawValue, "Filename buffer invariant failed")
+            return String(decoding: output[0..<outputLength].map(UInt8.init), as: UTF8.self)
+        }
+    }
+}
+
 // MARK: - App
 
 @MainActor
@@ -180,9 +246,9 @@ public final class App {
     private var handle: bobrvm_app_t?
     private var runtimeConfig: bobrvm_runtime_config_s
     private var vms: [VM] = []
-    
+
     public weak var delegate: BobrvmAppDelegate?
-    
+
     public init() throws {
         runtimeConfig = bobrvm_runtime_config_s()
         runtimeConfig.userdata = Unmanaged.passUnretained(self).toOpaque()
@@ -245,40 +311,44 @@ public final class App {
                 app.delegate?.app(app, didReceiveConsoleOutput: text)
             }
         }
-        
+
         guard let h = withUnsafePointer(to: &runtimeConfig, { bobrvm_app_new($0) }) else {
             throw BobrvmError.outOfMemory
         }
         handle = h
     }
-    
+
     deinit {
         if let h = handle {
             bobrvm_app_destroy(h)
         }
     }
-    
+
     public func tick() {
         guard let h = handle else { return }
         bobrvm_app_tick(h)
     }
-    
+
     public func createVM(config: VMConfig) throws -> VM {
         guard let appHandle = handle else {
             throw BobrvmError.invalidArgument
         }
-        
+
         let vm = try config.withCConfig { cfgPtr in
+            let validationCode = bobrvm_vm_config_validate(cfgPtr)
+            guard validationCode.rawValue == BOBRVM_OK.rawValue else {
+                throw BobrvmError(code: Int32(validationCode.rawValue))
+            }
             guard let vmHandle = bobrvm_vm_new(appHandle, cfgPtr) else {
                 throw BobrvmError.vmCreateFailed
             }
             return VM(handle: vmHandle, app: self)
         }
-        
+
         vms.append(vm)
         return vm
     }
-    
+
     func removeVM(_ vm: VM) {
         vms.removeAll { $0 === vm }
     }
@@ -296,13 +366,13 @@ public protocol BobrvmAppDelegate: AnyObject {
     func app(_ app: App, didReceiveConsoleOutput text: String)
 }
 
-public extension BobrvmAppDelegate {
-    func app(_ app: App, didRequestTitleChange title: String) {}
-    func appDidRequestClose(_ app: App) {}
-    func appReadClipboard(_ app: App) -> String? { nil }
-    func app(_ app: App, didRequestWriteClipboard text: String) {}
-    func appGPUFrameReady(_ app: App) {}
-    func app(_ app: App, didReceiveConsoleOutput text: String) {}
+extension BobrvmAppDelegate {
+    public func app(_ app: App, didRequestTitleChange title: String) {}
+    public func appDidRequestClose(_ app: App) {}
+    public func appReadClipboard(_ app: App) -> String? { nil }
+    public func app(_ app: App, didRequestWriteClipboard text: String) {}
+    public func appGPUFrameReady(_ app: App) {}
+    public func app(_ app: App, didReceiveConsoleOutput text: String) {}
 }
 
 // MARK: - VM
@@ -310,22 +380,22 @@ public extension BobrvmAppDelegate {
 @MainActor
 public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
-    
+
     private var handle: bobrvm_vm_t?
     private weak var app: App?
     private var surfaces: [Surface] = []
-    
+
     init(handle: bobrvm_vm_t, app: App) {
         self.handle = handle
         self.app = app
     }
-    
+
     deinit {
         if let h = handle {
             bobrvm_vm_destroy(h)
         }
     }
-    
+
     public func start() throws {
         guard state == .stopped || state == .paused else {
             return  // Already running or invalid state
@@ -339,25 +409,25 @@ public final class VM: ObservableObject {
         }
         state = .running
     }
-    
+
     public func stop() {
         guard let h = handle else { return }
         bobrvm_vm_stop(h)
         state = .stopped
     }
-    
+
     public func pause() {
         guard let h = handle else { return }
         bobrvm_vm_pause(h)
         state = .paused
     }
-    
+
     public func resume() {
         guard let h = handle else { return }
         bobrvm_vm_resume(h)
         state = .running
     }
-    
+
     public func createSurface(
         device: MTLDevice,
         layer: CAMetalLayer,
@@ -366,24 +436,24 @@ public final class VM: ObservableObject {
         guard let vmHandle = handle else {
             throw BobrvmError.invalidArgument
         }
-        
+
         let devicePtr = Unmanaged.passUnretained(device).toOpaque()
         let layerPtr = Unmanaged.passUnretained(layer).toOpaque()
         let queuePtr = Unmanaged.passUnretained(queue).toOpaque()
-        
+
         guard let surfaceHandle = bobrvm_surface_new(vmHandle, devicePtr, layerPtr, queuePtr) else {
             throw BobrvmError.surfaceCreateFailed
         }
-        
+
         let surface = Surface(handle: surfaceHandle, vm: self)
         surfaces.append(surface)
         return surface
     }
-    
+
     func removeSurface(_ surface: Surface) {
         surfaces.removeAll { $0 === surface }
     }
-    
+
     func destroy() {
         surfaces.removeAll()
         if let h = handle {
@@ -406,59 +476,60 @@ public enum VMState: String, CaseIterable {
 public final class Surface {
     private var handle: bobrvm_surface_t?
     private weak var vm: VM?
-    
+
     init(handle: bobrvm_surface_t, vm: VM) {
         self.handle = handle
         self.vm = vm
     }
-    
+
     deinit {
         if let h = handle {
             bobrvm_surface_destroy(h)
         }
     }
-    
+
     public func setSize(width: UInt32, height: UInt32) {
         guard let h = handle else { return }
         bobrvm_surface_set_size(h, width, height)
     }
-    
+
     public func setContentScale(x: Double, y: Double) {
         guard let h = handle else { return }
         bobrvm_surface_set_content_scale(h, x, y)
     }
-    
+
     public func setFocus(_ focused: Bool) {
         guard let h = handle else { return }
         bobrvm_surface_set_focus(h, focused)
     }
-    
+
     public func draw() {
         guard let h = handle else { return }
         bobrvm_surface_draw(h)
     }
-    
+
     public func sendKey(_ event: KeyEvent) {
         guard let h = handle else { return }
         let cEvent = event.toCStruct()
         bobrvm_surface_key(h, cEvent)
     }
-    
+
     public func sendMouseButton(_ button: MouseButton, pressed: Bool) {
         guard let h = handle else { return }
-        bobrvm_surface_mouse_button(h, bobrvm_mouse_button_e(rawValue: UInt32(button.rawValue)), pressed)
+        bobrvm_surface_mouse_button(
+            h, bobrvm_mouse_button_e(rawValue: UInt32(button.rawValue)), pressed)
     }
-    
+
     public func sendMousePos(x: Double, y: Double) {
         guard let h = handle else { return }
         bobrvm_surface_mouse_pos(h, x, y)
     }
-    
+
     public func sendMouseScroll(dx: Double, dy: Double) {
         guard let h = handle else { return }
         bobrvm_surface_mouse_scroll(h, dx, dy)
     }
-    
+
     func destroy() {
         if let h = handle {
             bobrvm_surface_destroy(h)

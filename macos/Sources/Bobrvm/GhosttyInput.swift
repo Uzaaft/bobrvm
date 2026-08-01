@@ -57,7 +57,8 @@ extension NSEvent {
         keyEvent.unshifted_codepoint = 0
         if type == .keyDown || type == .keyUp {
             if let chars = characters(byApplyingModifiers: []),
-               let codepoint = chars.unicodeScalars.first {
+                let codepoint = chars.unicodeScalars.first
+            {
                 keyEvent.unshifted_codepoint = codepoint.value
             }
         }
@@ -69,7 +70,8 @@ extension NSEvent {
         guard let characters else { return nil }
 
         if characters.count == 1,
-           let scalar = characters.unicodeScalars.first {
+            let scalar = characters.unicodeScalars.first
+        {
             if scalar.value < 0x20 {
                 return self.characters(byApplyingModifiers: modifierFlags.subtracting(.control))
             }

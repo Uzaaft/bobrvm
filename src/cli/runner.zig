@@ -63,6 +63,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .restore_path = restore_path,
         .display_width = config.display_width,
         .display_height = config.display_height,
+        .gpu_memory_bytes = config.gpu_memory_mb * 1024 * 1024,
     };
 
     log.info("creating VM: {}MB RAM, {} vCPUs", .{

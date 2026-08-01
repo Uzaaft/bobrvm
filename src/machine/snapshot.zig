@@ -46,16 +46,15 @@ pub const VcpuState = extern struct {
 
 /// Writable system registers, in VcpuState.sys order.
 pub const sys_regs = [_]hypervisor.SystemRegister{
-    .sctlr_el1,      .ttbr0_el1,     .ttbr1_el1,      .tcr_el1,       .mair_el1,
-    .vbar_el1,       .esr_el1,       .far_el1,        .elr_el1,       .spsr_el1,
-    .sp_el0,         .sp_el1,        .tpidr_el0,      .tpidr_el1,     .tpidrro_el0,
-    .cpacr_el1,      .cntv_ctl_el0,  .cntv_cval_el0,  .cntkctl_el1,   .mdscr_el1,
-    .contextidr_el1, .par_el1,       .afsr0_el1,      .afsr1_el1,     .amair_el1,
+    .sctlr_el1,      .ttbr0_el1,     .ttbr1_el1,     .tcr_el1,       .mair_el1,
+    .vbar_el1,       .esr_el1,       .far_el1,       .elr_el1,       .spsr_el1,
+    .sp_el0,         .sp_el1,        .tpidr_el0,     .tpidr_el1,     .tpidrro_el0,
+    .cpacr_el1,      .cntv_ctl_el0,  .cntv_cval_el0, .cntkctl_el1,   .mdscr_el1,
+    .contextidr_el1, .par_el1,       .afsr0_el1,     .afsr1_el1,     .amair_el1,
     // PAC keys: without these every signed return address in the guest
     // fails authentication after restore (panic in arch_cpu_idle).
-    .apiakeylo_el1,  .apiakeyhi_el1, .apibkeylo_el1,  .apibkeyhi_el1,
-    .apdakeylo_el1,  .apdakeyhi_el1, .apdbkeylo_el1,  .apdbkeyhi_el1,
-    .apgakeylo_el1,  .apgakeyhi_el1,
+    .apiakeylo_el1,  .apiakeyhi_el1, .apibkeylo_el1, .apibkeyhi_el1, .apdakeylo_el1,
+    .apdakeyhi_el1,  .apdbkeylo_el1, .apdbkeyhi_el1, .apgakeylo_el1, .apgakeyhi_el1,
 };
 
 const gp_regs = [_]hypervisor.Register{

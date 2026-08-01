@@ -113,13 +113,13 @@ pub const stats = struct {
         if (std.c.getenv("BOBRVM_GL_TRACE") == null or draws_traced >= 60) return;
         draws_traced += 1;
         log.info("draw[{d}] mode={s} indexed={} start={} count={} inst={} bias={} restart={}/{x} stride0={} off0={} scissor={},{}..{},{}", .{
-            draws_traced,        @tagName(cmd.mode),
-            cmd.indexed,         cmd.start,
-            cmd.count,           cmd.instance_count,
-            cmd.index_bias,      cmd.primitive_restart,
-            cmd.restart_index,   stride0,
-            offset0,             sc.minx,
-            sc.miny,             sc.maxx,
+            draws_traced,      @tagName(cmd.mode),
+            cmd.indexed,       cmd.start,
+            cmd.count,         cmd.instance_count,
+            cmd.index_bias,    cmd.primitive_restart,
+            cmd.restart_index, stride0,
+            offset0,           sc.minx,
+            sc.miny,           sc.maxx,
             sc.maxy,
         });
     }
@@ -196,9 +196,9 @@ pub const stats = struct {
 
     pub fn dump() void {
         log.info("gl-stats: draws={} with_tex={} sampler_binds={} tex_upload ok={} fail={} shaders ok={} drop_so={} multipart={}", .{
-            draws,           draws_with_tex,
-            sampler_binds,   tex_uploads_ok,
-            tex_uploads_fail, shaders_created,
+            draws,              draws_with_tex,
+            sampler_binds,      tex_uploads_ok,
+            tex_uploads_fail,   shaders_created,
             shaders_dropped_so, shaders_multipart,
         });
         log.info("gl-stats: vertex_elements created={} bound={}", .{ ve_creates, ve_binds });
@@ -2056,14 +2056,30 @@ test "GpuDevice applies guest blend state (additive over)" {
     const rt: u32 = 10;
     const vbuf: u32 = 30;
     try gpu.createResourceRecord(.{
-        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
-        .width = 64, .height = 64, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
     });
     try gpu.createResourceRecord(.{
-        .handle = vbuf, .target = .buffer, .format = .none,
-        .width = 24, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
     });
     if (gpu.renderer == null) return error.SkipZigTest;
 
@@ -2079,25 +2095,47 @@ test "GpuDevice applies guest blend state (additive over)" {
     const B = struct {
         buf: []u32,
         i: usize = 0,
-        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
-        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
         fn consts(self: *@This(), r: f32, g: f32, bl: f32) void {
-            self.cmd(12, 0, 6); self.w(1); self.w(0); self.f(r); self.f(g); self.f(bl); self.f(1.0);
+            self.cmd(12, 0, 6);
+            self.w(1);
+            self.w(0);
+            self.f(r);
+            self.f(g);
+            self.f(bl);
+            self.f(1.0);
         }
         fn draw(self: *@This()) void {
-            self.cmd(8, 0, 12); self.w(0); self.w(3);
+            self.cmd(8, 0, 12);
+            self.w(0);
+            self.w(3);
             self.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
             for (0..9) |_| self.w(0);
         }
         fn shader(self: *@This(), handle: u32, text: []const u8) void {
             const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
             self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
             var k: usize = 0;
             while (k < nwords) : (k += 1) {
                 var word: u32 = 0;
-                inline for (0..4) |bb| { const idx = k * 4 + bb; if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8); }
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
                 self.w(word);
             }
         }
@@ -2105,7 +2143,11 @@ test "GpuDevice applies guest blend state (additive over)" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0);
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(0);
     b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
     // Blend state: RT0 blend_enable, ADD, src=ONE, dst=ONE (additive).
     // Word layout (state.zig BlendState.parse): s0 flags at [0]; RT states
@@ -2126,13 +2168,35 @@ test "GpuDevice applies guest blend state (additive over)" {
     b.w(rt0);
     b.cmd(2, 1, 1); // bind_object BLEND
     b.w(70);
-    b.cmd(31, 0, 2); b.w(50); b.w(0);
-    b.cmd(31, 0, 2); b.w(51); b.w(0);
-    b.cmd(2, 5, 1); b.w(52);
-    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
-    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
-    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
-    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1);
+    b.w(52);
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
     // Two additive draws: red then green -> yellow.
     b.consts(1.0, 0.0, 0.0);
     b.draw();
@@ -2160,15 +2224,31 @@ test "GpuDevice renders to two color attachments (MRT)" {
     const vbuf: u32 = 30;
     for ([_]u32{ rt0, rt1 }) |h| {
         try gpu.createResourceRecord(.{
-            .handle = h, .target = .texture_2d, .format = .b8g8r8a8_unorm,
-            .width = 64, .height = 64, .depth = 1, .array_size = 1,
-            .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+            .handle = h,
+            .target = .texture_2d,
+            .format = .b8g8r8a8_unorm,
+            .width = 64,
+            .height = 64,
+            .depth = 1,
+            .array_size = 1,
+            .last_level = 0,
+            .nr_samples = 0,
+            .flags = 0,
+            .bind = PipeBind.render_target,
         });
     }
     try gpu.createResourceRecord(.{
-        .handle = vbuf, .target = .buffer, .format = .none,
-        .width = 24, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
     });
     if (gpu.renderer == null) return error.SkipZigTest;
 
@@ -2185,17 +2265,31 @@ test "GpuDevice renders to two color attachments (MRT)" {
     const B = struct {
         buf: []u32,
         i: usize = 0,
-        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
-        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
         fn shader(self: *@This(), handle: u32, text: []const u8) void {
             const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
             self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
             var k: usize = 0;
             while (k < nwords) : (k += 1) {
                 var word: u32 = 0;
-                inline for (0..4) |bb| { const idx = k * 4 + bb; if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8); }
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
                 self.w(word);
             }
         }
@@ -2203,17 +2297,51 @@ test "GpuDevice renders to two color attachments (MRT)" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
-    b.cmd(31, 0, 2); b.w(50); b.w(0);
-    b.cmd(31, 0, 2); b.w(51); b.w(0);
-    b.cmd(2, 5, 1); b.w(52);
-    b.cmd(1, 8, 3); b.w(60); b.w(rt0); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
-    b.cmd(1, 8, 3); b.w(61); b.w(rt1); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1);
+    b.w(52);
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt0);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(1, 8, 3);
+    b.w(61);
+    b.w(rt1);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
     // set_framebuffer: nr_cbufs=2, zsurf=0, cbuf0=60, cbuf1=61
-    b.cmd(5, 0, 4); b.w(2); b.w(0); b.w(60); b.w(61);
-    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
-    b.cmd(7, 0, 8); b.w(4 | 8); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
-    b.cmd(8, 0, 12); b.w(0); b.w(3); b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    b.cmd(5, 0, 4);
+    b.w(2);
+    b.w(0);
+    b.w(60);
+    b.w(61);
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
+    b.cmd(7, 0, 8);
+    b.w(4 | 8);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.cmd(8, 0, 12);
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
     for (0..9) |_| b.w(0);
 
     try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
@@ -2237,14 +2365,30 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
     const rt: u32 = 10;
     const vbuf: u32 = 30;
     try gpu.createResourceRecord(.{
-        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
-        .width = 64, .height = 64, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
     });
     try gpu.createResourceRecord(.{
-        .handle = vbuf, .target = .buffer, .format = .none,
-        .width = 24, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
     });
     if (gpu.renderer == null) return error.SkipZigTest;
 
@@ -2263,17 +2407,31 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
     const B = struct {
         buf: []u32,
         i: usize = 0,
-        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
-        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
         fn shader(self: *@This(), handle: u32, text: []const u8) void {
             const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
             self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
             var k: usize = 0;
             while (k < nwords) : (k += 1) {
                 var word: u32 = 0;
-                inline for (0..4) |bb| { const idx = k * 4 + bb; if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8); }
+                inline for (0..4) |bb| {
+                    const idx = k * 4 + bb;
+                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
+                }
                 self.w(word);
             }
         }
@@ -2281,17 +2439,46 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
-    b.cmd(31, 0, 2); b.w(50); b.w(0);
-    b.cmd(31, 0, 2); b.w(51); b.w(0);
-    b.cmd(2, 5, 1); b.w(52);
-    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
-    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
-    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
-    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1);
+    b.w(52);
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
     // draw_vbo: count=3, triangles, instance_count=2.
     b.cmd(8, 0, 12);
-    b.w(0); b.w(3); b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
     b.w(0); // indexed
     b.w(2); // instance_count
     for (0..7) |_| b.w(0);
@@ -2316,19 +2503,43 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     const vbuf: u32 = 30;
     const ibuf: u32 = 31;
     try gpu.createResourceRecord(.{
-        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
-        .width = 64, .height = 64, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
     });
     try gpu.createResourceRecord(.{
-        .handle = vbuf, .target = .buffer, .format = .none,
-        .width = 48, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 48,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
     });
     try gpu.createResourceRecord(.{
-        .handle = ibuf, .target = .buffer, .format = .none,
-        .width = 16, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.index_buffer,
+        .handle = ibuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 16,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.index_buffer,
     });
     if (gpu.renderer == null) return error.SkipZigTest;
 
@@ -2338,7 +2549,7 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     // restart the strip would connect them across the middle.
     const verts = [_][2]f32{
         .{ -0.9, -0.6 }, .{ -0.5, -0.6 }, .{ -0.7, 0.6 }, // A (left)
-        .{ 0.5, -0.6 },  .{ 0.9, -0.6 },  .{ 0.7, 0.6 },  // B (right)
+        .{ 0.5, -0.6 }, .{ 0.9, -0.6 }, .{ 0.7, 0.6 }, // B (right)
     };
     const vb: [*]const u8 = @ptrCast(&verts);
     try std.testing.expect(gpu.uploadToBuffer(vbuf, 0, vb[0..@sizeOf(@TypeOf(verts))]));
@@ -2354,17 +2565,31 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     const B = struct {
         buf: []u32,
         i: usize = 0,
-        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
-        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
         fn shader(self: *@This(), handle: u32, text: []const u8) void {
             const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
             self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
             var k: usize = 0;
             while (k < nwords) : (k += 1) {
                 var word: u32 = 0;
-                inline for (0..4) |bb| { const ix = k * 4 + bb; if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8); }
+                inline for (0..4) |bb| {
+                    const ix = k * 4 + bb;
+                    if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8);
+                }
                 self.w(word);
             }
         }
@@ -2372,19 +2597,51 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
-    b.cmd(31, 0, 2); b.w(50); b.w(0);
-    b.cmd(31, 0, 2); b.w(51); b.w(0);
-    b.cmd(2, 5, 1); b.w(52);
-    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
-    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
-    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1);
+    b.w(52);
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
     // set_index_buffer: handle, index_size=2, offset=0
-    b.cmd(11, 0, 3); b.w(ibuf); b.w(2); b.w(0);
-    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
+    b.cmd(11, 0, 3);
+    b.w(ibuf);
+    b.w(2);
+    b.w(0);
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
     // draw_vbo indexed triangle_strip, count=7, restart on.
     b.cmd(8, 0, 12);
-    b.w(0); b.w(7); b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangle_strip));
+    b.w(0);
+    b.w(7);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangle_strip));
     b.w(1); // indexed
     b.w(1); // instance_count
     b.w(0); // index_bias
@@ -2415,19 +2672,43 @@ test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
     const vbuf: u32 = 30;
     const ubo: u32 = 40;
     try gpu.createResourceRecord(.{
-        .handle = rt, .target = .texture_2d, .format = .b8g8r8a8_unorm,
-        .width = 64, .height = 64, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.render_target,
+        .handle = rt,
+        .target = .texture_2d,
+        .format = .b8g8r8a8_unorm,
+        .width = 64,
+        .height = 64,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.render_target,
     });
     try gpu.createResourceRecord(.{
-        .handle = vbuf, .target = .buffer, .format = .none,
-        .width = 24, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.vertex_buffer,
+        .handle = vbuf,
+        .target = .buffer,
+        .format = .none,
+        .width = 24,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.vertex_buffer,
     });
     try gpu.createResourceRecord(.{
-        .handle = ubo, .target = .buffer, .format = .none,
-        .width = 16, .height = 0, .depth = 1, .array_size = 1,
-        .last_level = 0, .nr_samples = 0, .flags = 0, .bind = PipeBind.constant_buffer,
+        .handle = ubo,
+        .target = .buffer,
+        .format = .none,
+        .width = 16,
+        .height = 0,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = PipeBind.constant_buffer,
     });
     if (gpu.renderer == null) return error.SkipZigTest;
 
@@ -2448,17 +2729,31 @@ test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
     const B = struct {
         buf: []u32,
         i: usize = 0,
-        fn w(self: *@This(), v: u32) void { self.buf[self.i] = v; self.i += 1; }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void { self.w(opcode | (objtype << 8) | (len << 16)); }
-        fn f(self: *@This(), v: f32) void { self.w(@bitCast(v)); }
+        fn w(self: *@This(), v: u32) void {
+            self.buf[self.i] = v;
+            self.i += 1;
+        }
+        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
+            self.w(opcode | (objtype << 8) | (len << 16));
+        }
+        fn f(self: *@This(), v: f32) void {
+            self.w(@bitCast(v));
+        }
         fn shader(self: *@This(), handle: u32, text: []const u8) void {
             const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
             self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle); self.w(0); self.w(0); self.w(0); self.w(0);
+            self.w(handle);
+            self.w(0);
+            self.w(0);
+            self.w(0);
+            self.w(0);
             var k: usize = 0;
             while (k < nwords) : (k += 1) {
                 var word: u32 = 0;
-                inline for (0..4) |bb| { const ix = k * 4 + bb; if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8); }
+                inline for (0..4) |bb| {
+                    const ix = k * 4 + bb;
+                    if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8);
+                }
                 self.w(word);
             }
         }
@@ -2466,17 +2761,52 @@ test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
     var b = B{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
-    b.cmd(1, 5, 5); b.w(52); b.w(0); b.w(0); b.w(0); b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
-    b.cmd(31, 0, 2); b.w(50); b.w(0);
-    b.cmd(31, 0, 2); b.w(51); b.w(0);
-    b.cmd(2, 5, 1); b.w(52);
-    b.cmd(1, 8, 3); b.w(60); b.w(rt); b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
-    b.cmd(5, 0, 3); b.w(1); b.w(0); b.w(60);
-    b.cmd(6, 0, 3); b.w(8); b.w(0); b.w(vbuf);
+    b.cmd(1, 5, 5);
+    b.w(52);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.w(@intFromEnum(virgl.protocol.Format.r32g32_float)); // offset, divisor, buffer, format
+    b.cmd(31, 0, 2);
+    b.w(50);
+    b.w(0);
+    b.cmd(31, 0, 2);
+    b.w(51);
+    b.w(0);
+    b.cmd(2, 5, 1);
+    b.w(52);
+    b.cmd(1, 8, 3);
+    b.w(60);
+    b.w(rt);
+    b.w(@intFromEnum(virgl.protocol.Format.b8g8r8a8_unorm));
+    b.cmd(5, 0, 3);
+    b.w(1);
+    b.w(0);
+    b.w(60);
+    b.cmd(6, 0, 3);
+    b.w(8);
+    b.w(0);
+    b.w(vbuf);
     // set_uniform_buffer: fragment stage(1), index 1, offset 0, len 16, res ubo.
-    b.cmd(27, 0, 5); b.w(1); b.w(1); b.w(0); b.w(16); b.w(ubo);
-    b.cmd(7, 0, 8); b.w(4); b.f(0.0); b.f(0.0); b.f(0.0); b.f(1.0); b.w(0); b.w(0); b.w(0);
-    b.cmd(8, 0, 12); b.w(0); b.w(3); b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
+    b.cmd(27, 0, 5);
+    b.w(1);
+    b.w(1);
+    b.w(0);
+    b.w(16);
+    b.w(ubo);
+    b.cmd(7, 0, 8);
+    b.w(4);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(0.0);
+    b.f(1.0);
+    b.w(0);
+    b.w(0);
+    b.w(0);
+    b.cmd(8, 0, 12);
+    b.w(0);
+    b.w(3);
+    b.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
     for (0..9) |_| b.w(0);
 
     try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));

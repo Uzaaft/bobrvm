@@ -55,6 +55,7 @@ fn make(step: *Step, opts: Step.MakeOptions) !void {
     const self: *XcodebuildStep = @fieldParentPtr("step", step);
     const b = step.owner;
     const xcodeproj_path = b.pathFromRoot("macos/Bobrvm.xcodeproj");
+    const derived_data_path = b.pathFromRoot("zig-out/xcode-derived-data");
 
     // Run xcodebuild
     var exit_code: u8 = 0;
@@ -66,8 +67,12 @@ fn make(step: *Step, opts: Step.MakeOptions) !void {
         "Bobrvm",
         "-configuration",
         self.configuration.toString(),
+        "-derivedDataPath",
+        derived_data_path,
+        "CODE_SIGNING_ALLOWED=YES",
+        "-quiet",
         "build",
-    }, &exit_code, .Inherit) catch {
+    }, &exit_code, .inherit) catch {
         return error.XcodebuildFailed;
     };
 }

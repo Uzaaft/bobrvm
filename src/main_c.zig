@@ -12,6 +12,8 @@ const lib = @import("lib.zig");
 const global = @import("global.zig");
 const os = @import("os/main.zig");
 const apprt = lib.apprt;
+const config = lib.config;
+const disk = lib.disk;
 
 const log = std.log.scoped(.main);
 
@@ -157,9 +159,69 @@ pub export fn bobrvm_app_tick(app: ?*apprt.App) void {
 // VM Lifecycle
 // --------------------------------------------------------------------------
 
+pub export fn bobrvm_vm_config_defaults() apprt.VMConfig {
+    return .{};
+}
+
+pub export fn bobrvm_vm_config_validate(cfg: ?*const apprt.VMConfig) c_int {
+    const value = cfg orelse return 1;
+    return if (value.validate()) 0 else 1;
+}
+
+pub export fn bobrvm_disk_create_sparse(path: ?[*:0]const u8, size_bytes: u64) c_int {
+    const path_ptr = path orelse return 1;
+    disk.createSparse(std.mem.span(path_ptr), size_bytes) catch |err| return diskErrorCode(err);
+    return 0;
+}
+
+pub export fn bobrvm_disk_grow_raw(path: ?[*:0]const u8, size_bytes: u64) c_int {
+    const path_ptr = path orelse return 1;
+    disk.growRaw(std.mem.span(path_ptr), size_bytes) catch |err| return diskErrorCode(err);
+    return 0;
+}
+
+pub export fn bobrvm_disk_logical_size(
+    path: ?[*:0]const u8,
+    out_size_bytes: ?*u64,
+) c_int {
+    const path_ptr = path orelse return 1;
+    const out = out_size_bytes orelse return 1;
+    out.* = disk.logicalSize(std.mem.span(path_ptr)) catch |err| return diskErrorCode(err);
+    return 0;
+}
+
+pub export fn bobrvm_filename_sanitize(
+    input: ?[*:0]const u8,
+    output: ?[*]u8,
+    output_capacity: usize,
+    out_length: ?*usize,
+) c_int {
+    const input_ptr = input orelse return 1;
+    const output_ptr = output orelse return 1;
+    const length_ptr = out_length orelse return 1;
+    const input_slice = std.mem.span(input_ptr);
+    const result = config.sanitizeFilename(
+        input_slice,
+        output_ptr[0..output_capacity],
+    ) catch return 1;
+    length_ptr.* = result.len;
+    return 0;
+}
+
+fn diskErrorCode(err: anyerror) c_int {
+    return switch (err) {
+        error.InvalidPath, error.InvalidSize => 1,
+        error.PathAlreadyExists => 10,
+        error.CannotShrink => 11,
+        error.UnsupportedFormat => 12,
+        else => 9,
+    };
+}
+
 pub export fn bobrvm_vm_new(app: ?*apprt.App, cfg: ?*const apprt.VMConfig) ?*apprt.VM {
     const a = app orelse return null;
     const c = cfg orelse return null;
+    if (!c.validate()) return null;
     return a.createVM(c) catch null;
 }
 

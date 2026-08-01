@@ -25,8 +25,8 @@
         ];
       };
 
-      # Pin to Zig 0.15.2 (0.16 has too many breaking changes)
-      zig = pkgs.zigpkgs."0.15.2";
+      # Bobrvm and the pinned Ghostty dependency share Zig 0.16.
+      zig = pkgs.zigpkgs."0.16.0";
 
       buildInputs =
         [

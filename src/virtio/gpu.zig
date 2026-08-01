@@ -13,6 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
@@ -491,6 +492,8 @@ pub const Gpu = struct {
 
     /// 2D resources.
     resources: std.AutoHashMap(u32, Resource2D),
+    memory_bytes_limit: u64,
+    memory_bytes_used: u64,
 
     /// Guards resource host_data lifetime + scanout id: the vCPU thread
     /// mutates while the renderer thread reads via lockScanout.
@@ -597,6 +600,22 @@ pub const Gpu = struct {
     pub const MAX_BACKING_ENTRIES: u32 = 16384;
 
     pub fn init(alloc: Allocator, enable_virgl: bool) Error!*Gpu {
+        assert(config_policy.gpu_memory_bytes_default >= config_policy.gpu_memory_bytes_min);
+        assert(config_policy.gpu_memory_bytes_default <= config_policy.gpu_memory_bytes_max);
+        return initWithMemoryLimit(
+            alloc,
+            enable_virgl,
+            config_policy.gpu_memory_bytes_default,
+        );
+    }
+
+    pub fn initWithMemoryLimit(
+        alloc: Allocator,
+        enable_virgl: bool,
+        memory_bytes_limit: u64,
+    ) Error!*Gpu {
+        assert(memory_bytes_limit >= config_policy.gpu_memory_bytes_min);
+        assert(memory_bytes_limit <= config_policy.gpu_memory_bytes_max);
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         var features = virtio_version_1 | Features.EDID;
@@ -622,6 +641,8 @@ pub const Gpu = struct {
             .ctrl_last_avail = 0,
             .cursor_last_avail = 0,
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
+            .memory_bytes_limit = memory_bytes_limit,
+            .memory_bytes_used = 0,
             .scanout_mutex = .init,
             .scanout_resource_id = 0,
             .frame_generation = 0,
@@ -672,6 +693,7 @@ pub const Gpu = struct {
             res.freePixels(self.alloc);
             res.entries.deinit(self.alloc);
         }
+        self.memory_bytes_used = 0;
         self.resources.deinit();
         var b3d = self.backing3d.valueIterator();
         while (b3d.next()) |list| list.deinit(self.alloc);
@@ -718,6 +740,13 @@ pub const Gpu = struct {
         height: u32,
         pixels: []const u8,
     ) Error!void {
+        const memory_bytes_without_old = self.memoryBytesWithoutResource(id);
+        const memory_bytes_after = std.math.add(
+            u64,
+            memory_bytes_without_old,
+            @intCast(pixels.len),
+        ) catch return error.OutOfMemory;
+        if (memory_bytes_after > self.memory_bytes_limit) return error.OutOfMemory;
         const host = try self.alloc.alloc(u8, pixels.len);
         errdefer self.alloc.free(host);
         @memcpy(host, pixels);
@@ -726,6 +755,7 @@ pub const Gpu = struct {
             var entries = old.value.entries;
             entries.deinit(self.alloc);
         }
+        self.memory_bytes_used = memory_bytes_without_old;
         self.resources.put(id, .{
             .id = id,
             .format = format,
@@ -738,6 +768,7 @@ pub const Gpu = struct {
             self.alloc.free(host);
             return err;
         };
+        self.memory_bytes_used = memory_bytes_after;
     }
 
     /// Minimum live-resize dimension: below this guests produce unusable
@@ -1218,6 +1249,13 @@ pub const Gpu = struct {
         }
 
         const size = @as(usize, cmd.width) * cmd.height * Resource2D.BYTES_PER_PIXEL;
+        const memory_bytes_without_old = self.memoryBytesWithoutResource(cmd.resource_id);
+        const memory_bytes_after = std.math.add(
+            u64,
+            memory_bytes_without_old,
+            @intCast(size),
+        ) catch return .resp_err_out_of_memory;
+        if (memory_bytes_after > self.memory_bytes_limit) return .resp_err_out_of_memory;
 
         // Prefer an IOSurface so the render thread can present these pixels with
         // no upload (zero-copy). Fall back to a heap buffer when IOSurface is
@@ -1235,6 +1273,7 @@ pub const Gpu = struct {
             var entries = old.value.entries;
             entries.deinit(self.alloc);
         }
+        self.memory_bytes_used = memory_bytes_without_old;
 
         log.info("resource_create_2d id={} {}x{}", .{ cmd.resource_id, cmd.width, cmd.height });
         self.resources.put(cmd.resource_id, .{
@@ -1249,6 +1288,7 @@ pub const Gpu = struct {
             if (surface) |surf| surf.release() else self.alloc.free(host_data);
             return .resp_err_out_of_memory;
         };
+        self.memory_bytes_used = memory_bytes_after;
 
         return .resp_ok_nodata;
     }
@@ -1258,6 +1298,8 @@ pub const Gpu = struct {
         const cmd = std.mem.bytesToValue(ResourceUnref, req[0..@sizeOf(ResourceUnref)]);
 
         if (self.resources.fetchRemove(cmd.resource_id)) |entry| {
+            assert(self.memory_bytes_used >= entry.value.host_data.len);
+            self.memory_bytes_used -= entry.value.host_data.len;
             entry.value.freePixels(self.alloc);
             var entries = entry.value.entries;
             entries.deinit(self.alloc);
@@ -1287,6 +1329,17 @@ pub const Gpu = struct {
         }
 
         return .resp_err_invalid_resource_id;
+    }
+
+    fn memoryBytesWithoutResource(self: *const Gpu, resource_id: u32) u64 {
+        assert(resource_id > 0);
+        assert(self.memory_bytes_used <= self.memory_bytes_limit);
+        const old_size = if (self.resources.get(resource_id)) |resource|
+            resource.host_data.len
+        else
+            0;
+        assert(self.memory_bytes_used >= old_size);
+        return self.memory_bytes_used - old_size;
     }
 
     fn cmdSetScanout(self: *Gpu, req: []const u8) CmdType {
@@ -1352,15 +1405,13 @@ pub const Gpu = struct {
         log.info(
             "set_scanout_blob res={} {}x{} rect={}x{}+{}+{} fmt=0x{x} stride0={} offset0={} blob_mem={?} flags=0x{x} size={?} iovs={}",
             .{
-                cmd.resource_id,       cmd.width,
-                cmd.height,            cmd.r.width,
-                cmd.r.height,          cmd.r.x,
-                cmd.r.y,               cmd.format,
-                cmd.strides[0],        cmd.offsets[0],
-                if (meta) |m| m.blob_mem else null,
-                if (meta) |m| m.blob_flags else 0,
-                if (meta) |m| m.size else null,
-                backing_iovs,
+                cmd.resource_id,                    cmd.width,
+                cmd.height,                         cmd.r.width,
+                cmd.r.height,                       cmd.r.x,
+                cmd.r.y,                            cmd.format,
+                cmd.strides[0],                     cmd.offsets[0],
+                if (meta) |m| m.blob_mem else null, if (meta) |m| m.blob_flags else 0,
+                if (meta) |m| m.size else null,     backing_iovs,
             },
         );
 
@@ -1492,11 +1543,11 @@ pub const Gpu = struct {
                 transfer_traces += 1;
                 const expect: u64 = @as(u64, cmd.box.y) * cmd.stride + @as(u64, cmd.box.x) * 4;
                 log.info("xfer3d res={} lvl={} box={},{} {}x{} stride={} layer_stride={} offset={} expect_if_folded={} delta={}", .{
-                    cmd.resource_id, cmd.level,
-                    cmd.box.x,       cmd.box.y,
-                    cmd.box.w,       cmd.box.h,
-                    cmd.stride,      cmd.layer_stride,
-                    cmd.offset,      expect,
+                    cmd.resource_id,                                             cmd.level,
+                    cmd.box.x,                                                   cmd.box.y,
+                    cmd.box.w,                                                   cmd.box.h,
+                    cmd.stride,                                                  cmd.layer_stride,
+                    cmd.offset,                                                  expect,
                     @as(i64, @intCast(cmd.offset)) - @as(i64, @intCast(expect)),
                 });
             }
@@ -2034,6 +2085,7 @@ test "Gpu resource lifecycle via direct command calls" {
     try testing.expectEqual(CmdType.resp_ok_nodata, resp);
     try testing.expect(gpu.resources.contains(1));
     try testing.expectEqual(@as(usize, 32), gpu.resources.get(1).?.host_data.len);
+    try testing.expectEqual(@as(u64, 32), gpu.memory_bytes_used);
 
     // Scanout it
     const scan = SetScanout{
@@ -2054,6 +2106,27 @@ test "Gpu resource lifecycle via direct command calls" {
     resp = gpu.cmdResourceUnref(std.mem.asBytes(&unref));
     try testing.expectEqual(CmdType.resp_ok_nodata, resp);
     try testing.expect(gpu.scanout() == null);
+    try testing.expectEqual(@as(u64, 0), gpu.memory_bytes_used);
+}
+
+test "Gpu rejects 2D resources above configured memory" {
+    const gpu = try Gpu.initWithMemoryLimit(
+        testing.allocator,
+        false,
+        config_policy.gpu_memory_bytes_min,
+    );
+    defer gpu.deinit();
+
+    const create = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 1,
+        .format = 2,
+        .width = Gpu.MAX_RESOURCE_DIM,
+        .height = Gpu.MAX_RESOURCE_DIM,
+    };
+    const response = gpu.cmdResourceCreate2D(std.mem.asBytes(&create));
+    try testing.expectEqual(CmdType.resp_err_out_of_memory, response);
+    try testing.expectEqual(@as(u64, 0), gpu.memory_bytes_used);
 }
 
 test "virgl capset info and submit decode" {

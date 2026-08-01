@@ -1,7 +1,4 @@
 const std = @import("std");
-const fs = std.fs;
-const mem = std.mem;
-const Allocator = mem.Allocator;
 const XCFrameworkStep = @import("src/build/XCFrameworkStep.zig");
 const XcodebuildStep = @import("src/build/XcodebuildStep.zig");
 
@@ -11,14 +8,21 @@ const GhosttySteps = struct {
     install_root_step: *std.Build.Step,
 };
 
+fn environmentVariable(b: *std.Build, key: []const u8) ?[]const u8 {
+    if (@hasField(std.Build.Graph, "environ_map")) {
+        return b.graph.environ_map.get(key);
+    }
+    return b.graph.env_map.get(key);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     // A sandboxed `nix build` sets NIX_BUILD_TOP but not IN_NIX_SHELL;
     // `nix develop` sets both. Codesigning must run in the dev shell (the
     // CLI needs the hypervisor entitlement) but can't run in the sandbox.
-    const in_nix_shell = b.graph.environ_map.get("IN_NIX_SHELL") != null;
-    const is_nix_build = b.graph.environ_map.get("NIX_BUILD_TOP") != null and !in_nix_shell;
+    const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
+    const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
     // Swift/Xcode/Ghostty steps never run under nix (nix builds the Zig core
     // only); resolving the ghostty dependency inside a nix shell also fails
     // because ghostty's apple-sdk detection can't see the real Darwin SDK.
@@ -32,7 +36,7 @@ pub fn build(b: *std.Build) void {
     // 3D contexts to virglrenderer(venus); the default build never links it.
     // Needs the macOS-patched virglrenderer (tools/build-virglrenderer-macos.sh).
     const gpu_venus = b.option(bool, "gpu-venus", "Enable the Venus/KosmicKrisp GPU backend") orelse false;
-    const home = b.graph.environ_map.get("HOME") orelse "/tmp";
+    const home = environmentVariable(b, "HOME") orelse "/tmp";
     const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-upstream", .{home});
     const virgl_prefix = b.option([]const u8, "virgl-prefix", "virglrenderer(venus) install prefix") orelse default_virgl_prefix;
     const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
@@ -67,7 +71,7 @@ pub fn build(b: *std.Build) void {
     // Link system frameworks on macOS
     if (target.result.os.tag == .macos) {
         // Add framework search path from SDKROOT if available
-        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
+        if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
             const library_path = b.fmt("{s}/usr/lib", .{sdk});
@@ -119,7 +123,7 @@ pub fn build(b: *std.Build) void {
 
     // Link system frameworks for CLI on macOS
     if (target.result.os.tag == .macos) {
-        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
+        if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
             const library_path = b.fmt("{s}/usr/lib", .{sdk});
@@ -195,7 +199,7 @@ pub fn build(b: *std.Build) void {
         // nix's xcrun/xcodebuild shims sit ahead of /usr/bin on PATH and
         // resolve the SDK to a mismatched nix-provided one; put the real
         // system toolchain first so swiftc finds Xcode's actual SDK.
-        if (b.graph.environ_map.get("PATH")) |path| {
+        if (environmentVariable(b, "PATH")) |path| {
             gui_build.setEnvironmentVariable("PATH", b.fmt("/usr/bin:/bin:{s}", .{path}));
         }
         if (gpu_venus) {
@@ -263,7 +267,7 @@ pub fn build(b: *std.Build) void {
         // Codesign with the Venus entitlements (library validation must be off
         // to load the ad-hoc-signed third-party GPU dylibs).
         const sign_venus_smoke = b.addSystemCommand(&.{
-            "codesign", "--sign", "-", "--entitlements", "venus.entitlements",
+            "codesign", "--sign",                  "-", "--entitlements", "venus.entitlements",
             "--force",  "zig-out/bin/venus_smoke",
         });
         sign_venus_smoke.step.dependOn(&install_venus_smoke.step);
@@ -306,7 +310,7 @@ pub fn build(b: *std.Build) void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
-        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
+        if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
             const library_path = b.fmt("{s}/usr/lib", .{sdk});
@@ -367,26 +371,9 @@ pub fn build(b: *std.Build) void {
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // XCFramework + app steps (macOS only, never under nix). The vendored
-    // ghostty dependency pins its own build.zig to zig 0.15.2 exactly
-    // (build.zig.zon requireZig) and hasn't been updated for 0.16+; skip
-    // this whole block on other compilers rather than hard error, so the
-    // core lib/cli/gui/test targets keep working on newer system zig.
-    const zig_version = @import("builtin").zig_version;
-    const ghostty_zig_compatible = zig_version.major == 0 and zig_version.minor == 15;
-    if (target.result.os.tag == .macos and !in_nix and !ghostty_zig_compatible) {
-        std.debug.print(
-            "note: skipping ghostty-lib/xcframework/run steps — the vendored " ++
-                "ghostty dependency requires zig 0.15.2, this is {}. Use `nix develop` " ++
-                "for those steps; gui/cli/test/install are unaffected.\n",
-            .{zig_version},
-        );
-    }
-    if (target.result.os.tag == .macos and !in_nix and ghostty_zig_compatible) {
-        const ghostty_steps = addGhosttySteps(b, optimize);
-        const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
-        ghostty_step.dependOn(ghostty_steps.install_root_step);
-
+    // XCFramework + app steps (macOS only, never under nix). Bobrvm and the
+    // pinned Ghostty dependency both use Zig 0.16.
+    if (target.result.os.tag == .macos and !in_nix) {
         const xcframework = XCFrameworkStep.create(b, lib);
         const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
         xcframework_step.dependOn(&xcframework.step);
@@ -394,6 +381,10 @@ pub fn build(b: *std.Build) void {
         if (emit_xcframework) {
             b.default_step.dependOn(&xcframework.step);
         }
+
+        const ghostty_steps = addGhosttySteps(b, optimize);
+        const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
+        ghostty_step.dependOn(ghostty_steps.install_root_step);
 
         // macOS app step
         if (emit_macos_app) {
@@ -408,15 +399,14 @@ pub fn build(b: *std.Build) void {
         xcodebuild_for_run.step.dependOn(ghostty_steps.install_root_step);
         run_step.dependOn(&xcodebuild_for_run.step);
 
-        // Run app directly (not via open) so stderr shows in terminal
-        // Set BOBRVM_LOG=true for dev mode logging
-        const xcodeproj_path = b.pathFromRoot("macos/Bobrvm.xcodeproj");
-        const run_script = b.fmt(
-            \\BUILT_PRODUCTS_DIR=$(xcodebuild -project "{s}" -scheme Bobrvm -showBuildSettings 2>/dev/null | grep ' BUILT_PRODUCTS_DIR' | head -1 | awk '{{print $3}}')
-            \\BOBRVM_LOG=true exec "$BUILT_PRODUCTS_DIR/Bobrvm.app/Contents/MacOS/Bobrvm"
-        , .{xcodeproj_path});
-        var run_cmd = b.addSystemCommand(&.{"sh"});
-        run_cmd.addArgs(&.{ "-c", run_script });
+        // Run the signed Xcode product directly so stderr remains visible.
+        const configuration = if (optimize == .Debug) "Debug" else "Release";
+        const app_executable = b.pathFromRoot(b.fmt(
+            "zig-out/xcode-derived-data/Build/Products/{s}/Bobrvm.app/Contents/MacOS/Bobrvm",
+            .{configuration},
+        ));
+        const run_cmd = b.addSystemCommand(&.{app_executable});
+        run_cmd.setEnvironmentVariable("BOBRVM_LOG", "true");
         run_cmd.step.dependOn(&xcodebuild_for_run.step);
         run_step.dependOn(&run_cmd.step);
     }
@@ -451,8 +441,6 @@ fn addGhosttySteps(
     ghostty_cmd.addFileInput(ghostty_dep.path("build.zig"));
     ghostty_cmd.addFileInput(ghostty_dep.path("build.zig.zon"));
     ghostty_cmd.addFileInput(ghostty_dep.path("include/ghostty.h"));
-    addRunFileInputsForDir(b, ghostty_cmd, ghostty_dep.path("src").getPath(b), &.{});
-    addRunFileInputsForDir(b, ghostty_cmd, ghostty_dep.path("include").getPath(b), &.{});
 
     const ghostty_install = b.addInstallDirectory(.{
         .source_dir = ghostty_dep.path("macos/GhosttyKit.xcframework"),
@@ -461,183 +449,5 @@ fn addGhosttySteps(
     });
     ghostty_install.step.dependOn(&ghostty_cmd.step);
 
-    const install_prefix = b.getInstallPath(.prefix, "");
-    const install_prefix_abs = if (fs.path.isAbsolute(install_prefix))
-        install_prefix
-    else
-        b.pathFromRoot(install_prefix);
-    const zig_out_abs = b.pathFromRoot("zig-out");
-    const ghostty_xcframework_src = b.fmt("{s}/GhosttyKit.xcframework", .{install_prefix_abs});
-    const ghostty_xcframework_dest = b.pathFromRoot("zig-out/GhosttyKit.xcframework");
-
-    const ghostty_install_root_step: *std.Build.Step = if (mem.eql(u8, install_prefix_abs, zig_out_abs))
-        &ghostty_install.step
-    else blk: {
-        const copy_step = CopyDirStep.create(
-            b,
-            .{ .cwd_relative = ghostty_xcframework_src },
-            .{ .cwd_relative = ghostty_xcframework_dest },
-        );
-        copy_step.step.dependOn(&ghostty_install.step);
-        break :blk &copy_step.step;
-    };
-
-    return .{ .install_root_step = ghostty_install_root_step };
-}
-
-fn addRunFileInputsForDir(
-    b: *std.Build,
-    run: *std.Build.Step.Run,
-    root_path: []const u8,
-    extensions: []const []const u8,
-) void {
-    const dir = if (fs.path.isAbsolute(root_path))
-        fs.openDirAbsolute(root_path, .{ .iterate = true })
-    else
-        fs.cwd().openDir(root_path, .{ .iterate = true });
-    var handle = dir catch @panic("unable to open directory");
-    defer handle.close();
-
-    var walker = handle.walk(b.allocator) catch @panic("OOM");
-    defer walker.deinit();
-
-    while (true) {
-        const entry = walker.next() catch @panic("unable to walk directory") orelse break;
-        if (entry.kind != .file) continue;
-        if (extensions.len != 0 and !hasExtension(entry.path, extensions)) continue;
-
-        const full_path = b.pathJoin(&.{ root_path, entry.path });
-        run.addFileInput(.{ .cwd_relative = full_path });
-    }
-}
-
-fn hasExtension(path: []const u8, extensions: []const []const u8) bool {
-    for (extensions) |ext| {
-        if (mem.endsWith(u8, path, ext)) return true;
-    }
-    return false;
-}
-
-const CopyDirStep = struct {
-    step: std.Build.Step,
-    source_dir: std.Build.LazyPath,
-    dest_dir: std.Build.LazyPath,
-
-    pub fn create(
-        b: *std.Build,
-        source_dir: std.Build.LazyPath,
-        dest_dir: std.Build.LazyPath,
-    ) *CopyDirStep {
-        const step = b.allocator.create(CopyDirStep) catch @panic("OOM");
-        step.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "copy GhosttyKit.xcframework",
-                .owner = b,
-                .makeFn = make,
-            }),
-            .source_dir = source_dir.dupe(b),
-            .dest_dir = dest_dir.dupe(b),
-        };
-        source_dir.addStepDependencies(&step.step);
-        return step;
-    }
-
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
-        _ = options;
-        const b = step.owner;
-        const self: *CopyDirStep = @fieldParentPtr("step", step);
-        step.clearWatchInputs();
-
-        const src_path = self.source_dir.getPath3(b, step);
-        const dest_path = self.dest_dir.getPath3(b, step);
-
-        const src = try src_path.toString(b.allocator);
-        defer b.allocator.free(src);
-        const dest = try dest_path.toString(b.allocator);
-        defer b.allocator.free(dest);
-
-        try copyDirTree(b.allocator, src, dest);
-    }
-};
-
-fn copyDirTree(allocator: Allocator, source_path: []const u8, dest_path: []const u8) !void {
-    try deleteTreePath(dest_path);
-    if (fs.path.isAbsolute(dest_path)) {
-        try ensureDirAbsolute(dest_path);
-    } else {
-        try fs.cwd().makePath(dest_path);
-    }
-
-    var source_dir = try openDirPath(source_path, true);
-    defer source_dir.close();
-    var dest_dir = try openDirPath(dest_path, false);
-    defer dest_dir.close();
-
-    try copyDirContents(allocator, source_dir, dest_dir);
-}
-
-fn copyDirContents(allocator: Allocator, source_dir: fs.Dir, dest_dir: fs.Dir) !void {
-    var walker = try source_dir.walk(allocator);
-    defer walker.deinit();
-
-    while (try walker.next()) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                try dest_dir.makePath(entry.path);
-            },
-            .file => {
-                try ensureParentDir(dest_dir, entry.path);
-                try source_dir.copyFile(entry.path, dest_dir, entry.path, .{});
-            },
-            .sym_link => {
-                try ensureParentDir(dest_dir, entry.path);
-                var buf: [fs.max_path_bytes]u8 = undefined;
-                const target = try source_dir.readLink(entry.path, &buf);
-                dest_dir.symLink(target, entry.path, .{}) catch |err| {
-                    if (err != error.PathAlreadyExists) return err;
-                };
-            },
-            else => {},
-        }
-    }
-}
-
-fn ensureParentDir(dir: fs.Dir, path: []const u8) !void {
-    const parent = fs.path.dirname(path) orelse return;
-    try dir.makePath(parent);
-}
-
-fn ensureDirAbsolute(path: []const u8) !void {
-    if (!fs.path.isAbsolute(path)) return error.BadPathName;
-    fs.makeDirAbsolute(path) catch |err| switch (err) {
-        error.PathAlreadyExists => return,
-        error.FileNotFound => {
-            const parent = fs.path.dirname(path) orelse return err;
-            try ensureDirAbsolute(parent);
-            try fs.makeDirAbsolute(path);
-        },
-        else => return err,
-    };
-}
-
-fn openDirPath(path: []const u8, iterate: bool) !fs.Dir {
-    const opts: fs.Dir.OpenOptions = .{ .iterate = iterate };
-    return if (fs.path.isAbsolute(path))
-        fs.openDirAbsolute(path, opts)
-    else
-        fs.cwd().openDir(path, opts);
-}
-
-fn deleteTreePath(path: []const u8) !void {
-    if (fs.path.isAbsolute(path)) {
-        fs.deleteTreeAbsolute(path) catch |err| {
-            if (err != error.FileNotFound) return err;
-        };
-        return;
-    }
-
-    fs.cwd().deleteTree(path) catch |err| {
-        if (err != error.FileNotFound) return err;
-    };
+    return .{ .install_root_step = &ghostty_install.step };
 }

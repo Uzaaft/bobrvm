@@ -39,9 +39,14 @@ fn logFn(
 }
 
 pub fn main(minimal: std.process.Init.Minimal) !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        if (builtin.mode == .Debug) _ = debug_allocator.deinit();
+    }
+    const alloc = if (builtin.mode == .Debug)
+        debug_allocator.allocator()
+    else
+        std.heap.c_allocator;
 
     cli.dispatch(alloc, minimal) catch |err| {
         switch (err) {

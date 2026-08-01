@@ -12,6 +12,8 @@ const builtin = @import("builtin");
 
 pub const agent = @import("agent/main.zig");
 pub const apprt = @import("apprt/main.zig");
+pub const config = @import("config.zig");
+pub const disk = @import("disk.zig");
 pub const fs = @import("fs/main.zig");
 pub const global = @import("global.zig");
 pub const hypervisor = @import("hypervisor/main.zig");
@@ -29,6 +31,8 @@ test {
     // Test all submodules
     _ = agent;
     _ = apprt;
+    _ = config;
+    _ = disk;
     _ = fs;
     _ = global;
     _ = hypervisor;
@@ -37,4 +41,5 @@ test {
     _ = virtio;
     _ = gpu;
     _ = renderer;
+    _ = @import("cli/Config.zig");
 }
