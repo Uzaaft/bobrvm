@@ -100,6 +100,13 @@ typedef struct {
     uint32_t display_width;
     /** Initial guest display height in pixels (0 = default 800). */
     uint32_t display_height;
+    /**
+     * Enable 3D acceleration on the virtio-gpu: the virgl capset, plus the
+     * venus capset when the library was built with -Dgpu-venus. Off by
+     * default — a 2D-only scanout is the safe path, and 3D additionally
+     * requires the host venus stack (virglrenderer + KosmicKrisp).
+     */
+    bool enable_gpu3d;
 } bobrvm_vm_config_s;
 
 /* -------------------------------------------------------------------------- */

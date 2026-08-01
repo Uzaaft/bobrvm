@@ -34,6 +34,18 @@ pub const Target = struct {
 };
 
 /// Optional per-draw state for the pipeline draw paths.
+/// Metal buffer index for virgl vertex-buffer slot `slot`.
+///
+/// The translated MSL reserves buffer(1) for the default uniform block and
+/// buffer(1+dim) for named UBOs (dim < 16), so vertex data lives above that
+/// range. Both pipeline creation and the draw-time bind go through here so
+/// they can never disagree.
+pub const VERTEX_BUFFER_BASE: u32 = 17;
+
+pub fn vertexBufferIndex(slot: u32) u32 {
+    return VERTEX_BUFFER_BASE + slot;
+}
+
 pub const DrawOpts = struct {
     vs_consts: []const u8 = &.{},
     fs_consts: []const u8 = &.{},
@@ -52,6 +64,28 @@ pub const DrawOpts = struct {
     /// Metal buffer(1+index) for its stage, matching the translator's
     /// `constant float4* cN [[buffer(1+N)]]`.
     ubos: []const UboBind = &.{},
+    /// First vertex of the draw (virgl draw_vbo `start`). A compositor packs
+    /// many quads into one vertex buffer and draws ranges out of it, so
+    /// dropping this renders the wrong vertices — stray wedges.
+    vertex_start: u32 = 0,
+    /// Stride of vertex-buffer slot 0, used to bias the buffer when a draw
+    /// starts partway in (the fan path indexes from the biased base).
+    vertex_stride: u32 = 0,
+    /// Scissor rect in Metal (top-left origin) pixels. Compositors clip each
+    /// draw to the damaged region this way; ignoring it lets a full-surface
+    /// quad smear across the whole screen.
+    scissor: ?metal.MTLScissorRect = null,
+    /// Every vertex-buffer slot the pipeline's attributes read from. The
+    /// primary slot is bound by the draw call itself; these cover the rest
+    /// (a compositor's per-quad data lives in a second slot).
+    vertex_buffers: []const VertexBufferBind = &.{},
+};
+
+/// A guest vertex buffer bound to a virgl vertex-buffer slot for a draw.
+pub const VertexBufferBind = struct {
+    slot: u32,
+    handle: ResourceHandle,
+    offset: u32,
 };
 
 /// A single named-UBO binding for a draw.
@@ -145,6 +179,13 @@ pub const Renderer = struct {
     /// Lazily-created linear-filtering sampler shared by all sampled draws
     /// (per-guest sampler-state translation lands with GL3).
     default_sampler: ?metal.SamplerState = null,
+    /// Index buffer that expands a GL triangle FAN into plain triangles.
+    /// Metal has no fan primitive, and drawing a fan's vertex list as
+    /// `.triangle` groups them (0,1,2)(3,4,5)… instead of (0,1,2)(0,2,3)…,
+    /// which turns every rounded rect / focus ring into stray triangles.
+    fan_indices: ?metal.Buffer = null,
+    /// Number of source fan vertices `fan_indices` can serve.
+    fan_index_capacity: u32 = 0,
     /// Guest depth-stencil resources backed by depth32Float textures.
     depth_targets: std.AutoHashMap(ResourceHandle, Target),
     /// Cached MTLDepthStencilStates keyed by (compare func, write mask).
@@ -193,6 +234,7 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        if (self.fan_indices) |b| b.release();
         var it = self.targets.valueIterator();
         while (it.next()) |t| {
             t.tex.release();
@@ -464,6 +506,9 @@ pub const Renderer = struct {
     fn ensureSampler(self: *Renderer) ?metal.SamplerState {
         if (self.default_sampler) |s| return s;
         const desc = metal.SamplerDescriptor.create() orelse return null;
+        // Metal defaults to NEAREST; GL's default for these sampled quads is
+        // linear, and nearest makes scaled window content and text crunchy.
+        desc.setMinMagFilter(.linear);
         self.default_sampler = self.device.newSamplerState(desc);
         return self.default_sampler;
     }
@@ -537,7 +582,17 @@ pub const Renderer = struct {
     pub const VertexAttr = struct {
         format: metal.MTLVertexFormat,
         offset: u32,
+        /// virgl vertex-buffer slot this attribute reads from (a compositor
+        /// feeds per-vertex and per-quad data from different slots).
         buffer_index: u32 = 0,
+    };
+
+    /// One virgl vertex-buffer slot's layout.
+    pub const VertexLayout = struct {
+        slot: u32,
+        stride: u32,
+        /// virgl instance_divisor: 0 = per-vertex, N = advance every N instances.
+        instance_divisor: u32 = 0,
     };
 
     /// Build a real render pipeline from TGSI-translated MSL sources and a
@@ -551,7 +606,7 @@ pub const Renderer = struct {
         fs_msl: [:0]const u8,
         fs_entry: [*:0]const u8,
         attrs: []const VertexAttr,
-        stride: u32,
+        layouts: []const VertexLayout,
         format: metal.MTLPixelFormat,
         has_depth: bool,
         blend: ?BlendDesc,
@@ -586,8 +641,16 @@ pub const Renderer = struct {
 
         if (attrs.len > 0) {
             const vd = metal.VertexDescriptor.create() orelse return Error.PipelineCreateFailed;
-            for (attrs, 0..) |a, i| vd.setAttribute(i, a.format, a.offset, a.buffer_index);
-            vd.setLayoutStride(0, stride);
+            for (attrs, 0..) |a, i| {
+                vd.setAttribute(i, a.format, a.offset, vertexBufferIndex(a.buffer_index));
+            }
+            for (layouts) |l| {
+                const mi = vertexBufferIndex(l.slot);
+                vd.setLayoutStride(mi, l.stride);
+                if (l.instance_divisor > 0) {
+                    vd.setLayoutStep(mi, .per_instance, l.instance_divisor);
+                }
+            }
             desc.setVertexDescriptor(vd);
         }
 
@@ -620,7 +683,9 @@ pub const Renderer = struct {
         const cmd = self.queue.commandBuffer() orelse return Error.CommandBufferFailed;
         const enc = cmd.renderCommandEncoderWithDescriptor(pass) orelse return Error.EncoderFailed;
         enc.setRenderPipelineState(pso.ptr);
-        enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        // `pso` comes from buildPipeline, whose vertex descriptor places
+        // vertex data at vertexBufferIndex(slot) — bind to match.
+        enc.setVertexBuffer(vbuf, vbuf_offset, vertexBufferIndex(0));
         enc.drawPrimitives(prim, 0, vertex_count);
         enc.endEncoding();
         cmd.commit();
@@ -657,12 +722,20 @@ pub const Renderer = struct {
         const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
         const pass = try self.beginLoadPassMrt(target_handle, opts.depth, opts.extra_color);
         pass.enc.setRenderPipelineState(pso.ptr);
-        pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        pass.enc.setVertexBuffer(vbuf, vbuf_offset, vertexBufferIndex(0));
+        // Additional vertex-buffer slots (multi-buffer / per-instance layouts).
+        for (opts.vertex_buffers) |vb| {
+            if (vb.slot == 0) continue;
+            if (self.buffers.get(vb.handle)) |b| {
+                pass.enc.setVertexBuffer(b, vb.offset, vertexBufferIndex(vb.slot));
+            }
+        }
+        if (opts.scissor) |sr| pass.enc.setScissorRect(sr);
         self.applyOpts(pass.enc, opts);
         if (opts.instance_count > 1) {
-            pass.enc.drawPrimitivesInstanced(prim, 0, vertex_count, opts.instance_count);
+            pass.enc.drawPrimitivesInstanced(prim, opts.vertex_start, vertex_count, opts.instance_count);
         } else {
-            pass.enc.drawPrimitives(prim, 0, vertex_count);
+            pass.enc.drawPrimitives(prim, opts.vertex_start, vertex_count);
         }
         pass.enc.endEncoding();
         pass.cmd.commit();
@@ -694,12 +767,62 @@ pub const Renderer = struct {
         const ibuf = self.buffers.get(ibuf_handle) orelse return Error.UnknownTarget;
         const pass = try self.beginLoadPassMrt(target_handle, opts.depth, opts.extra_color);
         pass.enc.setRenderPipelineState(pso.ptr);
-        pass.enc.setVertexBuffer(vbuf, vbuf_offset, 0);
+        pass.enc.setVertexBuffer(vbuf, vbuf_offset, vertexBufferIndex(0));
+        // Additional vertex-buffer slots (multi-buffer / per-instance layouts).
+        for (opts.vertex_buffers) |vb| {
+            if (vb.slot == 0) continue;
+            if (self.buffers.get(vb.handle)) |b| {
+                pass.enc.setVertexBuffer(b, vb.offset, vertexBufferIndex(vb.slot));
+            }
+        }
+        if (opts.scissor) |sr| pass.enc.setScissorRect(sr);
         self.applyOpts(pass.enc, opts);
         if (opts.instance_count > 1) {
             pass.enc.drawIndexedPrimitivesInstanced(prim, index_count, index_type, ibuf, ibuf_offset, opts.instance_count);
         } else {
             pass.enc.drawIndexedPrimitives(prim, index_count, index_type, ibuf, ibuf_offset);
+        }
+        pass.enc.endEncoding();
+        pass.cmd.commit();
+        pass.cmd.waitUntilCompleted();
+    }
+
+    /// Draw a GL triangle FAN (or polygon) with the guest's own pipeline, by
+    /// expanding it through the shared fan index buffer. Metal has no fan
+    /// primitive; without this a rounded rect / focus ring rasterizes as
+    /// stray triangles.
+    pub fn drawFanWithPipeline(
+        self: *Renderer,
+        target_handle: ResourceHandle,
+        pso: metal.RenderPipelineState,
+        vbuf_handle: ResourceHandle,
+        vbuf_offset: u32,
+        vertex_count: u32,
+        opts: DrawOpts,
+    ) Error!void {
+        if (vertex_count < 3) return;
+        const vbuf = self.buffers.get(vbuf_handle) orelse return Error.UnknownTarget;
+        const ibuf = self.ensureFanIndices(vertex_count) orelse return Error.UnknownTarget;
+        const index_count: u32 = (vertex_count - 2) * 3;
+
+        const pass = try self.beginLoadPassMrt(target_handle, opts.depth, opts.extra_color);
+        pass.enc.setRenderPipelineState(pso.ptr);
+        // The generated fan indices are relative to the draw's first vertex,
+        // so bias the vertex buffer by `vertex_start` instead of offsetting
+        // every index.
+        pass.enc.setVertexBuffer(vbuf, vbuf_offset + opts.vertex_start * opts.vertex_stride, vertexBufferIndex(0));
+        for (opts.vertex_buffers) |vb| {
+            if (vb.slot == 0) continue;
+            if (self.buffers.get(vb.handle)) |b| {
+                pass.enc.setVertexBuffer(b, vb.offset, vertexBufferIndex(vb.slot));
+            }
+        }
+        if (opts.scissor) |sr| pass.enc.setScissorRect(sr);
+        self.applyOpts(pass.enc, opts);
+        if (opts.instance_count > 1) {
+            pass.enc.drawIndexedPrimitivesInstanced(.triangle, index_count, .uint32, ibuf, 0, opts.instance_count);
+        } else {
+            pass.enc.drawIndexedPrimitives(.triangle, index_count, .uint32, ibuf, 0);
         }
         pass.enc.endEncoding();
         pass.cmd.commit();
@@ -802,12 +925,43 @@ pub const Renderer = struct {
     /// Map a Gallium primitive type to Metal's. Metal has no loop/fan/quad
     /// primitives; those fall back to the closest supported topology (a
     /// proper impl expands them index-side — deferred).
+    /// True when the GL primitive has to be expanded into indexed triangles
+    /// because Metal cannot express it directly.
+    pub fn needsFanExpansion(mode: proto.PrimitiveType) bool {
+        return mode == .triangle_fan or mode == .polygon;
+    }
+
+    /// (Re)build the shared fan index buffer so it covers `vertex_count`
+    /// source vertices: [0,1,2, 0,2,3, 0,3,4, …].
+    fn ensureFanIndices(self: *Renderer, vertex_count: u32) ?metal.Buffer {
+        if (vertex_count < 3) return null;
+        if (self.fan_indices != null and self.fan_index_capacity >= vertex_count) {
+            return self.fan_indices;
+        }
+        const tris: u32 = vertex_count - 2;
+        const idx = self.alloc.alloc(u32, @as(usize, tris) * 3) catch return null;
+        defer self.alloc.free(idx);
+        var t: u32 = 0;
+        while (t < tris) : (t += 1) {
+            idx[t * 3 + 0] = 0;
+            idx[t * 3 + 1] = t + 1;
+            idx[t * 3 + 2] = t + 2;
+        }
+        const buf = self.device.newBufferWithBytes(std.mem.sliceAsBytes(idx)) orelse return null;
+        if (self.fan_indices) |old_buf| old_buf.release();
+        self.fan_indices = buf;
+        self.fan_index_capacity = vertex_count;
+        return buf;
+    }
+
     pub fn mapPrimitive(mode: proto.PrimitiveType) metal.MTLPrimitiveType {
         return switch (mode) {
             .points => .point,
             .lines, .line_loop => .line,
             .line_strip => .lineStrip,
-            .triangles, .quads, .polygon => .triangle,
+            // Fans and polygons only rasterize correctly via the index
+            // expansion above; the primitive itself is plain triangles.
+            .triangles, .quads, .polygon, .triangle_fan => .triangle,
             .triangle_strip, .quad_strip => .triangleStrip,
             else => .triangle,
         };
@@ -1265,7 +1419,8 @@ test "translated shaders build a real pipeline and draw a triangle" {
     // Vertex layout: attribute 0 = float2 at offset 0, stride 8. Metal
     // expands the float2 to (x,y,0,1) for the float4 shader input.
     const attrs = [_]Renderer.VertexAttr{.{ .format = .float2, .offset = 0, .buffer_index = 0 }};
-    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, 8, .bgra8Unorm, false, null, &.{});
+    const layouts = [_]Renderer.VertexLayout{.{ .slot = 0, .stride = 8 }};
+    const pso = try r.buildPipeline(vz, "vs_main", fz, "fs_main", &attrs, &layouts, .bgra8Unorm, false, null, &.{});
     defer pso.release();
 
     const w: u32 = 64;

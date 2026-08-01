@@ -13,6 +13,181 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
+
+const log = std.log.scoped(.gpu);
+
+// ---------------------------------------------------------------------------
+// GL pipeline statistics (opt in with BOBRVM_GL_STATS=1). Diagnostics for the
+// "guest renders but the pixels are wrong" case: they show whether guest
+// textures actually reach us, and whether draws have a texture bound at all —
+// an unbound sampler is the classic cause of solid-white output.
+// ---------------------------------------------------------------------------
+pub const stats = struct {
+    var enabled_checked: bool = false;
+    var enabled: bool = false;
+    pub var draws: u64 = 0;
+    pub var draws_with_tex: u64 = 0;
+    pub var sampler_binds: u64 = 0;
+    pub var tex_uploads_ok: u64 = 0;
+    pub var tex_uploads_fail: u64 = 0;
+    pub var shaders_created: u64 = 0;
+    /// Shaders we refuse: stream-out present, or a multi-part (continued)
+    /// upload we can't assemble. A dropped shader means the draw runs with a
+    /// stale/missing program — a prime suspect for blank output.
+    pub var shaders_dropped_so: u64 = 0;
+    pub var shaders_multipart: u64 = 0;
+    pub var ve_creates: u64 = 0;
+    pub var ve_binds: u64 = 0;
+
+    pub fn on() bool {
+        if (!enabled_checked) {
+            enabled_checked = true;
+            enabled = std.c.getenv("BOBRVM_GL_STATS") != null;
+        }
+        return enabled;
+    }
+
+    pub fn noteDraw(has_tex: bool) void {
+        if (!on()) return;
+        draws += 1;
+        if (has_tex) draws_with_tex += 1;
+        if (draws % 200 == 0) dump();
+    }
+
+    var dump_seq: u32 = 0;
+    var no_pipeline_logged: u32 = 0;
+    var object_logged: u32 = 0;
+    /// Per-opcode counts, and which opcodes we skipped without handling.
+    /// A command carrying state we need (e.g. the vertex layout) shows up
+    /// here as "unhandled" instead of vanishing silently.
+    pub var opcodes: [256]u32 = [_]u32{0} ** 256;
+    pub var opcodes_unhandled: [256]u32 = [_]u32{0} ** 256;
+
+    pub fn noteOpcode(op: virgl.protocol.Command, unhandled: bool) void {
+        if (!on()) return;
+        const i: usize = @intFromEnum(op);
+        if (i >= 256) return;
+        if (unhandled) opcodes_unhandled[i] += 1 else opcodes[i] += 1;
+    }
+
+    pub fn dumpOpcodes() void {
+        if (!on()) return;
+        for (opcodes, 0..) |n, i| {
+            const u = opcodes_unhandled[i];
+            if (n == 0 and u == 0) continue;
+            const op: virgl.protocol.Command = @enumFromInt(@as(u8, @intCast(i)));
+            log.info("opcode {d} ({s}): seen={} unhandled={}", .{ i, @tagName(op), n, u });
+        }
+    }
+
+    /// Log the first handful of create/bind object commands so a missing
+    /// binding (e.g. vertex_elements) can be traced to the wire.
+    /// Handle of the object in the create/bind currently being noted.
+    pub var last_handle: u32 = 0;
+    pub var creates_by_type: [16]u32 = [_]u32{0} ** 16;
+    pub var binds_by_type: [16]u32 = [_]u32{0} ** 16;
+
+    pub fn noteObject(kind: []const u8, obj: virgl.protocol.ObjectType, length: u16) void {
+        if (!on()) return;
+        const t: usize = @intFromEnum(obj);
+        if (t < 16) {
+            if (kind[0] == 'c') creates_by_type[t] += 1 else binds_by_type[t] += 1;
+        }
+        if (object_logged < 120) {
+            object_logged += 1;
+            log.info("{s}_object type={s}({d}) len={} handle={}", .{
+                kind, @tagName(obj), @intFromEnum(obj), length, last_handle,
+            });
+        }
+    }
+
+    pub var submit_aborts: u64 = 0;
+    var consts_logged: u32 = 0;
+    var draw_consts_logged: u32 = 0;
+
+    pub fn noteConsts(stage: u32, index: u32, nwords: u16) void {
+        if (!on() or consts_logged >= 8) return;
+        consts_logged += 1;
+        log.info("set_constant_buffer stage={} index={} words={}", .{ stage, index, nwords });
+    }
+
+    /// The uniform bytes a draw actually hands the vertex/fragment stage. An
+    /// empty vs block means the shader reads garbage for CONST[] — geometry
+    /// then lands at arbitrary positions (sparse single-pixel dots).
+    pub fn noteDrawConsts(vs_len: usize, fs_len: usize) void {
+        if (!on() or draw_consts_logged >= 6) return;
+        draw_consts_logged += 1;
+        log.info("draw consts: vs={} bytes fs={} bytes", .{ vs_len, fs_len });
+    }
+
+    /// A command batch that stopped decoding early. Logged loudly the first
+    /// few times: everything after the failure point never happened.
+    pub fn noteSubmitAbort(err: anyerror, ctx_id: u32, bytes: usize) void {
+        submit_aborts += 1;
+        if (submit_aborts <= 10) {
+            log.warn("submit ABORTED after {} (ctx={} {} bytes) — remaining commands in this batch were DROPPED", .{ err, ctx_id, bytes });
+        }
+    }
+
+    pub fn dumpObjectTypes() void {
+        if (!on()) return;
+        for (creates_by_type, 0..) |n, t| {
+            const b = binds_by_type[t];
+            if (n == 0 and b == 0) continue;
+            const ot: virgl.protocol.ObjectType = @enumFromInt(@as(u8, @intCast(t)));
+            log.info("object type {d} ({s}): created={} bound={}", .{ t, @tagName(ot), n, b });
+        }
+    }
+
+    /// Record (and, for the first few, log) why a draw could not use the
+    /// guest's own shaders. Falling back paints solid white, so a silent
+    /// null here looks exactly like "the guest rendered nothing".
+    pub fn noPipeline(reason: []const u8) ?metal.RenderPipelineState {
+        if (on() and no_pipeline_logged < 8) {
+            no_pipeline_logged += 1;
+            log.warn("draw fell back to passthrough (paints WHITE): {s}", .{reason});
+        }
+        return null;
+    }
+
+    /// Write a translated shader pair to BOBRVM_DUMP_SHADERS=<dir>, capped so
+    /// a long session doesn't fill the disk.
+    pub fn dumpShaderPair(vs_tgsi: []const u8, vs_msl: []const u8, fs_tgsi: []const u8, fs_msl: []const u8) void {
+        const dir = std.c.getenv("BOBRVM_DUMP_SHADERS") orelse return;
+        if (dump_seq >= 12) return;
+        const seq = dump_seq;
+        dump_seq += 1;
+        const io = global.io();
+        var buf: [512]u8 = undefined;
+        const parts = [_]struct { suffix: []const u8, body: []const u8 }{
+            .{ .suffix = "vs.tgsi", .body = vs_tgsi },
+            .{ .suffix = "vs.metal", .body = vs_msl },
+            .{ .suffix = "fs.tgsi", .body = fs_tgsi },
+            .{ .suffix = "fs.metal", .body = fs_msl },
+        };
+        for (parts) |part| {
+            const path = std.fmt.bufPrint(&buf, "{s}/shader-{d}-{s}", .{ std.mem.span(dir), seq, part.suffix }) catch continue;
+            const f = std.Io.Dir.cwd().createFile(io, path, .{}) catch continue;
+            defer f.close(io);
+            f.writePositionalAll(io, part.body, 0) catch {};
+        }
+        log.info("dumped translated shader pair {} to {s}", .{ seq, std.mem.span(dir) });
+    }
+
+    pub fn dump() void {
+        log.info("gl-stats: draws={} with_tex={} sampler_binds={} tex_upload ok={} fail={} shaders ok={} drop_so={} multipart={}", .{
+            draws,           draws_with_tex,
+            sampler_binds,   tex_uploads_ok,
+            tex_uploads_fail, shaders_created,
+            shaders_dropped_so, shaders_multipart,
+        });
+        log.info("gl-stats: vertex_elements created={} bound={}", .{ ve_creates, ve_binds });
+        log.info("gl-stats: submit aborts={}", .{submit_aborts});
+        dumpOpcodes();
+        dumpObjectTypes();
+    }
+};
 
 pub const virgl = @import("virgl/main.zig");
 pub const metal = @import("metal.zig");
@@ -263,7 +438,14 @@ pub const GpuDevice = struct {
     /// Execute a virgl command buffer for a context.
     pub fn submit(self: *GpuDevice, ctx_id: ContextId, cmd_data: []const u8) Error!void {
         const ctx = self.contexts.get(ctx_id) orelse return;
-        try self.processCommandBuffer(ctx, cmd_data);
+        // A decode error abandons the REST of the batch, so one unsupported
+        // command silently swallows every command behind it (that is how ~60
+        // object creations — blend/rasterizer/dsa/vertex_elements — went
+        // missing while the draws that needed them kept coming). Surface it.
+        self.processCommandBuffer(ctx, cmd_data) catch |err| {
+            stats.noteSubmitAbort(err, ctx_id, cmd_data.len);
+            return err;
+        };
     }
 
     fn destroyContext(self: *GpuDevice, data: []const u8) Error!void {
@@ -348,6 +530,7 @@ pub const GpuDevice = struct {
         while (dec.hasMore()) {
             const header = try dec.nextHeader();
 
+            stats.noteOpcode(header.opcode, false);
             switch (header.opcode) {
                 .nop => {},
 
@@ -355,18 +538,44 @@ pub const GpuDevice = struct {
                     const handle = try dec.decodeObjectHandle();
                     const payload = try dec.payload(header.length - 1);
 
+                    stats.last_handle = handle;
+                    stats.noteObject("create", header.object_type, header.length);
                     switch (header.object_type) {
                         .blend => try ctx.createBlendState(handle, payload),
                         .rasterizer => try ctx.createRasterizerState(handle, payload),
                         .dsa => try ctx.createDsaState(handle, payload),
                         .sampler_state => try ctx.createSamplerState(handle, payload),
-                        .vertex_elements => try ctx.createVertexElements(handle, payload),
+                        .vertex_elements => {
+                            if (stats.on()) {
+                                stats.ve_creates += 1;
+                                log.info("create_object vertex_elements handle={} len={}", .{ handle, header.length });
+                            }
+                            try ctx.createVertexElements(handle, payload);
+                        },
                         .shader => {
                             // SHADER payload: [type, offset, num_tokens,
                             // so_num_outputs, <packed TGSI text words...>].
                             // Single-part shaders without stream-out only.
-                            if (payload.len > 4 and payload[3] == 0) {
-                                try ctx.createShader(handle, payload[4..]);
+                            if (payload.len > 4) {
+                                // virgl marks a continued upload by setting the
+                                // top bit of `offset`; a non-zero offset also
+                                // means "these tokens start mid-shader".
+                                const offset = payload[1];
+                                const so_outputs = payload[3];
+                                const continued = (offset & 0x8000_0000) != 0 or (offset & 0x7fff_ffff) != 0;
+                                if (stats.on()) {
+                                    if (so_outputs != 0) stats.shaders_dropped_so += 1;
+                                    if (continued) stats.shaders_multipart += 1;
+                                    if (stats.shaders_created + stats.shaders_multipart + stats.shaders_dropped_so < 12) {
+                                        log.info("shader create: handle={} type={} offset=0x{x} num_tokens={} so={} words={}", .{
+                                            handle, payload[0], offset, payload[2], so_outputs, payload.len - 4,
+                                        });
+                                    }
+                                }
+                                if (so_outputs == 0) {
+                                    try ctx.createShader(handle, payload[4..]);
+                                    if (stats.on()) stats.shaders_created += 1;
+                                }
                             }
                         },
                         .surface => {
@@ -391,11 +600,19 @@ pub const GpuDevice = struct {
 
                 .bind_object => {
                     const handle = try dec.readU32();
+                    stats.last_handle = handle;
+                    stats.noteObject("bind", header.object_type, header.length);
                     switch (header.object_type) {
                         .blend => ctx.bindBlendState(handle),
                         .rasterizer => ctx.bindRasterizerState(handle),
                         .dsa => ctx.bindDsaState(handle),
-                        .vertex_elements => ctx.bindVertexElements(handle),
+                        .vertex_elements => {
+                            if (stats.on()) {
+                                stats.ve_binds += 1;
+                                log.info("bind_object vertex_elements handle={}", .{handle});
+                            }
+                            ctx.bindVertexElements(handle);
+                        },
                         else => {},
                     }
                 },
@@ -464,6 +681,7 @@ pub const GpuDevice = struct {
                             if (shader_type < 6 and slot < 16) {
                                 ctx.sampler_views_bound[shader_type][slot] =
                                     if (vh == 0) null else vh;
+                                if (vh != 0 and stats.on()) stats.sampler_binds += 1;
                             }
                         }
                     } else dec.skip(header.length);
@@ -488,6 +706,7 @@ pub const GpuDevice = struct {
                                 dec.skip(@intCast(nwords - n / 4));
                             }
                             ctx.setConstants(shader_type, cbuf[0..n]) catch {};
+                            stats.noteConsts(shader_type, index, nwords);
                         } else {
                             dec.skip(nwords);
                         }
@@ -519,6 +738,29 @@ pub const GpuDevice = struct {
                         if (header.length > 3) dec.skip(header.length - 3);
                     }
                     ctx.setIndexBuffer(ihandle, @intCast(@min(idx_size, 4)), idx_offset);
+                },
+
+                .set_scissor_state => {
+                    // [start_slot, (minx | miny<<16), (maxx | maxy<<16)] per rect.
+                    if (header.length >= 3) {
+                        const start_slot = try dec.readU32();
+                        var i: u16 = 1;
+                        var slot: u32 = start_slot;
+                        while (i + 1 < header.length) : (i += 2) {
+                            const lo = try dec.readU32();
+                            const hi = try dec.readU32();
+                            if (slot < 16) {
+                                ctx.setScissor(@intCast(slot), .{
+                                    .minx = @truncate(lo),
+                                    .miny = @truncate(lo >> 16),
+                                    .maxx = @truncate(hi),
+                                    .maxy = @truncate(hi >> 16),
+                                });
+                            }
+                            slot += 1;
+                        }
+                        if (header.length > i) dec.skip(header.length - i);
+                    } else dec.skip(header.length);
                 },
 
                 .set_vertex_buffers => {
@@ -559,6 +801,8 @@ pub const GpuDevice = struct {
                                         opts.frag_tex = view.resource_handle;
                                     }
                                 }
+                                stats.noteDraw(opts.frag_tex != null);
+                                stats.noteDrawConsts(opts.vs_consts.len, opts.fs_consts.len);
                                 // Depth: bound zsurf + bound DSA state.
                                 opts.depth = self.resolveDepthTarget(ctx);
                                 if (opts.depth != null) {
@@ -587,6 +831,8 @@ pub const GpuDevice = struct {
                                 }
                                 opts.extra_color = extra_ct[0..n_ct];
                                 opts.instance_count = @max(draw_cmd.instance_count, 1);
+                                opts.vertex_start = draw_cmd.start;
+                                opts.vertex_stride = ctx.vbo_strides[0];
                                 // Named UBO bindings (vertex stage 0 + fragment
                                 // stage 1, dims 1..15) → buffer(1+dim).
                                 var ubo_binds: [30]virgl.renderer.UboBind = undefined;
@@ -606,8 +852,64 @@ pub const GpuDevice = struct {
                                     }
                                 }
                                 opts.ubos = ubo_binds[0..n_ubo];
+                                // Every non-primary vertex-buffer slot the
+                                // guest has bound (multi-buffer / per-instance
+                                // vertex layouts).
+                                var vb_binds: [16]virgl.renderer.VertexBufferBind = undefined;
+                                var n_vb: usize = 0;
+                                for (ctx.vbo_handles[0..], 0..) |vh, slot| {
+                                    if (vh == 0 or n_vb >= vb_binds.len) continue;
+                                    vb_binds[n_vb] = .{
+                                        .slot = @intCast(slot),
+                                        .handle = vh,
+                                        .offset = ctx.vbo_offsets[slot],
+                                    };
+                                    n_vb += 1;
+                                }
+                                opts.vertex_buffers = vb_binds[0..n_vb];
+                                // Scissor: virgl gives GL window coords
+                                // (origin bottom-left); Metal wants top-left,
+                                // so the box is flipped against the target's
+                                // height. Skipped when it already covers
+                                // everything (the default state).
+                                if (r.getTarget(target)) |tgt| {
+                                    const sc = ctx.scissors[0];
+                                    const th: u32 = tgt.height;
+                                    const tw: u32 = tgt.width;
+                                    if (sc.maxx > sc.minx and sc.maxy > sc.miny and
+                                        !(sc.minx == 0 and sc.miny == 0 and sc.maxx >= tw and sc.maxy >= th))
+                                    {
+                                        // Y IS flipped: virgl scissors are GL
+                                        // window coords (origin bottom-left) and
+                                        // the target is top-left. Verified
+                                        // empirically — leaving it unflipped made
+                                        // damage regions land in the wrong band and
+                                        // stale frames accumulated as ghost copies.
+                                        const x = @min(@as(u32, sc.minx), tw);
+                                        const w = @min(@as(u32, sc.maxx), tw) - x;
+                                        const top = if (th > sc.maxy) th - @as(u32, sc.maxy) else 0;
+                                        const h = @min(@as(u32, sc.maxy) - @as(u32, sc.miny), th - top);
+                                        if (w > 0 and h > 0) opts.scissor = .{
+                                            .x = x,
+                                            .y = top,
+                                            .width = w,
+                                            .height = h,
+                                        };
+                                    }
+                                }
                                 if (self.getOrBuildPipeline(ctx, r, target, opts.depth != null)) |pso| {
-                                    if (draw_cmd.indexed and ctx.index_buffer != 0) {
+                                    if (!draw_cmd.indexed and virgl.Renderer.needsFanExpansion(draw_cmd.mode)) {
+                                        // GL fans/polygons need index expansion
+                                        // (Metal has no fan primitive).
+                                        r.drawFanWithPipeline(
+                                            target,
+                                            pso,
+                                            vbo_handle,
+                                            ctx.vbo_offsets[0],
+                                            draw_cmd.count,
+                                            opts,
+                                        ) catch {};
+                                    } else if (draw_cmd.indexed and ctx.index_buffer != 0) {
                                         r.drawIndexedWithPipeline(
                                             target,
                                             pso,
@@ -639,7 +941,10 @@ pub const GpuDevice = struct {
                     }
                 },
 
-                else => dec.skip(header.length),
+                else => {
+                    stats.noteOpcode(header.opcode, true);
+                    dec.skip(header.length);
+                },
             }
         }
     }
@@ -745,10 +1050,16 @@ pub const GpuDevice = struct {
         target_handle: ResourceHandle,
         has_depth: bool,
     ) ?metal.RenderPipelineState {
-        const vs_h = ctx.bound.vs orelse return null;
-        const fs_h = ctx.bound.fs orelse return null;
-        const ve_h = ctx.bound.vertex_elements orelse return null;
-        const target = r.getTarget(target_handle) orelse return null;
+        const vs_h = ctx.bound.vs orelse return stats.noPipeline("no bound vs");
+        const fs_h = ctx.bound.fs orelse return stats.noPipeline("no bound fs");
+        // NOTE: niri's vertex shaders DO declare attributes (IN[0]/IN[1] ->
+        // [[attribute(0/1)]]), so a pipeline without a vertex descriptor is
+        // rejected by Metal. Building one anyway just fails ~145x per frame,
+        // so keep requiring the vertex_elements object and report its absence
+        // — tracking down why the guest never binds one is the open item.
+        const ve_h = ctx.bound.vertex_elements orelse
+            return stats.noPipeline("no bound vertex_elements (VS uses attributes)");
+        const target = r.getTarget(target_handle) orelse return stats.noPipeline("no metal target");
 
         // Extra MRT color-attachment formats (cbufs 1..nr_cbufs-1).
         var extra_fmt: [7]metal.MTLPixelFormat = undefined;
@@ -772,13 +1083,16 @@ pub const GpuDevice = struct {
         };
         if (self.pipelines.get(key)) |pso| return pso;
 
-        const vs = ctx.shaders.get(vs_h) orelse return null;
-        const fs = ctx.shaders.get(fs_h) orelse return null;
-        const vs_text = vs.tgsi_text orelse return null;
-        const fs_text = fs.tgsi_text orelse return null;
-        const ve = ctx.vertex_elements.get(ve_h) orelse return null;
+        const vs = ctx.shaders.get(vs_h) orelse return stats.noPipeline("vs handle not in shader table");
+        const fs = ctx.shaders.get(fs_h) orelse return stats.noPipeline("fs handle not in shader table");
+        const vs_text = vs.tgsi_text orelse return stats.noPipeline("vs has no tgsi text");
+        const fs_text = fs.tgsi_text orelse return stats.noPipeline("fs has no tgsi text");
+        const ve = ctx.vertex_elements.get(ve_h) orelse return stats.noPipeline("ve handle not in table");
 
-        const pso = self.buildTranslatedPipeline(r, vs_text, fs_text, ve, ctx, target.format, has_depth, extra_fmt[0..n_extra]) catch return null;
+        const pso = self.buildTranslatedPipeline(r, vs_text, fs_text, ve, ctx, target.format, has_depth, extra_fmt[0..n_extra]) catch |err| {
+            log.warn("translated pipeline build FAILED: {}", .{err});
+            return stats.noPipeline("pipeline build error");
+        };
         self.pipelines.put(key, pso) catch {
             pso.release();
             return null;
@@ -810,18 +1124,45 @@ pub const GpuDevice = struct {
         const fz = try self.alloc.dupeZ(u8, fmsl.source);
         defer self.alloc.free(fz);
 
-        // Vertex layout from vertex_elements (single vertex buffer, index 0).
+        // BOBRVM_DUMP_SHADERS=<dir>: write each translated pair (guest TGSI +
+        // the MSL we generate) so a wrong-pixels bug can be read off the
+        // source instead of guessed at.
+        stats.dumpShaderPair(vs_text, vmsl.source, fs_text, fmsl.source);
+
+        // Vertex layout from vertex_elements. Each element names the
+        // vertex-buffer SLOT it reads from and may advance per-instance —
+        // hardcoding slot 0 collapsed a compositor's per-quad attributes onto
+        // the per-vertex buffer, so its quads degenerated to single pixels.
         var attrs: [16]virgl.Renderer.VertexAttr = undefined;
+        var layouts: [16]virgl.Renderer.VertexLayout = undefined;
+        var n_layouts: usize = 0;
         const n = @min(ve.count, 16);
         for (0..n) |i| {
+            const el = ve.elements[i];
+            const slot: u32 = el.vertex_buffer_index;
             attrs[i] = .{
-                .format = virgl.Renderer.mapVertexFormat(ve.elements[i].src_format),
-                .offset = ve.elements[i].src_offset,
-                .buffer_index = 0,
+                .format = virgl.Renderer.mapVertexFormat(el.src_format),
+                .offset = el.src_offset,
+                .buffer_index = slot,
             };
+            // One layout entry per distinct slot.
+            var seen = false;
+            for (layouts[0..n_layouts]) |l| {
+                if (l.slot == slot) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen and n_layouts < layouts.len and slot < ctx.vbo_strides.len) {
+                layouts[n_layouts] = .{
+                    .slot = slot,
+                    .stride = ctx.vbo_strides[slot],
+                    .instance_divisor = el.instance_divisor,
+                };
+                n_layouts += 1;
+            }
         }
-        const stride = ctx.vbo_strides[0];
-        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], stride, format, has_depth, resolveBlend(ctx), extra_formats);
+        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], layouts[0..n_layouts], format, has_depth, resolveBlend(ctx), extra_formats);
     }
 
     /// Get a context by ID.

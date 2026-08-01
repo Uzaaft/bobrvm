@@ -260,8 +260,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let width = 1280.0
-        let height = 800.0
+        // Open at the screen's working-area size. The guest framebuffer is
+        // allocated ONCE at boot and can re-modeset smaller but never grow
+        // (fbdev), so starting the display large is what makes resize-to-fit
+        // work in both directions afterwards.
+        let work = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1280, height: 800)
+        let width = work.width
+        let height = work.height
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -320,6 +325,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var kernel: String? = nil
         var initrd: String? = nil
         var disk: String? = nil
+        var disk2: String? = nil
+        var disk2ReadOnly: Bool? = nil
+        var gpu3d = false
         var cmdline = "console=hvc0 earlycon=pl011,0x09000000"
         var memoryMB: UInt64 = 2048
         var enableNet = false
@@ -331,6 +339,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case "--kernel": kernel = args.next()
             case "--initrd": initrd = args.next()
             case "--disk": disk = args.next()
+            case "--disk2": disk2 = args.next()
+            case "--disk2-readonly": disk2ReadOnly = true
+            case "--disk2-writable": disk2ReadOnly = false
+            // 3D (virgl/venus) on the guest's virtio-gpu. Needs a libbobrvm
+            // built with -Dgpu-venus and the host venus stack for GL.
+            case "--gpu3d": gpu3d = true
             case "--cmdline": cmdline = args.next() ?? cmdline
             case "--memory-mb": memoryMB = UInt64(args.next() ?? "") ?? memoryMB
             case "--net": enableNet = true
@@ -343,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             view.metalLayer.contentsScale = window.backingScaleFactor
         }
         guard let kernelPath = kernel else {
-            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--net] [--cpus 1] [--memory-mb 2048] [--hidpi]")
+            print("usage: BobrvmDisplay --kernel Image [--initrd initrd] [--disk disk.img] [--disk2 d2.img [--disk2-writable]] [--net] [--gpu3d] [--cpus 1] [--memory-mb 2048] [--hidpi]")
             NSApp.terminate(nil)
             return
         }
@@ -352,6 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         kernelPath.withCString { kernelC in
             withOptionalCString(initrd) { initrdC in
                 withOptionalCString(disk) { diskC in
+                  withOptionalCString(disk2) { disk2C in
                     cmdline.withCString { cmdlineC in
                         var cfg = bobrvm_vm_config_s()
                         cfg.memory_bytes = memoryMB * 1024 * 1024
@@ -361,12 +376,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         cfg.disk_path = diskC
                         cfg.disk_read_only = diskC != nil && (disk?.hasSuffix(".iso") ?? false)
                         cfg.cmdline = cmdlineC
+                        cfg.disk2_path = disk2C
+                        // Default read-only for ISOs, writable otherwise;
+                        // an explicit flag always wins.
+                        cfg.disk2_read_only = disk2ReadOnly ?? (disk2?.hasSuffix(".iso") ?? true)
                         cfg.enable_net = enableNet
-                        let (gw, gh) = guestSize()
-                        cfg.display_width = gw
-                        cfg.display_height = gh
+                        cfg.enable_gpu3d = gpu3d
+                        // Boot the display with headroom for the LARGEST
+                        // attached screen: the guest fbdev framebuffer is
+                        // allocated once at this size and can re-modeset
+                        // smaller but never grow, so this is what lets
+                        // resize-to-fit work at any window size on any
+                        // monitor. The window-fit resize request that
+                        // follows the first windowDidResize shrinks the
+                        // mode to the actual window.
+                        let scale = hidpi ? (NSScreen.main?.backingScaleFactor ?? 1.0) : 1.0
+                        let maxScreen = NSScreen.screens.reduce(NSSize(width: 1280, height: 800)) {
+                            NSSize(width: max($0.width, $1.frame.width * scale),
+                                   height: max($0.height, $1.frame.height * scale))
+                        }
+                        cfg.display_width = UInt32(maxScreen.width) & ~1
+                        cfg.display_height = UInt32(maxScreen.height)
                         vm = bobrvm_vm_new(bobrApp, &cfg)
                     }
+                  }
                 }
             }
         }
@@ -407,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // transitions, announce a vdagent GRAB so the guest can paste.
         var tick = 0
         var lastChangeCount = NSPasteboard.general.changeCount
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self, let surface = self.surface else { return }
             bobrvm_surface_draw(surface)
             tick += 1
@@ -418,6 +451,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let vm = self.vm { bobrvm_vm_host_clipboard_changed(vm) }
                 }
             }
+        }
+        // .common (not scheduledTimer's .default): the run loop switches to
+        // the event-tracking mode during live window resizes and menu
+        // tracking, where .default timers don't fire — the display froze
+        // for the whole drag.
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+
+        // One-shot fit: the display boots at largest-screen size (for fbdev
+        // headroom); once the guest's display stack is up, shrink the mode
+        // to the actual window. Harmless no-op if window restoration
+        // already fired a resize.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            self?.guestResizeNow()
         }
     }
 

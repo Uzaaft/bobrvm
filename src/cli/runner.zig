@@ -380,6 +380,23 @@ fn testResizeLoop(hw: *machine.Machine, spec: ResizeSpec) void {
     sleepNs(spec.delay_s * std.time.ns_per_s);
     log.info("requesting guest display resize to {}x{}", .{ spec.width, spec.height });
     hw.requestDisplayResize(spec.width, spec.height);
+    // Storm mode (BOBRVM_TEST_RESIZE_STORM=n:ms): follow with n rapid
+    // alternating resizes, mimicking a live window drag, to chase modeset
+    // races that a single hotplug never hits.
+    const storm = std.c.getenv("BOBRVM_TEST_RESIZE_STORM") orelse return;
+    const s = std.mem.span(storm);
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return;
+    const n = std.fmt.parseInt(u32, s[0..colon], 10) catch return;
+    const gap_ms = std.fmt.parseInt(u64, s[colon + 1 ..], 10) catch return;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        sleepNs(gap_ms * std.time.ns_per_ms);
+        // Sweep through varied sizes (grow and shrink, odd heights).
+        const w = spec.width -| (i % 5) * 137;
+        const h = spec.height -| (i % 7) * 61;
+        log.info("storm resize {}/{}: {}x{}", .{ i + 1, n, w, h });
+        hw.requestDisplayResize(@max(w, 320), @max(h, 240));
+    }
 }
 
 /// Type a string on the virtio keyboard (BOBRVM_TEST_TYPE debug hook).
@@ -413,7 +430,20 @@ fn frameDump(_: ?*anyopaque) void {
     }) catch return;
     const file = std.Io.Dir.cwd().createFile(global.io(), path, .{}) catch return;
     defer file.close(global.io());
-    file.writePositionalAll(global.io(), scan.data, 0) catch {};
+    if (scan.width == scan.full_width and scan.height == scan.full_height) {
+        file.writePositionalAll(global.io(), scan.data, 0) catch {};
+    } else {
+        // Sub-rect scanout: extract the visible rows from the full-stride
+        // resource so the dump matches the WxH in the filename.
+        const stride: usize = @as(usize, scan.full_width) * 4;
+        const row_bytes: usize = @as(usize, scan.width) * 4;
+        var row: usize = 0;
+        while (row < scan.height) : (row += 1) {
+            const src_off = (@as(usize, scan.src_y) + row) * stride + @as(usize, scan.src_x) * 4;
+            if (src_off + row_bytes > scan.data.len) break;
+            file.writePositionalAll(global.io(), scan.data[src_off..][0..row_bytes], row * row_bytes) catch break;
+        }
+    }
     log.info("dumped frame {} ({}x{})", .{ frame_count, scan.width, scan.height });
 }
 

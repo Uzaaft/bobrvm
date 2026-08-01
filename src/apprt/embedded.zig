@@ -76,6 +76,10 @@ pub const VMConfig = extern struct {
     /// Initial guest display size in pixels (0 = machine default).
     display_width: u32 = 0,
     display_height: u32 = 0,
+    /// Enable 3D acceleration on the GUI's virtio-gpu (virgl capset, and the
+    /// venus capset when built with -Dgpu-venus). Off by default: a 2D-only
+    /// scanout is the safe path, and 3D needs the venus host stack present.
+    enable_gpu3d: bool = false,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
@@ -111,6 +115,7 @@ pub const VMConfig = extern struct {
             .enable_net = self.enable_net,
             .display_width = self.display_width,
             .display_height = self.display_height,
+            .enable_gpu3d = self.enable_gpu3d,
         };
     }
 };
@@ -131,6 +136,7 @@ pub const OwnedVMConfig = struct {
     enable_net: bool = false,
     display_width: u32 = 0,
     display_height: u32 = 0,
+    enable_gpu3d: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.firmware_path) |p| alloc.free(p);
@@ -399,8 +405,10 @@ pub const VM = struct {
                 .disk2_path = self.config.disk2_path,
                 .disk2_read_only = self.config.disk2_read_only,
                 .cmdline = self.config.cmdline orelse "console=hvc0 earlycon=pl011,0x09000000",
-                // GUI VMs always get a display device.
+                // GUI VMs always get a display device; 3D (virgl/venus) is
+                // opt-in via the config so a plain 2D scanout stays the default.
                 .enable_gpu = true,
+                .enable_virgl = self.config.enable_gpu3d,
                 .enable_net = self.config.enable_net,
                 .display_width = if (self.config.display_width != 0) self.config.display_width else 1280,
                 .display_height = if (self.config.display_height != 0) self.config.display_height else 800,
@@ -620,6 +628,10 @@ pub const Surface = struct {
             .data = view.data,
             .width = view.width,
             .height = view.height,
+            .src_x = view.src_x,
+            .src_y = view.src_y,
+            .full_width = view.full_width,
+            .full_height = view.full_height,
             .generation = view.generation,
             .surface = view.surface,
             .cursor = if (view.cursor) |c| .{

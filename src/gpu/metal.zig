@@ -426,6 +426,31 @@ pub const VertexDescriptor = struct {
         const set_n: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
         set_n(layout, sel("setStride:"), stride);
     }
+
+    /// Per-buffer step function + rate. A virgl vertex element with a nonzero
+    /// instance_divisor advances once per N instances rather than per vertex —
+    /// which is how a compositor feeds per-quad data (rects, colours) from a
+    /// second vertex buffer.
+    pub fn setLayoutStep(
+        self: VertexDescriptor,
+        index: NSUInteger,
+        step: MTLVertexStepFunction,
+        rate: NSUInteger,
+    ) void {
+        const layouts = msgSendId(self.ptr, sel("layouts")) orelse return;
+        const idx_func: *const fn (id, SEL, NSUInteger) callconv(.c) ?id = @ptrCast(&objc_msgSend);
+        const layout = idx_func(layouts, sel("objectAtIndexedSubscript:"), index) orelse return;
+        const set_n: *const fn (id, SEL, NSUInteger) callconv(.c) void = @ptrCast(&objc_msgSend);
+        set_n(layout, sel("setStepFunction:"), @intFromEnum(step));
+        set_n(layout, sel("setStepRate:"), rate);
+    }
+};
+
+/// MTLVertexStepFunction
+pub const MTLVertexStepFunction = enum(NSUInteger) {
+    constant = 0,
+    per_vertex = 1,
+    per_instance = 2,
 };
 
 /// MTLLibrary wrapper.
@@ -893,6 +918,16 @@ pub const MetalLayer = struct {
         func(self.ptr, s, .{ .width = width, .height = height });
     }
 
+    /// Current drawable size in pixels. CGSize is a two-double HFA, so on
+    /// arm64 it comes back in registers via plain objc_msgSend.
+    pub fn drawableSize(self: MetalLayer) struct { width: f64, height: f64 } {
+        const Size = extern struct { width: f64, height: f64 };
+        const s = sel("drawableSize");
+        const func: *const fn (id, SEL) callconv(.c) Size = @ptrCast(&objc_msgSend);
+        const size = func(self.ptr, s);
+        return .{ .width = size.width, .height = size.height };
+    }
+
     pub fn fromPtr(ptr: *anyopaque) MetalLayer {
         return .{ .ptr = ptr };
     }
@@ -1211,63 +1246,90 @@ pub const FrameRenderer = struct {
     /// replaceRegion. Either way the source is blitted to the drawable; the
     /// layer's drawable size is pinned to the framebuffer size and
     /// CoreAnimation scales it to the view.
+    /// Source placement of the visible scanout within the backing resource.
+    /// fbdev re-modesets to a smaller mode by scanning a sub-rect of the
+    /// same (never-shrinking) framebuffer, so the resource can be larger
+    /// than what is displayed.
+    pub const SrcRect = struct {
+        x: u32 = 0,
+        y: u32 = 0,
+        full_width: u32,
+        full_height: u32,
+    };
+
     pub fn renderFramebuffer(
         self: *FrameRenderer,
         data: []const u8,
         width: u32,
         height: u32,
+        src_rect: SrcRect,
         surface: ?*anyopaque,
         cursor: ?CursorInfo,
     ) bool {
         assert(width > 0 and height > 0);
+        assert(src_rect.x + width <= src_rect.full_width);
+        assert(src_rect.y + height <= src_rect.full_height);
         // `data` is only consumed by the upload fallback; the zero-copy path
         // reads pixels straight from `surface`.
-        assert(surface != null or data.len >= @as(usize, width) * height * 4);
+        assert(surface != null or data.len >= @as(usize, src_rect.full_width) * src_rect.full_height * 4);
 
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
 
         // Resolve the blit source: the shared IOSurface texture (zero-copy) or
-        // the uploaded staging texture (fallback).
+        // the uploaded staging texture (fallback). Textures span the FULL
+        // resource; the blit below selects the visible rect.
         const src_texture: Texture = if (surface) |surf| src: {
             if (self.surface_texture == null or self.surface_ref != surf or
-                self.surface_width != width or self.surface_height != height)
+                self.surface_width != src_rect.full_width or self.surface_height != src_rect.full_height)
             {
                 if (self.surface_texture) |tex| tex.release();
                 self.surface_texture = self.device.newTextureFromIOSurface(
                     .bgra8Unorm,
-                    width,
-                    height,
+                    src_rect.full_width,
+                    src_rect.full_height,
                     surf,
                     MTLTextureUsage.shader_read, // blit source only
                 ) orelse return false;
                 self.surface_ref = surf;
-                self.surface_width = width;
-                self.surface_height = height;
-                self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
+                self.surface_width = src_rect.full_width;
+                self.surface_height = src_rect.full_height;
             }
             break :src self.surface_texture.?;
         } else src: {
             // (Re)create the staging texture on size change.
-            if (self.fb_texture == null or self.fb_width != width or self.fb_height != height) {
+            if (self.fb_texture == null or self.fb_width != src_rect.full_width or
+                self.fb_height != src_rect.full_height)
+            {
                 if (self.fb_texture) |tex| tex.release();
-                self.fb_texture = createTexture2D(self.device, .bgra8Unorm, width, height) orelse
+                self.fb_texture = createTexture2D(self.device, .bgra8Unorm, src_rect.full_width, src_rect.full_height) orelse
                     return false;
-                self.fb_width = width;
-                self.fb_height = height;
-                self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
+                self.fb_width = src_rect.full_width;
+                self.fb_height = src_rect.full_height;
             }
             const fb_tex = self.fb_texture.?;
             fb_tex.replaceRegion(
-                .{ .size = .{ .width = width, .height = height } },
+                .{ .size = .{ .width = src_rect.full_width, .height = src_rect.full_height } },
                 0,
                 data.ptr,
-                @as(NSUInteger, width) * 4,
+                @as(NSUInteger, src_rect.full_width) * 4,
             );
             break :src fb_tex;
         };
 
-        // Blit to the drawable.
+        // Keep the drawable pinned to the VISIBLE scanout size. CAMetalLayer
+        // recomputes drawableSize from bounds x contentsScale whenever the
+        // window (layer bounds) resizes, silently clobbering any custom
+        // value — the blit below would then land in the corner of a larger
+        // drawable, or go out of bounds of a smaller one and the frame
+        // never presents (the "display freezes on resize" bug). CA scales
+        // the guest-sized drawable into the window per contentsGravity.
+        const ds = self.layer.drawableSize();
+        if (ds.width != @as(f64, @floatFromInt(width)) or ds.height != @as(f64, @floatFromInt(height))) {
+            self.layer.setDrawableSize(@floatFromInt(width), @floatFromInt(height));
+        }
+
+        // Blit the visible rect to the drawable.
         const drawable = self.layer.nextDrawable() orelse return false;
         const dst_texture = drawable.texture() orelse return false;
         const cmd_buffer = self.queue.commandBuffer() orelse return false;
@@ -1275,7 +1337,7 @@ pub const FrameRenderer = struct {
 
         blit.copyTexture(
             src_texture.ptr,
-            .{},
+            .{ .x = src_rect.x, .y = src_rect.y },
             .{ .width = width, .height = height },
             dst_texture,
             .{},

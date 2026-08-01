@@ -85,8 +85,12 @@ pub const Program = struct {
     /// Highest TEMP index referenced (-1 = none); temps are emitted as
     /// local float4 t0..tN.
     max_temp: i64 = -1,
-    /// Parsed IMM immediates (declared as const float4 immK).
-    imms: [MAX_IMM][4]f32 = undefined,
+    /// Parsed IMM immediates, held as RAW 32-BIT PATTERNS (emitted as
+    /// float4 immK via as_type). TGSI immediates come in FLT32/UINT32/INT32
+    /// flavours and an integer-typed one routinely carries a float bit
+    /// pattern (e.g. `IMM[0] UINT32 {1065353216}` is 1.0f); keeping bits
+    /// makes every flavour exact and survives round-tripping.
+    imms: [MAX_IMM][4]u32 = undefined,
     imm_present: [MAX_IMM]bool = [_]bool{false} ** MAX_IMM,
     /// Whether any CONST[] was referenced (needs a uniform buffer binding).
     uses_const: bool = false,
@@ -296,12 +300,24 @@ fn parseImm(prog: *Program, line: []const u8) void {
     const cb = std.mem.indexOfScalar(u8, line, '}') orelse return;
     if (cb <= ob + 1) return;
 
-    var vals = [_]f32{ 0, 0, 0, 0 };
+    // The type token sits between "IMM[k]" and "{": FLT32 | UINT32 | INT32.
+    // Integer flavours are literal bit patterns; only FLT32 is a decimal.
+    const type_tok = std.mem.trim(u8, line[rb + 1 .. ob], " \t");
+    const is_float = std.mem.indexOf(u8, type_tok, "FLT") != null;
+
+    var vals = [_]u32{ 0, 0, 0, 0 };
     var it = std.mem.tokenizeAny(u8, line[ob + 1 .. cb], ", \t");
     var i: usize = 0;
     while (it.next()) |tok| : (i += 1) {
         if (i >= 4) break;
-        vals[i] = std.fmt.parseFloat(f32, tok) catch 0;
+        vals[i] = if (is_float)
+            @bitCast(std.fmt.parseFloat(f32, tok) catch 0)
+        else if (std.fmt.parseInt(u32, tok, 10)) |u|
+            u
+        else |_| if (std.fmt.parseInt(i32, tok, 10)) |sv|
+            @bitCast(sv)
+        else |_|
+            0;
     }
     prog.imms[idx] = vals;
     prog.imm_present[idx] = true;
@@ -767,7 +783,15 @@ fn emitLocals(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
     }
     for (prog.imms[0..], 0..) |vals, k| {
         if (!prog.imm_present[k]) continue;
-        try app(w, alloc, "    float4 imm{d} = float4({d}, {d}, {d}, {d});\n", .{ k, vals[0], vals[1], vals[2], vals[3] });
+        // Bit-exact: printing a float32 as decimal loses the low bits (a
+        // 1.0f pattern of 1065353216 came back as 1065353200, which put ~1e9
+        // in a position's w and collapsed every vertex to a point).
+        try app(
+            w,
+            alloc,
+            "    float4 imm{d} = float4(as_type<float>(0x{x:0>8}u), as_type<float>(0x{x:0>8}u), as_type<float>(0x{x:0>8}u), as_type<float>(0x{x:0>8}u));\n",
+            .{ k, vals[0], vals[1], vals[2], vals[3] },
+        );
     }
 }
 
@@ -853,6 +877,13 @@ fn emitVertex(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
     if (!has_position) try app(w, alloc, "    out.position = float4(0.0,0.0,0.0,1.0);\n", .{});
     try emitLocals(w, alloc, prog);
     try emitBody(w, alloc, prog);
+    // GL framebuffers have their origin at the BOTTOM-left; Metal's is at the
+    // top-left. Without compensating, everything a guest renders arrives
+    // vertically mirrored (a whole compositor upside down). Flipping clip-space
+    // Y here — the standard fix for GL-on-Metal — keeps the guest's coordinate
+    // system intact for every draw, including renders into FBOs that are later
+    // sampled as textures.
+    try app(w, alloc, "    out.position.y = -out.position.y;\n", .{});
     try app(w, alloc, "    return out;\n}}\n", .{});
 }
 
@@ -1035,6 +1066,30 @@ test "emit MSL for passthrough vertex shader" {
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position.xyzw = (in.a0.xyzw).xyzw;") != null);
 }
 
+test "IMM UINT32 carrying a float bit pattern survives as that float" {
+    // Real niri/smithay vertex shader: `IMM[0] UINT32 {1065353216, ...}` is
+    // 0x3f800000 == 1.0f, used for the position's w. Parsing it as a decimal
+    // put ~1.07e9 in w and collapsed every vertex to a point (nothing drew).
+    const src =
+        \\VERT
+        \\DCL IN[0]
+        \\DCL OUT[0], POSITION
+        \\IMM[0] UINT32 {1065353216, 0, 0, 0}
+        \\  0: MOV OUT[0], IN[0]
+        \\  1: MOV OUT[0].w, IMM[0].xxxx
+        \\  2: END
+    ;
+    const prog = try parse(src);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), prog.imms[0][0]);
+    try std.testing.expectEqual(@as(f32, 1.0), @as(f32, @bitCast(prog.imms[0][0])));
+
+    var msl = try emit(std.testing.allocator, &prog);
+    defer msl.deinit(std.testing.allocator);
+    // Emitted bit-exactly, not as a lossy decimal.
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "as_type<float>(0x3f800000u)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "1065353") == null);
+}
+
 test "parse and emit arithmetic shader (MAD, DP4, swizzle, IMM, TEMP)" {
     const src =
         \\VERT
@@ -1052,13 +1107,14 @@ test "parse and emit arithmetic shader (MAD, DP4, swizzle, IMM, TEMP)" {
     const prog = try parse(src);
     try std.testing.expectEqual(@as(i64, 0), prog.max_temp);
     try std.testing.expect(prog.imm_present[0]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), prog.imms[0][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), @as(f32, @bitCast(prog.imms[0][0])), 0.001);
 
     var msl = try emit(std.testing.allocator, &prog);
     defer msl.deinit(std.testing.allocator);
     // MAD lowered to a*b+c; DP4 as dot; writemask + swizzle preserved.
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "float4 t0 = float4(0.0);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msl.source, "imm0 = float4(0.5") != null);
+    // 0.5f == 0x3f000000
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "imm0 = float4(as_type<float>(0x3f000000u)") != null);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position.x = (float4(dot(") != null);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.g1.xy = (in.a1.yxxx).xy;") != null);
 }

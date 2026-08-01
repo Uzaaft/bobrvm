@@ -216,6 +216,32 @@ pub const ResourceCreateBlob = extern struct {
     size: u64,
 };
 
+/// virtio_gpu_set_scanout_blob: a compositor page-flipping a blob resource
+/// (what niri/wlroots do once GBM allocates scanout buffers as blobs).
+pub const SetScanoutBlob = extern struct {
+    header: CtrlHeader,
+    r: Rect,
+    scanout_id: u32,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    _padding: u32 = 0,
+    strides: [4]u32,
+    offsets: [4]u32,
+};
+
+/// What we know about a live blob resource, recorded at create time so the
+/// scanout path can tell where its pixels actually live.
+pub const BlobMeta = struct {
+    /// VIRTIO_GPU_BLOB_MEM_*: 1 = guest RAM (presentable by gathering the
+    /// backing iovecs), 2 = host3d (pixels inside the host Vulkan driver),
+    /// 3 = host3d with guest backing.
+    blob_mem: u32,
+    blob_flags: u32,
+    size: u64,
+};
+
 /// virtio_gpu_resource_map_blob.
 pub const ResourceMapBlob = extern struct {
     header: CtrlHeader,
@@ -408,7 +434,7 @@ pub const CAPSET_VIRGL2: u32 = 2;
 /// transports these opaquely to mesa; sizes must be honest, contents
 /// grow as the translator does.
 pub const CAPS_V1_SIZE: u32 = 308;
-pub const CAPS_V2_SIZE: u32 = 1384;
+pub const CAPS_V2_SIZE: u32 = 1408;
 
 /// Display-changed event bit for config.events_read
 /// (VIRTIO_GPU_EVENT_DISPLAY): tells the guest to re-query display info.
@@ -470,6 +496,13 @@ pub const Gpu = struct {
     /// Current scanout.
     scanout_resource_id: u32,
 
+    /// Scanout sub-rectangle within the scanout resource. Linux fbdev
+    /// re-modesets to a smaller mode by scanning a sub-rect of the SAME
+    /// framebuffer resource (the fb buffer can never grow), so honoring
+    /// r is what makes resize-to-fit real for console guests. Zero
+    /// width/height = present the whole resource.
+    scanout_rect: Rect = .{},
+
     /// Bumped each time the scanout content changes (flush of the scanout
     /// resource). The renderer compares this to skip re-presenting an
     /// unchanged frame — no upload, no blit, no drawable for idle vsyncs.
@@ -478,6 +511,12 @@ pub const Gpu = struct {
     /// Display dimensions.
     display_width: u32,
     display_height: u32,
+
+    /// Boot-time display dimensions = the guest fbdev framebuffer's size,
+    /// which can never grow. Hotplug resizes are clamped to this so the
+    /// advertised mode always fits (see setDisplaySize/resizeDisplay).
+    boot_display_width: u32 = 1280,
+    boot_display_height: u32 = 800,
 
     /// Guest memory accessor.
     guest_memory: ?ring.GetMemFn,
@@ -517,6 +556,11 @@ pub const Gpu = struct {
     /// id. virglrenderer holds the pointer for the resource's lifetime, so the
     /// array must outlive create_blob and is freed on unref.
     venus_blobs: std.AutoHashMap(u32, []venus.iovec),
+    /// Per-blob metadata (blob_mem etc.), recorded at create time so the
+    /// scanout-blob path knows where a flipped buffer's pixels live.
+    blob_meta: std.AutoHashMap(u32, BlobMeta),
+    /// Most recent SET_SCANOUT_BLOB, for the venus present path.
+    scanout_blob: ?SetScanoutBlob = null,
 
     /// Host-visible memory window (VIRTIO_GPU_SHM_ID_HOST_VISIBLE). Guest maps
     /// host blob memory into [base, base+size) at driver-chosen offsets via
@@ -593,6 +637,7 @@ pub const Gpu = struct {
             .venus_host = null,
             .venus_contexts = std.AutoHashMap(u32, void).init(alloc),
             .venus_blobs = std.AutoHashMap(u32, []venus.iovec).init(alloc),
+            .blob_meta = std.AutoHashMap(u32, BlobMeta).init(alloc),
             .venus_mappings = std.AutoHashMap(u32, MapRecord).init(alloc),
         };
 
@@ -634,6 +679,7 @@ pub const Gpu = struct {
             var it = self.venus_blobs.valueIterator();
             while (it.next()) |iov| self.alloc.free(iov.*);
             self.venus_blobs.deinit();
+            self.blob_meta.deinit();
         }
         self.venus_mappings.deinit();
         if (comptime gpu_venus) venus.deinitHost();
@@ -642,12 +688,19 @@ pub const Gpu = struct {
         self.alloc.destroy(self);
     }
 
-    /// Set display dimensions (before guest probes).
+    /// Set display dimensions (before guest probes). Also records the boot
+    /// ceiling: the guest's fbdev framebuffer is allocated at this size and
+    /// can never grow, so later hotplug resizes are clamped to it — a mode
+    /// that can't fit the fb leaves the fbdev client with NO usable mode
+    /// and it turns the display off (black screen) until a fitting hotplug
+    /// arrives.
     pub fn setDisplaySize(self: *Gpu, width: u32, height: u32) void {
         assert(width > 0 and height > 0);
         assert(width <= MAX_RESOURCE_DIM and height <= MAX_RESOURCE_DIM);
         self.display_width = width;
         self.display_height = height;
+        self.boot_display_width = width;
+        self.boot_display_height = height;
     }
 
     /// Recreate a 2D resource from snapshot state: a heap-backed pixel copy
@@ -694,9 +747,15 @@ pub const Gpu = struct {
     /// modesets via DRM hotplug. Caller must hold the machine lock — that
     /// serializes this against the vCPU thread's MMIO/queue processing.
     pub fn resizeDisplay(self: *Gpu, width: u32, height: u32) void {
-        // Host-UI input: clamp rather than assert.
-        const w = std.math.clamp(width, MIN_DISPLAY_DIM, MAX_RESOURCE_DIM);
-        const h = std.math.clamp(height, MIN_DISPLAY_DIM, MAX_RESOURCE_DIM);
+        // Host-UI input: clamp rather than assert. The upper bound is the
+        // BOOT display size — the guest fbdev fb is allocated once at that
+        // size and a mode that can't fit it makes the fbdev client disable
+        // the display entirely (black screen), so never advertise one.
+        const w = std.math.clamp(width, MIN_DISPLAY_DIM, self.boot_display_width);
+        const h = std.math.clamp(height, MIN_DISPLAY_DIM, self.boot_display_height);
+        if (w != width or h != height) {
+            log.info("display resize {}x{} clamped to {}x{} (boot fb ceiling)", .{ width, height, w, h });
+        }
         if (w == self.display_width and h == self.display_height) return;
 
         // Serialize against the renderer thread reading display state.
@@ -762,8 +821,17 @@ pub const Gpu = struct {
 
     pub const ScanoutView = struct {
         data: []const u8,
+        /// Visible (scanned-out) dimensions — the scanout rect, not
+        /// necessarily the full resource.
         width: u32,
         height: u32,
+        /// Origin of the scanout rect within the resource.
+        src_x: u32 = 0,
+        src_y: u32 = 0,
+        /// Full resource dimensions (`data`/`surface` layout). Rows are
+        /// full_width*4 bytes; the visible rect starts at (src_x, src_y).
+        full_width: u32,
+        full_height: u32,
         /// Content generation; unchanged means the renderer can skip.
         generation: u64,
         /// IOSurfaceRef backing `data` when the zero-copy path is active; the
@@ -791,12 +859,25 @@ pub const Gpu = struct {
     /// Caller must be on the vCPU thread (unsynchronized).
     pub fn scanout(self: *Gpu) ?ScanoutView {
         if (self.scanout_resource_id == 0) return null;
-        // 2D scanout: served directly from the resource's host pixels.
+        // 2D scanout: served directly from the resource's host pixels,
+        // honoring the scanout rect (fbdev re-modesets to a smaller mode by
+        // scanning a sub-rect of the same resource). A zero-sized or
+        // out-of-bounds rect falls back to the full resource.
         if (self.resources.get(self.scanout_resource_id)) |res| {
+            var r = self.scanout_rect;
+            if (r.width == 0 or r.height == 0 or
+                r.x +| r.width > res.width or r.y +| r.height > res.height)
+            {
+                r = .{ .x = 0, .y = 0, .width = res.width, .height = res.height };
+            }
             return .{
                 .data = res.host_data,
-                .width = res.width,
-                .height = res.height,
+                .width = r.width,
+                .height = r.height,
+                .src_x = r.x,
+                .src_y = r.y,
+                .full_width = res.width,
+                .full_height = res.height,
                 .generation = self.frame_generation,
                 .surface = if (res.surface) |surf| surf.ref else null,
                 .cursor = self.cursorView(),
@@ -811,10 +892,14 @@ pub const Gpu = struct {
         else
             null;
         if (self.scanout3d_w > 0 and (surf != null or self.scanout3d_data.len > 0)) {
+            // 3D scanouts present the full render target (desktop stacks
+            // allocate a correctly-sized fb per mode, so rect == full).
             return .{
                 .data = self.scanout3d_data,
                 .width = self.scanout3d_w,
                 .height = self.scanout3d_h,
+                .full_width = self.scanout3d_w,
+                .full_height = self.scanout3d_h,
                 .generation = self.frame_generation,
                 .surface = surf,
                 .cursor = self.cursorView(),
@@ -1002,6 +1087,9 @@ pub const Gpu = struct {
             .set_scanout => {
                 resp_type = self.cmdSetScanout(req);
             },
+            .set_scanout_blob => {
+                resp_type = self.cmdSetScanoutBlob(req);
+            },
             .resource_flush => {
                 resp_type = self.cmdResourceFlush(req);
             },
@@ -1145,6 +1233,7 @@ pub const Gpu = struct {
             entries.deinit(self.alloc);
         }
 
+        log.info("resource_create_2d id={} {}x{}", .{ cmd.resource_id, cmd.width, cmd.height });
         self.resources.put(cmd.resource_id, .{
             .id = cmd.resource_id,
             .format = cmd.format,
@@ -1172,6 +1261,7 @@ pub const Gpu = struct {
             if (self.scanout_resource_id == cmd.resource_id) {
                 self.scanout_resource_id = 0;
             }
+            log.info("resource_unref id={}", .{cmd.resource_id});
             return .resp_ok_nodata;
         }
 
@@ -1200,17 +1290,81 @@ pub const Gpu = struct {
         if (req.len < @sizeOf(SetScanout)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(SetScanout, req[0..@sizeOf(SetScanout)]);
 
-        if (cmd.scanout_id != 0) return .resp_err_invalid_scanout_id;
+        if (cmd.scanout_id != 0) {
+            log.warn("set_scanout REJECTED: bad scanout_id={}", .{cmd.scanout_id});
+            return .resp_err_invalid_scanout_id;
+        }
         // resource_id 0 disables the scanout. Accept both a 2D resource and a
         // 3D (virgl-rendered) resource.
         if (cmd.resource_id != 0 and
             !self.resources.contains(cmd.resource_id) and
             self.gpu_device.getResource(cmd.resource_id) == null)
         {
+            log.warn("set_scanout REJECTED: unknown resource id={} rect={}x{}", .{
+                cmd.resource_id, cmd.r.width, cmd.r.height,
+            });
             return .resp_err_invalid_resource_id;
         }
         self.scanout_resource_id = cmd.resource_id;
+        self.scanout_rect = cmd.r;
         self.frame_generation +%= 1; // new scanout target: force a present
+        // A page flip IS a new frame. Compositors that drive KMS (niri and
+        // every other Wayland compositor) flip between buffers with
+        // SET_SCANOUT and never call RESOURCE_FLUSH, so without this the
+        // frame callback only ever fired for the boot console.
+        if (cmd.resource_id != 0) {
+            if (self.frame_callback) |cb| cb(self.frame_userdata);
+        }
+        log.info("set_scanout res={} rect={}x{}+{}+{}", .{
+            cmd.resource_id, cmd.r.width, cmd.r.height, cmd.r.x, cmd.r.y,
+        });
+        return .resp_ok_nodata;
+    }
+
+    /// SET_SCANOUT_BLOB: a compositor page-flipping a blob-backed buffer.
+    /// Decoded and recorded; presenting the pixels is the venus present path
+    /// (guest-backed blobs can be gathered from their iovecs, host3d blobs
+    /// live inside the host Vulkan driver and need an export). Accepting the
+    /// command rather than erroring keeps the compositor's flip loop alive so
+    /// the modeset path can be observed.
+    fn cmdSetScanoutBlob(self: *Gpu, req: []const u8) CmdType {
+        if (req.len < @sizeOf(SetScanoutBlob)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(SetScanoutBlob, req[0..@sizeOf(SetScanoutBlob)]);
+
+        if (cmd.scanout_id != 0) {
+            log.warn("set_scanout_blob REJECTED: bad scanout_id={}", .{cmd.scanout_id});
+            return .resp_err_invalid_scanout_id;
+        }
+        // resource_id 0 disables the scanout.
+        if (cmd.resource_id == 0) {
+            self.scanout_blob = null;
+            self.scanout_resource_id = 0;
+            self.frame_generation +%= 1;
+            log.info("set_scanout_blob: disable", .{});
+            return .resp_ok_nodata;
+        }
+
+        const meta = self.blob_meta.get(cmd.resource_id);
+        const backing_iovs: usize = if (self.venus_blobs.get(cmd.resource_id)) |v| v.len else 0;
+        log.info(
+            "set_scanout_blob res={} {}x{} rect={}x{}+{}+{} fmt=0x{x} stride0={} offset0={} blob_mem={?} flags=0x{x} size={?} iovs={}",
+            .{
+                cmd.resource_id,       cmd.width,
+                cmd.height,            cmd.r.width,
+                cmd.r.height,          cmd.r.x,
+                cmd.r.y,               cmd.format,
+                cmd.strides[0],        cmd.offsets[0],
+                if (meta) |m| m.blob_mem else null,
+                if (meta) |m| m.blob_flags else 0,
+                if (meta) |m| m.size else null,
+                backing_iovs,
+            },
+        );
+
+        self.scanout_blob = cmd;
+        self.scanout_resource_id = cmd.resource_id;
+        self.scanout_rect = .{ .x = cmd.r.x, .y = cmd.r.y, .width = cmd.r.width, .height = cmd.r.height };
+        self.frame_generation +%= 1;
         return .resp_ok_nodata;
     }
 
@@ -1344,8 +1498,10 @@ pub const Gpu = struct {
                     return .resp_err_unspec;
                 }
             }
-            // No Metal backing (decode-only CI) is not an error.
-            _ = self.gpu_device.uploadToTextureRegion(
+            // No Metal backing (decode-only CI) is not an error, but the
+            // outcome is worth counting: a texture that never lands is why a
+            // guest's textured draws come out blank.
+            const up_ok = self.gpu_device.uploadToTextureRegion(
                 cmd.resource_id,
                 cmd.box.x,
                 cmd.box.y,
@@ -1354,6 +1510,9 @@ pub const Gpu = struct {
                 staging,
                 @intCast(row_bytes),
             );
+            if (gpu_module.stats.on()) {
+                if (up_ok) gpu_module.stats.tex_uploads_ok += 1 else gpu_module.stats.tex_uploads_fail += 1;
+            }
             return .resp_ok_nodata;
         }
 
@@ -1611,6 +1770,11 @@ pub const Gpu = struct {
                 return .resp_err_unspec;
             };
             self.venus_blobs.put(cmd.resource_id, iovs) catch {};
+            self.blob_meta.put(cmd.resource_id, .{
+                .blob_mem = cmd.blob_mem,
+                .blob_flags = cmd.blob_flags,
+                .size = cmd.size,
+            }) catch {};
             return .resp_ok_nodata;
         }
         return .resp_err_unspec;
@@ -1881,9 +2045,9 @@ test "virgl capset info and submit decode" {
     try testing.expectEqual(CAPSET_VIRGL2, info.capset_id);
     try testing.expectEqual(CAPS_V2_SIZE, info.capset_max_size);
 
-    // Context create via header ctx_id
+    // Context create via header ctx_id (no request body = legacy virgl path)
     const hdr = CtrlHeader{ .type = @intFromEnum(CmdType.ctx_create), .ctx_id = 7 };
-    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdCtxCreate(hdr));
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdCtxCreate(hdr, &.{}));
     try testing.expect(gpu.gpu_device.contexts.contains(7));
 
     // Synthetic virgl stream: NOP + SET_SCISSOR (skipped) decoded without error
@@ -2417,6 +2581,9 @@ test "resizeDisplay flags the display event and raises config-change" {
     Line.level = false;
     gpu.transport.setIrqCallback(Line.cb, null);
 
+    // Boot size = fbdev framebuffer allocation = the resize ceiling.
+    gpu.setDisplaySize(2560, 1440);
+
     const gen_before = gpu.transport.config_generation;
     gpu.resizeDisplay(1920, 1080);
 
@@ -2447,6 +2614,13 @@ test "resizeDisplay flags the display event and raises config-change" {
     gpu.resizeDisplay(1, 1);
     try testing.expectEqual(Gpu.MIN_DISPLAY_DIM, gpu.display_width);
     try testing.expectEqual(Gpu.MIN_DISPLAY_DIM, gpu.display_height);
+
+    // Oversized requests clamp to the BOOT size: the guest fbdev fb can
+    // never grow, and advertising a mode that can't fit it makes the fbdev
+    // client disable the display (black screen).
+    gpu.resizeDisplay(4000, 3000);
+    try testing.expectEqual(@as(u32, 2560), gpu.display_width);
+    try testing.expectEqual(@as(u32, 1440), gpu.display_height);
 }
 
 test "guest modeset at new size after resizeDisplay" {

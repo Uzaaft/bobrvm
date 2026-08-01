@@ -610,6 +610,7 @@ pub const Machine = struct {
     /// scanout_mutex -> GIC via the irq callback) matches handleMmio's.
     pub fn requestDisplayResize(self: *Machine, width: u32, height: u32) void {
         const gpu = self.gpu orelse return;
+        log.info("display resize requested: {}x{}", .{ width, height });
         self.machine_lock.lockUncancelable(global.io());
         gpu.resizeDisplay(width, height);
         self.machine_lock.unlock(global.io());

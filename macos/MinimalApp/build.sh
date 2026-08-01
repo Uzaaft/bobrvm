@@ -17,11 +17,14 @@ trap 'rm -rf "$WORK"' EXIT
 # Venus GPU backend: the -Dgpu-venus libbobrvm.a references virgl_renderer_*;
 # link the upstream virglrenderer dylib and sign with the entitlements that
 # allow loading ad-hoc-signed third-party GPU dylibs.
-VENUS_LINK=()
+# NOTE: macOS ships bash 3.2, where "${arr[@]}" on an EMPTY array trips
+# `set -u` ("unbound variable"). Seed the array with a harmless flag so it is
+# never empty, instead of expanding an empty array below.
+VENUS_LINK=(-Xlinker -w)
 ENTITLEMENTS="$REPO/cli.entitlements"
 if [ "${BOBRVM_GUI_VENUS:-0}" = "1" ]; then
     VIRGL_PREFIX="${VIRGL_PREFIX:-$HOME/.local/opt/virgl-upstream}"
-    VENUS_LINK=(-L"$VIRGL_PREFIX/lib" -lvirglrenderer
+    VENUS_LINK+=(-L"$VIRGL_PREFIX/lib" -lvirglrenderer
         -Xlinker -rpath -Xlinker "$VIRGL_PREFIX/lib")
     ENTITLEMENTS="$REPO/cli-venus.entitlements"
 fi

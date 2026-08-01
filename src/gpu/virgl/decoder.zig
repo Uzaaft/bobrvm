@@ -67,6 +67,21 @@ pub const DecodeError = error{
 };
 
 /// Command decoder state machine.
+/// Largest payload a single virgl command can describe: the header's length
+/// field is a u16, in words.
+pub const MAX_PAYLOAD_WORDS: usize = std.math.maxInt(u16);
+
+/// Overflow scratch for payloads too large for the inline buffer. A real
+/// compositor sends commands well past 4096 words, and rejecting them used to
+/// abort the entire command batch (dropping every command behind it, which is
+/// how ~60 object creations went missing and left the screen blank).
+///
+/// Module-level rather than per-Decoder so a 256 KiB buffer never lands on the
+/// vCPU stack. Safe because virgl command decoding is serialized: submits are
+/// processed one at a time on the vCPU thread under the GPU lock, and a
+/// payload slice is always consumed before the next payload() call.
+var overflow_scratch: [MAX_PAYLOAD_WORDS]u32 = undefined;
+
 pub const Decoder = struct {
     /// Raw guest bytes (arbitrary alignment: the command buffer comes
     /// straight from a guest descriptor, which need not be 4-aligned).
@@ -75,8 +90,8 @@ pub const Decoder = struct {
     word_len: usize,
     /// Current position, in words.
     pos: usize,
-    /// Bounded scratch for payload() (virgl commands are small; the wire
-    /// header length is a u16 but practical payloads are far smaller).
+    /// Inline scratch for the common (small) payload. Kept modest because a
+    /// Decoder lives on the caller's stack.
     scratch: [4096]u32 = undefined,
 
     pub fn init(data: []const u8) Decoder {
@@ -126,10 +141,13 @@ pub const Decoder = struct {
         if (self.pos + length > self.word_len) {
             return DecodeError.UnexpectedEnd;
         }
-        if (length > self.scratch.len) return DecodeError.InvalidLength;
-        for (0..length) |i| self.scratch[i] = self.wordAt(self.pos + i);
+        const dst: []u32 = if (length <= self.scratch.len)
+            self.scratch[0..length]
+        else
+            overflow_scratch[0..length];
+        for (0..length) |i| dst[i] = self.wordAt(self.pos + i);
         self.pos += length;
-        return self.scratch[0..length];
+        return dst;
     }
 
     /// Skip current command payload (bounded to the buffer).

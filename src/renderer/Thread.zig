@@ -59,8 +59,16 @@ pub const Size = struct {
 /// A guest framebuffer view (BGRA, 4 bytes per pixel).
 pub const Scanout = struct {
     data: []const u8,
+    /// Visible (scanned-out) dimensions — the scanout rect.
     width: u32,
     height: u32,
+    /// Origin of the visible rect within the resource, whose rows are
+    /// full_width*4 bytes (fbdev re-modeset scans a sub-rect of its fb).
+    src_x: u32 = 0,
+    src_y: u32 = 0,
+    /// Full resource dimensions; 0 = same as width/height.
+    full_width: u32 = 0,
+    full_height: u32 = 0,
     /// Content generation; unchanged since last present means skip.
     generation: u64 = 0,
     /// IOSurfaceRef backing `data` for the zero-copy present path, if any.
@@ -518,6 +526,12 @@ pub const RenderThread = struct {
                     scan.data,
                     scan.width,
                     scan.height,
+                    .{
+                        .x = scan.src_x,
+                        .y = scan.src_y,
+                        .full_width = if (scan.full_width != 0) scan.full_width else scan.width,
+                        .full_height = if (scan.full_height != 0) scan.full_height else scan.height,
+                    },
                     scan.surface,
                     cursor_info,
                 );

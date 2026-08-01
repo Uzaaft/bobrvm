@@ -67,6 +67,16 @@ pub const IOSurface = struct {
     /// guest transfers tightly-packed rows and the rest of the pipeline assumes
     /// `stride == width*4`; a padded surface would misalign every row.
     pub fn createBGRA(width: u32, height: u32) ?IOSurface {
+        // Metal refuses to wrap a texture over an IOSurface whose bytesPerRow
+        // isn't 16-byte aligned ("IOSurface texture: bytesPerRow (N) must be
+        // aligned to 16 bytes" — a hard assertion that ABORTS the process, so
+        // this must be caught here rather than at texture creation). IOSurface
+        // itself happily hands out a tight odd stride, so check before asking:
+        // a tight BGRA stride is width*4, which is 16-aligned iff width % 4 == 0.
+        // Callers fall back to a heap buffer (upload path) when this returns
+        // null. Real-world trigger: a compositor sizing a surface 431px wide.
+        if (width % 4 != 0) return null;
+
         const w: i32 = @intCast(width);
         const h: i32 = @intCast(height);
         const bpe: i32 = @intCast(BYTES_PER_PIXEL);
@@ -130,6 +140,21 @@ pub const IOSurface = struct {
 /// from another module). Returns null if the ref has no mapping.
 pub fn baseAddressOf(ref: Ref) ?[*]u8 {
     return IOSurfaceGetBaseAddress(ref);
+}
+
+test "iosurface: widths with a non-16-byte-aligned stride are refused" {
+    // 431*4 == 1724, tight but not a multiple of 16: Metal ABORTS on such an
+    // IOSurface-backed texture, so creation must fail here and let the caller
+    // fall back to the upload path. (Regression: a compositor allocating a
+    // 431px-wide target crashed the VM.)
+    try std.testing.expect(IOSurface.createBGRA(431, 100) == null);
+    try std.testing.expect(IOSurface.createBGRA(1, 1) == null);
+    // Multiples of 4 stay on the zero-copy path.
+    if (IOSurface.createBGRA(432, 100)) |surf| {
+        defer surf.release();
+        try std.testing.expectEqual(@as(usize, 432 * 4), surf.bytes_per_row);
+        try std.testing.expectEqual(@as(usize, 0), surf.bytes_per_row % 16);
+    }
 }
 
 test "iosurface: tight-stride BGRA surface is CPU-writable" {
