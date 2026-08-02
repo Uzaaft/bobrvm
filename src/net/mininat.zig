@@ -1182,9 +1182,11 @@ pub const MiniNat = struct {
 
     /// Build and deliver one remote → guest TCP segment.
     fn tcpSend(self: *MiniNat, key: TcpKey, seq: u32, ack: u32, flags: u8, payload: []const u8) void {
-        var out: [ETH_HDR + 20 + 20 + TCP_MSS]u8 = undefined;
         if (payload.len > TCP_MSS) return;
         const total = ETH_HDR + 20 + 20 + payload.len;
+        var fallback: [ETH_HDR + 20 + 20 + TCP_MSS]u8 = undefined;
+        const reply_buffer = self.acquireReply(&fallback, total) orelse return;
+        const out = reply_buffer.frame;
 
         @memcpy(out[0..6], &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
         @memcpy(out[6..12], &GATEWAY_MAC);
@@ -1212,7 +1214,7 @@ pub const MiniNat = struct {
         @memcpy(tcp[20..][0..payload.len], payload);
         std.mem.writeInt(u16, tcp[16..18], tcpChecksum(key.remote_ip, GUEST_IP, tcp[0 .. 20 + payload.len]), .big);
 
-        self.reply(out[0..total], self.reply_userdata);
+        self.commitReply(reply_buffer);
     }
 
     /// TCP checksum over the pseudo-header + segment.
@@ -1805,6 +1807,7 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -1851,14 +1854,21 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
     flow.snd_nxt = 4000 + 1400;
     flow.rt_deadline_ns = std.math.maxInt(i64); // far future: only a dup-ack can trigger
     clearReplies();
+    test_reply_lease_len = 0;
+    test_reply_lease_committed = false;
     nat.processGuestAck(key, &flow, 4000, 65535); // dup 1
     nat.processGuestAck(key, &flow, 4000, 65535); // dup 2
     try testing.expectEqual(@as(usize, 0), test_replies.items.len); // not yet
     nat.processGuestAck(key, &flow, 4000, 65535); // dup 3 ⇒ retransmit
-    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
-    const seg = test_replies.items[0];
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expect(test_reply_lease_committed);
+    try testing.expectEqual(@as(usize, 54 + fresh_payload.len), test_reply_lease_len);
+    const seg = test_reply_lease[0..test_reply_lease_len];
     try testing.expectEqual(@as(u32, 4000), std.mem.readInt(u32, seg[38..42], .big)); // seq
     try testing.expectEqual(MiniNat.TCP_PSH | MiniNat.TCP_ACK, seg[47]); // flags
+    try testing.expectEqualSlices(u8, &fresh_payload, seg[54..]);
+    try testing.expectEqual(@as(u16, 0), MiniNat.checksum(seg[14..34]));
+    try testing.expectEqual(@as(u16, 0), MiniNat.tcpChecksum(key.remote_ip, GUEST_IP, seg[34..]));
     try testing.expectEqual(@as(u8, 0), flow.dup_acks); // counter reset after retransmit
 }
 
