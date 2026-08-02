@@ -208,11 +208,27 @@ pub const VirtioPciTransport = struct {
             allocation.ptr + layout.queues_offset,
         ));
         const queues = queues_ptr[0..num_queues];
-        @memset(queues, QueueConfig{});
         const device_config = allocation[layout.device_config_offset..];
+        transport.initEmbedded(alloc, device_id, device_features, queues, device_config);
+
+        assert(transport.queues.len == num_queues);
+        return transport;
+    }
+
+    fn initEmbedded(
+        self: *VirtioPciTransport,
+        alloc: Allocator,
+        device_id: u32,
+        device_features: u64,
+        queues: []QueueConfig,
+        device_config: []u8,
+    ) void {
+        assert(queues.len > 0);
+        assert(queues.len <= MAX_QUEUES);
+        @memset(queues, QueueConfig{});
         @memset(device_config, 0);
 
-        transport.* = .{
+        self.* = .{
             .alloc = alloc,
             .device_id = device_id,
             .device_features = device_features | (1 << 32), // VIRTIO_F_VERSION_1
@@ -222,7 +238,7 @@ pub const VirtioPciTransport = struct {
             .status = .{},
             .config_generation = 0,
             .queue_select = 0,
-            .num_queues = num_queues,
+            .num_queues = @intCast(queues.len),
             .queues = queues,
             .isr_status = .{},
             .device_config = device_config,
@@ -232,8 +248,8 @@ pub const VirtioPciTransport = struct {
             .irq_userdata = null,
         };
 
-        assert(transport.queues.len == num_queues);
-        return transport;
+        assert(self.queues.len == queues.len);
+        assert(self.device_config.len == device_config.len);
     }
 
     pub fn deinit(self: *VirtioPciTransport) void {
@@ -522,6 +538,29 @@ pub const VirtioPciDevice = struct {
     /// Device-specific info.
     subsystem_id: u16,
 
+    const AllocationLayout = struct {
+        transport_offset: usize,
+        transport: VirtioPciTransport.AllocationLayout,
+        size: usize,
+    };
+
+    fn allocationLayout(num_queues: u16, device_config_size: usize) Allocator.Error!AllocationLayout {
+        comptime assert(@alignOf(VirtioPciDevice) >= @alignOf(VirtioPciTransport));
+        const transport_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(VirtioPciDevice),
+            @alignOf(VirtioPciTransport),
+        );
+        const transport = try VirtioPciTransport.allocationLayout(
+            num_queues,
+            device_config_size,
+        );
+        const size = std.math.add(usize, transport_offset, transport.size) catch
+            return error.OutOfMemory;
+        assert(transport_offset >= @sizeOf(VirtioPciDevice));
+        return .{ .transport_offset = transport_offset, .transport = transport, .size = size };
+    }
+
     pub fn init(
         alloc: Allocator,
         device_id: u32,
@@ -530,17 +569,20 @@ pub const VirtioPciDevice = struct {
         num_queues: u16,
         device_config_size: usize,
     ) !*VirtioPciDevice {
-        const transport = try VirtioPciTransport.init(
-            alloc,
-            device_id,
-            device_features,
-            num_queues,
-            device_config_size,
-        );
-        errdefer transport.deinit();
-
-        const dev = try alloc.create(VirtioPciDevice);
-        errdefer alloc.destroy(dev);
+        const layout = try allocationLayout(num_queues, device_config_size);
+        const allocation = try alloc.alignedAlloc(u8, .of(VirtioPciDevice), layout.size);
+        errdefer alloc.free(allocation);
+        const dev: *VirtioPciDevice = @ptrCast(allocation.ptr);
+        const transport: *VirtioPciTransport = @ptrCast(@alignCast(
+            allocation.ptr + layout.transport_offset,
+        ));
+        const queues_ptr: [*]QueueConfig = @ptrCast(@alignCast(
+            allocation.ptr + layout.transport_offset + layout.transport.queues_offset,
+        ));
+        const queues = queues_ptr[0..num_queues];
+        const device_config_offset = layout.transport_offset + layout.transport.device_config_offset;
+        const device_config = allocation[device_config_offset..];
+        transport.initEmbedded(alloc, device_id, device_features, queues, device_config);
 
         dev.* = .{
             .alloc = alloc,
@@ -557,8 +599,14 @@ pub const VirtioPciDevice = struct {
     }
 
     pub fn deinit(self: *VirtioPciDevice) void {
-        self.transport.deinit();
-        self.alloc.destroy(self);
+        const layout = allocationLayout(
+            self.transport.num_queues,
+            self.transport.device_config.len,
+        ) catch unreachable;
+        self.transport.queues = &.{};
+        self.transport.device_config = &.{};
+        const allocation_ptr: [*]align(@alignOf(VirtioPciDevice)) u8 = @ptrCast(self);
+        self.alloc.free(allocation_ptr[0..layout.size]);
     }
 
     fn initConfigSpace(self: *VirtioPciDevice) void {
@@ -813,6 +861,28 @@ test "VirtioPciDevice init and config" {
     // Check capabilities pointer
     const cap_ptr = dev.readConfig(0x34, 1);
     try std.testing.expectEqual(@as(u64, 0x40), cap_ptr);
+}
+
+test "VirtioPciDevice allocation profile" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const num_queues: u16 = 2;
+    const device_config_size: usize = 64;
+    const dev = try VirtioPciDevice.init(
+        counted.allocator(),
+        2,
+        0x0002,
+        0,
+        num_queues,
+        device_config_size,
+    );
+    defer dev.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(
+        @sizeOf(VirtioPciDevice) + @sizeOf(VirtioPciTransport) +
+            @as(usize, num_queues) * @sizeOf(QueueConfig) + device_config_size,
+        counted.allocated_bytes,
+    );
 }
 
 test "VirtioPciDevice BAR sizing" {
