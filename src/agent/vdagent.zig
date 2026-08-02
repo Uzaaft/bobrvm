@@ -172,6 +172,9 @@ pub const Vdagent = struct {
 
     /// Feed guest→host port bytes (vCPU thread).
     pub fn feed(self: *Vdagent, data: []const u8) void {
+        if (self.in_buf.items.len == 0 and self.msg_buf.items.len == 0) {
+            if (self.handleCompleteChunk(data)) return;
+        }
         if (self.in_buf.items.len + data.len > BUF_MAX) {
             // Hostile/corrupt stream: reset framing.
             self.in_buf.clearRetainingCapacity();
@@ -205,6 +208,20 @@ pub const Vdagent = struct {
             self.handleMsg(@enumFromInt(msg_type), self.msg_buf.items[MSG_HDR..][0..size]);
             self.msg_buf.replaceRangeAssumeCapacity(0, MSG_HDR + size, &.{});
         }
+    }
+
+    fn handleCompleteChunk(self: *Vdagent, data: []const u8) bool {
+        std.debug.assert(self.in_buf.items.len == 0);
+        std.debug.assert(self.msg_buf.items.len == 0);
+        if (data.len < 8 + MSG_HDR) return false;
+        const chunk_size = std.mem.readInt(u32, data[4..8], .little);
+        if (chunk_size > BUF_MAX or data.len != 8 + chunk_size) return false;
+        const message = data[8..];
+        const payload_size = std.mem.readInt(u32, message[16..20], .little);
+        if (payload_size > BUF_MAX or message.len != MSG_HDR + payload_size) return false;
+        const msg_type = std.mem.readInt(u32, message[4..8], .little);
+        self.handleMsg(@enumFromInt(msg_type), message[MSG_HDR..]);
+        return true;
     }
 
     fn handleMsg(self: *Vdagent, msg_type: MsgType, payload: []const u8) void {
@@ -306,7 +323,8 @@ fn testHostReq(_: ?*anyopaque) void {
 
 test "vdagent: caps handshake replies with by-demand clipboard" {
     defer clearSent();
-    var vd = Vdagent.init(testing.allocator, testSend, null);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var vd = Vdagent.init(counted.allocator(), testSend, null);
     defer vd.deinit();
 
     var caps_payload: [8]u8 = undefined;
@@ -316,6 +334,11 @@ test "vdagent: caps handshake replies with by-demand clipboard" {
     defer testing.allocator.free(msg);
     vd.feed(msg);
 
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 0), vd.in_buf.capacity);
+    try testing.expectEqual(@as(usize, 0), vd.msg_buf.capacity);
     try testing.expect(vd.guest_caps_seen);
     const reply = firstSentMsg();
     try testing.expectEqual(@intFromEnum(MsgType.announce_capabilities), reply.msg_type);
