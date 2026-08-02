@@ -705,8 +705,8 @@ pub const P9Server = struct {
             Treadlink => {
                 const fid_id = try r.u32v();
                 const fid = try self.getFid(fid_id);
-                const path = try self.hostPath(fid.rel);
-                defer self.alloc.free(path);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(fid.rel, &path_storage);
                 var target: [1024]u8 = undefined;
                 const n = std.c.readlink(path.ptr, &target, target.len);
                 if (n < 0) return error.Errno;
@@ -839,6 +839,7 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         defer f.close(io);
         try f.writePositionalAll(io, "host says hi", 0);
     }
+    try std.Io.Dir.cwd().symLink(io, "hello.txt", root ++ "/hello.link", .{});
 
     var srv = try P9Server.init(testing.allocator, root);
     defer srv.deinit();
@@ -1006,10 +1007,31 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         try testing.expectEqual(@as(usize, 0), counted.allocations);
         try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     }
+    // TWALK to fid 4 "hello.link" + TREADLINK
+    {
+        var p = TestPayload{};
+        const walk_payload = p.u32v(1).u32v(4).u16v(1).str("hello.link").slice();
+        const walk = try tmsg(testing.allocator, Twalk, 14, walk_payload);
+        defer testing.allocator.free(walk);
+        const walk_n = srv.handle(walk, &resp);
+        try expectRType(resp[0..walk_n], Twalk + 1);
+
+        var p2 = TestPayload{};
+        const req = try tmsg(testing.allocator, Treadlink, 15, p2.u32v(4).slice());
+        defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
+        const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
+        try expectRType(resp[0..n], Treadlink + 1);
+        try testing.expectEqualStrings("hello.txt", resp[9..n]);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    }
     // TREMOVE fid 3 and its guest-created file
     {
         var p = TestPayload{};
-        const req = try tmsg(testing.allocator, Tremove, 14, p.u32v(3).slice());
+        const req = try tmsg(testing.allocator, Tremove, 16, p.u32v(3).slice());
         defer testing.allocator.free(req);
         var counted = testing.FailingAllocator.init(testing.allocator, .{});
         srv.alloc = counted.allocator();
@@ -1026,9 +1048,9 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
     }
     // TCLUNK everything
     {
-        for ([_]u32{ 1, 2 }) |fid| {
+        for ([_]u32{ 1, 2, 4 }) |fid| {
             var p = TestPayload{};
-            const req = try tmsg(testing.allocator, Tclunk, 15, p.u32v(fid).slice());
+            const req = try tmsg(testing.allocator, Tclunk, 17, p.u32v(fid).slice());
             defer testing.allocator.free(req);
             const n = srv.handle(req, &resp);
             try expectRType(resp[0..n], Tclunk + 1);
