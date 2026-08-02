@@ -29,6 +29,7 @@ pub const MAGIC = "BBRSNAP1";
 pub const VERSION: u32 = 1;
 const block_section_scratch_bytes = 128;
 const gic_section_scratch_bytes = 2 * 1024;
+const input_section_scratch_bytes = 128;
 const net_section_scratch_bytes = 128;
 const rng_section_scratch_bytes = 128;
 
@@ -511,6 +512,21 @@ pub fn serializeInput(alloc: Allocator, input: *const virtio.Input) ![]u8 {
     return result;
 }
 
+pub fn appendInputSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    name: []const u8,
+    input: *const virtio.Input,
+) !void {
+    assert(name.len > 0);
+    assert(name.len <= std.math.maxInt(u8));
+    var stack_allocator = std.heap.stackFallback(input_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeInput(scratch_alloc, input);
+    defer scratch_alloc.free(data);
+    try builder.section(name, data);
+}
+
 pub fn deserializeInput(input: *virtio.Input, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &input.transport);
@@ -898,6 +914,25 @@ test "snapshot: input device roundtrip" {
     try testing.expectEqual(@as(u64, 0x8000_0000), input2.transport.queues[0].device_addr);
     try testing.expectEqual(@as(u16, 41), input2.event_last_avail);
     try testing.expectEqual(@as(u16, 43), input2.status_last_avail);
+}
+
+test "snapshot: input section assembly allocation profile" {
+    const input = try virtio.Input.init(testing.allocator, .keyboard);
+    defer input.deinit();
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendInputSection(&builder, alloc, "kbd", input);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(usize, 2), counted.allocations);
+    try testing.expectEqual(@as(usize, 252), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 88), reader.section("kbd").?.len);
 }
 
 test "snapshot: P9 device roundtrip with fids" {

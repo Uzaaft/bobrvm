@@ -871,14 +871,10 @@ pub const Machine = struct {
             try snapshot.appendNetSection(&builder, alloc, net);
         }
         if (self.keyboard) |kbd| {
-            const data = try snapshot.serializeInput(alloc, kbd);
-            defer alloc.free(data);
-            try builder.section("kbd", data);
+            try snapshot.appendInputSection(&builder, alloc, "kbd", kbd);
         }
         if (self.mouse) |mouse| {
-            const data = try snapshot.serializeInput(alloc, mouse);
-            defer alloc.free(data);
-            try builder.section("mouse", data);
+            try snapshot.appendInputSection(&builder, alloc, "mouse", mouse);
         }
         if (self.p9) |p9_dev| {
             const data = try snapshot.serializeP9(alloc, p9_dev);
