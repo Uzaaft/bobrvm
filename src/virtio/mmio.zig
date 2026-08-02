@@ -140,6 +140,18 @@ pub const Transport = struct {
     pub const Error = Allocator.Error;
     pub const MAX_QUEUES = 16;
 
+    fn allocationSize(num_queues: usize) usize {
+        assert(num_queues > 0);
+        assert(num_queues <= MAX_QUEUES);
+
+        const queues_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(Transport),
+            @alignOf(QueueConfig),
+        );
+        return queues_offset + num_queues * @sizeOf(QueueConfig);
+    }
+
     /// Advertise a shared-memory region to the guest. `index` is the shmid the
     /// guest selects via shm_sel (VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1).
     pub fn setShmRegion(self: *Transport, index: u32, base: u64, len: u64) void {
@@ -158,11 +170,22 @@ pub const Transport = struct {
         assert(num_queues > 0);
         assert(num_queues <= MAX_QUEUES);
 
-        const transport = try alloc.create(Transport);
-        errdefer alloc.destroy(transport);
+        comptime assert(@alignOf(Transport) >= @alignOf(QueueConfig));
+        const allocation = try alloc.alignedAlloc(
+            u8,
+            .of(Transport),
+            allocationSize(num_queues),
+        );
+        errdefer alloc.free(allocation);
 
-        const queues = try alloc.alloc(QueueConfig, num_queues);
-        errdefer alloc.free(queues);
+        const transport: *Transport = @ptrCast(allocation.ptr);
+        const queues_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(Transport),
+            @alignOf(QueueConfig),
+        );
+        const queues_ptr: [*]QueueConfig = @ptrCast(@alignCast(allocation.ptr + queues_offset));
+        const queues = queues_ptr[0..num_queues];
 
         @memset(queues, QueueConfig{});
 
@@ -192,8 +215,13 @@ pub const Transport = struct {
     }
 
     pub fn deinit(self: *Transport) void {
-        self.alloc.free(self.queues);
-        self.alloc.destroy(self);
+        assert(self.queues.len > 0);
+        assert(self.queues.len <= MAX_QUEUES);
+
+        const alloc = self.alloc;
+        const allocation_len = allocationSize(self.queues.len);
+        const allocation_ptr: [*]align(@alignOf(Transport)) u8 = @ptrCast(self);
+        alloc.free(allocation_ptr[0..allocation_len]);
     }
 
     /// Set notification callback.
