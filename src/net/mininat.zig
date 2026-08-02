@@ -1306,12 +1306,20 @@ pub const MiniNat = struct {
             else => return,
         };
 
+        const bootp_len: usize = 300;
+        const total = ETH_HDR + 20 + 8 + bootp_len;
+        assert(bootp_len >= 240);
+        assert(total <= 590);
+        var fallback: [590]u8 = undefined;
+        const reply_buffer = self.acquireReply(&fallback, total) orelse return;
+        const out = reply_buffer.frame;
+        @memset(out, 0);
+
         const xid = bootp[4..8];
         const chaddr = bootp[28..44];
 
         // BOOTP reply
-        var b: [300]u8 = undefined;
-        @memset(&b, 0);
+        const b = out[ETH_HDR + 28 .. total];
         b[0] = 2; // BOOTREPLY
         b[1] = 1; // ethernet
         b[2] = 6; // hlen
@@ -1321,21 +1329,15 @@ pub const MiniNat = struct {
         @memcpy(b[28..44], chaddr);
         @memcpy(b[236..240], &[_]u8{ 0x63, 0x82, 0x53, 0x63 });
         var o: usize = 240;
-        o = putOpt(&b, o, 53, &.{reply_type});
-        o = putOpt(&b, o, 54, &GATEWAY_IP); // server id
-        o = putOpt(&b, o, 51, &.{ 0, 1, 0x51, 0x80 }); // lease 86400s
-        o = putOpt(&b, o, 1, &NETMASK);
-        o = putOpt(&b, o, 3, &GATEWAY_IP); // router
-        o = putOpt(&b, o, 6, &DNS_IP); // dns
+        o = putOpt(b, o, 53, &.{reply_type});
+        o = putOpt(b, o, 54, &GATEWAY_IP); // server id
+        o = putOpt(b, o, 51, &.{ 0, 1, 0x51, 0x80 }); // lease 86400s
+        o = putOpt(b, o, 1, &NETMASK);
+        o = putOpt(b, o, 3, &GATEWAY_IP); // router
+        o = putOpt(b, o, 6, &DNS_IP); // dns
         b[o] = 0xFF;
         o += 1;
-        const bootp_len = @max(o, 300);
-
-        const total = ETH_HDR + 20 + 8 + bootp_len;
-        var fallback: [590]u8 = undefined;
-        const reply_buffer = self.acquireReply(&fallback, total) orelse return;
-        const out = reply_buffer.frame;
-        @memset(out, 0);
+        assert(o <= bootp_len);
 
         // Ethernet: broadcast reply (guest may not have its IP yet)
         @memcpy(out[0..6], frame[6..12]);
@@ -1358,8 +1360,6 @@ pub const MiniNat = struct {
         std.mem.writeInt(u16, udp[0..2], 67, .big);
         std.mem.writeInt(u16, udp[2..4], 68, .big);
         std.mem.writeInt(u16, udp[4..6], @intCast(8 + bootp_len), .big);
-
-        @memcpy(out[ETH_HDR + 28 ..][0..bootp_len], b[0..bootp_len]);
 
         self.commitReply(reply_buffer);
     }
