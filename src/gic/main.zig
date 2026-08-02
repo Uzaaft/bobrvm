@@ -144,16 +144,53 @@ pub const Gic = struct {
 
     pub const Error = Allocator.Error;
 
+    const AllocationLayout = struct {
+        spis_offset: usize,
+        redists_offset: usize,
+        size: usize,
+
+        fn init(num_cpus: usize) AllocationLayout {
+            assert(num_cpus > 0);
+            assert(num_cpus <= MAX_VCPUS);
+
+            const spis_offset = std.mem.alignForward(
+                usize,
+                @sizeOf(Gic),
+                @alignOf(InterruptState),
+            );
+            const redists_offset = std.mem.alignForward(
+                usize,
+                spis_offset + @sizeOf(InterruptState) * MAX_SPI,
+                @alignOf(RedistState),
+            );
+            return .{
+                .spis_offset = spis_offset,
+                .redists_offset = redists_offset,
+                .size = redists_offset + @sizeOf(RedistState) * num_cpus,
+            };
+        }
+    };
+
     pub fn init(alloc: Allocator, num_cpus: u8) Error!*Gic {
         assert(num_cpus > 0 and num_cpus <= MAX_VCPUS);
 
-        const gic = try alloc.create(Gic);
-        errdefer alloc.destroy(gic);
+        comptime assert(@alignOf(Gic) >= @alignOf(InterruptState));
+        comptime assert(@alignOf(Gic) >= @alignOf(RedistState));
+        const layout = AllocationLayout.init(num_cpus);
+        const allocation = try alloc.alignedAlloc(u8, .of(Gic), layout.size);
+
+        const gic: *Gic = @ptrCast(allocation.ptr);
+        const spis_ptr: [*]InterruptState = @ptrCast(
+            @alignCast(allocation.ptr + layout.spis_offset),
+        );
+        const redists_ptr: [*]RedistState = @ptrCast(
+            @alignCast(allocation.ptr + layout.redists_offset),
+        );
 
         gic.* = .{
             .alloc = alloc,
-            .spis = try alloc.alloc(InterruptState, MAX_SPI),
-            .redists = try alloc.alloc(RedistState, num_cpus),
+            .spis = spis_ptr[0..MAX_SPI],
+            .redists = redists_ptr[0..num_cpus],
             .num_cpus = num_cpus,
         };
 
@@ -178,9 +215,13 @@ pub const Gic = struct {
     }
 
     pub fn deinit(self: *Gic) void {
-        self.alloc.free(self.spis);
-        self.alloc.free(self.redists);
-        self.alloc.destroy(self);
+        assert(self.num_cpus > 0);
+        assert(self.num_cpus <= MAX_VCPUS);
+
+        const alloc = self.alloc;
+        const layout = AllocationLayout.init(self.num_cpus);
+        const allocation_ptr: [*]align(@alignOf(Gic)) u8 = @ptrCast(self);
+        alloc.free(allocation_ptr[0..layout.size]);
     }
 
     /// Set callback for IRQ injection.
