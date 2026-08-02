@@ -424,37 +424,8 @@ pub const Block = struct {
     ) Status {
         const req_type: RequestType = @enumFromInt(header.type);
         switch (req_type) {
-            .in => {
-                // Per-descriptor reads: preadAll loops internally, so it is
-                // robust to the short readv/preadv behavior macOS exhibits
-                // for multi-iovec vectored reads (which corrupts blocks).
-                const file = self.file orelse return .io_err;
-                var offset = header.sector * SECTOR_SIZE;
-                for (data) |desc| {
-                    if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
-                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
-                    if (offset + buf.len > self.capacity_bytes) return .io_err;
-                    const n = file.readPositionalAll(global.io(), buf, offset) catch return .io_err;
-                    // Short read within capacity: zero-fill (sparse tail).
-                    @memset(buf[n..], 0);
-                    offset += buf.len;
-                    data_written.* += @intCast(buf.len);
-                }
-                return .ok;
-            },
-            .out => {
-                if (self.read_only) return .io_err;
-                const file = self.file orelse return .io_err;
-                var offset = header.sector * SECTOR_SIZE;
-                for (data) |desc| {
-                    if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
-                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
-                    if (offset + buf.len > self.capacity_bytes) return .io_err;
-                    file.writePositionalAll(global.io(), buf, offset) catch return .io_err;
-                    offset += buf.len;
-                }
-                return .ok;
-            },
+            .in => return self.executeRead(header.sector, data, get_mem, data_written),
+            .out => return self.executeWrite(header.sector, data, get_mem),
             .flush => {
                 if (self.file) |f| {
                     f.sync(global.io()) catch return .io_err;
@@ -497,6 +468,104 @@ pub const Block = struct {
             },
             else => return .unsupp,
         }
+    }
+
+    fn executeRead(
+        self: *Block,
+        sector: u64,
+        data: []const GuestDesc,
+        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        data_written: *u32,
+    ) Status {
+        assert(data.len <= MAX_CHAIN - 2);
+        assert(data_written.* == 0);
+        const file = self.file orelse return .io_err;
+        var buffers: [MAX_CHAIN][]u8 = undefined;
+        var count: usize = 0;
+        var total: usize = 0;
+        for (data) |desc| {
+            if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
+            buffers[count] = get_mem(desc.addr, desc.len) orelse return .io_err;
+            total += buffers[count].len;
+            count += 1;
+        }
+        const offset = sector * SECTOR_SIZE;
+        if (offset + total > self.capacity_bytes or offset + total < offset) return .io_err;
+
+        var active = buffers[0..count];
+        var completed: usize = 0;
+        while (completed < total) {
+            const n = file.readPositional(global.io(), active, offset + completed) catch return .io_err;
+            if (n == 0) {
+                for (active) |buffer| @memset(buffer, 0);
+                break;
+            }
+            active = advanceBuffers(active, n);
+            completed += n;
+        }
+        data_written.* = @intCast(total);
+        return .ok;
+    }
+
+    fn executeWrite(
+        self: *Block,
+        sector: u64,
+        data: []const GuestDesc,
+        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+    ) Status {
+        assert(data.len <= MAX_CHAIN - 2);
+        assert(SECTOR_SIZE > 0);
+        if (self.read_only) return .io_err;
+        const file = self.file orelse return .io_err;
+        var buffers: [MAX_CHAIN][]const u8 = undefined;
+        var count: usize = 0;
+        var total: usize = 0;
+        for (data) |desc| {
+            if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
+            buffers[count] = get_mem(desc.addr, desc.len) orelse return .io_err;
+            total += buffers[count].len;
+            count += 1;
+        }
+        const offset = sector * SECTOR_SIZE;
+        if (offset + total > self.capacity_bytes or offset + total < offset) return .io_err;
+
+        var active = buffers[0..count];
+        var completed: usize = 0;
+        while (completed < total) {
+            const n = file.writePositional(global.io(), active, offset + completed) catch return .io_err;
+            if (n == 0) return .io_err;
+            active = advanceBuffersConst(active, n);
+            completed += n;
+        }
+        return .ok;
+    }
+
+    fn advanceBuffers(buffers: [][]u8, consumed: usize) [][]u8 {
+        assert(buffers.len > 0);
+        assert(consumed > 0);
+        var active = buffers;
+        var remaining = consumed;
+        while (remaining >= active[0].len) {
+            remaining -= active[0].len;
+            active = active[1..];
+            if (active.len == 0) return active;
+        }
+        active[0] = active[0][remaining..];
+        return active;
+    }
+
+    fn advanceBuffersConst(buffers: [][]const u8, consumed: usize) [][]const u8 {
+        assert(buffers.len > 0);
+        assert(consumed > 0);
+        var active = buffers;
+        var remaining = consumed;
+        while (remaining >= active[0].len) {
+            remaining -= active[0].len;
+            active = active[1..];
+            if (active.len == 0) return active;
+        }
+        active[0] = active[0][remaining..];
+        return active;
     }
 
     /// Apply one discard/write-zeroes segment. Discard is advisory: the
@@ -703,4 +772,63 @@ test "discard request path via executeRequest" {
     // Read-only disks refuse.
     blk.read_only = true;
     try std.testing.expectEqual(Status.io_err, blk.executeRequest(header, &data, Ctx.get, &written));
+}
+
+test "vectored block reads and writes preserve descriptor order" {
+    const io = global.io();
+    const path = ".zig-cache/blk-vectored-test.raw";
+    var disk: [4096]u8 = undefined;
+    for (&disk, 0..) |*byte, i| byte.* = @truncate(i);
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, &disk, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, false);
+
+    const Ctx = struct {
+        var mem: [2048]u8 = @splat(0);
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    const read_data = [_]Block.GuestDesc{
+        .{ .addr = 0x1000, .len = 512, .flags = Block.GuestDesc.F_WRITE, .next = 0 },
+        .{ .addr = 0x1400, .len = 512, .flags = Block.GuestDesc.F_WRITE, .next = 0 },
+    };
+    var written: u32 = 0;
+    const read_header = RequestHeader{ .type = @intFromEnum(RequestType.in), .sector = 2 };
+    try std.testing.expectEqual(Status.ok, blk.executeRequest(read_header, &read_data, Ctx.get, &written));
+    try std.testing.expectEqual(@as(u32, 1024), written);
+    try std.testing.expectEqualSlices(u8, disk[1024..1536], Ctx.mem[0..512]);
+    try std.testing.expectEqualSlices(u8, disk[1536..2048], Ctx.mem[1024..1536]);
+
+    @memset(Ctx.mem[0..512], 0xA5);
+    @memset(Ctx.mem[1024..1536], 0x5A);
+    const write_data = [_]Block.GuestDesc{
+        .{ .addr = 0x1000, .len = 512, .flags = 0, .next = 0 },
+        .{ .addr = 0x1400, .len = 512, .flags = 0, .next = 0 },
+    };
+    const write_header = RequestHeader{ .type = @intFromEnum(RequestType.out), .sector = 4 };
+    try std.testing.expectEqual(Status.ok, blk.executeRequest(write_header, &write_data, Ctx.get, &written));
+    _ = try blk.file.?.readPositionalAll(io, &disk, 0);
+    try std.testing.expectEqualSlices(u8, Ctx.mem[0..512], disk[2048..2560]);
+    try std.testing.expectEqualSlices(u8, Ctx.mem[1024..1536], disk[2560..3072]);
+}
+
+test "vectored block short I/O advancement crosses buffers" {
+    var first: [4]u8 = undefined;
+    var second: [6]u8 = undefined;
+    var buffers = [_][]u8{ &first, &second };
+    const active = Block.advanceBuffers(&buffers, 7);
+    try std.testing.expectEqual(@as(usize, 1), active.len);
+    try std.testing.expectEqual(@as(usize, 3), active[0].len);
+    try std.testing.expectEqual(second[3..].ptr, active[0].ptr);
 }
