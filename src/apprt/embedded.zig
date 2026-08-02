@@ -213,7 +213,8 @@ pub const ContentScale = extern struct {
 pub const App = struct {
     alloc: Allocator,
     runtime: RuntimeConfig,
-    vms: std.ArrayListUnmanaged(*VM),
+    vms_head: ?*VM,
+    vm_count: usize,
     debug_allocator: if (builtin.mode == .Debug) std.heap.DebugAllocator(.{}) else void,
 
     pub const CreateError = Allocator.Error;
@@ -230,7 +231,8 @@ pub const App = struct {
         app.* = .{
             .alloc = undefined,
             .runtime = runtime.*,
-            .vms = .empty,
+            .vms_head = null,
+            .vm_count = 0,
             .debug_allocator = if (builtin.mode == .Debug) .init else {},
         };
         app.alloc = if (builtin.mode == .Debug)
@@ -239,7 +241,8 @@ pub const App = struct {
             std.heap.c_allocator;
 
         // Post-condition: app is initialized
-        assert(app.vms.items.len == 0);
+        assert(app.vms_head == null);
+        assert(app.vm_count == 0);
 
         // Register with global state for signal cleanup
         global.state.setActiveApp(app);
@@ -250,17 +253,15 @@ pub const App = struct {
 
     pub fn destroy(self: *App) void {
         // Pre-condition: self is valid
-        assert(self.vms.items.len <= 1024); // Sanity bound
+        assert(self.vm_count <= 1024); // Sanity bound
 
-        log.debug("destroying app with {} VMs", .{self.vms.items.len});
+        log.debug("destroying app with {} VMs", .{self.vm_count});
 
         // Unregister from global state
         global.state.setActiveApp(null);
 
-        for (self.vms.items) |vm| {
-            vm.destroy();
-        }
-        self.vms.deinit(self.alloc);
+        while (self.vms_head) |vm| vm.destroy();
+        assert(self.vm_count == 0);
         if (builtin.mode == .Debug) _ = self.debug_allocator.deinit();
         std.heap.c_allocator.destroy(self);
 
@@ -270,8 +271,11 @@ pub const App = struct {
     /// Process pending events from all VMs.
     /// Called from Swift main thread periodically.
     pub fn tick(self: *App) void {
-        for (self.vms.items) |vm| {
-            vm.tick();
+        var vm = self.vms_head;
+        while (vm) |current| {
+            const next = current.app_next;
+            current.tick();
+            vm = next;
         }
     }
 
@@ -285,25 +289,34 @@ pub const App = struct {
         });
 
         const vm = try VM.create(self, cfg);
-        errdefer vm.destroy();
 
-        try self.vms.append(self.alloc, vm);
+        vm.app_next = self.vms_head;
+        if (self.vms_head) |head| head.app_prev = vm;
+        self.vms_head = vm;
+        self.vm_count += 1;
 
         // Post-condition: VM added to list
-        assert(self.vms.items.len > 0);
+        assert(self.vms_head == vm);
+        assert(self.vm_count > 0);
 
-        log.info("VM created (total: {})", .{self.vms.items.len});
+        log.info("VM created (total: {})", .{self.vm_count});
         return vm;
     }
 
     /// Remove VM from app's list (called by VM.destroy).
     fn removeVM(self: *App, vm: *VM) void {
-        for (self.vms.items, 0..) |v, i| {
-            if (v == vm) {
-                _ = self.vms.swapRemove(i);
-                return;
-            }
+        assert(vm.app == self);
+        assert(self.vm_count > 0);
+        if (vm.app_prev) |previous| {
+            previous.app_next = vm.app_next;
+        } else {
+            assert(self.vms_head == vm);
+            self.vms_head = vm.app_next;
         }
+        if (vm.app_next) |next| next.app_prev = vm.app_prev;
+        vm.app_prev = null;
+        vm.app_next = null;
+        self.vm_count -= 1;
     }
 
     // -------------------------------------------------------------------------
@@ -350,6 +363,8 @@ pub const App = struct {
 pub const VM = struct {
     alloc: Allocator,
     app: *App,
+    app_prev: ?*VM,
+    app_next: ?*VM,
     config: OwnedVMConfig,
     state: State,
     surfaces: std.ArrayListUnmanaged(*Surface),
@@ -381,6 +396,8 @@ pub const VM = struct {
         vm.* = .{
             .alloc = app.alloc,
             .app = app,
+            .app_prev = null,
+            .app_next = null,
             .config = owned_config,
             .state = .stopped,
             .surfaces = .empty,
@@ -914,4 +931,42 @@ test "VMConfig owns strings in one allocation" {
     try std.testing.expectEqualStrings("firmware.fd", owned.firmware_path.?);
     try std.testing.expectEqualStrings("console=hvc0", owned.cmdline.?);
     try std.testing.expectEqualStrings("install.iso", owned.disk2_path.?);
+}
+
+test "App VM registry does not allocate" {
+    var runtime = RuntimeConfig{};
+    const app = try App.create(&runtime);
+    defer app.destroy();
+
+    const base_alloc = app.alloc;
+    var counted = std.testing.FailingAllocator.init(base_alloc, .{});
+    app.alloc = counted.allocator();
+    const cfg = VMConfig{ .memory_bytes = 1024, .vcpu_count = 1 };
+    const vm = try app.createVM(&cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    vm.destroy();
+    app.alloc = base_alloc;
+}
+
+test "App VM registry unlinks arbitrary entries" {
+    var runtime = RuntimeConfig{};
+    const app = try App.create(&runtime);
+    defer app.destroy();
+    const cfg = VMConfig{ .memory_bytes = 1024, .vcpu_count = 1 };
+
+    const first = try app.createVM(&cfg);
+    const middle = try app.createVM(&cfg);
+    const last = try app.createVM(&cfg);
+    try std.testing.expectEqual(@as(usize, 3), app.vm_count);
+
+    middle.destroy();
+    try std.testing.expectEqual(@as(usize, 2), app.vm_count);
+    try std.testing.expect(last.app_next == first);
+    try std.testing.expect(first.app_prev == last);
+
+    first.destroy();
+    last.destroy();
+    try std.testing.expectEqual(@as(usize, 0), app.vm_count);
+    try std.testing.expect(app.vms_head == null);
 }
