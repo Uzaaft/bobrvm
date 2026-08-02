@@ -199,7 +199,7 @@ pub const Block = struct {
         };
 
         // Set up notification callback
-        blk.transport.initEmbedded(alloc, 2, features, &blk.transport_queues);
+        blk.transport.initEmbedded(2, features, &blk.transport_queues);
         blk.transport.setNotifyCallback(handleNotify, blk);
 
         // Post-condition

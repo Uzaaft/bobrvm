@@ -214,7 +214,7 @@ pub const Snd = struct {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio.
         const virtio_version_1: u64 = 1 << 32;
         const transport = try mmio.Transport.init(alloc, 25, virtio_version_1, NUM_QUEUES); // 25 = sound
-        errdefer transport.deinit();
+        errdefer transport.deinit(alloc);
 
         const snd = try alloc.create(Snd);
         snd.* = .{
@@ -235,7 +235,7 @@ pub const Snd = struct {
     }
 
     pub fn deinit(self: *Snd) void {
-        self.transport.deinit();
+        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 

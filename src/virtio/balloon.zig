@@ -53,7 +53,7 @@ pub const Balloon = struct {
         // / STATS_VQ, so exactly two queues.
         const virtio_version_1: u64 = 1 << 32;
         const transport = try mmio.Transport.init(alloc, 5, virtio_version_1, 2); // 5 = balloon
-        errdefer transport.deinit();
+        errdefer transport.deinit(alloc);
 
         const balloon = try alloc.create(Balloon);
         balloon.* = .{
@@ -71,7 +71,7 @@ pub const Balloon = struct {
     }
 
     pub fn deinit(self: *Balloon) void {
-        self.transport.deinit();
+        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 

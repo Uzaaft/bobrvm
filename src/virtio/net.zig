@@ -106,7 +106,7 @@ pub const Net = struct {
         const virtio_version_1: u64 = 1 << 32;
         const features = Features.MAC | virtio_version_1;
         const transport = try mmio.Transport.init(alloc, 1, features, 2); // 1 = net device ID
-        errdefer transport.deinit();
+        errdefer transport.deinit(alloc);
 
         const net = try alloc.create(Net);
         net.* = .{
@@ -136,7 +136,7 @@ pub const Net = struct {
     pub fn deinit(self: *Net) void {
         self.releaseQueuedFrames();
         for (self.rx_free[0..self.rx_free_count]) |storage| self.alloc.free(storage);
-        self.transport.deinit();
+        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 

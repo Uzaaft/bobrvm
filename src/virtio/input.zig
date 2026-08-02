@@ -253,7 +253,7 @@ pub const Input = struct {
             .interrupt_userdata = null,
         };
 
-        input.transport.initEmbedded(alloc, 18, virtio_version_1, &input.transport_queues);
+        input.transport.initEmbedded(18, virtio_version_1, &input.transport_queues);
         input.transport.setNotifyCallback(handleNotify, input);
 
         assert(input.transport.device_id == 18);

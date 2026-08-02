@@ -199,7 +199,7 @@ pub const Console = struct {
         }
 
         // Set up notification callback
-        console.transport.initEmbedded(alloc, 3, features, queues);
+        console.transport.initEmbedded(3, features, queues);
         console.transport.setNotifyCallback(handleNotify, console);
 
         // Post-condition

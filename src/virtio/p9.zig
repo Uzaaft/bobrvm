@@ -40,7 +40,7 @@ pub const P9 = struct {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         const transport = try mmio.Transport.init(alloc, 9, virtio_version_1 | FEATURE_MOUNT_TAG, 1);
-        errdefer transport.deinit();
+        errdefer transport.deinit(alloc);
 
         var server = try p9.P9Server.init(alloc, root_path);
         errdefer server.deinit();
@@ -72,7 +72,7 @@ pub const P9 = struct {
         self.alloc.free(self.tag);
         self.alloc.free(self.req_buf);
         self.alloc.free(self.resp_buf);
-        self.transport.deinit();
+        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 

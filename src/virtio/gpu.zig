@@ -631,7 +631,7 @@ pub const Gpu = struct {
         // (guest kernel VIRTGPU_PARAM_RESOURCE_BLOB — "kernel param 3").
         if (gpu_venus and enable_virgl) features |= Features.CONTEXT_INIT | Features.RESOURCE_BLOB;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
-        errdefer transport.deinit();
+        errdefer transport.deinit(alloc);
 
         const gpu = try alloc.create(Gpu);
         errdefer alloc.destroy(gpu);
@@ -718,7 +718,7 @@ pub const Gpu = struct {
         self.venus_mappings.deinit();
         if (comptime gpu_venus) venus.deinitHost();
         self.gpu_device.deinit();
-        self.transport.deinit();
+        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 

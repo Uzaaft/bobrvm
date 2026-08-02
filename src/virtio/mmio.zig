@@ -118,7 +118,6 @@ pub const Transport = struct {
     queues: []QueueConfig,
     interrupt_status: InterruptStatus,
     config_generation: u32,
-    alloc: Allocator,
 
     /// Callback for queue notifications.
     notify_callback: ?*const fn (queue_idx: u32, userdata: ?*anyopaque) void,
@@ -187,7 +186,7 @@ pub const Transport = struct {
         const queues_ptr: [*]QueueConfig = @ptrCast(@alignCast(allocation.ptr + queues_offset));
         const queues = queues_ptr[0..num_queues];
 
-        transport.initEmbedded(alloc, device_id, device_features, queues);
+        transport.initEmbedded(device_id, device_features, queues);
 
         // Post-condition
         assert(transport.queues.len == num_queues);
@@ -199,7 +198,6 @@ pub const Transport = struct {
     /// call deinit; it releases the enclosing allocation instead.
     pub fn initEmbedded(
         self: *Transport,
-        alloc: Allocator,
         device_id: u32,
         device_features: u64,
         queues: []QueueConfig,
@@ -220,7 +218,6 @@ pub const Transport = struct {
             .queues = queues,
             .interrupt_status = .{},
             .config_generation = 0,
-            .alloc = alloc,
             .notify_callback = null,
             .notify_userdata = null,
             .irq_callback = null,
@@ -228,11 +225,10 @@ pub const Transport = struct {
         };
     }
 
-    pub fn deinit(self: *Transport) void {
+    pub fn deinit(self: *Transport, alloc: Allocator) void {
         assert(self.queues.len > 0);
         assert(self.queues.len <= MAX_QUEUES);
 
-        const alloc = self.alloc;
         const allocation_len = allocationSize(self.queues.len);
         const allocation_ptr: [*]align(@alignOf(Transport)) u8 = @ptrCast(self);
         alloc.free(allocation_ptr[0..allocation_len]);
@@ -440,7 +436,7 @@ pub const Transport = struct {
 
 test "Transport init and magic" {
     const transport = try Transport.init(std.testing.allocator, 3, 0, 2);
-    defer transport.deinit();
+    defer transport.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(MAGIC, transport.read(@intFromEnum(Reg.magic)));
     try std.testing.expectEqual(VERSION, transport.read(@intFromEnum(Reg.version)));
@@ -449,7 +445,7 @@ test "Transport init and magic" {
 
 test "Transport queue selection" {
     const transport = try Transport.init(std.testing.allocator, 3, 0, 4);
-    defer transport.deinit();
+    defer transport.deinit(std.testing.allocator);
 
     // Select queue 2
     transport.write(@intFromEnum(Reg.queue_sel), 2);
@@ -462,7 +458,7 @@ test "Transport queue selection" {
 
 test "Transport status reset" {
     const transport = try Transport.init(std.testing.allocator, 3, 0, 2);
-    defer transport.deinit();
+    defer transport.deinit(std.testing.allocator);
 
     // Set some status
     transport.write(@intFromEnum(Reg.status), 0x0F);
@@ -475,7 +471,7 @@ test "Transport status reset" {
 
 test "Transport config change raises and ack clears the interrupt line" {
     const transport = try Transport.init(std.testing.allocator, 16, 0, 2);
-    defer transport.deinit();
+    defer transport.deinit(std.testing.allocator);
 
     const Line = struct {
         level: bool = false,
