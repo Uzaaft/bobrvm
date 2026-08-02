@@ -45,8 +45,9 @@ pub const Config = extern struct {
     mtu: u16 = 1500,
 };
 
-/// Frame sink for guest → host traffic. The callback may be invoked on
-/// the vCPU thread; backends queue replies via queueRxFrame.
+/// Frame sink for guest → host traffic. The frame is borrowed only for the
+/// callback duration. The callback may run on the vCPU thread; backends queue
+/// replies via queueRxFrame.
 pub const TxCallback = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
 
 const RxFrame = struct {
@@ -253,6 +254,20 @@ pub const Net = struct {
     /// Gather one TX chain (skipping the 12-byte header) and hand the
     /// frame to the backend.
     fn transmitChain(self: *Net, chain: *const ring.Chain, get_mem: ring.GetMemFn) void {
+        if (chain.count == 1) {
+            const desc = chain.descs[0];
+            if (!desc.isWrite() and desc.len > @sizeOf(NetHeader) and
+                desc.len <= @sizeOf(NetHeader) + MAX_FRAME)
+            {
+                const mem = get_mem(desc.addr, desc.len) orelse return;
+                const frame = mem[@sizeOf(NetHeader)..];
+                assert(frame.len > 0);
+                assert(frame.len <= MAX_FRAME);
+                if (self.tx_callback) |cb| cb(frame, self.tx_userdata);
+                return;
+            }
+        }
+
         var frame_buf: [MAX_FRAME]u8 = undefined;
         var frame_len: usize = 0;
         var skip: usize = @sizeOf(NetHeader);
@@ -430,4 +445,32 @@ test "Net recycles normal RX buffers" {
     net.releaseQueuedFrames();
     net.queueRxFrame(&frame);
     try testing.expectEqual(storage, net.rx_frames[net.rx_head].storage.ptr);
+}
+
+var test_tx_memory: [1514]u8 = @splat(0xA5);
+var test_tx_frame: ?[]const u8 = null;
+
+fn testTxGetMem(addr: u64, len: usize) ?[]u8 {
+    if (addr != 0x1000 or len > test_tx_memory.len) return null;
+    return test_tx_memory[0..len];
+}
+
+fn testTxCallback(frame: []const u8, _: ?*anyopaque) void {
+    test_tx_frame = frame;
+}
+
+test "Net sends a contiguous TX payload without copying" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+    net.setTxCallback(testTxCallback, null);
+
+    var chain: ring.Chain = .{};
+    chain.descs[0] = .{ .addr = 0x1000, .len = test_tx_memory.len, .flags = 0, .next = 0 };
+    chain.count = 1;
+
+    test_tx_frame = null;
+    net.transmitChain(&chain, testTxGetMem);
+    const frame = test_tx_frame.?;
+    try testing.expectEqual(test_tx_memory.len - @sizeOf(NetHeader), frame.len);
+    try testing.expectEqual(@intFromPtr(&test_tx_memory) + @sizeOf(NetHeader), @intFromPtr(frame.ptr));
 }
