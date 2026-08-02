@@ -92,34 +92,54 @@ pub const Vdagent = struct {
 
     /// Frame and send one VDAgentMessage, split into <=2048-byte chunks.
     fn sendMsg(self: *Vdagent, msg_type: MsgType, payload: []const u8) void {
+        self.sendMsgParts(msg_type, &.{payload});
+    }
+
+    fn sendMsgParts(self: *Vdagent, msg_type: MsgType, payload_parts: []const []const u8) void {
+        std.debug.assert(payload_parts.len > 0);
+        std.debug.assert(CHUNK_MAX <= std.math.maxInt(u32));
+        var payload_len: usize = 0;
+        for (payload_parts) |part| {
+            payload_len = std.math.add(usize, payload_len, part.len) catch return;
+        }
+        if (payload_len > std.math.maxInt(u32)) return;
+
         var hdr: [MSG_HDR]u8 = undefined;
         std.mem.writeInt(u32, hdr[0..4], PROTOCOL, .little);
         std.mem.writeInt(u32, hdr[4..8], @intFromEnum(msg_type), .little);
         std.mem.writeInt(u64, hdr[8..16], 0, .little); // opaque
-        std.mem.writeInt(u32, hdr[16..20], @intCast(payload.len), .little);
+        std.mem.writeInt(u32, hdr[16..20], @intCast(payload_len), .little);
 
-        // Chunk the concatenation of header+payload.
+        var chunk: [8 + CHUNK_MAX]u8 = undefined;
         var remaining_hdr: []const u8 = &hdr;
-        var remaining_payload = payload;
-        while (remaining_hdr.len + remaining_payload.len > 0) {
-            const total = remaining_hdr.len + remaining_payload.len;
-            const chunk_len = @min(total, CHUNK_MAX);
-            var chunk_hdr: [8]u8 = undefined;
-            std.mem.writeInt(u32, chunk_hdr[0..4], VDP_CLIENT_PORT, .little);
-            std.mem.writeInt(u32, chunk_hdr[4..8], @intCast(chunk_len), .little);
-            self.send_fn(&chunk_hdr, self.send_userdata);
-
-            var left = chunk_len;
+        var part_index: usize = 0;
+        var part_offset: usize = 0;
+        var remaining = MSG_HDR + payload_len;
+        while (remaining > 0) {
+            const chunk_len = @min(remaining, CHUNK_MAX);
+            std.mem.writeInt(u32, chunk[0..4], VDP_CLIENT_PORT, .little);
+            std.mem.writeInt(u32, chunk[4..8], @intCast(chunk_len), .little);
+            var copied: usize = 0;
             if (remaining_hdr.len > 0) {
-                const n = @min(remaining_hdr.len, left);
-                self.send_fn(remaining_hdr[0..n], self.send_userdata);
+                const n = @min(remaining_hdr.len, chunk_len);
+                @memcpy(chunk[8..][0..n], remaining_hdr[0..n]);
                 remaining_hdr = remaining_hdr[n..];
-                left -= n;
+                copied += n;
             }
-            if (left > 0) {
-                self.send_fn(remaining_payload[0..left], self.send_userdata);
-                remaining_payload = remaining_payload[left..];
+            while (copied < chunk_len) {
+                const part = payload_parts[part_index][part_offset..];
+                const n = @min(part.len, chunk_len - copied);
+                @memcpy(chunk[8 + copied ..][0..n], part[0..n]);
+                copied += n;
+                part_offset += n;
+                if (part_offset == payload_parts[part_index].len) {
+                    part_index += 1;
+                    part_offset = 0;
+                }
             }
+            std.debug.assert(copied == chunk_len);
+            self.send_fn(chunk[0 .. 8 + chunk_len], self.send_userdata);
+            remaining -= chunk_len;
         }
     }
 
@@ -141,11 +161,9 @@ pub const Vdagent = struct {
 
     /// Deliver host clipboard text (answers the guest's REQUEST).
     pub fn sendClipboard(self: *Vdagent, text: []const u8) void {
-        const payload = self.alloc.alloc(u8, 4 + text.len) catch return;
-        defer self.alloc.free(payload);
-        std.mem.writeInt(u32, payload[0..4], CLIP_UTF8_TEXT, .little);
-        @memcpy(payload[4..], text);
-        self.sendMsg(.clipboard, payload);
+        var data_type: [4]u8 = undefined;
+        std.mem.writeInt(u32, &data_type, CLIP_UTF8_TEXT, .little);
+        self.sendMsgParts(.clipboard, &.{ &data_type, text });
     }
 
     // =========================================================================
@@ -241,13 +259,16 @@ pub const Vdagent = struct {
 const testing = std.testing;
 
 var test_sent: std.ArrayListUnmanaged(u8) = .empty;
+var test_send_calls: usize = 0;
 fn testSend(data: []const u8, _: ?*anyopaque) void {
+    test_send_calls += 1;
     test_sent.appendSlice(testing.allocator, data) catch {};
 }
 
 fn clearSent() void {
     test_sent.deinit(testing.allocator);
     test_sent = .empty;
+    test_send_calls = 0;
 }
 
 /// Build a chunked guest message for feeding.
@@ -371,7 +392,8 @@ test "vdagent: host grab + guest request + data delivery" {
 
 test "vdagent: large message splits into 2048-byte chunks" {
     defer clearSent();
-    var vd = Vdagent.init(testing.allocator, testSend, null);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var vd = Vdagent.init(counted.allocator(), testSend, null);
     defer vd.deinit();
 
     const big = try testing.allocator.alloc(u8, 5000);
@@ -392,4 +414,7 @@ test "vdagent: large message splits into 2048-byte chunks" {
     }
     try testing.expectEqual(@as(usize, MSG_HDR + 4 + 5000), payload_total);
     try testing.expect(chunks >= 3);
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 3), test_send_calls);
 }
