@@ -18,6 +18,7 @@ const keymap = @import("keymap.zig");
 const renderer = @import("../renderer/main.zig");
 
 const log = std.log.scoped(.apprt);
+const clipboard_scratch_bytes = 4 * 1024;
 
 /// Runtime configuration with platform callbacks.
 /// Passed from Swift to Zig at app creation.
@@ -636,8 +637,12 @@ pub const VM = struct {
     fn guestClipboardCallback(text: []const u8, userdata: ?*anyopaque) void {
         const self: *VM = @ptrCast(@alignCast(userdata));
         const cb = self.app.runtime.write_clipboard orelse return;
-        const c = self.alloc.dupeZ(u8, text) catch return;
-        defer self.alloc.free(c);
+        assert(clipboard_scratch_bytes > 0);
+        assert(text.len < std.math.maxInt(usize));
+        var stack_allocator = std.heap.stackFallback(clipboard_scratch_bytes, self.alloc);
+        const temp_alloc = stack_allocator.get();
+        const c = temp_alloc.dupeZ(u8, text) catch return;
+        defer temp_alloc.free(c);
         cb(self.app.runtime.userdata, c.ptr);
     }
 
@@ -997,6 +1002,45 @@ test "VMConfig validation" {
 
     const invalid_cpu = VMConfig{ .memory_bytes = 1024, .vcpu_count = 0 };
     assert(!invalid_cpu.validate());
+}
+
+test "guest clipboard callback forwards text" {
+    const Clipboard = struct {
+        var calls: usize = 0;
+        var length: usize = 0;
+
+        fn write(_: ?*anyopaque, text: [*:0]const u8) callconv(.c) void {
+            calls += 1;
+            length = std.mem.len(text);
+        }
+    };
+    Clipboard.calls = 0;
+    Clipboard.length = 0;
+
+    var runtime = RuntimeConfig{ .write_clipboard = Clipboard.write };
+    const app = try App.create(&runtime);
+    defer app.destroy();
+    const cfg = VMConfig{ .memory_bytes = 1024, .vcpu_count = 1 };
+    const vm = try app.createVM(&cfg);
+    defer vm.destroy();
+
+    const base_alloc = vm.alloc;
+    defer vm.alloc = base_alloc;
+    var counted = std.testing.FailingAllocator.init(base_alloc, .{});
+    vm.alloc = counted.allocator();
+    VM.guestClipboardCallback("clipboard text", vm);
+
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 1), Clipboard.calls);
+    try std.testing.expectEqual("clipboard text".len, Clipboard.length);
+
+    const large: [clipboard_scratch_bytes]u8 = @splat('x');
+    VM.guestClipboardCallback(&large, vm);
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@as(usize, clipboard_scratch_bytes + 1), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 2), Clipboard.calls);
+    try std.testing.expectEqual(large.len, Clipboard.length);
 }
 
 test "VMConfig owns strings in one allocation" {
