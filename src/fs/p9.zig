@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = @import("../quirks.zig").inlineAssert;
 
 const log = std.log.scoped(.p9);
 
@@ -91,18 +92,35 @@ pub const P9Server = struct {
     msize: u32 = MSIZE_MAX,
 
     pub fn init(alloc: Allocator, root_path: []const u8) !P9Server {
+        const root = try alloc.dupe(u8, root_path);
+        return initEmbedded(alloc, root);
+    }
+
+    pub fn initEmbedded(alloc: Allocator, root_storage: []u8) P9Server {
+        assert(@sizeOf(u8) == 1);
+        assert(@sizeOf([]u8) == 2 * @sizeOf(usize));
         return .{
             .alloc = alloc,
-            .root = try alloc.dupe(u8, root_path),
+            .root = root_storage,
             .fids = std.AutoHashMap(u32, Fid).init(alloc),
         };
     }
 
     pub fn deinit(self: *P9Server) void {
+        self.deinitFids();
+        self.alloc.free(self.root);
+        self.root = &.{};
+    }
+
+    pub fn deinitEmbedded(self: *P9Server) void {
+        self.deinitFids();
+        self.root = &.{};
+    }
+
+    fn deinitFids(self: *P9Server) void {
         var iter = self.fids.valueIterator();
         while (iter.next()) |fid| self.dropFid(fid);
         self.fids.deinit();
-        self.alloc.free(self.root);
     }
 
     fn dropFid(self: *P9Server, fid: *Fid) void {
