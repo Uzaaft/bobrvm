@@ -10,6 +10,7 @@ const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
 
 const log = std.log.scoped(.cli);
+const input_stack_size_bytes: usize = 1024 * 1024;
 
 /// zig 0.16 removed std.Thread.sleep in favor of the Io.Clock
 /// abstraction; thin wrapper for these debug-hook sleeps.
@@ -198,7 +199,11 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     }
     defer restoreTermios();
 
-    const input_thread = std.Thread.spawn(.{}, inputLoop, .{ hw, stdin_is_tty }) catch |err| blk: {
+    const input_thread = std.Thread.spawn(
+        .{ .stack_size = input_stack_size_bytes },
+        inputLoop,
+        .{ hw, stdin_is_tty },
+    ) catch |err| blk: {
         log.warn("failed to start console input thread: {}", .{err});
         break :blk null;
     };
