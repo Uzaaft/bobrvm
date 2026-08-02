@@ -589,7 +589,6 @@ pub const Block = struct {
         if (!must_zero) return .ok; // discard: advisory, done either way
 
         // write_zeroes: explicitly zero whatever the punch didn't cover.
-        var zeros: [65536]u8 = @splat(0);
         var ranges: [2][2]u64 = undefined;
         var n_ranges: usize = 0;
         if (punched) {
@@ -605,7 +604,14 @@ pub const Block = struct {
             ranges[0] = .{ start, start + len };
             n_ranges = 1;
         }
-        for (ranges[0..n_ranges]) |range| {
+        return writeZeroRanges(file, ranges[0..n_ranges]);
+    }
+
+    noinline fn writeZeroRanges(file: std.Io.File, ranges: []const [2]u64) Status {
+        assert(ranges.len > 0);
+        assert(ranges.len <= 2);
+        var zeros: [65536]u8 = @splat(0);
+        for (ranges) |range| {
             var pos = range[0];
             while (pos < range[1]) {
                 const chunk = @min(range[1] - pos, zeros.len);
