@@ -86,7 +86,7 @@ const Port = struct {
 /// Console device.
 pub const Console = struct {
     alloc: Allocator,
-    transport: *mmio.Transport,
+    transport: mmio.Transport,
     config: Config,
 
     /// Shadow cursors for the guest-owned receive and transmit queues.
@@ -120,16 +120,31 @@ pub const Console = struct {
     pub const QUEUE_SIZE: u16 = 128;
     pub const INPUT_BUFFER_MAX: usize = 64 * 1024;
 
-    fn allocationSize(port_count: usize) usize {
+    const AllocationLayout = struct {
+        ports_offset: usize,
+        queues_offset: usize,
+        queue_count: usize,
+        size: usize,
+    };
+
+    fn allocationLayout(port_count: usize) AllocationLayout {
         assert(port_count <= (mmio.Transport.MAX_QUEUES - 4) / 2);
-        assert(@alignOf(Console) >= @alignOf(Port));
+        assert(@alignOf(Console) >= @max(@alignOf(Port), @alignOf(mmio.QueueConfig)));
 
         const ports_offset = std.mem.alignForward(
             usize,
             @sizeOf(Console),
             @alignOf(Port),
         );
-        return ports_offset + @sizeOf(Port) * port_count;
+        const ports_end = ports_offset + @sizeOf(Port) * port_count;
+        const queues_offset = std.mem.alignForward(usize, ports_end, @alignOf(mmio.QueueConfig));
+        const queue_count = if (port_count > 0) 4 + 2 * port_count else 2;
+        return .{
+            .ports_offset = ports_offset,
+            .queues_offset = queues_offset,
+            .queue_count = queue_count,
+            .size = queues_offset + @sizeOf(mmio.QueueConfig) * queue_count,
+        };
     }
 
     /// Queue indices for multiport port p (p >= 1).
@@ -149,28 +164,25 @@ pub const Console = struct {
         var features = Features.SIZE | Features.EMERG_WRITE | virtio_version_1;
         const multiport = port_names.len > 0;
         if (multiport) features |= Features.MULTIPORT;
-        const num_queues: u8 = if (multiport) @intCast(4 + 2 * port_names.len) else 2;
-        const transport = try mmio.Transport.init(alloc, 3, features, num_queues);
-        errdefer transport.deinit();
+        const layout = allocationLayout(port_names.len);
 
         const allocation = try alloc.alignedAlloc(
             u8,
             .of(Console),
-            allocationSize(port_names.len),
+            layout.size,
         );
         errdefer alloc.free(allocation);
 
         const console: *Console = @ptrCast(allocation.ptr);
-        const ports_offset = std.mem.alignForward(
-            usize,
-            @sizeOf(Console),
-            @alignOf(Port),
-        );
-        const ports_ptr: [*]Port = @ptrCast(@alignCast(allocation.ptr + ports_offset));
+        const ports_ptr: [*]Port = @ptrCast(@alignCast(allocation.ptr + layout.ports_offset));
         const ports = ports_ptr[0..port_names.len];
+        const queues_ptr: [*]mmio.QueueConfig = @ptrCast(@alignCast(
+            allocation.ptr + layout.queues_offset,
+        ));
+        const queues = queues_ptr[0..layout.queue_count];
         console.* = .{
             .alloc = alloc,
-            .transport = transport,
+            .transport = undefined,
             .config = .{ .max_nr_ports = @intCast(1 + port_names.len) },
             .receive_last_avail = 0,
             .transmit_last_avail = 0,
@@ -187,7 +199,8 @@ pub const Console = struct {
         }
 
         // Set up notification callback
-        transport.setNotifyCallback(handleNotify, console);
+        console.transport.initEmbedded(alloc, 3, features, queues);
+        console.transport.setNotifyCallback(handleNotify, console);
 
         // Post-condition
         assert(console.transport.device_id == 3); // console device ID
@@ -200,10 +213,9 @@ pub const Console = struct {
         self.ctrl_pending.deinit(self.alloc);
         self.output_buffer.deinit(self.alloc);
         self.input_buffer.deinit(self.alloc);
-        self.transport.deinit();
 
         const alloc = self.alloc;
-        const allocation_len = allocationSize(self.ports.len);
+        const allocation_len = allocationLayout(self.ports.len).size;
         const allocation_ptr: [*]align(@alignOf(Console)) u8 = @ptrCast(self);
         alloc.free(allocation_ptr[0..allocation_len]);
     }

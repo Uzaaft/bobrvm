@@ -302,7 +302,7 @@ pub fn deserializeTransport(cur: *Cursor, t: *mmio.Transport) !void {
 pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
-    try serializeTransport(&out, con.transport);
+    try serializeTransport(&out, &con.transport);
     try out.int(u16, con.receive_last_avail);
     try out.int(u16, con.transmit_last_avail);
     try out.blob(con.input_buffer.items);
@@ -317,7 +317,7 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
 
 pub fn deserializeConsole(alloc: Allocator, con: *virtio.Console, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
-    try deserializeTransport(&cur, con.transport);
+    try deserializeTransport(&cur, &con.transport);
     con.receive_last_avail = try cur.int(u16);
     con.transmit_last_avail = try cur.int(u16);
     const input = try cur.blob();
