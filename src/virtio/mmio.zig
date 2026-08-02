@@ -187,9 +187,28 @@ pub const Transport = struct {
         const queues_ptr: [*]QueueConfig = @ptrCast(@alignCast(allocation.ptr + queues_offset));
         const queues = queues_ptr[0..num_queues];
 
-        @memset(queues, QueueConfig{});
+        transport.initEmbedded(alloc, device_id, device_features, queues);
 
-        transport.* = .{
+        // Post-condition
+        assert(transport.queues.len == num_queues);
+
+        return transport;
+    }
+
+    /// Initialize transport state in caller-owned storage. The owner must not
+    /// call deinit; it releases the enclosing allocation instead.
+    pub fn initEmbedded(
+        self: *Transport,
+        alloc: Allocator,
+        device_id: u32,
+        device_features: u64,
+        queues: []QueueConfig,
+    ) void {
+        assert(queues.len > 0);
+        assert(queues.len <= MAX_QUEUES);
+
+        @memset(queues, QueueConfig{});
+        self.* = .{
             .device_id = device_id,
             .vendor_id = 0x554D4551, // "QEMU"
             .device_features = device_features,
@@ -207,11 +226,6 @@ pub const Transport = struct {
             .irq_callback = null,
             .irq_userdata = null,
         };
-
-        // Post-condition
-        assert(transport.queues.len == num_queues);
-
-        return transport;
     }
 
     pub fn deinit(self: *Transport) void {

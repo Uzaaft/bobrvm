@@ -195,7 +195,8 @@ pub const Config = extern struct {
 /// Input device.
 pub const Input = struct {
     alloc: Allocator,
-    transport: *mmio.Transport,
+    transport: mmio.Transport,
+    transport_queues: [2]mmio.QueueConfig,
     config: Config,
     subtype: Subtype,
 
@@ -230,13 +231,12 @@ pub const Input = struct {
     pub fn init(alloc: Allocator, subtype: Subtype) Error!*Input {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
-        const transport = try mmio.Transport.init(alloc, 18, virtio_version_1, 2); // 18 = input device ID
-        errdefer transport.deinit();
-
         const input = try alloc.create(Input);
+        errdefer alloc.destroy(input);
         input.* = .{
             .alloc = alloc,
-            .transport = transport,
+            .transport = undefined,
+            .transport_queues = undefined,
             .config = .{},
             .subtype = subtype,
             .pending_events = .empty,
@@ -253,7 +253,8 @@ pub const Input = struct {
             .interrupt_userdata = null,
         };
 
-        transport.setNotifyCallback(handleNotify, input);
+        input.transport.initEmbedded(alloc, 18, virtio_version_1, &input.transport_queues);
+        input.transport.setNotifyCallback(handleNotify, input);
 
         assert(input.transport.device_id == 18);
 
@@ -262,7 +263,6 @@ pub const Input = struct {
 
     pub fn deinit(self: *Input) void {
         self.pending_events.deinit(self.alloc);
-        self.transport.deinit();
         self.alloc.destroy(self);
     }
 

@@ -381,7 +381,7 @@ pub fn deserializeNet(net: *virtio.Net, data: []const u8) !void {
 pub fn serializeInput(alloc: Allocator, input: *const virtio.Input) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
-    try serializeTransport(&out, input.transport);
+    try serializeTransport(&out, &input.transport);
     try out.int(u16, input.event_last_avail);
     try out.int(u16, input.status_last_avail);
     return out.buf.toOwnedSlice(alloc);
@@ -389,7 +389,7 @@ pub fn serializeInput(alloc: Allocator, input: *const virtio.Input) ![]u8 {
 
 pub fn deserializeInput(input: *virtio.Input, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
-    try deserializeTransport(&cur, input.transport);
+    try deserializeTransport(&cur, &input.transport);
     input.event_last_avail = try cur.int(u16);
     input.status_last_avail = try cur.int(u16);
 }
