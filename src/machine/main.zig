@@ -330,6 +330,11 @@ pub const Machine = struct {
     /// Running state.
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Set before or during startup to prevent the vCPU loop from beginning.
+    /// Embedded runtimes prepare this token before spawning the owning thread,
+    /// so an immediate Stop cannot be lost before startSyncPrepared enters.
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Paused: vCPU threads park on their wake condvars instead of
     /// entering hv_vcpu_run. All guest state (RAM, registers, devices)
     /// is preserved, unlike stop.
@@ -355,6 +360,7 @@ pub const Machine = struct {
             InitrdTooLarge,
             FirmwareTooLarge,
             RestoreFailed,
+            StartCancelled,
         };
 
     pub fn init(alloc: Allocator, config: MachineConfig) Error!*Machine {
@@ -747,6 +753,7 @@ pub const Machine = struct {
     /// a signal handler; the vCPU loops observe running=false and unwind
     /// (WFI-halted CPUs wake within their 1ms condvar timeout).
     pub fn requestStop(self: *Machine) void {
+        self.stop_requested.store(true, .release);
         self.running.store(false, .release);
         for (self.cpu_states) |*state| {
             if (state.vcpu) |v| v.forceExit() catch {};
@@ -754,6 +761,7 @@ pub const Machine = struct {
     }
 
     pub fn stop(self: *Machine) void {
+        self.stop_requested.store(true, .release);
         if (!self.running.load(.acquire)) return;
 
         log.info("stopping machine", .{});
@@ -1170,11 +1178,27 @@ pub const Machine = struct {
     /// Start and run the machine synchronously on the current thread.
     /// vCPU is created and run on the same thread (required by Apple Hypervisor).
     pub fn startSync(self: *Machine) Error!void {
+        self.prepareStart();
+        return self.startSyncPrepared();
+    }
+
+    pub fn prepareStart(self: *Machine) void {
+        assert(!self.running.load(.acquire));
+        assert(self.hv_vm == null);
+        self.stop_requested.store(false, .release);
+        self.paused.store(false, .release);
+    }
+
+    pub fn startSyncPrepared(self: *Machine) Error!void {
+        assert(!self.running.load(.acquire));
+        assert(self.hv_vm == null);
+        try self.checkStartupCancelled();
         log.info("starting machine (sync)", .{});
 
         // Create hypervisor VM
         self.hv_vm = try hypervisor.VM.create(self.alloc);
         errdefer self.cleanupHypervisor();
+        try self.checkStartupCancelled();
 
         const vm = self.hv_vm.?;
 
@@ -1186,6 +1210,7 @@ pub const Machine = struct {
         if (self.config.isFirmwareBoot()) {
             try self.mapPflashRegions(vm);
             try self.loadFirmware();
+            try self.checkStartupCancelled();
         }
 
         // Map guest RAM
@@ -1194,6 +1219,7 @@ pub const Machine = struct {
             self.config.ram_size,
             hypervisor.MEM_READ_WRITE_EXEC,
         );
+        try self.checkStartupCancelled();
         log.debug("mapped RAM: 0x{x} - 0x{x}", .{
             MemoryLayout.RAM_BASE,
             MemoryLayout.RAM_BASE + self.config.ram_size,
@@ -1213,13 +1239,16 @@ pub const Machine = struct {
 
             // Generate and load DTB
             try self.generateDtb();
+            try self.checkStartupCancelled();
         }
 
         // Initialize GIC (interrupt controller)
         try self.initGic();
+        try self.checkStartupCancelled();
 
         // Initialize virtio devices
         try self.initVirtioDevices();
+        try self.checkStartupCancelled();
 
         // Set current machine for guest memory access
         current_machine = self;
@@ -1238,6 +1267,7 @@ pub const Machine = struct {
         if (self.config.restore_path) |path| {
             try self.restoreFromFile(path, vcpu);
         }
+        try self.checkStartupCancelled();
 
         self.running.store(true, .release);
         log.info("machine started, running vCPU loop", .{});
@@ -1251,6 +1281,12 @@ pub const Machine = struct {
         self.joinSecondaryVcpus();
         current_machine = null;
         log.info("machine stopped", .{});
+    }
+
+    fn checkStartupCancelled(self: *const Machine) error{StartCancelled}!void {
+        assert(!self.running.load(.acquire));
+        assert(self.cpu_states.len == self.config.vcpu_count);
+        if (self.stop_requested.load(.acquire)) return error.StartCancelled;
     }
 
     fn runVcpuLoop(self: *Machine, vcpu: *hypervisor.Vcpu, cpu_id: u8) !void {
@@ -2792,4 +2828,17 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
+}
+
+test "stop before synchronous thread entry cancels startup" {
+    const testing = std.testing;
+    const machine = try Machine.init(testing.allocator, .{ .vcpu_count = 1 });
+    defer machine.deinit();
+
+    machine.prepareStart();
+    machine.requestStop();
+
+    try testing.expectError(error.StartCancelled, machine.startSyncPrepared());
+    try testing.expect(!machine.running.load(.acquire));
+    try testing.expect(machine.stop_requested.load(.acquire));
 }

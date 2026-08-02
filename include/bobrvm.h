@@ -239,6 +239,8 @@ bobrvm_error_e bobrvm_vm_start(bobrvm_vm_t vm);
  * Stop VM execution.
  */
 void bobrvm_vm_stop(bobrvm_vm_t vm);
+void bobrvm_vm_request_stop(bobrvm_vm_t vm);
+void bobrvm_vm_finish_stop(bobrvm_vm_t vm);
 
 /**
  * Pause VM execution.

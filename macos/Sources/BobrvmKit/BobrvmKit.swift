@@ -380,6 +380,7 @@ extension BobrvmAppDelegate {
 @MainActor
 public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
+    @Published public private(set) var isStopping = false
 
     private var handle: bobrvm_vm_t?
     private weak var app: App?
@@ -397,7 +398,7 @@ public final class VM: ObservableObject {
     }
 
     public func start() throws {
-        guard state == .stopped || state == .paused else {
+        guard !isStopping, state == .stopped || state == .paused else {
             return  // Already running or invalid state
         }
         guard let h = handle else {
@@ -411,19 +412,28 @@ public final class VM: ObservableObject {
     }
 
     public func stop() {
-        guard let h = handle else { return }
-        bobrvm_vm_stop(h)
-        state = .stopped
+        guard !isStopping, let h = handle else { return }
+        isStopping = true
+        let sendableHandle = SendableVMHandle(value: h)
+        bobrvm_vm_request_stop(h)
+        let stopTask = Task.detached(priority: .userInitiated) { [sendableHandle] in
+            bobrvm_vm_finish_stop(sendableHandle.value)
+        }
+        Task { [self, stopTask] in
+            await stopTask.value
+            state = .stopped
+            isStopping = false
+        }
     }
 
     public func pause() {
-        guard let h = handle else { return }
+        guard !isStopping, let h = handle else { return }
         bobrvm_vm_pause(h)
         state = .paused
     }
 
     public func resume() {
-        guard let h = handle else { return }
+        guard !isStopping, let h = handle else { return }
         bobrvm_vm_resume(h)
         state = .running
     }
@@ -468,6 +478,10 @@ public enum VMState: String, CaseIterable {
     case stopped
     case running
     case paused
+}
+
+private struct SendableVMHandle: @unchecked Sendable {
+    let value: bobrvm_vm_t
 }
 
 // MARK: - Surface

@@ -404,10 +404,15 @@ pub const VM = struct {
     /// Thread running the synchronous vCPU loop.
     vcpu_thread: ?std.Thread = null,
 
+    /// Stop spans the UI thread (request) and a worker thread (join/deinit).
+    stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stop_mutex: std.Io.Mutex = .init,
+
     pub const State = enum {
         stopped,
         running,
         paused,
+        stopping,
     };
 
     pub const CreateError = Allocator.Error;
@@ -534,6 +539,7 @@ pub const VM = struct {
 
         // Run the synchronous vCPU loop on a dedicated thread (the same
         // proven loop the CLI uses; the async VMRunner path is legacy).
+        self.hw_machine.?.prepareStart();
         self.vcpu_thread = std.Thread.spawn(.{}, vcpuThreadMain, .{self.hw_machine.?}) catch |err| {
             log.warn("failed to spawn vCPU thread: {}", .{err});
             return error.MachineStartFailed;
@@ -547,12 +553,28 @@ pub const VM = struct {
     }
 
     fn vcpuThreadMain(hw: *machine.Machine) void {
-        hw.startSync() catch |err| {
+        assert(hw.config.vcpu_count > 0);
+        assert(hw.cpu_states.len == hw.config.vcpu_count);
+        hw.startSyncPrepared() catch |err| {
+            if (err == error.StartCancelled) {
+                log.debug("VM startup cancelled", .{});
+                return;
+            }
             log.warn("vCPU loop failed: {}", .{err});
         };
     }
 
     pub fn stop(self: *VM) void {
+        self.requestStop();
+        self.finishStop();
+    }
+
+    /// Synchronously quiesce renderers and signal the machine to stop, but
+    /// leave the potentially blocking vCPU join to finishStop.
+    pub fn requestStop(self: *VM) void {
+        assert(self.surface_count <= 16);
+        assert(self.vcpu_thread != null or self.hw_machine == null);
+        if (self.stopping.swap(true, .acq_rel)) return;
         log.info("stopping VM", .{});
 
         // Renderer threads read the machine's virtio-gpu scanout. Join them
@@ -568,16 +590,30 @@ pub const VM = struct {
 
         if (self.hw_machine) |hw| {
             hw.stop();
-            if (self.vcpu_thread) |thread| {
-                thread.join();
-                self.vcpu_thread = null;
-            }
-            // Must fully deinit to release hypervisor (only one VM per process)
+        }
+        self.state = .stopping;
+    }
+
+    /// Join and destroy the stopped machine. Safe to run off the UI thread
+    /// after requestStop has quiesced every surface.
+    pub fn finishStop(self: *VM) void {
+        self.stop_mutex.lockUncancelable(global.io());
+        defer self.stop_mutex.unlock(global.io());
+        if (!self.stopping.load(.acquire)) return;
+        assert(self.state == .stopping);
+        assert(self.hw_machine != null or self.vcpu_thread == null);
+        if (self.vcpu_thread) |thread| {
+            thread.join();
+            self.vcpu_thread = null;
+        }
+        if (self.hw_machine) |hw| {
+            // Must fully deinit to release hypervisor (only one VM per process).
             hw.deinit();
             self.hw_machine = null;
         }
 
         self.state = .stopped;
+        self.stopping.store(false, .release);
 
         // Post-condition: now stopped
         assert(self.state == .stopped);
@@ -847,6 +883,7 @@ pub const Surface = struct {
     pub fn draw(self: *Surface) void {
         // Pre-condition: must have valid size to draw
         if (self.width == 0 or self.height == 0) return;
+        if (self.vm.stopping.load(.acquire)) return;
         const hw = self.vm.hw_machine orelse return;
         const gpu = hw.gpu orelse return;
         const generation = gpu.presentationGeneration();

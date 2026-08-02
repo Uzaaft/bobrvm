@@ -241,6 +241,16 @@ pub export fn bobrvm_vm_stop(vm: ?*apprt.VM) void {
     v.stop();
 }
 
+pub export fn bobrvm_vm_request_stop(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.requestStop();
+}
+
+pub export fn bobrvm_vm_finish_stop(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.finishStop();
+}
+
 pub export fn bobrvm_vm_pause(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.pause();
