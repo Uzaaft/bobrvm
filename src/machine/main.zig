@@ -1962,20 +1962,22 @@ pub const Machine = struct {
             .pcie_mmio_size = MemoryLayout.PCI_MMIO_SIZE,
         };
 
-        const dtb_data = try builder.generate(config);
-        defer self.alloc.free(dtb_data);
-
-        // Copy DTB to RAM at dtbBase
         const dtb_addr = MemoryLayout.dtbBase(self.config.ram_size);
         const ram_offset = dtb_addr - MemoryLayout.RAM_BASE;
         const ram = self.ram.?;
 
-        if (ram_offset + dtb_data.len > ram.len) {
+        if (ram_offset >= ram.len) {
             log.err("DTB too large or wrong offset", .{});
             return error.InitrdTooLarge; // Reuse error
         }
 
-        @memcpy(ram[ram_offset..][0..dtb_data.len], dtb_data);
+        const dtb_data = builder.generateInto(config, ram[ram_offset..]) catch |err| switch (err) {
+            error.NoSpaceLeft => {
+                log.err("DTB too large or wrong offset", .{});
+                return error.InitrdTooLarge;
+            },
+            else => return err,
+        };
         log.info("loaded DTB: {} bytes at 0x{x}", .{ dtb_data.len, dtb_addr });
     }
 

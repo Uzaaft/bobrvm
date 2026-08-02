@@ -101,10 +101,11 @@ pub const DtbBuilder = struct {
         self.string_offsets.deinit(self.alloc);
     }
 
-    /// Generate DTB for the given configuration.
-    pub fn generate(self: *DtbBuilder, config: DtbConfig) ![]u8 {
+    /// Generate a DTB directly into caller-owned storage.
+    pub fn generateInto(self: *DtbBuilder, config: DtbConfig, output: []u8) ![]u8 {
         assert(config.ram_size > 0);
         assert(config.vcpu_count > 0);
+        assert(@intFromPtr(output.ptr) % @alignOf(FdtHeader) == 0);
 
         // Build the device tree structure
         try self.buildTree(config);
@@ -120,9 +121,8 @@ pub const DtbBuilder = struct {
         const off_dt_strings = off_dt_struct + struct_size;
         const totalsize = off_dt_strings + strings_size;
 
-        // Allocate final buffer
-        const dtb = try self.alloc.alloc(u8, totalsize);
-        errdefer self.alloc.free(dtb);
+        if (output.len < totalsize) return error.NoSpaceLeft;
+        const dtb = output[0..totalsize];
 
         // Write header
         const header = @as(*FdtHeader, @ptrCast(@alignCast(dtb.ptr)));
@@ -469,7 +469,8 @@ pub const DtbBuilder = struct {
 // =============================================================================
 
 test "DtbBuilder basic generation" {
-    const alloc = std.testing.allocator;
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counted.allocator();
     var builder = DtbBuilder.init(alloc);
     defer builder.deinit();
 
@@ -480,13 +481,16 @@ test "DtbBuilder basic generation" {
         .cmdline = "console=ttyAMA0",
     };
 
-    const dtb = try builder.generate(config);
-    defer alloc.free(dtb);
+    var output: [4096]u8 align(@alignOf(FdtHeader)) = undefined;
+    const dtb = try builder.generateInto(config, &output);
 
     // Verify magic
     const header = @as(*const FdtHeader, @ptrCast(@alignCast(dtb.ptr)));
     try std.testing.expectEqual(FDT_MAGIC, std.mem.bigToNative(u32, header.magic));
     try std.testing.expectEqual(FDT_VERSION, std.mem.bigToNative(u32, header.version));
+    try std.testing.expectEqual(@as(u32, @intCast(dtb.len)), std.mem.bigToNative(u32, header.totalsize));
+    try std.testing.expect(std.mem.bigToNative(u32, header.off_dt_strings) < dtb.len);
+    try std.testing.expectEqual(@as(usize, 9), counted.allocations);
 }
 
 test "DtbConfig defaults" {
