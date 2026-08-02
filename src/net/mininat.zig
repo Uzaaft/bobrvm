@@ -135,6 +135,11 @@ const TcpSendBuffer = struct {
     len: usize = 0,
     pool_index: ?u16 = null,
 
+    const Prefix = struct {
+        first: []const u8,
+        second: []const u8,
+    };
+
     fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!TcpSendBuffer {
         const storage = try alloc.alloc(u8, SND_BUF_MAX);
         assert(storage.len == SND_BUF_MAX);
@@ -179,15 +184,15 @@ const TcpSendBuffer = struct {
         }
     }
 
-    fn prefix(self: *const TcpSendBuffer, scratch: []u8) []const u8 {
-        assert(scratch.len > 0);
+    fn prefixParts(self: *const TcpSendBuffer, max_len: usize) Prefix {
+        assert(max_len > 0);
         assert(self.len <= self.storage.len);
-        const prefix_len = @min(self.len, scratch.len);
+        const prefix_len = @min(self.len, max_len);
         const first_len = @min(prefix_len, self.storage.len - self.head);
-        if (first_len == prefix_len) return self.storage[self.head..][0..prefix_len];
-        @memcpy(scratch[0..first_len], self.storage[self.head..][0..first_len]);
-        @memcpy(scratch[first_len..prefix_len], self.storage[0 .. prefix_len - first_len]);
-        return scratch[0..prefix_len];
+        return .{
+            .first = self.storage[self.head..][0..first_len],
+            .second = self.storage[0 .. prefix_len - first_len],
+        };
     }
 };
 
@@ -769,9 +774,15 @@ pub const MiniNat = struct {
             // A single frame, well under the hard RX cap, so it goes even
             // when rx_ok is false — retransmission must always make progress.
             if (flow.snd_buf.len > 0 and flow.rt_deadline_ns != 0 and now_ns >= flow.rt_deadline_ns) {
-                var retransmit: [TCP_MSS]u8 = undefined;
-                const payload = flow.snd_buf.prefix(&retransmit);
-                self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, payload);
+                const payload = flow.snd_buf.prefixParts(TCP_MSS);
+                self.tcpSendParts(
+                    key,
+                    flow.snd_una,
+                    flow.rcv_nxt,
+                    TCP_PSH | TCP_ACK,
+                    payload.first,
+                    payload.second,
+                );
                 flow.rto_ns = @min(flow.rto_ns * 2, MAX_RTO_NS);
                 flow.rt_deadline_ns = now_ns + flow.rto_ns;
                 flow.last_used = now;
@@ -1094,9 +1105,15 @@ pub const MiniNat = struct {
             if (outstanding > 0) {
                 flow.dup_acks +%= 1;
                 if (flow.dup_acks >= 3 and flow.snd_buf.len > 0) {
-                    var retransmit: [TCP_MSS]u8 = undefined;
-                    const payload = flow.snd_buf.prefix(&retransmit);
-                    self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, payload);
+                    const payload = flow.snd_buf.prefixParts(TCP_MSS);
+                    self.tcpSendParts(
+                        key,
+                        flow.snd_una,
+                        flow.rcv_nxt,
+                        TCP_PSH | TCP_ACK,
+                        payload.first,
+                        payload.second,
+                    );
                     flow.rt_deadline_ns = nowNanos() + flow.rto_ns;
                     flow.dup_acks = 0;
                 }
@@ -1181,9 +1198,32 @@ pub const MiniNat = struct {
     }
 
     /// Build and deliver one remote → guest TCP segment.
-    fn tcpSend(self: *MiniNat, key: TcpKey, seq: u32, ack: u32, flags: u8, payload: []const u8) void {
-        if (payload.len > TCP_MSS) return;
-        const total = ETH_HDR + 20 + 20 + payload.len;
+    fn tcpSend(
+        self: *MiniNat,
+        key: TcpKey,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: []const u8,
+    ) void {
+        assert(payload.len <= TCP_MSS);
+        assert(payload.len <= std.math.maxInt(u16));
+        self.tcpSendParts(key, seq, ack, flags, payload, &.{});
+    }
+
+    fn tcpSendParts(
+        self: *MiniNat,
+        key: TcpKey,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload_first: []const u8,
+        payload_second: []const u8,
+    ) void {
+        assert(payload_first.len <= TCP_MSS);
+        assert(payload_second.len <= TCP_MSS - payload_first.len);
+        const payload_len = payload_first.len + payload_second.len;
+        const total = ETH_HDR + 20 + 20 + payload_len;
         var fallback: [ETH_HDR + 20 + 20 + TCP_MSS]u8 = undefined;
         const reply_buffer = self.acquireReply(&fallback, total) orelse return;
         const out = reply_buffer.frame;
@@ -1195,7 +1235,7 @@ pub const MiniNat = struct {
         const ip = out[ETH_HDR..];
         @memset(ip[0..20], 0);
         ip[0] = 0x45;
-        std.mem.writeInt(u16, ip[2..4], @intCast(20 + 20 + payload.len), .big);
+        std.mem.writeInt(u16, ip[2..4], @intCast(20 + 20 + payload_len), .big);
         ip[8] = 64;
         ip[9] = 6; // TCP
         @memcpy(ip[12..16], &key.remote_ip);
@@ -1211,8 +1251,14 @@ pub const MiniNat = struct {
         tcp[12] = 5 << 4; // data offset = 5 words
         tcp[13] = flags;
         std.mem.writeInt(u16, tcp[14..16], 0xFFFF, .big); // window
-        @memcpy(tcp[20..][0..payload.len], payload);
-        std.mem.writeInt(u16, tcp[16..18], tcpChecksum(key.remote_ip, GUEST_IP, tcp[0 .. 20 + payload.len]), .big);
+        @memcpy(tcp[20..][0..payload_first.len], payload_first);
+        @memcpy(tcp[20 + payload_first.len ..][0..payload_second.len], payload_second);
+        std.mem.writeInt(
+            u16,
+            tcp[16..18],
+            tcpChecksum(key.remote_ip, GUEST_IP, tcp[0 .. 20 + payload_len]),
+            .big,
+        );
 
         self.commitReply(reply_buffer);
     }
@@ -1888,7 +1934,17 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
     try testing.expectEqual(@as(u8, 0), flow.dup_acks); // counter reset after retransmit
 }
 
-test "TcpSendBuffer preserves retransmit order across wrap" {
+test "TcpSendBuffer sends wrapped retransmit without scratch copy" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+    }
+
     var buffer = try TcpSendBuffer.init(testing.allocator);
     defer buffer.deinit(testing.allocator);
 
@@ -1901,12 +1957,39 @@ test "TcpSendBuffer preserves retransmit order across wrap" {
     for (&appended, 0..) |*byte, i| byte.* = @truncate(i + 17);
     try testing.expect(buffer.append(&appended));
 
-    var scratch: [MiniNat.TCP_MSS]u8 = undefined;
-    const prefix = buffer.prefix(&scratch);
+    const prefix = buffer.prefixParts(MiniNat.TCP_MSS);
     try testing.expectEqual(@as(usize, 1535), buffer.len);
-    try testing.expectEqual(@as(usize, MiniNat.TCP_MSS), prefix.len);
-    try testing.expectEqualSlices(u8, initial[65_000..], prefix[0..535]);
-    try testing.expectEqualSlices(u8, appended[0..865], prefix[535..]);
+    try testing.expectEqual(@as(usize, 535), prefix.first.len);
+    try testing.expectEqual(@as(usize, 865), prefix.second.len);
+    try testing.expectEqual(buffer.storage[65_000..].ptr, prefix.first.ptr);
+    try testing.expectEqual(buffer.storage.ptr, prefix.second.ptr);
+
+    test_reply_lease_len = 0;
+    test_reply_lease_committed = false;
+    const key = TcpKey{
+        .guest_port = 1234,
+        .remote_ip = .{ 93, 184, 216, 34 },
+        .remote_port = 80,
+    };
+    nat.tcpSendParts(
+        key,
+        4000,
+        5000,
+        MiniNat.TCP_PSH | MiniNat.TCP_ACK,
+        prefix.first,
+        prefix.second,
+    );
+
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expect(test_reply_lease_committed);
+    try testing.expectEqual(@as(usize, 54 + MiniNat.TCP_MSS), test_reply_lease_len);
+    const payload = test_reply_lease[54..test_reply_lease_len];
+    try testing.expectEqualSlices(u8, initial[65_000..], payload[0..535]);
+    try testing.expectEqualSlices(u8, appended[0..865], payload[535..]);
+    try testing.expectEqual(
+        @as(u16, 0),
+        MiniNat.tcpChecksum(key.remote_ip, GUEST_IP, test_reply_lease[34..test_reply_lease_len]),
+    );
 }
 
 test "TcpSendBuffer allocation profile" {
