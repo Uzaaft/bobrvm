@@ -255,10 +255,13 @@ pub const PciDevice = struct {
 /// PCIe ECAM host bridge.
 pub const EcamHost = struct {
     alloc: Allocator,
+    devices: ?*DeviceNode,
 
-    /// Bus 0 devices (we only support bus 0 for now).
-    /// Index = device * 8 + function
-    devices: [MAX_DEVICES * MAX_FUNCTIONS]?*PciDevice,
+    const DeviceNode = struct {
+        next: ?*DeviceNode,
+        index: u8,
+        device: PciDevice,
+    };
 
     pub fn init(alloc: Allocator) !*EcamHost {
         const host = try alloc.create(EcamHost);
@@ -266,7 +269,7 @@ pub const EcamHost = struct {
 
         host.* = .{
             .alloc = alloc,
-            .devices = .{null} ** (MAX_DEVICES * MAX_FUNCTIONS),
+            .devices = null,
         };
 
         log.info("initialized PCIe ECAM host at 0x{x}-0x{x}", .{ ECAM_BASE, ECAM_BASE + ECAM_SIZE });
@@ -274,20 +277,26 @@ pub const EcamHost = struct {
     }
 
     pub fn deinit(self: *EcamHost) void {
-        for (self.devices) |device| {
-            if (device) |dev| self.alloc.destroy(dev);
+        var node = self.devices;
+        while (node) |current| {
+            node = current.next;
+            self.alloc.destroy(current);
         }
         self.alloc.destroy(self);
     }
 
     pub fn addDevice(self: *EcamHost, device: u5, function: u3, dev: PciDevice) Allocator.Error!void {
         assert(dev.present);
-        const idx = @as(usize, device) * MAX_FUNCTIONS + function;
-        assert(self.devices[idx] == null);
+        const index: u8 = @intCast(@as(usize, device) * MAX_FUNCTIONS + function);
+        assert(self.findDevice(index) == null);
 
-        const stored = try self.alloc.create(PciDevice);
-        stored.* = dev;
-        self.devices[idx] = stored;
+        const node = try self.alloc.create(DeviceNode);
+        node.* = .{
+            .next = self.devices,
+            .index = index,
+            .device = dev,
+        };
+        self.devices = node;
         log.debug("added PCI device at 00:{x:0>2}.{}", .{ device, function });
     }
 
@@ -297,11 +306,19 @@ pub const EcamHost = struct {
         function: u3,
         config: *const [CONFIG_SPACE_SIZE]u8,
     ) void {
-        const idx = @as(usize, device) * MAX_FUNCTIONS + function;
-        const dev = self.devices[idx] orelse unreachable;
+        const index: u8 = @intCast(@as(usize, device) * MAX_FUNCTIONS + function);
+        const dev = self.findDevice(index) orelse unreachable;
         assert(dev.present);
         assert(config.len == CONFIG_SPACE_SIZE);
         @memcpy(&dev.config, config);
+    }
+
+    fn findDevice(self: *const EcamHost, index: u8) ?*PciDevice {
+        var node = self.devices;
+        while (node) |current| : (node = current.next) {
+            if (current.index == index) return &current.device;
+        }
+        return null;
     }
 
     pub fn read(self: *const EcamHost, addr: u64, size: u8) u64 {
@@ -312,8 +329,8 @@ pub const EcamHost = struct {
             return 0xFFFFFFFF;
         }
 
-        const idx = @as(usize, ecam.device) * MAX_FUNCTIONS + ecam.function;
-        const device = self.devices[idx] orelse return 0xFFFFFFFF;
+        const index: u8 = @intCast(@as(usize, ecam.device) * MAX_FUNCTIONS + ecam.function);
+        const device = self.findDevice(index) orelse return 0xFFFFFFFF;
         const value = device.read(ecam.reg, size);
 
         if (ecam.reg < 0x40) {
@@ -328,8 +345,8 @@ pub const EcamHost = struct {
 
         if (ecam.bus != 0) return;
 
-        const idx = @as(usize, ecam.device) * MAX_FUNCTIONS + ecam.function;
-        const device = self.devices[idx] orelse return;
+        const index: u8 = @intCast(@as(usize, ecam.device) * MAX_FUNCTIONS + ecam.function);
+        const device = self.findDevice(index) orelse return;
         device.write(ecam.reg, size, value);
 
         log.debug("ECAM write {any} reg=0x{x} size={d} <- 0x{x}", .{ ecam, ecam.reg, size, value });
