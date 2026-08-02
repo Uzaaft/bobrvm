@@ -349,6 +349,21 @@ pub const Net = struct {
                 return;
             }
         }
+        if (chain.count == 2) {
+            const header_desc = chain.descs[0];
+            const frame_desc = chain.descs[1];
+            if (!header_desc.isWrite() and !frame_desc.isWrite() and
+                header_desc.len == @sizeOf(NetHeader) and
+                frame_desc.len > 0 and frame_desc.len <= MAX_FRAME)
+            {
+                _ = get_mem(header_desc.addr, header_desc.len) orelse return;
+                const frame = get_mem(frame_desc.addr, frame_desc.len) orelse return;
+                assert(frame.len > 0);
+                assert(frame.len <= MAX_FRAME);
+                if (self.tx_callback) |cb| cb(frame, self.tx_userdata);
+                return;
+            }
+        }
 
         var frame_buf: [MAX_FRAME]u8 = undefined;
         var frame_len: usize = 0;
@@ -636,6 +651,10 @@ test "Net allocates oversized RX buffers outside the fixed slab" {
 
 var test_tx_memory: [1514]u8 = @splat(0xA5);
 var test_tx_frame: ?[]const u8 = null;
+var test_tx_split_header: [@sizeOf(NetHeader)]u8 = @splat(0);
+var test_tx_split_payload: [1500]u8 = @splat(0x5A);
+var test_tx_split_ptr: usize = 0;
+var test_tx_split_matches: bool = false;
 
 fn testTxGetMem(addr: u64, len: usize) ?[]u8 {
     if (addr != 0x1000 or len > test_tx_memory.len) return null;
@@ -644,6 +663,21 @@ fn testTxGetMem(addr: u64, len: usize) ?[]u8 {
 
 fn testTxCallback(frame: []const u8, _: ?*anyopaque) void {
     test_tx_frame = frame;
+}
+
+fn testTxSplitGetMem(addr: u64, len: usize) ?[]u8 {
+    if (addr == 0x1000 and len <= test_tx_split_header.len) {
+        return test_tx_split_header[0..len];
+    }
+    if (addr == 0x2000 and len <= test_tx_split_payload.len) {
+        return test_tx_split_payload[0..len];
+    }
+    return null;
+}
+
+fn testTxSplitCallback(frame: []const u8, _: ?*anyopaque) void {
+    test_tx_split_ptr = @intFromPtr(frame.ptr);
+    test_tx_split_matches = std.mem.eql(u8, frame, &test_tx_split_payload);
 }
 
 test "Net sends a contiguous TX payload without copying" {
@@ -660,4 +694,21 @@ test "Net sends a contiguous TX payload without copying" {
     const frame = test_tx_frame.?;
     try testing.expectEqual(test_tx_memory.len - @sizeOf(NetHeader), frame.len);
     try testing.expectEqual(@intFromPtr(&test_tx_memory) + @sizeOf(NetHeader), @intFromPtr(frame.ptr));
+}
+
+test "Net borrows a split-header TX payload without copying" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+    net.setTxCallback(testTxSplitCallback, null);
+
+    var chain: ring.Chain = .{};
+    chain.descs[0] = .{ .addr = 0x1000, .len = test_tx_split_header.len, .flags = 0, .next = 1 };
+    chain.descs[1] = .{ .addr = 0x2000, .len = test_tx_split_payload.len, .flags = 0, .next = 0 };
+    chain.count = 2;
+
+    test_tx_split_ptr = 0;
+    test_tx_split_matches = false;
+    net.transmitChain(&chain, testTxSplitGetMem);
+    try testing.expect(test_tx_split_matches);
+    try testing.expectEqual(@intFromPtr(&test_tx_split_payload), test_tx_split_ptr);
 }
