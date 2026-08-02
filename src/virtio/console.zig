@@ -109,7 +109,7 @@ pub const Console = struct {
     guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
 
     /// Multiport: named ports 1..N (empty = plain single-port console).
-    ports: std.ArrayListUnmanaged(Port) = .empty,
+    ports: []Port,
     /// Host→guest control messages awaiting control-rx buffers.
     ctrl_pending: std.ArrayListUnmanaged(PendingCtrl) = .empty,
     /// last_avail cursors for the multiport queues (control + per-port),
@@ -119,6 +119,18 @@ pub const Console = struct {
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 128;
     pub const INPUT_BUFFER_MAX: usize = 64 * 1024;
+
+    fn allocationSize(port_count: usize) usize {
+        assert(port_count <= (mmio.Transport.MAX_QUEUES - 4) / 2);
+        assert(@alignOf(Console) >= @alignOf(Port));
+
+        const ports_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(Console),
+            @alignOf(Port),
+        );
+        return ports_offset + @sizeOf(Port) * port_count;
+    }
 
     /// Queue indices for multiport port p (p >= 1).
     fn portRxQueue(port: u32) u32 {
@@ -141,8 +153,21 @@ pub const Console = struct {
         const transport = try mmio.Transport.init(alloc, 3, features, num_queues);
         errdefer transport.deinit();
 
-        const console = try alloc.create(Console);
-        errdefer alloc.destroy(console);
+        const allocation = try alloc.alignedAlloc(
+            u8,
+            .of(Console),
+            allocationSize(port_names.len),
+        );
+        errdefer alloc.free(allocation);
+
+        const console: *Console = @ptrCast(allocation.ptr);
+        const ports_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(Console),
+            @alignOf(Port),
+        );
+        const ports_ptr: [*]Port = @ptrCast(@alignCast(allocation.ptr + ports_offset));
+        const ports = ports_ptr[0..port_names.len];
         console.* = .{
             .alloc = alloc,
             .transport = transport,
@@ -155,9 +180,10 @@ pub const Console = struct {
             .output_callback = null,
             .output_userdata = null,
             .guest_memory = null,
+            .ports = ports,
         };
-        for (port_names) |name| {
-            try console.ports.append(alloc, .{ .name = name });
+        for (console.ports, port_names) |*port, name| {
+            port.* = .{ .name = name };
         }
 
         // Set up notification callback
@@ -170,13 +196,16 @@ pub const Console = struct {
     }
 
     pub fn deinit(self: *Console) void {
-        for (self.ports.items) |*port| port.input_buffer.deinit(self.alloc);
-        self.ports.deinit(self.alloc);
+        for (self.ports) |*port| port.input_buffer.deinit(self.alloc);
         self.ctrl_pending.deinit(self.alloc);
         self.output_buffer.deinit(self.alloc);
         self.input_buffer.deinit(self.alloc);
         self.transport.deinit();
-        self.alloc.destroy(self);
+
+        const alloc = self.alloc;
+        const allocation_len = allocationSize(self.ports.len);
+        const allocation_ptr: [*]align(@alignOf(Console)) u8 = @ptrCast(self);
+        alloc.free(allocation_ptr[0..allocation_len]);
     }
 
     /// Attach a guest→host data sink for multiport port `id` (1-based).
@@ -186,26 +215,26 @@ pub const Console = struct {
         callback: *const fn ([]const u8, ?*anyopaque) void,
         userdata: ?*anyopaque,
     ) void {
-        assert(id >= 1 and id <= self.ports.items.len);
-        self.ports.items[id - 1].output_callback = callback;
-        self.ports.items[id - 1].output_userdata = userdata;
+        assert(id >= 1 and id <= self.ports.len);
+        self.ports[id - 1].output_callback = callback;
+        self.ports[id - 1].output_userdata = userdata;
     }
 
     /// Queue host→guest data for multiport port `id` (1-based). Same
     /// threading contract as queueInput.
     pub fn queuePortInput(self: *Console, id: u32, data: []const u8) Error!void {
-        assert(id >= 1 and id <= self.ports.items.len);
+        assert(id >= 1 and id <= self.ports.len);
         self.input_mutex.lockUncancelable(global.io());
         defer self.input_mutex.unlock(global.io());
-        const port = &self.ports.items[id - 1];
+        const port = &self.ports[id - 1];
         if (port.input_buffer.items.len + data.len > INPUT_BUFFER_MAX) return;
         try port.input_buffer.appendSlice(self.alloc, data);
     }
 
     /// Whether the guest has opened multiport port `id` (1-based).
     pub fn portGuestOpen(self: *Console, id: u32) bool {
-        assert(id >= 1 and id <= self.ports.items.len);
-        return self.ports.items[id - 1].guest_open;
+        assert(id >= 1 and id <= self.ports.len);
+        return self.ports[id - 1].guest_open;
     }
 
     /// Set output callback (called when guest writes to console).
@@ -293,7 +322,7 @@ pub const Console = struct {
                 const port_base = 4;
                 if (queue_idx < port_base) return;
                 const p: u32 = (queue_idx - port_base) / 2 + 1;
-                if (p > self.ports.items.len) return;
+                if (p > self.ports.len) return;
                 if ((queue_idx - port_base) % 2 == 0) {
                     self.processPortRx(p);
                 } else {
@@ -344,7 +373,7 @@ pub const Console = struct {
                 if (msg.value != 1) return;
                 // Announce every port (0 = the console, 1..N = named).
                 var p: u32 = 0;
-                while (p <= self.ports.items.len) : (p += 1) {
+                while (p <= self.ports.len) : (p += 1) {
                     self.queueCtrl(p, .device_add, 0, &.{});
                 }
             },
@@ -354,8 +383,8 @@ pub const Console = struct {
                     // Port 0 is the console (hvc0).
                     self.queueCtrl(0, .console_port, 1, &.{});
                     self.queueCtrl(0, .port_open, 1, &.{});
-                } else if (msg.id <= self.ports.items.len) {
-                    const port = &self.ports.items[msg.id - 1];
+                } else if (msg.id <= self.ports.len) {
+                    const port = &self.ports[msg.id - 1];
                     self.queueCtrl(msg.id, .port_name, 1, port.name);
                     // Host side is considered always-open: guest agents may
                     // write immediately; data is dropped until a host
@@ -364,8 +393,8 @@ pub const Console = struct {
                 }
             },
             .port_open => {
-                if (msg.id >= 1 and msg.id <= self.ports.items.len) {
-                    self.ports.items[msg.id - 1].guest_open = msg.value == 1;
+                if (msg.id >= 1 and msg.id <= self.ports.len) {
+                    self.ports[msg.id - 1].guest_open = msg.value == 1;
                 }
             },
             else => {},
@@ -412,7 +441,7 @@ pub const Console = struct {
         const qc = self.transport.queues[qidx];
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
-        const port = &self.ports.items[p - 1];
+        const port = &self.ports[p - 1];
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
         var processed: u32 = 0;
@@ -437,7 +466,7 @@ pub const Console = struct {
         const qc = self.transport.queues[qidx];
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
-        const port = &self.ports.items[p - 1];
+        const port = &self.ports[p - 1];
         // Flow control: the guest driver discards rx data on ports it
         // hasn't opened. Hold data in the host buffer until PORT_OPEN so
         // nothing sent early is silently lost.
@@ -547,9 +576,9 @@ pub const Console = struct {
     /// Poll the transmit queues. Can be called from vCPU loop.
     pub fn pollTransmit(self: *Console) void {
         self.processTransmitQueue();
-        if (self.ports.items.len > 0) {
+        if (self.ports.len > 0) {
             self.processControlTx();
-            for (1..self.ports.items.len + 1) |p| self.processPortTx(@intCast(p));
+            for (1..self.ports.len + 1) |p| self.processPortTx(@intCast(p));
         }
     }
 
@@ -558,9 +587,9 @@ pub const Console = struct {
     /// thread.
     pub fn pollReceive(self: *Console) void {
         self.processReceiveQueue();
-        if (self.ports.items.len > 0) {
+        if (self.ports.len > 0) {
             self.processControlRx();
-            for (1..self.ports.items.len + 1) |p| self.processPortRx(@intCast(p));
+            for (1..self.ports.len + 1) |p| self.processPortRx(@intCast(p));
         }
     }
 

@@ -307,8 +307,8 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
     try out.int(u16, con.transmit_last_avail);
     try out.blob(con.input_buffer.items);
     for (con.mp_last_avail) |cursor| try out.int(u16, cursor);
-    try out.int(u8, @intCast(con.ports.items.len));
-    for (con.ports.items) |port| {
+    try out.int(u8, @intCast(con.ports.len));
+    for (con.ports) |port| {
         try out.int(u8, @intFromBool(port.guest_open));
         try out.blob(port.input_buffer.items);
     }
@@ -325,8 +325,8 @@ pub fn deserializeConsole(alloc: Allocator, con: *virtio.Console, data: []const 
     try con.input_buffer.appendSlice(alloc, input);
     for (&con.mp_last_avail) |*cursor| cursor.* = try cur.int(u16);
     const nports = try cur.int(u8);
-    if (nports != con.ports.items.len) return error.Mismatch;
-    for (con.ports.items) |*port| {
+    if (nports != con.ports.len) return error.Mismatch;
+    for (con.ports) |*port| {
         port.guest_open = (try cur.int(u8)) != 0;
         const pbuf = try cur.blob();
         port.input_buffer.clearRetainingCapacity();
@@ -542,7 +542,7 @@ test "snapshot: console device roundtrip (multiport)" {
     con.receive_last_avail = 17;
     try con.queueInput("pending host input");
     try con.queuePortInput(1, "agent bytes");
-    con.ports.items[0].guest_open = true;
+    con.ports[0].guest_open = true;
 
     const data = try serializeConsole(testing.allocator, con);
     defer testing.allocator.free(data);
@@ -556,8 +556,8 @@ test "snapshot: console device roundtrip (multiport)" {
     try testing.expectEqual(@as(u64, 0x4000_0000), con2.transport.queues[0].desc_addr);
     try testing.expectEqual(@as(u16, 17), con2.receive_last_avail);
     try testing.expectEqualStrings("pending host input", con2.input_buffer.items);
-    try testing.expectEqualStrings("agent bytes", con2.ports.items[0].input_buffer.items);
-    try testing.expect(con2.ports.items[0].guest_open);
+    try testing.expectEqualStrings("agent bytes", con2.ports[0].input_buffer.items);
+    try testing.expect(con2.ports[0].guest_open);
 }
 
 test "snapshot: gpu 2D framebuffer survives roundtrip" {
