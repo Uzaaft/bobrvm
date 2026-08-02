@@ -714,17 +714,12 @@ pub const GpuDevice = struct {
                         const index = try dec.readU32();
                         const nwords: u16 = header.length - 2;
                         if (index == 0 and shader_type < 6) {
-                            var cbuf: [4096]u8 = undefined;
-                            const n = @min(@as(usize, nwords) * 4, cbuf.len);
-                            var w: usize = 0;
-                            while (w * 4 < n) : (w += 1) {
-                                std.mem.writeInt(u32, cbuf[w * 4 ..][0..4], try dec.readU32(), .little);
-                            }
+                            const words_max = virgl.Context.INLINE_CONSTANT_BYTES_MAX / 4;
+                            const words_len: u16 = @intCast(@min(nwords, words_max));
+                            const words = try dec.payload(words_len);
+                            ctx.setConstants(shader_type, std.mem.sliceAsBytes(words));
                             // Words beyond our 4KB inline cap are dropped.
-                            if (@as(usize, nwords) * 4 > n) {
-                                dec.skip(@intCast(nwords - n / 4));
-                            }
-                            ctx.setConstants(shader_type, cbuf[0..n]);
+                            if (nwords > words_len) dec.skip(nwords - words_len);
                             stats.noteConsts(shader_type, index, nwords);
                         } else {
                             dec.skip(nwords);
