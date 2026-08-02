@@ -111,29 +111,47 @@ pub const VMConfig = extern struct {
         return if (slice.len == 0) null else slice;
     }
 
-    /// Dupe a C string to owned slice.
-    fn dupeString(alloc: Allocator, ptr: ?[*:0]const u8) Allocator.Error!?[]const u8 {
-        if (ptr) |p| {
-            const slice = std.mem.span(p);
-            if (slice.len == 0) return null;
-            return try alloc.dupe(u8, slice);
-        }
-        return null;
-    }
-
     /// Create owned copy of all string fields.
     pub fn dupe(self: VMConfig, alloc: Allocator) Allocator.Error!OwnedVMConfig {
+        const strings = [_]?[]const u8{
+            optionalString(self.firmware_path),
+            optionalString(self.vars_path),
+            optionalString(self.kernel_path),
+            optionalString(self.initrd_path),
+            optionalString(self.cmdline),
+            optionalString(self.disk_path),
+            optionalString(self.disk2_path),
+        };
+        var total: usize = 0;
+        for (strings) |string| {
+            if (string) |value| {
+                total = std.math.add(usize, total, value.len) catch return error.OutOfMemory;
+            }
+        }
+
+        const storage: []u8 = if (total > 0) try alloc.alloc(u8, total) else @constCast(&.{});
+        var owned_strings: [strings.len]?[]const u8 = @splat(null);
+        var offset: usize = 0;
+        for (strings, 0..) |string, index| {
+            const value = string orelse continue;
+            @memcpy(storage[offset..][0..value.len], value);
+            owned_strings[index] = storage[offset..][0..value.len];
+            offset += value.len;
+        }
+        assert(offset == storage.len);
+
         return OwnedVMConfig{
             .memory_bytes = self.memory_bytes,
             .vcpu_count = self.vcpu_count,
-            .firmware_path = try dupeString(alloc, self.firmware_path),
-            .vars_path = try dupeString(alloc, self.vars_path),
-            .kernel_path = try dupeString(alloc, self.kernel_path),
-            .initrd_path = try dupeString(alloc, self.initrd_path),
-            .cmdline = try dupeString(alloc, self.cmdline),
-            .disk_path = try dupeString(alloc, self.disk_path),
+            .string_storage = storage,
+            .firmware_path = owned_strings[0],
+            .vars_path = owned_strings[1],
+            .kernel_path = owned_strings[2],
+            .initrd_path = owned_strings[3],
+            .cmdline = owned_strings[4],
+            .disk_path = owned_strings[5],
             .disk_read_only = self.disk_read_only,
-            .disk2_path = try dupeString(alloc, self.disk2_path),
+            .disk2_path = owned_strings[6],
             .disk2_read_only = self.disk2_read_only,
             .enable_net = self.enable_net,
             .display_width = self.display_width,
@@ -148,6 +166,7 @@ pub const VMConfig = extern struct {
 pub const OwnedVMConfig = struct {
     memory_bytes: u64,
     vcpu_count: u8,
+    string_storage: []u8 = &.{},
     firmware_path: ?[]const u8 = null,
     vars_path: ?[]const u8 = null,
     kernel_path: ?[]const u8 = null,
@@ -164,13 +183,7 @@ pub const OwnedVMConfig = struct {
     enable_gpu3d: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
-        if (self.firmware_path) |p| alloc.free(p);
-        if (self.vars_path) |p| alloc.free(p);
-        if (self.kernel_path) |p| alloc.free(p);
-        if (self.initrd_path) |p| alloc.free(p);
-        if (self.cmdline) |p| alloc.free(p);
-        if (self.disk_path) |p| alloc.free(p);
-        if (self.disk2_path) |p| alloc.free(p);
+        if (self.string_storage.len > 0) alloc.free(self.string_storage);
         self.* = .{ .memory_bytes = 0, .vcpu_count = 0 };
     }
 };
@@ -877,4 +890,28 @@ test "VMConfig validation" {
 
     const invalid_cpu = VMConfig{ .memory_bytes = 1024, .vcpu_count = 0 };
     assert(!invalid_cpu.validate());
+}
+
+test "VMConfig owns strings in one allocation" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counted.allocator();
+    const cfg = VMConfig{
+        .memory_bytes = 1024,
+        .vcpu_count = 1,
+        .firmware_path = "firmware.fd",
+        .vars_path = "vars.fd",
+        .kernel_path = "kernel",
+        .initrd_path = "initrd",
+        .cmdline = "console=hvc0",
+        .disk_path = "disk.raw",
+        .disk2_path = "install.iso",
+    };
+
+    var owned = try cfg.dupe(alloc);
+    defer owned.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqualStrings("firmware.fd", owned.firmware_path.?);
+    try std.testing.expectEqualStrings("console=hvc0", owned.cmdline.?);
+    try std.testing.expectEqualStrings("install.iso", owned.disk2_path.?);
 }
