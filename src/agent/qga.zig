@@ -33,6 +33,7 @@ pub const Qga = struct {
     guest_ips: std.ArrayListUnmanaged(u8) = .empty,
 
     pub const LINE_MAX: usize = 64 * 1024;
+    const parse_scratch_bytes = 8 * 1024;
 
     pub fn init(alloc: Allocator, send_fn: SendFn, userdata: ?*anyopaque) Qga {
         return .{ .alloc = alloc, .send_fn = send_fn, .send_userdata = userdata };
@@ -134,7 +135,13 @@ pub const Qga = struct {
         const trimmed = std.mem.trim(u8, line, " \r\t");
         if (trimmed.len == 0) return;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, trimmed, .{}) catch {
+        var stack_allocator = std.heap.stackFallback(parse_scratch_bytes, self.alloc);
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            stack_allocator.get(),
+            trimmed,
+            .{},
+        ) catch {
             log.debug("unparseable agent line ({} bytes)", .{trimmed.len});
             return;
         };
@@ -258,6 +265,21 @@ test "qga: partial line assembly allocation profile" {
     try testing.expectEqual(@as(usize, 1664), counted.allocated_bytes);
     try testing.expectEqual(@as(usize, 0), counted.resize_index);
     try testing.expectEqual(input.len, qga.line_buf.items.len);
+}
+
+test "qga: sync response JSON parse allocation profile" {
+    var qga = Qga.init(testing.allocator, testSend, null);
+    defer qga.deinit();
+    try qga.line_buf.ensureTotalCapacity(testing.allocator, 64);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    qga.alloc = counted.allocator();
+
+    qga.feed("{\"return\":42}\n");
+    qga.alloc = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(i64, 42), qga.last_sync_id.?);
 }
 
 test "qga: guest-network-get-interfaces parses ipv4 addresses" {
