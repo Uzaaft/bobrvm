@@ -1559,16 +1559,25 @@ pub const Gpu = struct {
         // Fallback: read the rendered pixels back into a host buffer.
         self.scanout3d_direct = false;
         const needed = @as(usize, res.width) * res.height * 4;
-        if (self.scanout3d_data.len != needed) {
-            const nb = if (self.scanout3d_data.len == 0)
-                self.alloc.alloc(u8, needed) catch return
-            else
-                self.alloc.realloc(self.scanout3d_data, needed) catch return;
-            self.scanout3d_data = nb;
-        }
+        if (!self.ensureScanout3dCapacity(needed)) return;
         if (!self.gpu_device.readbackResource(id, self.scanout3d_data)) return;
         self.scanout3d_w = res.width;
         self.scanout3d_h = res.height;
+    }
+
+    fn ensureScanout3dCapacity(self: *Gpu, needed: usize) bool {
+        assert(needed > 0);
+        assert(needed <= @as(usize, MAX_RESOURCE_DIM) * MAX_RESOURCE_DIM * 4);
+        if (self.scanout3d_data.len >= needed) return true;
+
+        const growth = self.scanout3d_data.len + self.scanout3d_data.len / 2;
+        const capacity = @max(needed, growth);
+        const buffer = if (self.scanout3d_data.len == 0)
+            self.alloc.alloc(u8, capacity) catch return false
+        else
+            self.alloc.realloc(self.scanout3d_data, capacity) catch return false;
+        self.scanout3d_data = buffer;
+        return true;
     }
 
     fn cmdTransferToHost2D(self: *Gpu, req: []const u8, get_mem: ring.GetMemFn) CmdType {
@@ -3042,4 +3051,21 @@ test "guest modeset at new size after resizeDisplay" {
     const view = gpu.scanout().?;
     try testing.expectEqual(@as(u32, 640), view.width);
     try testing.expectEqual(@as(u32, 480), view.height);
+}
+
+test "3D scanout capacity amortizes incremental growth" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    gpu.alloc = counted.allocator();
+    defer gpu.deinit();
+
+    for (0..64) |step| {
+        try testing.expect(gpu.ensureScanout3dCapacity(4096 + step * 4));
+    }
+    try testing.expect(gpu.ensureScanout3dCapacity(4096));
+
+    try testing.expectEqual(@as(usize, 2), counted.allocations);
+    try testing.expectEqual(@as(usize, 10_240), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 6144), gpu.scanout3d_data.len);
 }
