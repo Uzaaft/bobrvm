@@ -2178,7 +2178,7 @@ pub const Machine = struct {
     }
 
     fn initEcam(self: *Machine) !void {
-        self.ecam_host = try pci.EcamHost.init(self.alloc);
+        self.ecam_host = try pci.EcamHost.init(self.alloc, self.config.disk_path != null);
         log.debug("initialized PCIe ECAM at 0x{x}-0x{x}", .{
             MemoryLayout.ECAM_BASE,
             MemoryLayout.ECAM_BASE + MemoryLayout.ECAM_SIZE,

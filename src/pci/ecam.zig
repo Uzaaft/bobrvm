@@ -260,16 +260,43 @@ pub const EcamHost = struct {
     const DeviceNode = struct {
         next: ?*DeviceNode,
         index: u8,
+        embedded: bool,
+        occupied: bool,
         device: PciDevice,
     };
 
-    pub fn init(alloc: Allocator) !*EcamHost {
-        const host = try alloc.create(EcamHost);
-        errdefer alloc.destroy(host);
+    pub fn init(alloc: Allocator, reserve_first_device: bool) !*EcamHost {
+        comptime {
+            assert(@alignOf(EcamHost) >= @alignOf(DeviceNode));
+            const LegacyDeviceNode = struct {
+                next: ?*DeviceNode,
+                index: u8,
+                device: PciDevice,
+            };
+            assert(@sizeOf(DeviceNode) == @sizeOf(LegacyDeviceNode));
+        }
+        const allocation_bytes = @sizeOf(EcamHost) +
+            @as(usize, @intFromBool(reserve_first_device)) * @sizeOf(DeviceNode);
+        const allocation = try alloc.alignedAlloc(u8, .of(EcamHost), allocation_bytes);
+        errdefer alloc.free(allocation);
+        const host: *EcamHost = @ptrCast(allocation.ptr);
+        const embedded_node: ?*DeviceNode = if (reserve_first_device)
+            @ptrCast(@alignCast(allocation.ptr + @sizeOf(EcamHost)))
+        else
+            null;
+        if (embedded_node) |node| {
+            node.* = .{
+                .next = null,
+                .index = 0,
+                .embedded = true,
+                .occupied = false,
+                .device = undefined,
+            };
+        }
 
         host.* = .{
             .alloc = alloc,
-            .devices = null,
+            .devices = embedded_node,
         };
 
         log.info("initialized PCIe ECAM host at 0x{x}-0x{x}", .{ ECAM_BASE, ECAM_BASE + ECAM_SIZE });
@@ -278,11 +305,20 @@ pub const EcamHost = struct {
 
     pub fn deinit(self: *EcamHost) void {
         var node = self.devices;
+        var embedded = false;
         while (node) |current| {
             node = current.next;
-            self.alloc.destroy(current);
+            if (current.embedded) {
+                assert(!embedded);
+                embedded = true;
+            } else {
+                self.alloc.destroy(current);
+            }
         }
-        self.alloc.destroy(self);
+        const allocation_bytes = @sizeOf(EcamHost) +
+            @as(usize, @intFromBool(embedded)) * @sizeOf(DeviceNode);
+        const allocation_ptr: [*]align(@alignOf(EcamHost)) u8 = @ptrCast(self);
+        self.alloc.free(allocation_ptr[0..allocation_bytes]);
     }
 
     pub fn addDevice(self: *EcamHost, device: u5, function: u3, dev: PciDevice) Allocator.Error!void {
@@ -290,10 +326,24 @@ pub const EcamHost = struct {
         const index: u8 = @intCast(@as(usize, device) * MAX_FUNCTIONS + function);
         assert(self.findDevice(index) == null);
 
+        var available = self.devices;
+        while (available) |node| : (available = node.next) {
+            if (!node.occupied) {
+                assert(node.embedded);
+                node.index = index;
+                node.device = dev;
+                node.occupied = true;
+                log.debug("added PCI device at 00:{x:0>2}.{}", .{ device, function });
+                return;
+            }
+        }
+
         const node = try self.alloc.create(DeviceNode);
         node.* = .{
             .next = self.devices,
             .index = index,
+            .embedded = false,
+            .occupied = true,
             .device = dev,
         };
         self.devices = node;
@@ -316,7 +366,7 @@ pub const EcamHost = struct {
     fn findDevice(self: *const EcamHost, index: u8) ?*PciDevice {
         var node = self.devices;
         while (node) |current| : (node = current.next) {
-            if (current.index == index) return &current.device;
+            if (current.occupied and current.index == index) return &current.device;
         }
         return null;
     }
@@ -403,7 +453,7 @@ test "PciDevice virtio block" {
 
 test "EcamHost basic" {
     const alloc = std.testing.allocator;
-    const host = try EcamHost.init(alloc);
+    const host = try EcamHost.init(alloc, true);
     defer host.deinit();
 
     // Nonexistent device returns 0xFFFFFFFF
@@ -416,4 +466,43 @@ test "EcamHost basic" {
     // Now it should return vendor ID
     const vendor = host.read(ECAM_BASE, 2);
     try std.testing.expectEqual(@as(u64, 0x1AF4), vendor);
+}
+
+test "EcamHost first device allocation profile" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const host = try EcamHost.init(counted.allocator(), true);
+    defer host.deinit();
+
+    try host.addDevice(0, 0, PciDevice.initVirtioBlock(0x10000000));
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(
+        @sizeOf(EcamHost) + @sizeOf(EcamHost.DeviceNode),
+        counted.allocated_bytes,
+    );
+}
+
+test "EcamHost without reserved devices stays compact" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const host = try EcamHost.init(counted.allocator(), false);
+    defer host.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@sizeOf(EcamHost), counted.allocated_bytes);
+}
+
+test "EcamHost reserved node falls back for additional devices" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const host = try EcamHost.init(counted.allocator(), true);
+    defer host.deinit();
+
+    try host.addDevice(0, 0, PciDevice.initVirtioBlock(0x10000000));
+    try host.addDevice(1, 0, PciDevice.initVirtioBlock(0x10001000));
+
+    try std.testing.expectEqual(@as(usize, 2), counted.allocations);
+    try std.testing.expectEqual(
+        @sizeOf(EcamHost) + 2 * @sizeOf(EcamHost.DeviceNode),
+        counted.allocated_bytes,
+    );
+    try std.testing.expectEqual(@as(u64, 0x1AF4), host.read(ECAM_BASE + (1 << 15), 2));
 }
