@@ -316,8 +316,13 @@ enum VMStorage {
 
         var vmConfig: VMConfig {
             // Use stored firmware path, or fall back to bundled firmware
-            // Treat empty string as nil
-            let storedFirmware = (firmwarePath?.isEmpty == false) ? firmwarePath : nil
+            // Treat empty or stale paths as nil.
+            let storedFirmware: String? = firmwarePath.flatMap { path -> String? in
+                guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+                    return nil
+                }
+                return path
+            }
             let bundledFirmware = Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd")
 
             // Debug: print to stderr so it shows in zig build run output
