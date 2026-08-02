@@ -175,9 +175,11 @@ pub const Context = struct {
     // Inline constants (set_constant_buffer): raw little-endian float
     // words per stage (0 = vertex, 1 = fragment; other stages accepted
     // but unused by the Metal translator so far).
-    const_data: [6]std.ArrayListUnmanaged(u8),
+    const_data: [6][INLINE_CONSTANT_BYTES_MAX]u8,
+    const_data_len: [6]u16,
 
     pub const Error = Allocator.Error;
+    pub const INLINE_CONSTANT_BYTES_MAX: usize = 4096;
 
     pub fn init(alloc: Allocator, id: u32) Error!*Context {
         const ctx = try alloc.create(Context);
@@ -210,22 +212,28 @@ pub const Context = struct {
             .ubo_handles = .{.{0} ** 16} ** 6,
             .ubo_offsets = .{.{0} ** 16} ** 6,
             .ubo_sizes = .{.{0} ** 16} ** 6,
-            .const_data = .{std.ArrayListUnmanaged(u8).empty} ** 6,
+            .const_data = undefined,
+            .const_data_len = .{0} ** 6,
         };
         return ctx;
     }
 
     /// Replace the inline constant block for a shader stage.
-    pub fn setConstants(self: *Context, stage: usize, data: []const u8) Error!void {
+    pub fn setConstants(self: *Context, stage: usize, data: []const u8) void {
         if (stage >= self.const_data.len) return;
-        self.const_data[stage].clearRetainingCapacity();
-        try self.const_data[stage].appendSlice(self.alloc, data);
+        if (data.len > INLINE_CONSTANT_BYTES_MAX) return;
+        assert(stage < self.const_data.len);
+        assert(data.len <= self.const_data[stage].len);
+        @memcpy(self.const_data[stage][0..data.len], data);
+        self.const_data_len[stage] = @intCast(data.len);
     }
 
     /// Inline constants for a stage ([] if never set).
     pub fn constants(self: *const Context, stage: usize) []const u8 {
         if (stage >= self.const_data.len) return &.{};
-        return self.const_data[stage].items;
+        assert(stage < self.const_data.len);
+        assert(self.const_data_len[stage] <= self.const_data[stage].len);
+        return self.const_data[stage][0..self.const_data_len[stage]];
     }
 
     /// Bind a buffer resource as uniform-buffer `index` for a stage
@@ -273,7 +281,6 @@ pub const Context = struct {
         self.shaders.deinit();
         self.surfaces.deinit();
         self.sampler_views.deinit();
-        for (&self.const_data) |*cd| cd.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -500,4 +507,19 @@ test "Context shader capture allocation profile" {
 
     try std.testing.expectEqual(@as(usize, 1), counted.allocations);
     try std.testing.expectEqual(@as(usize, 4), counted.allocated_bytes);
+}
+
+test "Context inline constants allocation profile" {
+    var ctx = try Context.init(std.testing.allocator, 1);
+    defer ctx.deinit();
+
+    const constants = [_]u8{0x3F} ** 16;
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    ctx.alloc = counted.allocator();
+    ctx.setConstants(0, &constants);
+    ctx.alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try std.testing.expectEqualSlices(u8, &constants, ctx.constants(0));
 }

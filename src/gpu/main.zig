@@ -724,7 +724,7 @@ pub const GpuDevice = struct {
                             if (@as(usize, nwords) * 4 > n) {
                                 dec.skip(@intCast(nwords - n / 4));
                             }
-                            ctx.setConstants(shader_type, cbuf[0..n]) catch {};
+                            ctx.setConstants(shader_type, cbuf[0..n]);
                             stats.noteConsts(shader_type, index, nwords);
                         } else {
                             dec.skip(nwords);
