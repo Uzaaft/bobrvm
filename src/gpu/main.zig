@@ -1184,7 +1184,8 @@ pub const GpuDevice = struct {
     }
 
     noinline fn translateShader(self: *GpuDevice, text: []const u8) !virgl.tgsi.Msl {
-        const program = try virgl.tgsi.parse(text);
+        var program: virgl.tgsi.Program = undefined;
+        try virgl.tgsi.parseInto(&program, text);
         return virgl.tgsi.emit(self.alloc, &program);
     }
 

@@ -206,9 +206,16 @@ fn stripLeadingNumber(line: []const u8) []const u8 {
 
 /// Parse TGSI text into a Program.
 pub fn parse(text: []const u8) Error!Program {
+    var prog: Program = undefined;
+    try parseInto(&prog, text);
+    return prog;
+}
+
+/// Parse TGSI directly into caller-provided storage.
+pub fn parseInto(prog: *Program, text: []const u8) Error!void {
     // Field defaults apply (n_* = 0, uses_* = false); `undefined` would
     // leave the bool flags as garbage when never set by trackOperand.
-    var prog: Program = .{ .stage = .vertex };
+    prog.* = .{ .stage = .vertex };
 
     var have_header = false;
 
@@ -237,20 +244,19 @@ pub fn parse(text: []const u8) Error!Program {
         }
 
         if (std.mem.startsWith(u8, line, "DCL ")) {
-            try parseDecl(&prog, line[4..]);
+            try parseDecl(prog, line[4..]);
             continue;
         }
         if (std.mem.startsWith(u8, line, "IMM")) {
-            parseImm(&prog, line);
+            parseImm(prog, line);
             continue;
         }
         if (std.mem.startsWith(u8, line, "PROPERTY")) continue;
 
-        try parseInstr(&prog, stripLeadingNumber(line));
+        try parseInstr(prog, stripLeadingNumber(line));
     }
 
     if (!have_header) return Error.NoHeader;
-    return prog;
 }
 
 fn parseDecl(prog: *Program, rest: []const u8) Error!void {
