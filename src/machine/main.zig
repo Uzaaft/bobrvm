@@ -363,15 +363,28 @@ pub const Machine = struct {
             config.vcpu_count,
         });
 
-        const machine = try alloc.create(Machine);
-        errdefer alloc.destroy(machine);
+        comptime assert(@alignOf(Machine) >= @alignOf(VcpuRunState));
+        const cpu_states_bytes = std.math.mul(
+            usize,
+            config.vcpu_count,
+            @sizeOf(VcpuRunState),
+        ) catch return error.OutOfMemory;
+        const allocation_bytes = std.math.add(usize, @sizeOf(Machine), cpu_states_bytes) catch
+            return error.OutOfMemory;
+        const allocation = try alloc.alignedAlloc(u8, .of(Machine), allocation_bytes);
+        errdefer alloc.free(allocation);
+        const machine: *Machine = @ptrCast(allocation.ptr);
+        const cpu_states_ptr: [*]VcpuRunState = @ptrCast(@alignCast(
+            allocation.ptr + @sizeOf(Machine),
+        ));
+        const cpu_states = cpu_states_ptr[0..config.vcpu_count];
 
         machine.* = .{
             .alloc = alloc,
             .config = config,
             .vcpus = .empty,
+            .cpu_states = cpu_states,
         };
-        machine.cpu_states = try alloc.alloc(VcpuRunState, config.vcpu_count);
         for (machine.cpu_states) |*state| state.* = .{};
 
         return machine;
@@ -470,12 +483,11 @@ pub const Machine = struct {
         // Clean up hypervisor (vCPUs then VM)
         self.cleanupHypervisor();
         self.vcpus.deinit(self.alloc);
-        if (self.cpu_states.len > 0) {
-            self.alloc.free(self.cpu_states);
-            self.cpu_states = &.{};
-        }
+        const allocation_bytes = @sizeOf(Machine) + self.cpu_states.len * @sizeOf(VcpuRunState);
+        self.cpu_states = &.{};
 
-        self.alloc.destroy(self);
+        const allocation_ptr: [*]align(@alignOf(Machine)) u8 = @ptrCast(self);
+        self.alloc.free(allocation_ptr[0..allocation_bytes]);
     }
 
     /// Set frame ready callback (must be called before start).
@@ -2761,4 +2773,20 @@ test "MachineConfig.blockDeviceCount" {
         .disk2_path = "/disk2",
     };
     try testing.expectEqual(@as(u8, 2), two_disks.blockDeviceCount());
+}
+
+test "Machine and CPU states allocation profile" {
+    const testing = std.testing;
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const config = MachineConfig{ .vcpu_count = 2 };
+
+    const machine = try Machine.init(counted.allocator(), config);
+    defer machine.deinit();
+
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(
+        @sizeOf(Machine) + @as(usize, config.vcpu_count) * @sizeOf(VcpuRunState),
+        counted.allocated_bytes,
+    );
+    try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
 }
