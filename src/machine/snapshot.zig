@@ -27,6 +27,7 @@ const log = std.log.scoped(.snapshot);
 
 pub const MAGIC = "BBRSNAP1";
 pub const VERSION: u32 = 1;
+const gic_section_scratch_bytes = 2 * 1024;
 
 // =============================================================================
 // vCPU state
@@ -258,6 +259,20 @@ pub fn serializeGic(alloc: Allocator, gic: *const gic_mod.Gic) ![]u8 {
     const result = out.buf.items;
     out.buf = .empty;
     return result;
+}
+
+pub fn appendGicSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    gic: *const gic_mod.Gic,
+) !void {
+    assert(gic.num_cpus > 0);
+    assert(gic.num_cpus <= gic_mod.MAX_VCPUS);
+    var stack_allocator = std.heap.stackFallback(gic_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeGic(scratch_alloc, gic);
+    defer scratch_alloc.free(data);
+    try builder.section("gic", data);
 }
 
 pub fn deserializeGic(gic: *gic_mod.Gic, data: []const u8) !void {
@@ -621,6 +636,25 @@ test "snapshot: gic state roundtrip" {
     try testing.expectEqual(@as(u8, 1), gic2.spis[10].target_cpu);
     try testing.expectEqual(@as(u32, 7), gic2.redists[1].waker);
     try testing.expect(gic2.redists[1].sgi_ppi[27].pending);
+}
+
+test "snapshot: GIC section assembly allocation profile" {
+    const gic = try gic_mod.Gic.init(testing.allocator, 2);
+    defer gic.deinit();
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendGicSection(&builder, alloc, gic);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(usize, 3), counted.allocations);
+    try testing.expectEqual(@as(usize, 1810), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 593), reader.section("gic").?.len);
 }
 
 test "snapshot: console device roundtrip (multiport)" {

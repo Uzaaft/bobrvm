@@ -851,9 +851,7 @@ pub const Machine = struct {
         }
 
         if (self.gic_device) |gic_dev| {
-            const data = try snapshot.serializeGic(alloc, gic_dev);
-            defer alloc.free(data);
-            try builder.section("gic", data);
+            try snapshot.appendGicSection(&builder, alloc, gic_dev);
         }
         if (self.console) |con| {
             const data = try snapshot.serializeConsole(alloc, con);
