@@ -115,6 +115,60 @@ const DEFAULT_SND_WND: u32 = 65535;
 const INITIAL_RTO_NS: i64 = 250 * std.time.ns_per_ms;
 const MAX_RTO_NS: i64 = 4 * std.time.ns_per_s;
 
+const TcpSendBuffer = struct {
+    storage: []u8 = &.{},
+    head: usize = 0,
+    len: usize = 0,
+
+    fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!TcpSendBuffer {
+        const storage = try alloc.alloc(u8, SND_BUF_MAX);
+        assert(storage.len == SND_BUF_MAX);
+        assert(storage.len > 0);
+        return .{ .storage = storage };
+    }
+
+    fn deinit(self: *TcpSendBuffer, alloc: std.mem.Allocator) void {
+        assert(self.head < self.storage.len or self.storage.len == 0);
+        assert(self.len <= self.storage.len);
+        if (self.storage.len > 0) alloc.free(self.storage);
+        self.* = .{};
+    }
+
+    fn append(self: *TcpSendBuffer, data: []const u8) bool {
+        assert(self.storage.len == SND_BUF_MAX);
+        assert(self.len <= self.storage.len);
+        if (data.len > self.storage.len - self.len) return false;
+        const tail = (self.head + self.len) % self.storage.len;
+        const first_len = @min(data.len, self.storage.len - tail);
+        @memcpy(self.storage[tail..][0..first_len], data[0..first_len]);
+        @memcpy(self.storage[0 .. data.len - first_len], data[first_len..]);
+        self.len += data.len;
+        return true;
+    }
+
+    fn consume(self: *TcpSendBuffer, count: usize) void {
+        assert(count <= self.len);
+        assert(self.storage.len == SND_BUF_MAX);
+        self.len -= count;
+        if (self.len == 0) {
+            self.head = 0;
+        } else {
+            self.head = (self.head + count) % self.storage.len;
+        }
+    }
+
+    fn prefix(self: *const TcpSendBuffer, scratch: []u8) []const u8 {
+        assert(scratch.len > 0);
+        assert(self.len <= self.storage.len);
+        const prefix_len = @min(self.len, scratch.len);
+        const first_len = @min(prefix_len, self.storage.len - self.head);
+        if (first_len == prefix_len) return self.storage[self.head..][0..prefix_len];
+        @memcpy(scratch[0..first_len], self.storage[self.head..][0..first_len]);
+        @memcpy(scratch[first_len..prefix_len], self.storage[0 .. prefix_len - first_len]);
+        return scratch[0..prefix_len];
+    }
+};
+
 /// A forwarded TCP connection (guest ↔ host socket).
 const TcpFlow = struct {
     socket: std.posix.socket_t,
@@ -133,7 +187,7 @@ const TcpFlow = struct {
     /// Unacked host→guest payload = the bytes [snd_una, snd_nxt). Kept so
     /// a lost segment can be retransmitted (the source bytes are already
     /// gone from the host socket by the time we send them).
-    snd_buf: std.ArrayListUnmanaged(u8) = .empty,
+    snd_buf: TcpSendBuffer = .{},
     /// Absolute nanosecond deadline for retransmitting the oldest unacked
     /// segment; 0 = no data outstanding / timer disarmed.
     rt_deadline_ns: i64 = 0,
@@ -590,9 +644,10 @@ pub const MiniNat = struct {
             // (1) Retransmit the oldest unacked segment if its timer fired.
             // A single frame, well under the hard RX cap, so it goes even
             // when rx_ok is false — retransmission must always make progress.
-            if (flow.snd_buf.items.len > 0 and flow.rt_deadline_ns != 0 and now_ns >= flow.rt_deadline_ns) {
-                const seg_len = @min(TCP_MSS, flow.snd_buf.items.len);
-                self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, flow.snd_buf.items[0..seg_len]);
+            if (flow.snd_buf.len > 0 and flow.rt_deadline_ns != 0 and now_ns >= flow.rt_deadline_ns) {
+                var retransmit: [TCP_MSS]u8 = undefined;
+                const payload = flow.snd_buf.prefix(&retransmit);
+                self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, payload);
                 flow.rto_ns = @min(flow.rto_ns * 2, MAX_RTO_NS);
                 flow.rt_deadline_ns = now_ns + flow.rto_ns;
                 flow.last_used = now;
@@ -606,10 +661,10 @@ pub const MiniNat = struct {
             // the host socket, so the real sender is throttled).
             const in_flight = flow.snd_nxt -% flow.snd_una;
             const eff_wnd: u32 = @min(@max(flow.snd_wnd, @as(u32, 1)), @as(u32, SND_BUF_MAX));
-            const buffered: u32 = @intCast(flow.snd_buf.items.len);
+            const buffered: u32 = @intCast(flow.snd_buf.len);
             if (rx_ok and !flow.host_eof and in_flight < eff_wnd and buffered < SND_BUF_MAX) {
                 const window_room = eff_wnd - in_flight;
-                const buf_room: u32 = @intCast(SND_BUF_MAX - flow.snd_buf.items.len);
+                const buf_room: u32 = @intCast(SND_BUF_MAX - flow.snd_buf.len);
                 const want: usize = @min(@min(@as(u32, TCP_MSS), window_room), buf_room);
                 const n = net_compat.recv(flow.socket, buf[0..want], 0) catch |e| {
                     if (e != error.WouldBlock) {
@@ -622,7 +677,7 @@ pub const MiniNat = struct {
                     // Host EOF: stop reading, drain snd_buf, then FIN below.
                     flow.host_eof = true;
                 } else {
-                    flow.snd_buf.appendSlice(self.alloc, buf[0..n]) catch continue;
+                    if (!flow.snd_buf.append(buf[0..n])) continue;
                     self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_PSH | TCP_ACK, buf[0..n]);
                     flow.snd_nxt +%= @intCast(n);
                     if (flow.rt_deadline_ns == 0) flow.rt_deadline_ns = now_ns + flow.rto_ns;
@@ -632,7 +687,7 @@ pub const MiniNat = struct {
             }
 
             // (3) Host closed and everything acked → FIN, then drop the flow.
-            if (flow.host_eof and flow.snd_buf.items.len == 0 and flow.snd_una == flow.snd_nxt) {
+            if (flow.host_eof and flow.snd_buf.len == 0 and flow.snd_una == flow.snd_nxt) {
                 self.tcpSend(key, flow.snd_nxt, flow.rcv_nxt, TCP_FIN | TCP_ACK, &.{});
                 flow.snd_nxt +%= 1;
                 remove_key = key;
@@ -666,7 +721,7 @@ pub const MiniNat = struct {
                     net_compat.socketClose(sock);
                     break;
                 };
-                const flow = TcpFlow{
+                var flow = TcpFlow{
                     .socket = sock,
                     .state = .syn_to_guest,
                     .snd_nxt = 0x2000,
@@ -674,7 +729,12 @@ pub const MiniNat = struct {
                     .rcv_nxt = 0, // learned from the guest's SYN-ACK
                     .last_used = nowSeconds(),
                 };
+                flow.snd_buf = TcpSendBuffer.init(self.alloc) catch {
+                    net_compat.socketClose(sock);
+                    break;
+                };
                 self.tcp_flows.put(key, flow) catch {
+                    flow.deinit(self.alloc);
                     net_compat.socketClose(sock);
                     break;
                 };
@@ -905,9 +965,10 @@ pub const MiniNat = struct {
             // than waiting for the RTO (fast retransmit).
             if (outstanding > 0) {
                 flow.dup_acks +%= 1;
-                if (flow.dup_acks >= 3 and flow.snd_buf.items.len > 0) {
-                    const seg_len = @min(TCP_MSS, flow.snd_buf.items.len);
-                    self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, flow.snd_buf.items[0..seg_len]);
+                if (flow.dup_acks >= 3 and flow.snd_buf.len > 0) {
+                    var retransmit: [TCP_MSS]u8 = undefined;
+                    const payload = flow.snd_buf.prefix(&retransmit);
+                    self.tcpSend(key, flow.snd_una, flow.rcv_nxt, TCP_PSH | TCP_ACK, payload);
                     flow.rt_deadline_ns = nowNanos() + flow.rto_ns;
                     flow.dup_acks = 0;
                 }
@@ -918,12 +979,8 @@ pub const MiniNat = struct {
         if (acked > outstanding) return;
 
         // New data acknowledged — drop it from the front of the buffer.
-        const drop = @min(@as(usize, acked), flow.snd_buf.items.len);
-        if (drop > 0) {
-            const remaining = flow.snd_buf.items.len - drop;
-            std.mem.copyForwards(u8, flow.snd_buf.items[0..remaining], flow.snd_buf.items[drop..]);
-            flow.snd_buf.shrinkRetainingCapacity(remaining);
-        }
+        const drop = @min(@as(usize, acked), flow.snd_buf.len);
+        if (drop > 0) flow.snd_buf.consume(drop);
         flow.snd_una = ack;
         flow.dup_acks = 0;
         flow.rto_ns = INITIAL_RTO_NS; // forward progress resets the backoff
@@ -966,7 +1023,7 @@ pub const MiniNat = struct {
 
         // Our ISN is arbitrary; use a fixed base plus the guest seq for
         // variety (determinism is fine for a single-host proxy).
-        const flow = TcpFlow{
+        var flow = TcpFlow{
             .socket = sock,
             .state = .connecting,
             .snd_nxt = 0x1000,
@@ -974,7 +1031,12 @@ pub const MiniNat = struct {
             .rcv_nxt = guest_seq +% 1, // SYN consumes a sequence number
             .last_used = nowSeconds(),
         };
+        flow.snd_buf = TcpSendBuffer.init(self.alloc) catch {
+            net_compat.socketClose(sock);
+            return;
+        };
         self.tcp_flows.put(key, flow) catch {
+            flow.deinit(self.alloc);
             net_compat.socketClose(sock);
             return;
         };
@@ -1574,10 +1636,12 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
         .rcv_nxt = 5000,
         .last_used = 0,
     };
+    flow.snd_buf = try TcpSendBuffer.init(testing.allocator);
     defer flow.deinit(testing.allocator);
 
     // Pretend we've sent 3000 unacked bytes to the guest.
-    try flow.snd_buf.appendNTimes(testing.allocator, 0xAB, 3000);
+    var initial_payload: [3000]u8 = @splat(0xAB);
+    try testing.expect(flow.snd_buf.append(&initial_payload));
     flow.snd_nxt = 1000 + 3000;
     flow.rt_deadline_ns = 1;
 
@@ -1585,19 +1649,20 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
     // timer stays armed (data still outstanding).
     nat.processGuestAck(key, &flow, 2000, 32768);
     try testing.expectEqual(@as(u32, 2000), flow.snd_una);
-    try testing.expectEqual(@as(usize, 2000), flow.snd_buf.items.len);
+    try testing.expectEqual(@as(usize, 2000), flow.snd_buf.len);
     try testing.expectEqual(@as(u32, 32768), flow.snd_wnd);
     try testing.expect(flow.rt_deadline_ns != 0);
 
     // Full ACK: buffer empties and the retransmit timer disarms.
     nat.processGuestAck(key, &flow, 4000, 65535);
     try testing.expectEqual(@as(u32, 4000), flow.snd_una);
-    try testing.expectEqual(@as(usize, 0), flow.snd_buf.items.len);
+    try testing.expectEqual(@as(usize, 0), flow.snd_buf.len);
     try testing.expectEqual(@as(i64, 0), flow.rt_deadline_ns);
 
     // Send a fresh segment, then three duplicate ACKs ⇒ one fast retransmit
     // of the oldest unacked byte (seq == snd_una), without waiting for the RTO.
-    try flow.snd_buf.appendNTimes(testing.allocator, 0xCD, 1400);
+    var fresh_payload: [1400]u8 = @splat(0xCD);
+    try testing.expect(flow.snd_buf.append(&fresh_payload));
     flow.snd_nxt = 4000 + 1400;
     flow.rt_deadline_ns = std.math.maxInt(i64); // far future: only a dup-ack can trigger
     clearReplies();
@@ -1610,4 +1675,25 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
     try testing.expectEqual(@as(u32, 4000), std.mem.readInt(u32, seg[38..42], .big)); // seq
     try testing.expectEqual(MiniNat.TCP_PSH | MiniNat.TCP_ACK, seg[47]); // flags
     try testing.expectEqual(@as(u8, 0), flow.dup_acks); // counter reset after retransmit
+}
+
+test "TcpSendBuffer preserves retransmit order across wrap" {
+    var buffer = try TcpSendBuffer.init(testing.allocator);
+    defer buffer.deinit(testing.allocator);
+
+    var initial: [SND_BUF_MAX]u8 = undefined;
+    for (&initial, 0..) |*byte, i| byte.* = @truncate(i);
+    try testing.expect(buffer.append(&initial));
+    buffer.consume(65_000);
+
+    var appended: [1000]u8 = undefined;
+    for (&appended, 0..) |*byte, i| byte.* = @truncate(i + 17);
+    try testing.expect(buffer.append(&appended));
+
+    var scratch: [MiniNat.TCP_MSS]u8 = undefined;
+    const prefix = buffer.prefix(&scratch);
+    try testing.expectEqual(@as(usize, 1535), buffer.len);
+    try testing.expectEqual(@as(usize, MiniNat.TCP_MSS), prefix.len);
+    try testing.expectEqualSlices(u8, initial[65_000..], prefix[0..535]);
+    try testing.expectEqualSlices(u8, appended[0..865], prefix[535..]);
 }
