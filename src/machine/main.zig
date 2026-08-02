@@ -237,9 +237,6 @@ pub const Machine = struct {
     /// Hypervisor VM.
     hv_vm: ?*hypervisor.VM = null,
 
-    /// vCPUs.
-    vcpus: std.ArrayListUnmanaged(*hypervisor.Vcpu),
-
     /// VM runner (manages vCPU threads).
     runner: ?hypervisor.VMRunner = null,
 
@@ -388,7 +385,6 @@ pub const Machine = struct {
         machine.* = .{
             .alloc = alloc,
             .config = config,
-            .vcpus = .empty,
             .cpu_states = cpu_states,
         };
         for (machine.cpu_states) |*state| state.* = .{};
@@ -488,7 +484,6 @@ pub const Machine = struct {
 
         // Clean up hypervisor (vCPUs then VM)
         self.cleanupHypervisor();
-        self.vcpus.deinit(self.alloc);
         const allocation_bytes = @sizeOf(Machine) + self.cpu_states.len * @sizeOf(VcpuRunState);
         self.cpu_states = &.{};
 
@@ -735,9 +730,6 @@ pub const Machine = struct {
     /// Clean up hypervisor resources.
     /// VM.destroy() handles vCPU cleanup internally.
     fn cleanupHypervisor(self: *Machine) void {
-        // Clear our vcpu references (VM.destroy handles actual cleanup)
-        self.vcpus.clearRetainingCapacity();
-
         // Destroy the VM (this also destroys vCPUs and unmaps memory)
         if (self.hv_vm) |vm| {
             vm.destroy();
@@ -2837,6 +2829,7 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
+    try testing.expect(@sizeOf(Machine) <= 5752);
 }
 
 test "stop before synchronous thread entry cancels startup" {
