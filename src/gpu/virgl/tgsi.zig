@@ -395,7 +395,7 @@ fn parseInstr(prog: *Program, body: []const u8) Error!void {
 
 /// A translated shader ready to hand to Metal.
 pub const Msl = struct {
-    source: []u8, // owned by caller
+    source: [:0]u8, // owned by caller
     entry: []const u8, // static string
     stage: Stage,
 
@@ -814,10 +814,10 @@ pub fn emit(alloc: Allocator, prog: *const Program) Error!Msl {
 
     if (prog.stage == .vertex) {
         try emitVertex(&w, temp_alloc, prog);
-        return .{ .source = try alloc.dupe(u8, w.items), .entry = "vs_main", .stage = .vertex };
+        return .{ .source = try alloc.dupeZ(u8, w.items), .entry = "vs_main", .stage = .vertex };
     } else if (prog.stage == .fragment) {
         try emitFragment(&w, temp_alloc, prog);
-        return .{ .source = try alloc.dupe(u8, w.items), .entry = "fs_main", .stage = .fragment };
+        return .{ .source = try alloc.dupeZ(u8, w.items), .entry = "fs_main", .stage = .fragment };
     }
     return Error.Malformed;
 }
@@ -1071,7 +1071,7 @@ test "emit MSL for passthrough vertex shader" {
     var msl = try emit(counted.allocator(), &prog);
     defer msl.deinit(counted.allocator());
     try std.testing.expectEqual(@as(usize, 1), counted.allocations);
-    try std.testing.expectEqual(@as(usize, 307), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 308), counted.allocated_bytes);
     try std.testing.expectEqual(@as(usize, 0), counted.resize_index);
     try std.testing.expectEqual(@as(usize, 307), msl.source.len);
 

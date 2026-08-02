@@ -1131,11 +1131,6 @@ pub const GpuDevice = struct {
         var fmsl = try self.translateShader(fs_text);
         defer fmsl.deinit(self.alloc);
 
-        const vz = try self.alloc.dupeZ(u8, vmsl.source);
-        defer self.alloc.free(vz);
-        const fz = try self.alloc.dupeZ(u8, fmsl.source);
-        defer self.alloc.free(fz);
-
         // BOBRVM_DUMP_SHADERS=<dir>: write each translated pair (guest TGSI +
         // the MSL we generate) so a wrong-pixels bug can be read off the
         // source instead of guessed at.
@@ -1180,7 +1175,18 @@ pub const GpuDevice = struct {
                 n_layouts += 1;
             }
         }
-        return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], layouts[0..n_layouts], format, has_depth, resolveBlend(ctx), extra_formats);
+        return r.buildPipeline(
+            vmsl.source,
+            "vs_main",
+            fmsl.source,
+            "fs_main",
+            attrs[0..n],
+            layouts[0..n_layouts],
+            format,
+            has_depth,
+            resolveBlend(ctx),
+            extra_formats,
+        );
     }
 
     noinline fn translateShader(self: *GpuDevice, text: []const u8) !virgl.tgsi.Msl {
