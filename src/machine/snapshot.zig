@@ -29,6 +29,7 @@ pub const MAGIC = "BBRSNAP1";
 pub const VERSION: u32 = 1;
 const block_section_scratch_bytes = 128;
 const gic_section_scratch_bytes = 2 * 1024;
+const rng_section_scratch_bytes = 128;
 
 // =============================================================================
 // vCPU state
@@ -438,6 +439,20 @@ pub fn serializeRng(alloc: Allocator, rng: *const virtio.Rng) ![]u8 {
     return result;
 }
 
+pub fn appendRngSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    rng: *const virtio.Rng,
+) !void {
+    assert(rng.transport.queues.len > 0);
+    assert(rng.transport.queues.len <= mmio.Transport.MAX_QUEUES);
+    var stack_allocator = std.heap.stackFallback(rng_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeRng(scratch_alloc, rng);
+    defer scratch_alloc.free(data);
+    try builder.section("rng", data);
+}
+
 pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &rng.transport);
@@ -774,6 +789,25 @@ test "snapshot: RNG device roundtrip" {
     try testing.expect(rng2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x6000_0000), rng2.transport.queues[0].driver_addr);
     try testing.expectEqual(@as(u16, 29), rng2.last_avail);
+}
+
+test "snapshot: RNG section assembly allocation profile" {
+    const rng = try virtio.Rng.init(testing.allocator);
+    defer rng.deinit();
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendRngSection(&builder, alloc, rng);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(usize, 2), counted.allocations);
+    try testing.expectEqual(@as(usize, 223), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 59), reader.section("rng").?.len);
 }
 
 test "snapshot: network device roundtrip" {

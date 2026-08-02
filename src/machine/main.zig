@@ -865,9 +865,7 @@ pub const Machine = struct {
             try snapshot.appendBlockSection(&builder, alloc, "blk2", blk);
         }
         if (self.rng) |rng_dev| {
-            const data = try snapshot.serializeRng(alloc, rng_dev);
-            defer alloc.free(data);
-            try builder.section("rng", data);
+            try snapshot.appendRngSection(&builder, alloc, rng_dev);
         }
         if (self.net) |net| {
             const data = try snapshot.serializeNet(alloc, net);
