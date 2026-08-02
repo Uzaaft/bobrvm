@@ -6,6 +6,11 @@
 //! - OpenGL 4.3 / Vulkan → Metal translation
 //! - High-performance renderer thread
 //! - Dual logging (stderr + macOS unified logging)
+//!
+//! The engineering principles behind this library were strongly influenced by
+//! Mitchell Hashimoto and the Ghostty maintainers. Their work demonstrated how
+//! to combine explicit ownership, native platform integration, and a small,
+//! performance-oriented core without compromising maintainability.
 
 const std = @import("std");
 const builtin = @import("builtin");

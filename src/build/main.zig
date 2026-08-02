@@ -1,6 +1,4 @@
 //! Build system modules for bobrvm.
-//!
-//! Follows Ghostty's pattern of modular build configuration.
 
 const std = @import("std");
 

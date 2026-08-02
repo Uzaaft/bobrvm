@@ -4,7 +4,6 @@
 //! Swift calls these functions via the C FFI.
 //!
 //! Also provides custom logging infrastructure for the entire library.
-//! Pattern follows Ghostty's main_ghostty.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");

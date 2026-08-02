@@ -3,8 +3,6 @@
 //! Provides Zig wrappers around Metal Objective-C API using
 //! direct message passing. This allows command buffer encoding
 //! without external dependencies.
-//!
-//! Pattern follows Ghostty's renderer/metal implementation.
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;

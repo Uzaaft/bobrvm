@@ -3,7 +3,7 @@
 //! Handles the render loop and Metal command encoding.
 //! Communicates with main thread via mailbox.
 //!
-//! Pattern follows Ghostty's renderer/Thread.zig:
+//! The design uses:
 //! - Fixed-capacity mailbox for message passing
 //! - Wakeup mechanism for low-latency notifications
 //! - VSync coordination via CVDisplayLink (from Swift)

@@ -23,9 +23,8 @@ pub fn build(b: *std.Build) void {
     // CLI needs the hypervisor entitlement) but can't run in the sandbox.
     const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
     const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
-    // Swift/Xcode/Ghostty steps never run under nix (nix builds the Zig core
-    // only); resolving the ghostty dependency inside a nix shell also fails
-    // because ghostty's apple-sdk detection can't see the real Darwin SDK.
+    // Swift/Xcode integration never runs under nix, which builds only the Zig
+    // core. The terminal dependency also needs the real Darwin SDK.
     const in_nix = is_nix_build or in_nix_shell;
 
     // Build options
@@ -185,9 +184,8 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("cli", "Run the headless CLI");
     cli_step.dependOn(&cli_run.step);
 
-    // GUI run step - build the minimal Swift display app (macos/MinimalApp)
-    // and run it. Doesn't touch ghostty/xcodebuild, so unlike the full
-    // Xcode "run" step below it works fine inside a nix dev shell too.
+    // GUI run step - build and run the minimal Swift display app. This avoids
+    // the full Xcode integration, so it also works inside a nix dev shell.
     if (target.result.os.tag == .macos) {
         // swiftc must use the real system Xcode/SDK, not the nix-provided
         // SDKROOT/DEVELOPER_DIR (a mismatched Swift toolchain + SDK pair
@@ -371,8 +369,8 @@ pub fn build(b: *std.Build) void {
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // XCFramework + app steps (macOS only, never under nix). Bobrvm and the
-    // pinned Ghostty dependency both use Zig 0.16.
+    // XCFramework + app steps (macOS only, never under nix). All Zig
+    // dependencies are pinned to compatible compiler versions.
     if (target.result.os.tag == .macos and !in_nix) {
         const xcframework = XCFrameworkStep.create(b, lib);
         const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");

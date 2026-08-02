@@ -1,7 +1,6 @@
 //! XCFramework generation step.
 //!
 //! Creates BobrvmKit.xcframework from the static library and headers.
-//! Pattern follows Ghostty's src/build/XCFrameworkStep.zig.
 
 const XCFrameworkStep = @This();
 

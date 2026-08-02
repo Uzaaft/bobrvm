@@ -1,7 +1,6 @@
 //! Global state for bobrvm.
 //!
 //! Contains logging configuration and other cross-cutting concerns.
-//! Pattern follows Ghostty's src/global.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -62,8 +61,7 @@ pub const GlobalState = struct {
 /// syscalls here; this preset only skips the async/concurrent worker pool
 /// we never use. Being a static value (no init() call required) also means
 /// it's safe from unit tests that construct components directly, without
-/// going through GlobalState.init(). Pattern follows Ghostty's global.io(),
-/// simplified since we don't thread Io through call signatures.
+/// going through GlobalState.init().
 pub fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

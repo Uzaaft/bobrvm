@@ -4,8 +4,6 @@
 //! - Exports C API functions for Swift FFI
 //! - Accepts callback struct from Swift for platform actions
 //! - Manages VM instances and surfaces
-//!
-//! Pattern follows Ghostty's apprt/embedded.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");

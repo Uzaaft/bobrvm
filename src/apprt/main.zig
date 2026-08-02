@@ -7,7 +7,6 @@
 //! - Input event handling
 //!
 //! This module re-exports the embedded runtime for macOS/Swift integration.
-//! Pattern follows Ghostty's apprt module structure.
 
 pub const embedded = @import("embedded.zig");
 

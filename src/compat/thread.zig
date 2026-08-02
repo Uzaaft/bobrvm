@@ -1,6 +1,6 @@
-//! Vendored from Ghostty's src/lib/compat/thread.zig (itself lifted from
-//! 0.17.0-dev `std.Io.Condition`, MIT licensed) since zig 0.16 doesn't yet
-//! ship a timed condition wait. Remove once we're on a zig that has
+//! Adapted from MIT-licensed compatibility work by the Ghostty maintainers,
+//! originally based on Zig 0.17.0-dev `std.Io.Condition`. Zig 0.16 does not
+//! yet ship a timed condition wait. Remove once the standard library has
 //! `std.Io.Condition.waitTimeout` built in.
 //! See: https://codeberg.org/ziglang/zig/pulls/31278
 

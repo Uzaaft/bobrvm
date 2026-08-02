@@ -1,7 +1,6 @@
 //! Xcodebuild invocation step.
 //!
 //! Builds the macOS app using xcodebuild after the XCFramework is ready.
-//! Pattern follows Ghostty's src/build/GhosttyXcodebuild.zig.
 
 const XcodebuildStep = @This();
 

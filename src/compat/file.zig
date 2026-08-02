@@ -1,6 +1,6 @@
-//! Vendored from Ghostty's src/lib/compat/file.zig (itself lifted from
-//! zig 0.15.2 std.fs.File, MIT licensed) since zig 0.16 removed
-//! File.readToEndAlloc when it restructured file I/O into std.Io.
+//! Adapted from MIT-licensed compatibility work by the Ghostty maintainers,
+//! originally based on Zig 0.15.2 std.fs.File. Zig 0.16 removed
+//! File.readToEndAlloc when file I/O moved into std.Io.
 
 const std = @import("std");
 const global = @import("../global.zig");

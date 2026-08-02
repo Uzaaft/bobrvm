@@ -2,8 +2,6 @@
 //!
 //! Provides Zig wrappers around Apple's os/log.h API for integration
 //! with the macOS unified logging system.
-//!
-//! Pattern follows Ghostty's pkg/macos/os/log.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");

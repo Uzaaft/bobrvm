@@ -1,7 +1,6 @@
 //! Optimization quirks and workarounds.
 //!
-//! Central location for platform-specific optimizations,
-//! following Ghostty's pattern.
+//! Central location for platform-specific optimizations.
 
 const std = @import("std");
 const builtin = @import("builtin");
