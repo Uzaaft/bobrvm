@@ -365,7 +365,7 @@ pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
 pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
-    try serializeTransport(&out, net.transport);
+    try serializeTransport(&out, &net.transport);
     try out.int(u16, net.rx_last_avail);
     try out.int(u16, net.tx_last_avail);
     return out.buf.toOwnedSlice(alloc);
@@ -373,7 +373,7 @@ pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
 
 pub fn deserializeNet(net: *virtio.Net, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
-    try deserializeTransport(&cur, net.transport);
+    try deserializeTransport(&cur, &net.transport);
     net.rx_last_avail = try cur.int(u16);
     net.tx_last_avail = try cur.int(u16);
 }

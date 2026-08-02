@@ -73,7 +73,8 @@ const rx_index_none: u16 = std.math.maxInt(u16);
 /// Network device.
 pub const Net = struct {
     alloc: Allocator,
-    transport: *mmio.Transport,
+    transport: mmio.Transport,
+    transport_queues: [2]mmio.QueueConfig,
     config: Config,
 
     /// Shadow avail-ring cursors.
@@ -114,13 +115,12 @@ pub const Net = struct {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         const features = Features.MAC | virtio_version_1;
-        const transport = try mmio.Transport.init(alloc, 1, features, 2); // 1 = net device ID
-        errdefer transport.deinit(alloc);
-
         const net = try alloc.create(Net);
+        errdefer alloc.destroy(net);
         net.* = .{
             .alloc = alloc,
-            .transport = transport,
+            .transport = undefined,
+            .transport_queues = undefined,
             .config = .{ .mac = GUEST_MAC },
             .rx_last_avail = 0,
             .tx_last_avail = 0,
@@ -145,7 +145,8 @@ pub const Net = struct {
             };
         }
 
-        transport.setNotifyCallback(handleNotify, net);
+        net.transport.initEmbedded(1, features, &net.transport_queues); // 1 = net device ID
+        net.transport.setNotifyCallback(handleNotify, net);
 
         assert(net.transport.device_id == 1);
         assert(@sizeOf(RxFrame) == 4);
@@ -158,7 +159,6 @@ pub const Net = struct {
         for (&self.rx_storage) |*storage| {
             if (storage.ptr != null) self.alloc.free(storage.bytes());
         }
-        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
