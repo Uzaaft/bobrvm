@@ -1306,9 +1306,6 @@ pub const MiniNat = struct {
             else => return,
         };
 
-        var out: [590]u8 = undefined;
-        @memset(&out, 0);
-
         const xid = bootp[4..8];
         const chaddr = bootp[28..44];
 
@@ -1335,6 +1332,10 @@ pub const MiniNat = struct {
         const bootp_len = @max(o, 300);
 
         const total = ETH_HDR + 20 + 8 + bootp_len;
+        var fallback: [590]u8 = undefined;
+        const reply_buffer = self.acquireReply(&fallback, total) orelse return;
+        const out = reply_buffer.frame;
+        @memset(out, 0);
 
         // Ethernet: broadcast reply (guest may not have its IP yet)
         @memcpy(out[0..6], frame[6..12]);
@@ -1360,7 +1361,7 @@ pub const MiniNat = struct {
 
         @memcpy(out[ETH_HDR + 28 ..][0..bootp_len], b[0..bootp_len]);
 
-        self.reply(out[0..total], self.reply_userdata);
+        self.commitReply(reply_buffer);
     }
 
     fn putOpt(buf: []u8, offset: usize, opt: u8, data: []const u8) usize {
@@ -1538,6 +1539,9 @@ test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    test_reply_lease_len = 0;
+    test_reply_lease_committed = false;
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -1564,12 +1568,15 @@ test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
     bootp[243] = 0xFF;
 
     nat.handleFrame(&req);
-    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
-    const rep = test_replies.items[0];
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expect(test_reply_lease_committed);
+    try testing.expectEqual(@as(usize, ETH_HDR + 20 + 8 + 300), test_reply_lease_len);
+    const rep = test_reply_lease[0..test_reply_lease_len];
     const rbootp = rep[ETH_HDR + 28 ..];
     try testing.expectEqual(@as(u8, 2), rbootp[0]); // BOOTREPLY
     try testing.expect(std.mem.eql(u8, rbootp[16..20], &GUEST_IP)); // yiaddr
     try testing.expectEqual(@as(u8, 2), rbootp[242]); // OFFER
+    try testing.expectEqual(@as(u16, 0), MiniNat.checksum(rep[ETH_HDR .. ETH_HDR + 20]));
 }
 
 test "mininat: ICMP echo to gateway gets a reply" {
