@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = @import("../quirks.zig").inlineAssert;
 const hypervisor = @import("../hypervisor/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
@@ -200,6 +201,14 @@ const Out = struct {
     }
 };
 
+fn inputBufferBlob(out: *Out, buffer: anytype) !void {
+    assert(buffer.count <= virtio.Console.INPUT_BUFFER_MAX);
+    assert(buffer.firstSlice().len + buffer.secondSlice().len == buffer.count);
+    try out.int(u64, buffer.count);
+    try out.bytes(buffer.firstSlice());
+    try out.bytes(buffer.secondSlice());
+}
+
 // =============================================================================
 // GIC
 // =============================================================================
@@ -305,32 +314,30 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
     try serializeTransport(&out, &con.transport);
     try out.int(u16, con.receive_last_avail);
     try out.int(u16, con.transmit_last_avail);
-    try out.blob(con.input_buffer.items);
+    try inputBufferBlob(&out, &con.input_buffer);
     for (con.mp_last_avail) |cursor| try out.int(u16, cursor);
     try out.int(u8, @intCast(con.ports.len));
     for (con.ports) |port| {
         try out.int(u8, @intFromBool(port.guest_open));
-        try out.blob(port.input_buffer.items);
+        try inputBufferBlob(&out, &port.input_buffer);
     }
     return out.buf.toOwnedSlice(alloc);
 }
 
-pub fn deserializeConsole(alloc: Allocator, con: *virtio.Console, data: []const u8) !void {
+pub fn deserializeConsole(_: Allocator, con: *virtio.Console, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &con.transport);
     con.receive_last_avail = try cur.int(u16);
     con.transmit_last_avail = try cur.int(u16);
     const input = try cur.blob();
-    con.input_buffer.clearRetainingCapacity();
-    try con.input_buffer.appendSlice(alloc, input);
+    if (!con.input_buffer.replace(input)) return error.Mismatch;
     for (&con.mp_last_avail) |*cursor| cursor.* = try cur.int(u16);
     const nports = try cur.int(u8);
     if (nports != con.ports.len) return error.Mismatch;
     for (con.ports) |*port| {
         port.guest_open = (try cur.int(u8)) != 0;
         const pbuf = try cur.blob();
-        port.input_buffer.clearRetainingCapacity();
-        try port.input_buffer.appendSlice(alloc, pbuf);
+        if (!port.input_buffer.replace(pbuf)) return error.Mismatch;
     }
 }
 
@@ -540,7 +547,9 @@ test "snapshot: console device roundtrip (multiport)" {
     con.transport.queues[0].ready = true;
     con.transport.queues[0].desc_addr = 0x4000_0000;
     con.receive_last_avail = 17;
+    con.input_buffer.head = virtio.Console.INPUT_BUFFER_MAX - 4;
     try con.queueInput("pending host input");
+    con.ports[0].input_buffer.head = virtio.Console.INPUT_BUFFER_MAX - 3;
     try con.queuePortInput(1, "agent bytes");
     con.ports[0].guest_open = true;
 
@@ -555,8 +564,8 @@ test "snapshot: console device roundtrip (multiport)" {
     try testing.expect(con2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x4000_0000), con2.transport.queues[0].desc_addr);
     try testing.expectEqual(@as(u16, 17), con2.receive_last_avail);
-    try testing.expectEqualStrings("pending host input", con2.input_buffer.items);
-    try testing.expectEqualStrings("agent bytes", con2.ports[0].input_buffer.items);
+    try testing.expectEqualStrings("pending host input", con2.input_buffer.firstSlice());
+    try testing.expectEqualStrings("agent bytes", con2.ports[0].input_buffer.firstSlice());
     try testing.expect(con2.ports[0].guest_open);
 }
 

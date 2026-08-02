@@ -68,6 +68,72 @@ const PendingCtrl = struct {
     payload_len: u8 = 0,
 };
 
+const input_buffer_max: usize = 64 * 1024;
+
+const InputBuffer = struct {
+    storage: [input_buffer_max]u8 = undefined,
+    head: usize = 0,
+    count: usize = 0,
+
+    fn append(self: *InputBuffer, data: []const u8) bool {
+        assert(self.head < self.storage.len);
+        assert(self.count <= self.storage.len);
+        if (data.len > self.storage.len - self.count) return false;
+
+        const tail = (self.head + self.count) % self.storage.len;
+        const first_len = @min(data.len, self.storage.len - tail);
+        @memcpy(self.storage[tail..][0..first_len], data[0..first_len]);
+        @memcpy(self.storage[0 .. data.len - first_len], data[first_len..]);
+        self.count += data.len;
+
+        assert(self.count <= self.storage.len);
+        return true;
+    }
+
+    fn copyAt(self: *const InputBuffer, offset: usize, dst: []u8) usize {
+        assert(self.head < self.storage.len);
+        assert(self.count <= self.storage.len);
+        if (offset >= self.count) return 0;
+
+        const copy_len = @min(dst.len, self.count - offset);
+        const start = (self.head + offset) % self.storage.len;
+        const first_len = @min(copy_len, self.storage.len - start);
+        @memcpy(dst[0..first_len], self.storage[start..][0..first_len]);
+        @memcpy(dst[first_len..copy_len], self.storage[0 .. copy_len - first_len]);
+        return copy_len;
+    }
+
+    fn consume(self: *InputBuffer, count: usize) void {
+        assert(count <= self.count);
+        assert(self.count <= self.storage.len);
+        self.head = (self.head + count) % self.storage.len;
+        self.count -= count;
+        if (self.count == 0) self.head = 0;
+    }
+
+    pub fn firstSlice(self: *const InputBuffer) []const u8 {
+        assert(self.head < self.storage.len);
+        assert(self.count <= self.storage.len);
+        const len = @min(self.count, self.storage.len - self.head);
+        return self.storage[self.head..][0..len];
+    }
+
+    pub fn secondSlice(self: *const InputBuffer) []const u8 {
+        assert(self.head < self.storage.len);
+        assert(self.count <= self.storage.len);
+        return self.storage[0 .. self.count - self.firstSlice().len];
+    }
+
+    pub fn replace(self: *InputBuffer, data: []const u8) bool {
+        assert(self.head < self.storage.len);
+        assert(self.count <= self.storage.len);
+        if (data.len > self.storage.len) return false;
+        self.head = 0;
+        self.count = 0;
+        return self.append(data);
+    }
+};
+
 /// A multiport serial port (ports 1..N; port 0 is the console itself).
 const Port = struct {
     /// Static name announced via PORT_NAME (e.g. "org.qemu.guest_agent.0");
@@ -78,7 +144,7 @@ const Port = struct {
     output_userdata: ?*anyopaque = null,
     /// Host→guest bytes awaiting rx buffers. Guarded by the console's
     /// input_mutex (same append-on-host-thread/drain-on-vCPU pattern).
-    input_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    input_buffer: InputBuffer = .{},
     /// Guest-side open state (PORT_OPEN from the guest).
     guest_open: bool = false,
 };
@@ -98,7 +164,7 @@ pub const Console = struct {
 
     /// Input buffer (host → guest). Guarded by input_mutex: the host
     /// input thread appends, the vCPU thread drains.
-    input_buffer: std.ArrayListUnmanaged(u8),
+    input_buffer: InputBuffer,
     input_mutex: std.Io.Mutex,
 
     /// Callback for output data.
@@ -118,7 +184,7 @@ pub const Console = struct {
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 128;
-    pub const INPUT_BUFFER_MAX: usize = 64 * 1024;
+    pub const INPUT_BUFFER_MAX: usize = input_buffer_max;
 
     const AllocationLayout = struct {
         ports_offset: usize,
@@ -187,7 +253,7 @@ pub const Console = struct {
             .receive_last_avail = 0,
             .transmit_last_avail = 0,
             .output_buffer = .empty,
-            .input_buffer = .empty,
+            .input_buffer = .{},
             .input_mutex = .init,
             .output_callback = null,
             .output_userdata = null,
@@ -209,10 +275,8 @@ pub const Console = struct {
     }
 
     pub fn deinit(self: *Console) void {
-        for (self.ports) |*port| port.input_buffer.deinit(self.alloc);
         self.ctrl_pending.deinit(self.alloc);
         self.output_buffer.deinit(self.alloc);
-        self.input_buffer.deinit(self.alloc);
 
         const alloc = self.alloc;
         const allocation_len = allocationLayout(self.ports.len).size;
@@ -239,8 +303,7 @@ pub const Console = struct {
         self.input_mutex.lockUncancelable(global.io());
         defer self.input_mutex.unlock(global.io());
         const port = &self.ports[id - 1];
-        if (port.input_buffer.items.len + data.len > INPUT_BUFFER_MAX) return;
-        try port.input_buffer.appendSlice(self.alloc, data);
+        _ = port.input_buffer.append(data);
     }
 
     /// Whether the guest has opened multiport port `id` (1-based).
@@ -273,8 +336,7 @@ pub const Console = struct {
         self.input_mutex.lockUncancelable(global.io());
         defer self.input_mutex.unlock(global.io());
         // Bound the buffer so a wedged guest can't grow it forever.
-        if (self.input_buffer.items.len + data.len > INPUT_BUFFER_MAX) return;
-        try self.input_buffer.appendSlice(self.alloc, data);
+        _ = self.input_buffer.append(data);
     }
 
     /// Handle MMIO read.
@@ -486,22 +548,20 @@ pub const Console = struct {
 
         self.input_mutex.lockUncancelable(global.io());
         defer self.input_mutex.unlock(global.io());
-        if (port.input_buffer.items.len == 0) return;
+        if (port.input_buffer.count == 0) return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
         var consumed: usize = 0;
         var delivered: u32 = 0;
-        while (self.mp_last_avail[qidx] != avail_idx and consumed < port.input_buffer.items.len) {
+        while (self.mp_last_avail[qidx] != avail_idx and consumed < port.input_buffer.count) {
             const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
             const chain = ring.Chain.collect(qc, head, get_mem);
             var written: u32 = 0;
             for (chain.slice()) |desc| {
                 if (!desc.isWrite()) continue;
                 const buf = get_mem(desc.addr, desc.len) orelse continue;
-                const remaining = port.input_buffer.items[consumed..];
-                if (remaining.len == 0) break;
-                const n: usize = @min(buf.len, remaining.len);
-                @memcpy(buf[0..n], remaining[0..n]);
+                const n = port.input_buffer.copyAt(consumed, buf);
+                if (n == 0) break;
                 consumed += n;
                 written += @intCast(n);
             }
@@ -509,7 +569,7 @@ pub const Console = struct {
             self.mp_last_avail[qidx] +%= 1;
             delivered += written;
         }
-        if (consumed > 0) port.input_buffer.replaceRangeAssumeCapacity(0, consumed, &.{});
+        if (consumed > 0) port.input_buffer.consume(consumed);
         if (delivered > 0) self.transport.signalUsedBuffer();
     }
 
@@ -520,7 +580,7 @@ pub const Console = struct {
 
         self.input_mutex.lockUncancelable(global.io());
         defer self.input_mutex.unlock(global.io());
-        if (self.input_buffer.items.len == 0) return;
+        if (self.input_buffer.count == 0) return;
 
         const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
@@ -529,7 +589,7 @@ pub const Console = struct {
         var consumed: usize = 0;
         var delivered: u32 = 0;
 
-        while (last_avail_idx != avail_idx and consumed < self.input_buffer.items.len) {
+        while (last_avail_idx != avail_idx and consumed < self.input_buffer.count) {
             const ring_idx = last_avail_idx % qc.num;
             const ring_entry = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse break;
             const desc_idx = std.mem.readInt(u16, ring_entry[0..2], .little);
@@ -538,7 +598,7 @@ pub const Console = struct {
             var written: u32 = 0;
             var idx = desc_idx;
             var iterations: u16 = 0;
-            while (iterations < qc.num and consumed < self.input_buffer.items.len) : (iterations += 1) {
+            while (iterations < qc.num and consumed < self.input_buffer.count) : (iterations += 1) {
                 const desc_mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse break;
                 const buf_addr = std.mem.readInt(u64, desc_mem[0..8], .little);
                 const buf_len = std.mem.readInt(u32, desc_mem[8..12], .little);
@@ -548,9 +608,7 @@ pub const Console = struct {
                 // Only fill device-writable descriptors (VIRTQ_DESC_F_WRITE).
                 if ((flags & 2) != 0) {
                     if (get_mem(buf_addr, buf_len)) |buf| {
-                        const remaining = self.input_buffer.items[consumed..];
-                        const n: usize = @min(buf.len, remaining.len);
-                        @memcpy(buf[0..n], remaining[0..n]);
+                        const n = self.input_buffer.copyAt(consumed, buf);
                         consumed += n;
                         written += @intCast(n);
                     }
@@ -578,7 +636,7 @@ pub const Console = struct {
         self.receive_last_avail = last_avail_idx;
 
         if (consumed > 0) {
-            self.input_buffer.replaceRangeAssumeCapacity(0, consumed, &.{});
+            self.input_buffer.consume(consumed);
         }
         if (delivered > 0) {
             self.transport.signalUsedBuffer();
@@ -765,8 +823,29 @@ test "Console queue input" {
     const console = try Console.init(std.testing.allocator, &.{});
     defer console.deinit();
 
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    console.alloc = counted.allocator();
     try console.queueInput("Hello, guest!");
-    try std.testing.expectEqual(@as(usize, 13), console.input_buffer.items.len);
+    console.alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 13), console.input_buffer.count);
+}
+
+test "Console input ring preserves wrapped byte order" {
+    var input: InputBuffer = .{};
+    input.head = input.storage.len - 2;
+    try std.testing.expect(input.append("abcd"));
+
+    try std.testing.expectEqualStrings("ab", input.firstSlice());
+    try std.testing.expectEqualStrings("cd", input.secondSlice());
+    var copied: [4]u8 = undefined;
+    try std.testing.expectEqual(copied.len, input.copyAt(0, &copied));
+    try std.testing.expectEqualStrings("abcd", &copied);
+
+    input.consume(3);
+    try std.testing.expectEqual(@as(usize, 1), input.count);
+    try std.testing.expectEqualStrings("d", input.firstSlice());
 }
 
 // -----------------------------------------------------------------------------
