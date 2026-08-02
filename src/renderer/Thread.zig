@@ -315,6 +315,7 @@ pub const RenderThread = struct {
 
     // Clear color (can be set from GPU state)
     clear_color: metal.MTLClearColor = .{ .red = 0.0, .green = 0.0, .blue = 0.1, .alpha = 1.0 },
+    clear_presented: bool = false,
 
     // Last scanout generation presented; skip re-upload when unchanged.
     // maxInt = "nothing presented yet" so the first frame always draws.
@@ -468,6 +469,7 @@ pub const RenderThread = struct {
             switch (msg) {
                 .resize => |size| {
                     self.size = size;
+                    self.clear_presented = false;
                 },
                 .content_scale => |scale| {
                     self.content_scale = scale;
@@ -478,12 +480,14 @@ pub const RenderThread = struct {
                 },
                 .visible => |visible| {
                     self.visible = visible;
+                    if (visible) self.clear_presented = false;
                     self.setQosClass();
                 },
                 .commands_ready => |batch| {
                     self.pending_batch = batch;
                 },
                 .draw_now => {
+                    self.clear_presented = false;
                     self.drawFrame();
                 },
                 .shutdown => {
@@ -538,6 +542,7 @@ pub const RenderThread = struct {
                 if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
                 self.pending_batch = null;
                 if (ok) {
+                    self.clear_presented = false;
                     self.last_generation = scan.generation;
                     self.last_cursor_generation = cursor_gen;
                     if (self.present_callback) |cb| cb(self.present_userdata);
@@ -547,6 +552,7 @@ pub const RenderThread = struct {
         }
 
         // No scanout yet: clear (color from pending batch if available).
+        if (self.pending_batch == null and self.clear_presented) return;
         var clear_color = self.clear_color;
         if (self.pending_batch) |batch| {
             clear_color = .{
@@ -565,6 +571,7 @@ pub const RenderThread = struct {
 
         // Notify Swift that frame was presented
         if (success) {
+            self.clear_presented = true;
             if (self.present_callback) |cb| {
                 cb(self.present_userdata);
             }
