@@ -383,7 +383,10 @@ pub const P9Server = struct {
             },
             Tattach => {
                 const fid = try r.u32v();
-                const st = self.statRel("") catch return error.Stat;
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto("", &path_storage);
+                var st: std.c.Stat = undefined;
+                if (lstat(path.ptr, &st) != 0) return error.Stat;
                 const rel = try self.alloc.dupe(u8, "");
                 errdefer self.alloc.free(rel);
                 if (self.fids.fetchRemove(fid)) |old| {
@@ -833,9 +836,14 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p = TestPayload{};
         const req = try tmsg(testing.allocator, Tattach, 1, p.u32v(1).u32v(0xFFFF_FFFF).str("user").str("").u32v(1000).slice());
         defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n], Tattach + 1);
         try testing.expectEqual(@as(u8, 0x80), resp[7]); // root qid is a dir
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     }
     // TWALK fid1 -> fid2 "hello.txt"
     {
