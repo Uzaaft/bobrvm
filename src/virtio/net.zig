@@ -51,15 +51,23 @@ pub const Config = extern struct {
 pub const TxCallback = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
 
 const RxFrame = struct {
-    storage: []u8,
-    len: usize,
+    storage_index: u16,
+    len: u32,
+};
 
-    fn bytes(self: RxFrame) []const u8 {
-        assert(self.len > 0);
-        assert(self.len <= self.storage.len);
-        return self.storage[0..self.len];
+const RxStorage = struct {
+    ptr: ?[*]u8,
+    capacity: u32,
+    next_free: u16,
+
+    fn bytes(self: RxStorage) []u8 {
+        assert(self.ptr != null);
+        assert(self.capacity > 0);
+        return self.ptr.?[0..self.capacity];
     }
 };
+
+const rx_index_none: u16 = std.math.maxInt(u16);
 
 /// Network device.
 pub const Net = struct {
@@ -74,10 +82,10 @@ pub const Net = struct {
     /// Frames waiting for guest RX buffers. Guarded by rx_mutex: backend
     /// threads append, the vCPU thread drains via pollRx.
     rx_frames: [MAX_RX_QUEUED]RxFrame,
+    rx_storage: [MAX_RX_QUEUED]RxStorage,
     rx_head: usize,
     rx_count: usize,
-    rx_free: [MAX_RX_QUEUED][]u8,
-    rx_free_count: usize,
+    rx_free_head: u16,
     rx_mutex: std.Io.Mutex,
 
     /// Guest memory accessor.
@@ -116,26 +124,39 @@ pub const Net = struct {
             .rx_last_avail = 0,
             .tx_last_avail = 0,
             .rx_frames = undefined,
+            .rx_storage = undefined,
             .rx_head = 0,
             .rx_count = 0,
-            .rx_free = undefined,
-            .rx_free_count = 0,
+            .rx_free_head = 0,
             .rx_mutex = .init,
             .guest_memory = null,
             .tx_callback = null,
             .tx_userdata = null,
         };
+        for (&net.rx_storage, 0..) |*storage, index| {
+            storage.* = .{
+                .ptr = null,
+                .capacity = 0,
+                .next_free = if (index + 1 < MAX_RX_QUEUED)
+                    @intCast(index + 1)
+                else
+                    rx_index_none,
+            };
+        }
 
         transport.setNotifyCallback(handleNotify, net);
 
         assert(net.transport.device_id == 1);
+        assert(@sizeOf(RxFrame) == 8);
+        assert(@sizeOf(RxStorage) == 16);
 
         return net;
     }
 
     pub fn deinit(self: *Net) void {
-        self.releaseQueuedFrames();
-        for (self.rx_free[0..self.rx_free_count]) |storage| self.alloc.free(storage);
+        for (&self.rx_storage) |*storage| {
+            if (storage.ptr != null) self.alloc.free(storage.bytes());
+        }
         self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -158,10 +179,14 @@ pub const Net = struct {
         defer self.rx_mutex.unlock(global.io());
         if (self.rx_count >= self.rx_frames.len) return;
 
-        const storage = self.takeRxStorage(frame.len) orelse return;
+        const storage_index = self.takeRxStorage(frame.len) orelse return;
+        const storage = self.rx_storage[storage_index].bytes();
         @memcpy(storage[0..frame.len], frame);
         const tail = (self.rx_head + self.rx_count) % self.rx_frames.len;
-        self.rx_frames[tail] = .{ .storage = storage, .len = frame.len };
+        self.rx_frames[tail] = .{
+            .storage_index = storage_index,
+            .len = @intCast(frame.len),
+        };
         self.rx_count += 1;
     }
 
@@ -314,7 +339,9 @@ pub const Net = struct {
             const head = ring.availEntry(qc, last_avail, get_mem) orelse break;
             const chain = ring.Chain.collect(qc, head, get_mem);
             const frame_index = (self.rx_head + delivered) % self.rx_frames.len;
-            const frame = self.rx_frames[frame_index].bytes();
+            const queued = self.rx_frames[frame_index];
+            const storage = self.rx_storage[queued.storage_index].bytes();
+            const frame = storage[0..queued.len];
 
             const written = deliverFrame(&chain, frame, get_mem) orelse break;
             ring.pushUsed(qc, head, written, get_mem);
@@ -330,35 +357,73 @@ pub const Net = struct {
         }
     }
 
-    fn takeRxStorage(self: *Net, frame_len: usize) ?[]u8 {
+    fn takeRxStorage(self: *Net, frame_len: usize) ?u16 {
         assert(frame_len > 0);
         assert(frame_len <= MAX_FRAME);
-        var index = self.rx_free_count;
-        while (index > 0) {
-            index -= 1;
-            if (self.rx_free[index].len < frame_len) continue;
-            const storage = self.rx_free[index];
-            self.rx_free_count -= 1;
-            self.rx_free[index] = self.rx_free[self.rx_free_count];
-            return storage;
+        assert(self.rx_free_head != rx_index_none);
+
+        var previous = rx_index_none;
+        var index = self.rx_free_head;
+        while (index != rx_index_none) {
+            const storage = &self.rx_storage[index];
+            if (storage.capacity >= frame_len) {
+                self.removeFreeStorage(previous, index);
+                return index;
+            }
+            previous = index;
+            index = storage.next_free;
         }
-        return self.alloc.alloc(u8, @max(frame_len, RX_BUFFER_SIZE)) catch null;
+
+        index = self.rx_free_head;
+        const storage = &self.rx_storage[index];
+        self.removeFreeStorage(rx_index_none, index);
+        const replacement = self.alloc.alloc(u8, @max(frame_len, RX_BUFFER_SIZE)) catch {
+            storage.next_free = self.rx_free_head;
+            self.rx_free_head = index;
+            return null;
+        };
+        if (storage.ptr != null) self.alloc.free(storage.bytes());
+        storage.ptr = replacement.ptr;
+        storage.capacity = @intCast(replacement.len);
+        return index;
+    }
+
+    fn removeFreeStorage(self: *Net, previous: u16, index: u16) void {
+        assert(index != rx_index_none);
+        assert(index < self.rx_storage.len);
+        if (previous == rx_index_none) {
+            self.rx_free_head = self.rx_storage[index].next_free;
+        } else {
+            assert(previous < self.rx_storage.len);
+            self.rx_storage[previous].next_free = self.rx_storage[index].next_free;
+        }
+        self.rx_storage[index].next_free = rx_index_none;
     }
 
     fn releaseRxFrame(self: *Net) void {
         assert(self.rx_count > 0);
-        assert(self.rx_free_count < self.rx_free.len);
-        self.rx_free[self.rx_free_count] = self.rx_frames[self.rx_head].storage;
-        self.rx_free_count += 1;
+        const storage_index = self.rx_frames[self.rx_head].storage_index;
+        assert(storage_index < self.rx_storage.len);
+        assert(self.rx_storage[storage_index].next_free == rx_index_none);
+        self.rx_storage[storage_index].next_free = self.rx_free_head;
+        self.rx_free_head = storage_index;
         self.rx_head = (self.rx_head + 1) % self.rx_frames.len;
         self.rx_count -= 1;
     }
 
     fn releaseQueuedFrames(self: *Net) void {
         assert(self.rx_count <= self.rx_frames.len);
-        assert(self.rx_free_count <= self.rx_free.len);
         while (self.rx_count > 0) self.releaseRxFrame();
         self.rx_head = 0;
+    }
+
+    fn queuedFrame(self: *const Net, frame_index: usize) []const u8 {
+        assert(frame_index < self.rx_frames.len);
+        const frame = self.rx_frames[frame_index];
+        const storage = self.rx_storage[frame.storage_index].bytes();
+        assert(frame.len > 0);
+        assert(frame.len <= storage.len);
+        return storage[0..frame.len];
     }
 
     /// Scatter header + frame into a writable RX chain; returns bytes
@@ -432,7 +497,7 @@ test "Net queues and drops rx frames at capacity" {
         net.queueRxFrame(&[_]u8{ 1, 2, 3, 4 });
     }
     try testing.expectEqual(Net.MAX_RX_QUEUED, net.rx_count);
-    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, net.rx_frames[net.rx_head].bytes());
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, net.queuedFrame(net.rx_head));
 }
 
 test "Net recycles normal RX buffers" {
@@ -441,10 +506,12 @@ test "Net recycles normal RX buffers" {
 
     var frame: [1514]u8 = @splat(0xA5);
     net.queueRxFrame(&frame);
-    const storage = net.rx_frames[net.rx_head].storage.ptr;
+    const storage_index = net.rx_frames[net.rx_head].storage_index;
+    const storage = net.rx_storage[storage_index].ptr;
     net.releaseQueuedFrames();
     net.queueRxFrame(&frame);
-    try testing.expectEqual(storage, net.rx_frames[net.rx_head].storage.ptr);
+    const recycled_index = net.rx_frames[net.rx_head].storage_index;
+    try testing.expectEqual(storage, net.rx_storage[recycled_index].ptr);
 }
 
 var test_tx_memory: [1514]u8 = @splat(0xA5);
