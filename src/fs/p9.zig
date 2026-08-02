@@ -690,9 +690,10 @@ pub const P9Server = struct {
             Tremove => {
                 const fid_id = try r.u32v();
                 const fid = try self.getFid(fid_id);
-                const path = try self.hostPath(fid.rel);
-                defer self.alloc.free(path);
-                const st = self.statRel(fid.rel) catch return error.Stat;
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(fid.rel, &path_storage);
+                var st: std.c.Stat = undefined;
+                if (lstat(path.ptr, &st) != 0) return error.Stat;
                 const rc = if (std.c.S.ISDIR(st.mode)) std.c.rmdir(path.ptr) else std.c.unlink(path.ptr);
                 if (self.fids.fetchRemove(fid_id)) |old| {
                     var v = old.value;
@@ -1005,11 +1006,29 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         try testing.expectEqual(@as(usize, 0), counted.allocations);
         try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     }
+    // TREMOVE fid 3 and its guest-created file
+    {
+        var p = TestPayload{};
+        const req = try tmsg(testing.allocator, Tremove, 14, p.u32v(3).slice());
+        defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
+        const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
+        try expectRType(resp[0..n], Tremove + 1);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+        try testing.expect(!srv.fids.contains(3));
+        try testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().openFile(io, root ++ "/guest.txt", .{}),
+        );
+    }
     // TCLUNK everything
     {
-        for ([_]u32{ 1, 2, 3 }) |fid| {
+        for ([_]u32{ 1, 2 }) |fid| {
             var p = TestPayload{};
-            const req = try tmsg(testing.allocator, Tclunk, 14, p.u32v(fid).slice());
+            const req = try tmsg(testing.allocator, Tclunk, 15, p.u32v(fid).slice());
             defer testing.allocator.free(req);
             const n = srv.handle(req, &resp);
             try expectRType(resp[0..n], Tclunk + 1);
