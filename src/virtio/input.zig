@@ -202,7 +202,9 @@ pub const Input = struct {
 
     /// Pending events to deliver. Guarded by events_mutex: the host
     /// UI thread appends, the vCPU thread drains via pollEvents.
-    pending_events: std.ArrayListUnmanaged(InputEvent),
+    pending_events: [PENDING_EVENTS_MAX]InputEvent,
+    pending_head: usize,
+    pending_count: usize,
     events_mutex: std.Io.Mutex,
 
     /// Shadow avail-ring cursors.
@@ -239,7 +241,9 @@ pub const Input = struct {
             .transport_queues = undefined,
             .config = .{},
             .subtype = subtype,
-            .pending_events = .empty,
+            .pending_events = undefined,
+            .pending_head = 0,
+            .pending_count = 0,
             .events_mutex = .init,
             .event_last_avail = 0,
             .status_last_avail = 0,
@@ -262,7 +266,6 @@ pub const Input = struct {
     }
 
     pub fn deinit(self: *Input) void {
-        self.pending_events.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -377,8 +380,10 @@ pub const Input = struct {
         self.events_mutex.lockUncancelable(global.io());
         defer self.events_mutex.unlock(global.io());
         // Bound the queue so a wedged guest can't grow it forever.
-        if (self.pending_events.items.len >= PENDING_EVENTS_MAX) return;
-        try self.pending_events.append(self.alloc, event);
+        if (self.pending_count >= self.pending_events.len) return;
+        const tail = (self.pending_head + self.pending_count) % self.pending_events.len;
+        self.pending_events[tail] = event;
+        self.pending_count += 1;
     }
 
     fn queueSyn(self: *Input) !void {
@@ -549,13 +554,13 @@ pub const Input = struct {
 
         self.events_mutex.lockUncancelable(global.io());
         defer self.events_mutex.unlock(global.io());
-        if (self.pending_events.items.len == 0) return;
+        if (self.pending_count == 0) return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
         var last_avail = self.event_last_avail;
         var delivered: usize = 0;
 
-        while (last_avail != avail_idx and delivered < self.pending_events.items.len) {
+        while (last_avail != avail_idx and delivered < self.pending_count) {
             const head = ring.availEntry(qc, last_avail, get_mem) orelse break;
             const desc = ring.readDesc(qc, head, get_mem) orelse break;
             if (!desc.isWrite() or desc.len < @sizeOf(InputEvent)) {
@@ -566,7 +571,8 @@ pub const Input = struct {
             }
 
             const mem = get_mem(desc.addr, @sizeOf(InputEvent)) orelse break;
-            const event = self.pending_events.items[delivered];
+            const event_index = (self.pending_head + delivered) % self.pending_events.len;
+            const event = self.pending_events[event_index];
             @memcpy(mem[0..@sizeOf(InputEvent)], std.mem.asBytes(&event));
             ring.pushUsed(qc, head, @sizeOf(InputEvent), get_mem);
 
@@ -576,7 +582,9 @@ pub const Input = struct {
 
         self.event_last_avail = last_avail;
         if (delivered > 0) {
-            self.pending_events.replaceRangeAssumeCapacity(0, delivered, &.{});
+            self.pending_head = (self.pending_head + delivered) % self.pending_events.len;
+            self.pending_count -= delivered;
+            if (self.pending_count == 0) self.pending_head = 0;
             self.transport.signalUsedBuffer();
         }
     }
@@ -636,10 +644,31 @@ test "Input inject key" {
     const input = try Input.init(std.testing.allocator, .keyboard);
     defer input.deinit();
 
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    input.alloc = counted.allocator();
     try input.injectKey(@intFromEnum(KeyCode.a), true);
+    input.alloc = std.testing.allocator;
 
     // Should have key event + syn event
-    try std.testing.expectEqual(@as(usize, 2), input.pending_events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 2), input.pending_count);
+}
+
+test "Input pending event ring wraps without allocation" {
+    const input = try Input.init(std.testing.allocator, .keyboard);
+    defer input.deinit();
+
+    input.pending_head = input.pending_events.len - 1;
+    const first = InputEvent{ .type = 1, .code = 30, .value = 1 };
+    const second = InputEvent{ .type = 0, .code = 0, .value = 0 };
+    try input.queueEvent(first);
+    try input.queueEvent(second);
+
+    try std.testing.expectEqual(@as(usize, 2), input.pending_count);
+    const last = input.pending_events[input.pending_events.len - 1];
+    try std.testing.expectEqual(first.code, last.code);
+    try std.testing.expectEqual(second.type, input.pending_events[0].type);
 }
 
 test "KeyCode values" {
