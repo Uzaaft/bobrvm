@@ -343,12 +343,19 @@ pub const Machine = struct {
     /// state across vCPU threads and host input threads.
     machine_lock: std.Io.Mutex = .init,
 
-    pub const Error = hypervisor.Error || Allocator.Error || std.Io.File.OpenError || std.Io.File.ReadPositionalError || std.Io.File.StatError || std.Thread.SpawnError || error{
-        KernelTooLarge,
-        InitrdTooLarge,
-        FirmwareTooLarge,
-        RestoreFailed,
-    };
+    pub const Error = hypervisor.Error ||
+        Allocator.Error ||
+        std.posix.MMapError ||
+        std.Io.File.OpenError ||
+        std.Io.File.ReadPositionalError ||
+        std.Io.File.StatError ||
+        std.Thread.SpawnError ||
+        error{
+            KernelTooLarge,
+            InitrdTooLarge,
+            FirmwareTooLarge,
+            RestoreFailed,
+        };
 
     pub fn init(alloc: Allocator, config: MachineConfig) Error!*Machine {
         log.info("initializing machine: {}MB RAM, {} vCPUs", .{

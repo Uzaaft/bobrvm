@@ -36,13 +36,13 @@ const PAGE_SIZE = 4096; // Standard page size on ARM64/x86_64
 
 /// Memory region tracking.
 pub const MemoryRegion = struct {
-    host_addr: [*]align(PAGE_SIZE) u8,
+    host_addr: [*]u8,
     guest_addr: u64,
     size: usize,
     flags: MemoryFlags,
-    /// True if this VM allocated host_addr (via map) and must free it on unmap.
+    /// True if this VM mapped host_addr (via map) and must unmap it on teardown.
     /// False for mapExisting regions where the host memory is caller-owned
-    /// (e.g. Venus blob memory owned by virglrenderer) — freeing it is invalid.
+    /// (e.g. Venus blob memory owned by virglrenderer).
     owned: bool = true,
 };
 
@@ -56,7 +56,7 @@ pub const VM = struct {
     regions: std.ArrayListUnmanaged(MemoryRegion),
     vcpus: std.ArrayListUnmanaged(*Vcpu),
 
-    pub const Error = c.Error || Allocator.Error;
+    pub const Error = c.Error || Allocator.Error || std.posix.MMapError;
 
     /// Create a new VM.
     ///
@@ -98,7 +98,7 @@ pub const VM = struct {
         // Unmap all memory regions
         for (self.regions.items) |region| {
             _ = c.hv_vm_unmap(region.guest_addr, region.size);
-            self.alloc.free(region.host_addr[0..region.size]);
+            if (region.owned) std.posix.munmap(@alignCast(region.host_addr[0..region.size]));
         }
         self.regions.deinit(self.alloc);
 
@@ -125,12 +125,17 @@ pub const VM = struct {
         assert(guest_addr % PAGE_SIZE == 0);
         assert(size % PAGE_SIZE == 0);
 
-        // Allocate page-aligned memory
-        const host_mem = try self.alloc.alignedAlloc(u8, .fromByteUnits(PAGE_SIZE), size);
-        errdefer self.alloc.free(host_mem);
-
-        // Zero-initialize for security
-        @memset(host_mem, 0);
+        // Anonymous pages are securely zero-filled by the kernel and committed
+        // lazily, avoiding a full write across multi-gigabyte guest RAM at boot.
+        const host_mem = try std.posix.mmap(
+            null,
+            size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        );
+        errdefer std.posix.munmap(host_mem);
 
         // Map into guest
         const ret = c.hv_vm_map(
@@ -140,6 +145,7 @@ pub const VM = struct {
             flags.toRaw(),
         );
         try c.check(ret);
+        errdefer _ = c.hv_vm_unmap(guest_addr, size);
 
         // Track the region
         try self.regions.append(self.alloc, .{
@@ -178,6 +184,7 @@ pub const VM = struct {
             flags.toRaw(),
         );
         try c.check(ret);
+        errdefer _ = c.hv_vm_unmap(guest_addr, host_addr.len);
 
         // Track but don't free (host_addr ownership stays with caller)
         // We track it to ensure proper cleanup order
@@ -204,10 +211,9 @@ pub const VM = struct {
         while (i < self.regions.items.len) {
             if (self.regions.items[i].guest_addr == guest_addr) {
                 const region = self.regions.swapRemove(i);
-                // Only free memory this VM allocated; mapExisting regions are
-                // caller-owned (freeing them would be an invalid free).
-                if (region.owned)
-                    self.alloc.free(region.host_addr[0..region.size]);
+                // Only unmap memory this VM owns; mapExisting regions are
+                // caller-owned.
+                if (region.owned) std.posix.munmap(@alignCast(region.host_addr[0..region.size]));
             } else {
                 i += 1;
             }
