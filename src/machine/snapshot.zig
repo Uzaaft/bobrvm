@@ -28,6 +28,7 @@ const log = std.log.scoped(.snapshot);
 pub const MAGIC = "BBRSNAP1";
 pub const VERSION: u32 = 1;
 const block_section_scratch_bytes = 128;
+const console_section_scratch_bytes = 512;
 const gic_section_scratch_bytes = 2 * 1024;
 const input_section_scratch_bytes = 128;
 const net_section_scratch_bytes = 128;
@@ -374,6 +375,20 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
     const result = out.buf.items;
     out.buf = .empty;
     return result;
+}
+
+pub fn appendConsoleSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    con: *const virtio.Console,
+) !void {
+    assert(con.ports.len <= std.math.maxInt(u8));
+    assert(con.input_buffer.count <= virtio.Console.INPUT_BUFFER_MAX);
+    var stack_allocator = std.heap.stackFallback(console_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeConsole(scratch_alloc, con);
+    defer scratch_alloc.free(data);
+    try builder.section("console", data);
 }
 
 pub fn deserializeConsole(_: Allocator, con: *virtio.Console, data: []const u8) !void {
@@ -766,6 +781,27 @@ test "snapshot: console device roundtrip (multiport)" {
     try testing.expectEqualStrings("pending host input", con2.input_buffer.firstSlice());
     try testing.expectEqualStrings("agent bytes", con2.ports[0].input_buffer.firstSlice());
     try testing.expect(con2.ports[0].guest_open);
+}
+
+test "snapshot: console section assembly allocation profile" {
+    const con = try virtio.Console.init(testing.allocator, &.{"org.qemu.guest_agent.0"});
+    defer con.deinit();
+    try con.queueInput("pending host input");
+    try con.queuePortInput(1, "agent bytes");
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendConsoleSection(&builder, alloc, con);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(usize, 3), counted.allocations);
+    try testing.expectEqual(@as(usize, 1025), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 275), reader.section("console").?.len);
 }
 
 test "snapshot: block device roundtrip" {
