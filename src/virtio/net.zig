@@ -50,9 +50,10 @@ pub const Config = extern struct {
 /// replies via queueRxFrame.
 pub const TxCallback = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
 
-const RxFrame = struct {
-    storage_index: u16,
-    len: u32,
+const RxFrame = packed struct(u32) {
+    storage_index: u10,
+    len: u17,
+    _padding: u5 = 0,
 };
 
 const RxStorage = struct {
@@ -147,7 +148,7 @@ pub const Net = struct {
         transport.setNotifyCallback(handleNotify, net);
 
         assert(net.transport.device_id == 1);
-        assert(@sizeOf(RxFrame) == 8);
+        assert(@sizeOf(RxFrame) == 4);
         assert(@sizeOf(RxStorage) == 16);
 
         return net;
@@ -184,7 +185,7 @@ pub const Net = struct {
         @memcpy(storage[0..frame.len], frame);
         const tail = (self.rx_head + self.rx_count) % self.rx_frames.len;
         self.rx_frames[tail] = .{
-            .storage_index = storage_index,
+            .storage_index = @intCast(storage_index),
             .len = @intCast(frame.len),
         };
         self.rx_count += 1;
