@@ -1733,10 +1733,17 @@ pub const Gpu = struct {
             }
         }
         if (self.transfer3d_staging.len < total) {
+            const growth = std.math.add(
+                usize,
+                self.transfer3d_staging.len,
+                self.transfer3d_staging.len / 2,
+            ) catch total;
+            const capacity = @max(total, growth);
             self.transfer3d_staging = if (self.transfer3d_staging.len == 0)
-                self.alloc.alloc(u8, total) catch return error.OutOfMemory
+                self.alloc.alloc(u8, capacity) catch return error.OutOfMemory
             else
-                self.alloc.realloc(self.transfer3d_staging, total) catch return error.OutOfMemory;
+                self.alloc.realloc(self.transfer3d_staging, capacity) catch
+                    return error.OutOfMemory;
         }
         const staging = self.transfer3d_staging[0..total];
         var y: u32 = 0;
@@ -2549,10 +2556,6 @@ test "strided fragmented texture upload retains compact staging" {
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
     gpu.alloc = counted.allocator();
     const upload = try gpu.textureUploadData(&entries, 0, 16, 8, 4, 32, Ctx.get);
-    gpu.alloc = testing.allocator;
-
-    try testing.expectEqual(@as(usize, 1), counted.allocations);
-    try testing.expectEqual(@as(usize, 32), counted.allocated_bytes);
     try testing.expectEqual(@as(usize, 32), upload.data.len);
     try testing.expectEqual(@as(u32, 8), upload.bytes_per_row);
     for (0..4) |row| {
@@ -2562,6 +2565,15 @@ test "strided fragmented texture upload retains compact staging" {
             upload.data[row * 8 ..][0..8],
         );
     }
+
+    _ = try gpu.textureUploadData(&entries, 0, 16, 10, 4, 40, Ctx.get);
+    _ = try gpu.textureUploadData(&entries, 0, 16, 12, 4, 48, Ctx.get);
+    gpu.alloc = testing.allocator;
+
+    try testing.expectEqual(@as(usize, 2), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 80), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 48), gpu.transfer3d_staging.len);
 }
 
 test "transfer_to_host_3d uploads guest vertex data into the resource's MTLBuffer" {
