@@ -323,6 +323,15 @@ pub const MiniNat = struct {
         buffer.deinit(self.alloc);
     }
 
+    fn reserveFlowTables(self: *MiniNat) std.mem.Allocator.Error!void {
+        assert(self.udp_flows.count() == 0);
+        assert(self.tcp_flows.count() == 0);
+        assert(self.icmp_flows.count() == 0);
+        try self.udp_flows.ensureTotalCapacity(UDP_FLOW_MAX);
+        try self.tcp_flows.ensureTotalCapacity(TCP_FLOW_MAX);
+        try self.icmp_flows.ensureTotalCapacity(ICMP_FLOW_MAX);
+    }
+
     /// Set the RX back-pressure predicate (see rx_ready).
     pub fn setRxReady(self: *MiniNat, cb: *const fn (?*anyopaque) bool, userdata: ?*anyopaque) void {
         self.rx_ready = cb;
@@ -358,6 +367,7 @@ pub const MiniNat = struct {
     pub fn start(self: *MiniNat) !void {
         try self.initTcpSendPool();
         errdefer self.deinitTcpSendPool();
+        try self.reserveFlowTables();
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.poll_thread = try std.Thread.spawn(.{ .stack_size = stack_size_bytes }, pollLoop, .{self});
@@ -495,12 +505,9 @@ pub const MiniNat = struct {
         self.flows_mutex.lockUncancelable(global.io());
         defer self.flows_mutex.unlock(global.io());
 
+        if (self.udp_flows.count() >= UDP_FLOW_MAX and !self.udp_flows.contains(key)) return;
         const gop = self.udp_flows.getOrPut(key) catch return;
         if (!gop.found_existing) {
-            if (self.udp_flows.count() > UDP_FLOW_MAX) {
-                _ = self.udp_flows.remove(key);
-                return;
-            }
             const sock = net_compat.socketCreate(
                 std.posix.AF.INET,
                 std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
@@ -540,12 +547,9 @@ pub const MiniNat = struct {
         self.flows_mutex.lockUncancelable(global.io());
         defer self.flows_mutex.unlock(global.io());
 
+        if (self.icmp_flows.count() >= ICMP_FLOW_MAX and !self.icmp_flows.contains(key)) return;
         const gop = self.icmp_flows.getOrPut(key) catch return;
         if (!gop.found_existing) {
-            if (self.icmp_flows.count() > ICMP_FLOW_MAX) {
-                _ = self.icmp_flows.remove(key);
-                return;
-            }
             const sock = net_compat.socketCreate(
                 std.posix.AF.INET,
                 std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
@@ -1810,4 +1814,89 @@ test "MiniNat TCP send slab checks out and recycles without allocation" {
     try testing.expectEqual(@as(usize, 1), counted.allocations);
     for (&all) |*buffer| nat.releaseTcpSendBuffer(buffer);
     try testing.expectEqual(@as(u16, MiniNat.TCP_FLOW_MAX), nat.tcp_send_free_count);
+}
+
+test "MiniNat first flow-table inserts allocation profile" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var nat = MiniNat.init(counted.allocator(), testReply, null);
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+    }
+
+    try nat.udp_flows.put(.{ .guest_port = 1, .remote_ip = .{ 1, 1, 1, 1 }, .remote_port = 2 }, .{
+        .socket = -1,
+        .last_used = 0,
+    });
+    try nat.tcp_flows.put(.{ .guest_port = 3, .remote_ip = .{ 2, 2, 2, 2 }, .remote_port = 4 }, .{
+        .socket = -1,
+        .state = .established,
+        .snd_nxt = 0,
+        .rcv_nxt = 0,
+        .last_used = 0,
+    });
+    try nat.icmp_flows.put(.{ .remote_ip = .{ 3, 3, 3, 3 }, .id = 5 }, .{
+        .socket = -1,
+        .last_used = 0,
+    });
+
+    try testing.expectEqual(@as(usize, 3), counted.allocations);
+    try testing.expectEqual(@as(usize, 1232), counted.allocated_bytes);
+}
+
+test "MiniNat reserved flow tables fill without allocation" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var nat = MiniNat.init(counted.allocator(), testReply, null);
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+    }
+    try nat.reserveFlowTables();
+    const allocations = counted.allocations;
+    const allocated_bytes = counted.allocated_bytes;
+
+    for (0..MiniNat.UDP_FLOW_MAX) |index| {
+        const port: u16 = @intCast(index);
+        const udp_key = UdpKey{
+            .guest_port = port,
+            .remote_ip = .{ 1, 1, 1, 1 },
+            .remote_port = 1,
+        };
+        try nat.udp_flows.put(udp_key, .{
+            .socket = -1,
+            .last_used = 0,
+        });
+        const tcp_key = TcpKey{
+            .guest_port = port,
+            .remote_ip = .{ 2, 2, 2, 2 },
+            .remote_port = 2,
+        };
+        try nat.tcp_flows.put(tcp_key, .{
+            .socket = -1,
+            .state = .established,
+            .snd_nxt = 0,
+            .rcv_nxt = 0,
+            .last_used = 0,
+        });
+        try nat.icmp_flows.put(.{ .remote_ip = .{ 3, 3, 3, 3 }, .id = port }, .{
+            .socket = -1,
+            .last_used = 0,
+        });
+    }
+
+    try testing.expectEqual(@as(usize, 3), allocations);
+    try testing.expectEqual(@as(usize, 74_312), allocated_bytes);
+    try testing.expectEqual(allocations, counted.allocations);
+    try testing.expectEqual(allocated_bytes, counted.allocated_bytes);
+    try testing.expectEqual(MiniNat.UDP_FLOW_MAX, nat.udp_flows.count());
+    try testing.expectEqual(MiniNat.TCP_FLOW_MAX, nat.tcp_flows.count());
+    try testing.expectEqual(MiniNat.ICMP_FLOW_MAX, nat.icmp_flows.count());
+
+    nat.forwardUdp(60_000, .{ 4, 4, 4, 4 }, 53, "full");
+    nat.forwardIcmp(.{ 5, 5, 5, 5 }, 60_000, 1, "full");
+    try testing.expectEqual(allocations, counted.allocations);
+    try testing.expectEqual(MiniNat.UDP_FLOW_MAX, nat.udp_flows.count());
+    try testing.expectEqual(MiniNat.ICMP_FLOW_MAX, nat.icmp_flows.count());
 }
