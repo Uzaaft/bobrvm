@@ -4,6 +4,7 @@
 //! Tracks bound state objects and translates commands to Metal.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
 const proto = @import("protocol.zig");
@@ -309,9 +310,8 @@ pub const Context = struct {
     /// little-endian, nul-terminated). The stage is derived from the TGSI
     /// header token so we don't depend on the wire type encoding.
     pub fn createShader(self: *Context, handle: ObjectHandle, words: []const u32) Error!void {
-        const raw = try self.alloc.alloc(u8, words.len * 4);
-        defer self.alloc.free(raw);
-        for (0..words.len) |i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], words[i], .little);
+        comptime assert(builtin.cpu.arch.endian() == .little);
+        const raw = std.mem.sliceAsBytes(words);
         const end = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
         const text = try self.alloc.dupe(u8, raw[0..end]);
         errdefer self.alloc.free(text);
@@ -486,4 +486,18 @@ test "Context create and bind blend state" {
 
     try std.testing.expectEqual(@as(?ObjectHandle, 42), ctx.bound.blend);
     try std.testing.expect(ctx.blend_states.contains(42));
+}
+
+test "Context shader capture allocation profile" {
+    var ctx = try Context.init(std.testing.allocator, 1);
+    defer ctx.deinit();
+
+    const words = [_]u32{ 0x5452_4556, 0 };
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    ctx.alloc = counted.allocator();
+    try ctx.createShader(7, &words);
+    ctx.alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 4), counted.allocated_bytes);
 }
