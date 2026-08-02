@@ -99,19 +99,35 @@ pub const Qga = struct {
     /// Feed guest→host bytes (console port output). Called on the vCPU
     /// thread; parses complete newline-terminated JSON responses.
     pub fn feed(self: *Qga, data: []const u8) void {
-        for (data) |byte| {
-            if (byte == '\n') {
+        var remaining = data;
+        while (remaining.len > 0) {
+            if (std.mem.indexOfScalar(u8, remaining, '\n')) |newline| {
+                if (!self.appendLineSegment(remaining[0..newline])) return;
                 self.handleLine(self.line_buf.items);
                 self.line_buf.clearRetainingCapacity();
+                remaining = remaining[newline + 1 ..];
                 continue;
             }
+            if (!self.appendLineSegment(remaining)) return;
+            return;
+        }
+    }
+
+    fn appendLineSegment(self: *Qga, data: []const u8) bool {
+        std.debug.assert(self.line_buf.items.len <= LINE_MAX);
+        const available = LINE_MAX - self.line_buf.items.len;
+        if (data.len <= available) {
+            self.line_buf.appendSlice(self.alloc, data) catch return false;
+            return true;
+        }
+        for (data) |byte| {
             if (self.line_buf.items.len >= LINE_MAX) {
                 // Hostile/corrupt stream: drop the line.
                 self.line_buf.clearRetainingCapacity();
-                continue;
             }
-            self.line_buf.append(self.alloc, byte) catch return;
+            self.line_buf.append(self.alloc, byte) catch return false;
         }
+        return true;
     }
 
     fn handleLine(self: *Qga, line: []const u8) void {
@@ -229,6 +245,19 @@ test "qga: feed parses split responses and sync ids" {
     // Garbage lines don't count or crash.
     qga.feed("not json at all\n");
     try testing.expectEqual(@as(u64, 3), qga.responses_seen);
+}
+
+test "qga: partial line assembly allocation profile" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var qga = Qga.init(counted.allocator(), testSend, null);
+    defer qga.deinit();
+    var input: [1024]u8 = @splat('x');
+
+    qga.feed(&input);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 1664), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(input.len, qga.line_buf.items.len);
 }
 
 test "qga: guest-network-get-interfaces parses ipv4 addresses" {
