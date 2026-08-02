@@ -458,8 +458,15 @@ pub fn deserializeInput(input: *virtio.Input, data: []const u8) !void {
 }
 
 pub fn serializeP9(alloc: Allocator, dev: *const virtio.P9) ![]u8 {
+    assert(dev.server.fids.count() <= std.math.maxInt(u32));
+    const fid_state_bytes = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32);
+    var serialized_bytes = transportSerializedBytes(dev.transport) + @sizeOf(u16) +
+        2 * @sizeOf(u32);
+    var size_iter = dev.server.fids.valueIterator();
+    while (size_iter.next()) |fid| serialized_bytes += fid_state_bytes + fid.rel.len;
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try serializeTransport(&out, dev.transport);
     try out.int(u16, dev.last_avail);
     try out.int(u32, dev.server.msize);
@@ -470,7 +477,11 @@ pub fn serializeP9(alloc: Allocator, dev: *const virtio.P9) ![]u8 {
         try out.blob(entry.value_ptr.rel);
         try out.int(u32, entry.value_ptr.open_linux_flags orelse 0xFFFF_FFFF);
     }
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void {
@@ -750,6 +761,35 @@ test "snapshot: input device roundtrip" {
     try testing.expectEqual(@as(u64, 0x8000_0000), input2.transport.queues[0].device_addr);
     try testing.expectEqual(@as(u16, 41), input2.event_last_avail);
     try testing.expectEqual(@as(u16, 43), input2.status_last_avail);
+}
+
+test "snapshot: P9 device roundtrip with fids" {
+    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    defer dev.deinit();
+    dev.transport.status = @bitCast(@as(u8, 0x0F));
+    dev.transport.queues[0].ready = true;
+    dev.server.msize = 64 * 1024;
+    dev.last_avail = 47;
+    try dev.server.restoreFid(testing.allocator, 3, "src", null);
+    try dev.server.restoreFid(testing.allocator, 9, "src/machine", null);
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeP9(counted.allocator(), dev);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+
+    const dev2 = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    defer dev2.deinit();
+    try deserializeP9(testing.allocator, dev2, data);
+    try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(dev2.transport.status)));
+    try testing.expect(dev2.transport.queues[0].ready);
+    try testing.expectEqual(@as(u32, 64 * 1024), dev2.server.msize);
+    try testing.expectEqual(@as(u16, 47), dev2.last_avail);
+    try testing.expectEqual(@as(usize, 2), dev2.server.fids.count());
+    try testing.expectEqualStrings("src", dev2.server.fids.get(3).?.rel);
+    try testing.expectEqualStrings("src/machine", dev2.server.fids.get(9).?.rel);
 }
 
 test "snapshot: gpu 2D framebuffer survives roundtrip" {
