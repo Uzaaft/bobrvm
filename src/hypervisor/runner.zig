@@ -23,6 +23,12 @@ fn sleepNs(ns: u64) void {
         .clock = .awake,
     }, global.io()) catch {};
 }
+
+fn monotonicMilliseconds() i64 {
+    const nanoseconds = std.Io.Clock.awake.now(global.io()).nanoseconds;
+    return @intCast(@divFloor(nanoseconds, std.time.ns_per_ms));
+}
+
 const c = @import("c.zig");
 const Vcpu = @import("vcpu.zig").Vcpu;
 const ExitInfo = @import("vcpu.zig").ExitInfo;
@@ -178,7 +184,7 @@ pub const VcpuRunner = struct {
     pub fn getTimeSinceLastExit(self: *const VcpuRunner) i64 {
         const last = self.last_exit_time.load(.acquire);
         if (last == 0) return 0;
-        return std.time.milliTimestamp() - last;
+        return monotonicMilliseconds() - last;
     }
 
     /// Force the vCPU to exit from hv_vcpu_run.
@@ -218,27 +224,9 @@ pub const VcpuRunner = struct {
         }
 
         // Main run loop
-        var last_heartbeat: i64 = std.time.milliTimestamp();
+        var last_heartbeat: i64 = monotonicMilliseconds();
 
         while (self.running.load(.acquire)) {
-            const now = std.time.milliTimestamp();
-
-            // Heartbeat every 5 seconds
-            if (now - last_heartbeat > 5000) {
-                std.log.info("vcpu {}: exits={} mmio={} gic={} uart={} pci={} vtimer={} wfi={} sysreg={}", .{
-                    self.id,
-                    self.exit_count,
-                    self.mmio_count,
-                    self.other_mmio_count,
-                    self.uart_count,
-                    self.pci_count,
-                    self.vtimer_count,
-                    self.wfi_count,
-                    self.sysreg_count,
-                });
-                last_heartbeat = now;
-            }
-
             // Check if halted (WFI)
             if (self.halted.load(.acquire)) {
                 sleepNs(1_000_000); // 1ms
@@ -251,11 +239,26 @@ pub const VcpuRunner = struct {
             }
 
             // Track time before hv_vcpu_run to detect hangs
-            const run_start = std.time.milliTimestamp();
+            const run_start = monotonicMilliseconds();
+            if (run_start - last_heartbeat > 5000) {
+                std.log.info("vcpu {}: exits={} mmio={} gic={} uart={} pci={} vtimer={} wfi={} sysreg={}", .{
+                    self.id,
+                    self.exit_count,
+                    self.mmio_count,
+                    self.other_mmio_count,
+                    self.uart_count,
+                    self.pci_count,
+                    self.vtimer_count,
+                    self.wfi_count,
+                    self.sysreg_count,
+                });
+                last_heartbeat = run_start;
+            }
             self.last_exit_time.store(run_start, .release);
             const exit_info = try self.vcpu.?.run();
-            const run_duration = std.time.milliTimestamp() - run_start;
-            self.last_exit_time.store(std.time.milliTimestamp(), .release);
+            const run_end = monotonicMilliseconds();
+            const run_duration = run_end - run_start;
+            self.last_exit_time.store(run_end, .release);
 
             self.exit_count += 1;
 
