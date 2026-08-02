@@ -64,7 +64,6 @@ struct DebugBuildWarningView: View {
 
 struct ContentView: View {
     @EnvironmentObject var vmManager: VMManager
-    @StateObject private var ghosttyRuntime = GhosttyRuntime()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,7 +77,7 @@ struct ContentView: View {
                     .frame(minWidth: 200)
             } detail: {
                 if let vm = vmManager.selectedVM {
-                    VMDetailView(vmInstance: vm, ghosttyRuntime: ghosttyRuntime)
+                    VMDetailView(vmInstance: vm)
                 } else {
                     VMLibraryHomeView()
                 }
@@ -347,32 +346,12 @@ struct VMListRow: View {
 
 struct VMDetailView: View {
     @ObservedObject var vmInstance: VMInstance
-    @ObservedObject var ghosttyRuntime: GhosttyRuntime
-    @EnvironmentObject var vmManager: VMManager
     @State private var showingConsole = true
 
     var body: some View {
         VStack(spacing: 0) {
             if vmInstance.state == .running || vmInstance.state == .paused {
-                VSplitView {
-                    VMSurfaceRepresentable(vmInstance: vmInstance)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                    if showingConsole {
-                        if let app = ghosttyRuntime.app {
-                            GhosttySurfaceViewRepresentable(
-                                app: app,
-                                command: "/usr/bin/true",
-                                workingDirectory: nil
-                            )
-                            .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
-                        } else {
-                            Text("Terminal unavailable")
-                                .foregroundColor(.secondary)
-                                .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
-                        }
-                    }
-                }
+                RunningVMDetail(vmInstance: vmInstance, showingConsole: showingConsole)
             } else {
                 VStack(spacing: 16) {
                     Image(systemName: "desktopcomputer")
@@ -400,6 +379,34 @@ struct VMDetailView: View {
                     Image(systemName: "terminal")
                 }
                 .help("Toggle Console")
+            }
+        }
+    }
+}
+
+private struct RunningVMDetail: View {
+    @ObservedObject var vmInstance: VMInstance
+    let showingConsole: Bool
+    @StateObject private var ghosttyRuntime = GhosttyRuntime()
+
+    var body: some View {
+        VSplitView {
+            VMSurfaceRepresentable(vmInstance: vmInstance)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if showingConsole {
+                if let app = ghosttyRuntime.app {
+                    GhosttySurfaceViewRepresentable(
+                        app: app,
+                        command: "/usr/bin/true",
+                        workingDirectory: nil
+                    )
+                    .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
+                } else {
+                    Text("Terminal unavailable")
+                        .foregroundColor(.secondary)
+                        .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
+                }
             }
         }
     }
