@@ -36,6 +36,31 @@ pub const P9 = struct {
     /// Guest memory accessor.
     guest_memory: ?ring.GetMemFn = null,
 
+    const AllocationLayout = struct {
+        tag_offset: usize,
+        req_buf_offset: usize,
+        resp_buf_offset: usize,
+        size: usize,
+    };
+
+    fn allocationLayout(tag_len: usize) Allocator.Error!AllocationLayout {
+        const tag_offset = @sizeOf(P9);
+        const req_buf_offset = std.math.add(usize, tag_offset, tag_len) catch
+            return error.OutOfMemory;
+        const resp_buf_offset = std.math.add(usize, req_buf_offset, p9.MSIZE_MAX) catch
+            return error.OutOfMemory;
+        const size = std.math.add(usize, resp_buf_offset, p9.MSIZE_MAX) catch
+            return error.OutOfMemory;
+        assert(tag_offset <= req_buf_offset);
+        assert(resp_buf_offset <= size);
+        return .{
+            .tag_offset = tag_offset,
+            .req_buf_offset = req_buf_offset,
+            .resp_buf_offset = resp_buf_offset,
+            .size = size,
+        };
+    }
+
     pub fn init(alloc: Allocator, tag: []const u8, root_path: []const u8) !*P9 {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
@@ -45,14 +70,14 @@ pub const P9 = struct {
         var server = try p9.P9Server.init(alloc, root_path);
         errdefer server.deinit();
 
-        const owned_tag = try alloc.dupe(u8, tag);
-        errdefer alloc.free(owned_tag);
-        const req_buf = try alloc.alloc(u8, p9.MSIZE_MAX);
-        errdefer alloc.free(req_buf);
-        const resp_buf = try alloc.alloc(u8, p9.MSIZE_MAX);
-        errdefer alloc.free(resp_buf);
-
-        const dev = try alloc.create(P9);
+        const layout = try allocationLayout(tag.len);
+        const allocation = try alloc.alignedAlloc(u8, .of(P9), layout.size);
+        errdefer alloc.free(allocation);
+        const dev: *P9 = @ptrCast(allocation.ptr);
+        const owned_tag = allocation[layout.tag_offset..layout.req_buf_offset];
+        const req_buf = allocation[layout.req_buf_offset..layout.resp_buf_offset];
+        const resp_buf = allocation[layout.resp_buf_offset..];
+        @memcpy(owned_tag, tag);
         dev.* = .{
             .alloc = alloc,
             .transport = transport,
@@ -69,11 +94,13 @@ pub const P9 = struct {
 
     pub fn deinit(self: *P9) void {
         self.server.deinit();
-        self.alloc.free(self.tag);
-        self.alloc.free(self.req_buf);
-        self.alloc.free(self.resp_buf);
         self.transport.deinit(self.alloc);
-        self.alloc.destroy(self);
+        const layout = allocationLayout(self.tag.len) catch unreachable;
+        self.tag = &.{};
+        self.req_buf = &.{};
+        self.resp_buf = &.{};
+        const allocation_ptr: [*]align(@alignOf(P9)) u8 = @ptrCast(self);
+        self.alloc.free(allocation_ptr[0..layout.size]);
     }
 
     /// Set guest memory accessor.
@@ -173,6 +200,21 @@ pub const P9 = struct {
 // =============================================================================
 
 const testing = std.testing;
+
+test "P9 startup allocation profile" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const tag = "host";
+    const root = ".";
+    const dev = try P9.init(counted.allocator(), tag, root);
+    defer dev.deinit();
+
+    try testing.expectEqual(@as(usize, 3), counted.allocations);
+    try testing.expectEqual(
+        @sizeOf(P9) + tag.len + 2 * p9.MSIZE_MAX + root.len +
+            @sizeOf(mmio.Transport) + @sizeOf(mmio.QueueConfig),
+        counted.allocated_bytes,
+    );
+}
 
 test "P9 device: identity, mount tag config, and a version exchange" {
     const io = @import("../global.zig").io();
