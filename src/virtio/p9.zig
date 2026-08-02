@@ -37,6 +37,8 @@ pub const P9 = struct {
     guest_memory: ?ring.GetMemFn = null,
 
     const AllocationLayout = struct {
+        transport_offset: usize,
+        queue_offset: usize,
         tag_offset: usize,
         root_offset: usize,
         req_buf_offset: usize,
@@ -45,7 +47,19 @@ pub const P9 = struct {
     };
 
     fn allocationLayout(tag_len: usize, root_len: usize) Allocator.Error!AllocationLayout {
-        const tag_offset = @sizeOf(P9);
+        comptime assert(@alignOf(P9) >= @max(@alignOf(mmio.Transport), @alignOf(mmio.QueueConfig)));
+        const transport_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(P9),
+            @alignOf(mmio.Transport),
+        );
+        const queue_offset = std.mem.alignForward(
+            usize,
+            transport_offset + @sizeOf(mmio.Transport),
+            @alignOf(mmio.QueueConfig),
+        );
+        const tag_offset = std.math.add(usize, queue_offset, @sizeOf(mmio.QueueConfig)) catch
+            return error.OutOfMemory;
         const root_offset = std.math.add(usize, tag_offset, tag_len) catch
             return error.OutOfMemory;
         const req_buf_offset = std.math.add(usize, root_offset, root_len) catch
@@ -58,6 +72,8 @@ pub const P9 = struct {
         assert(root_offset <= req_buf_offset);
         assert(resp_buf_offset <= size);
         return .{
+            .transport_offset = transport_offset,
+            .queue_offset = queue_offset,
             .tag_offset = tag_offset,
             .root_offset = root_offset,
             .req_buf_offset = req_buf_offset,
@@ -69,13 +85,17 @@ pub const P9 = struct {
     pub fn init(alloc: Allocator, tag: []const u8, root_path: []const u8) !*P9 {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
-        const transport = try mmio.Transport.init(alloc, 9, virtio_version_1 | FEATURE_MOUNT_TAG, 1);
-        errdefer transport.deinit(alloc);
-
         const layout = try allocationLayout(tag.len, root_path.len);
         const allocation = try alloc.alignedAlloc(u8, .of(P9), layout.size);
         errdefer alloc.free(allocation);
         const dev: *P9 = @ptrCast(allocation.ptr);
+        const transport: *mmio.Transport = @ptrCast(@alignCast(
+            allocation.ptr + layout.transport_offset,
+        ));
+        const queue: *mmio.QueueConfig = @ptrCast(@alignCast(
+            allocation.ptr + layout.queue_offset,
+        ));
+        transport.initEmbedded(9, virtio_version_1 | FEATURE_MOUNT_TAG, queue[0..1]);
         const owned_tag = allocation[layout.tag_offset..layout.root_offset];
         const owned_root = allocation[layout.root_offset..layout.req_buf_offset];
         const req_buf = allocation[layout.req_buf_offset..layout.resp_buf_offset];
@@ -99,8 +119,8 @@ pub const P9 = struct {
     pub fn deinit(self: *P9) void {
         const root_len = self.server.root.len;
         self.server.deinitEmbedded();
-        self.transport.deinit(self.alloc);
         const layout = allocationLayout(self.tag.len, root_len) catch unreachable;
+        self.transport.queues = &.{};
         self.tag = &.{};
         self.req_buf = &.{};
         self.resp_buf = &.{};
@@ -213,7 +233,7 @@ test "P9 startup allocation profile" {
     const dev = try P9.init(counted.allocator(), tag, root);
     defer dev.deinit();
 
-    try testing.expectEqual(@as(usize, 2), counted.allocations);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
     try testing.expectEqual(
         @sizeOf(P9) + tag.len + 2 * p9.MSIZE_MAX + root.len +
             @sizeOf(mmio.Transport) + @sizeOf(mmio.QueueConfig),
