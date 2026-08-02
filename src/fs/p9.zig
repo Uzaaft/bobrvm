@@ -565,8 +565,8 @@ pub const P9Server = struct {
                 const offset = try r.u64v();
                 const count = try r.u32v();
                 const fid = try self.getFid(fid_id);
-                const path = try self.hostPath(fid.rel);
-                defer self.alloc.free(path);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(fid.rel, &path_storage);
 
                 const dir = std.c.opendir(path.ptr) orelse return error.Errno;
                 defer _ = std.c.closedir(dir);
@@ -890,9 +890,14 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p2 = TestPayload{};
         const req2 = try tmsg(testing.allocator, Treaddir, 6, p2.u32v(1).u64v(0).u32v(8192).slice());
         defer testing.allocator.free(req2);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n2 = srv.handle(req2, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n2], Treaddir + 1);
         try testing.expect(std.mem.indexOf(u8, resp[0..n2], "hello.txt") != null);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     }
     // TWALK fid1 -> fid3 (clone root), TLCREATE guest.txt, TWRITE
     {
