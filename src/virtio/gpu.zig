@@ -1585,23 +1585,18 @@ pub const Gpu = struct {
             const stride: u64 = if (cmd.stride != 0) cmd.stride else res_pitch;
             const total_u64 = row_bytes * cmd.box.h;
             if (total_u64 > 512 * 1024 * 1024) return .resp_err_invalid_parameter;
-            const total: usize = @intCast(total_u64);
-            if (self.transfer3d_staging.len < total) {
-                const staging = if (self.transfer3d_staging.len == 0)
-                    self.alloc.alloc(u8, total) catch return .resp_err_out_of_memory
-                else
-                    self.alloc.realloc(self.transfer3d_staging, total) catch return .resp_err_out_of_memory;
-                self.transfer3d_staging = staging;
-            }
-            const staging = self.transfer3d_staging[0..total];
-            var y: u32 = 0;
-            while (y < cmd.box.h) : (y += 1) {
-                const src_off = cmd.offset + @as(u64, y) * stride;
-                const dst_row = staging[@intCast(@as(u64, y) * row_bytes)..][0..@intCast(row_bytes)];
-                if (!copyFromBacking(list.items, src_off, dst_row, get_mem)) {
-                    return .resp_err_unspec;
-                }
-            }
+            const upload = self.textureUploadData(
+                list.items,
+                cmd.offset,
+                stride,
+                row_bytes,
+                cmd.box.h,
+                @intCast(total_u64),
+                get_mem,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return .resp_err_out_of_memory,
+                error.InvalidBacking => return .resp_err_unspec,
+            };
             // No Metal backing (decode-only CI) is not an error, but the
             // outcome is worth counting: a texture that never lands is why a
             // guest's textured draws come out blank.
@@ -1611,7 +1606,7 @@ pub const Gpu = struct {
                 cmd.box.y,
                 cmd.box.w,
                 cmd.box.h,
-                staging,
+                upload,
                 @intCast(row_bytes),
             );
             if (gpu_module.stats.on()) {
@@ -1636,6 +1631,62 @@ pub const Gpu = struct {
             return .resp_err_unspec;
         }
         return .resp_ok_nodata;
+    }
+
+    const TextureUploadError = error{ OutOfMemory, InvalidBacking };
+
+    fn textureUploadData(
+        self: *Gpu,
+        entries: []const MemEntry,
+        offset: u64,
+        stride: u64,
+        row_bytes: u64,
+        height: u32,
+        total: usize,
+        get_mem: ring.GetMemFn,
+    ) TextureUploadError![]const u8 {
+        assert(entries.len > 0);
+        assert(row_bytes > 0 and height > 0);
+        if (stride == row_bytes) {
+            if (sliceFromBacking(entries, offset, total, get_mem)) |direct| return direct;
+        }
+        if (self.transfer3d_staging.len < total) {
+            self.transfer3d_staging = if (self.transfer3d_staging.len == 0)
+                self.alloc.alloc(u8, total) catch return error.OutOfMemory
+            else
+                self.alloc.realloc(self.transfer3d_staging, total) catch return error.OutOfMemory;
+        }
+        const staging = self.transfer3d_staging[0..total];
+        var y: u32 = 0;
+        while (y < height) : (y += 1) {
+            const src_off = offset + @as(u64, y) * stride;
+            const dst_offset: usize = @intCast(@as(u64, y) * row_bytes);
+            const dst_row = staging[dst_offset..][0..@intCast(row_bytes)];
+            if (!copyFromBacking(entries, src_off, dst_row, get_mem)) return error.InvalidBacking;
+        }
+        return staging;
+    }
+
+    fn sliceFromBacking(
+        entries: []const MemEntry,
+        offset: u64,
+        len: usize,
+        get_mem: ring.GetMemFn,
+    ) ?[]u8 {
+        assert(entries.len > 0);
+        assert(len > 0);
+        var skip = offset;
+        for (entries) |entry| {
+            if (skip >= entry.length) {
+                skip -= entry.length;
+                continue;
+            }
+            const available = @as(u64, entry.length) - skip;
+            if (len > available) return null;
+            const address = std.math.add(u64, entry.addr, skip) catch return null;
+            return get_mem(address, len);
+        }
+        return null;
     }
 
     /// Copy `dst.len` bytes starting at linear `offset` out of the
@@ -2323,10 +2374,16 @@ test "transfer_to_host_3d uploads guest TEXTURE data via replaceRegion" {
         .stride = 0,
         .layer_stride = 0,
     };
-    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get));
-    const staging_ptr = gpu.transfer3d_staging.ptr;
-    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get));
-    try testing.expectEqual(staging_ptr, gpu.transfer3d_staging.ptr);
+    var counted = std.testing.FailingAllocator.init(testing.allocator, .{});
+    gpu.alloc = counted.allocator();
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get),
+    );
+    gpu.alloc = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), gpu.transfer3d_staging.len);
 
     // Read the texture back from the GPU: must match the guest bytes.
     var out: [nbytes]u8 = undefined;
