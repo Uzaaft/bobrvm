@@ -47,6 +47,18 @@ const ETHERTYPE_ARP: u16 = 0x0806;
 /// Reply sink: frames the responder wants delivered to the guest.
 pub const ReplyFn = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
 
+/// Exclusive frame storage borrowed from a reply sink until commit.
+pub const ReplyLease = struct {
+    frame: []u8,
+    token: usize,
+};
+
+pub const ReplyReserveFn = *const fn (
+    frame_len: usize,
+    userdata: ?*anyopaque,
+) ?ReplyLease;
+pub const ReplyCommitFn = *const fn (lease: ReplyLease, userdata: ?*anyopaque) void;
+
 const UdpKey = struct {
     guest_port: u16,
     remote_ip: [4]u8,
@@ -222,6 +234,8 @@ const TcpFlow = struct {
 pub const MiniNat = struct {
     reply: ReplyFn,
     reply_userdata: ?*anyopaque,
+    reply_reserve: ?ReplyReserveFn = null,
+    reply_commit: ?ReplyCommitFn = null,
 
     alloc: std.mem.Allocator,
     udp_flows: std.AutoHashMap(UdpKey, UdpFlow),
@@ -269,6 +283,40 @@ pub const MiniNat = struct {
             .tcp_flows = std.AutoHashMap(TcpKey, TcpFlow).init(alloc),
             .icmp_flows = std.AutoHashMap(IcmpKey, IcmpFlow).init(alloc),
         };
+    }
+
+    pub fn setReplyLease(self: *MiniNat, reserve: ReplyReserveFn, commit: ReplyCommitFn) void {
+        assert(self.reply_reserve == null);
+        assert(self.reply_commit == null);
+        self.reply_reserve = reserve;
+        self.reply_commit = commit;
+    }
+
+    const ReplyBuffer = struct {
+        frame: []u8,
+        token: ?usize,
+    };
+
+    fn acquireReply(self: *MiniNat, fallback: []u8, frame_len: usize) ?ReplyBuffer {
+        assert(frame_len > 0);
+        assert(fallback.len >= frame_len);
+        if (self.reply_reserve) |reserve| {
+            const lease = reserve(frame_len, self.reply_userdata) orelse return null;
+            assert(lease.frame.len == frame_len);
+            return .{ .frame = lease.frame, .token = lease.token };
+        }
+        assert(self.reply_commit == null);
+        return .{ .frame = fallback[0..frame_len], .token = null };
+    }
+
+    fn commitReply(self: *MiniNat, buffer: ReplyBuffer) void {
+        assert(buffer.frame.len > 0);
+        assert((buffer.token == null) == (self.reply_commit == null));
+        if (buffer.token) |token| {
+            self.reply_commit.?(.{ .frame = buffer.frame, .token = token }, self.reply_userdata);
+            return;
+        }
+        self.reply(buffer.frame, self.reply_userdata);
     }
 
     fn initTcpSendPool(self: *MiniNat) std.mem.Allocator.Error!void {
@@ -424,7 +472,9 @@ pub const MiniNat = struct {
             std.mem.eql(u8, target_ip, &DNS_IP);
         if (!ours) return;
 
-        var out: [ETH_HDR + 28]u8 = undefined;
+        var fallback: [ETH_HDR + 28]u8 = undefined;
+        const reply_buffer = self.acquireReply(&fallback, fallback.len) orelse return;
+        const out = reply_buffer.frame;
         // Ethernet: dst = requester, src = us
         @memcpy(out[0..6], frame[6..12]);
         @memcpy(out[6..12], &GATEWAY_MAC);
@@ -441,7 +491,7 @@ pub const MiniNat = struct {
         @memcpy(rep[18..24], arp[8..14]); // target hw = requester
         @memcpy(rep[24..28], arp[14..18]); // target ip = requester
 
-        self.reply(&out, self.reply_userdata);
+        self.commitReply(reply_buffer);
     }
 
     // =========================================================================
@@ -1380,10 +1430,26 @@ const testing = std.testing;
 
 var test_replies: std.ArrayListUnmanaged([]u8) = .empty;
 var test_alloc: std.mem.Allocator = undefined;
+var test_reply_lease: [ETH_HDR + 28]u8 = undefined;
+var test_reply_lease_committed: bool = false;
 
 fn testReply(frame: []const u8, _: ?*anyopaque) void {
     const copy = test_alloc.dupe(u8, frame) catch return;
     test_replies.append(test_alloc, copy) catch {};
+}
+
+fn testReplyReserve(frame_len: usize, userdata: ?*anyopaque) ?ReplyLease {
+    assert(userdata == null);
+    assert(frame_len > 0);
+    if (frame_len > test_reply_lease.len) return null;
+    return .{ .frame = test_reply_lease[0..frame_len], .token = 42 };
+}
+
+fn testReplyCommit(lease: ReplyLease, userdata: ?*anyopaque) void {
+    assert(userdata == null);
+    assert(lease.token == 42);
+    assert(lease.frame.ptr == test_reply_lease[0..].ptr);
+    test_reply_lease_committed = true;
 }
 
 fn clearReplies() void {
@@ -1396,6 +1462,8 @@ test "mininat: ARP request for gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    test_reply_lease_committed = false;
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -1418,8 +1486,9 @@ test "mininat: ARP request for gateway gets a reply" {
     @memcpy(arp[24..28], &GATEWAY_IP);
 
     nat.handleFrame(&req);
-    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
-    const rep = test_replies.items[0];
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expect(test_reply_lease_committed);
+    const rep = test_reply_lease[0..];
     try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, rep[20..22], .big)); // ARP reply
     try testing.expect(std.mem.eql(u8, rep[22..28], &GATEWAY_MAC)); // sender hw
 }

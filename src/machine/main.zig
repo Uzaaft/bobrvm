@@ -2159,6 +2159,7 @@ pub const Machine = struct {
             self.net.?.setGuestMemory(getGuestMemoryWrapper);
             self.net.?.transport.setIrqCallback(netIrqCallback, self);
             self.nat = mininat.MiniNat.init(self.alloc, natReplyCallback, self);
+            self.nat.setReplyLease(natReplyReserveCallback, natReplyCommitCallback);
             self.nat.setRxReady(natRxReadyCallback, self);
             for (self.config.forwards) |fwd| {
                 self.nat.addForward(fwd) catch |err| {
@@ -2703,6 +2704,32 @@ pub const Machine = struct {
     fn natReplyCallback(frame: []const u8, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
         if (self.net) |net| net.queueRxFrame(frame);
+    }
+
+    fn natReplyReserveCallback(
+        frame_len: usize,
+        userdata: ?*anyopaque,
+    ) ?mininat.ReplyLease {
+        assert(frame_len > 0);
+        assert(frame_len <= virtio.Net.MAX_FRAME);
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        const net = self.net orelse return null;
+        const reservation = net.reserveRxFrame(frame_len) orelse return null;
+        return .{
+            .frame = reservation.bytes,
+            .token = reservation.storage_index,
+        };
+    }
+
+    fn natReplyCommitCallback(lease: mininat.ReplyLease, userdata: ?*anyopaque) void {
+        assert(lease.frame.len > 0);
+        assert(lease.token <= std.math.maxInt(u16));
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        const net = self.net orelse unreachable;
+        net.commitRxFrame(.{
+            .bytes = lease.frame,
+            .storage_index = @intCast(lease.token),
+        });
     }
 
     /// NAT back-pressure: true while the guest RX queue has headroom.

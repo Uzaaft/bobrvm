@@ -60,6 +60,7 @@ const RxStorage = struct {
     ptr: ?[*]u8,
     capacity: u32,
     next_free: u16,
+    reserved: bool,
 
     fn bytes(self: RxStorage) []u8 {
         assert(self.ptr != null);
@@ -69,6 +70,11 @@ const RxStorage = struct {
 };
 
 const rx_index_none: u16 = std.math.maxInt(u16);
+
+pub const RxReservation = struct {
+    bytes: []u8,
+    storage_index: u16,
+};
 
 /// Network device.
 pub const Net = struct {
@@ -88,6 +94,7 @@ pub const Net = struct {
     rx_buffer_pool: [MAX_RX_QUEUED][RX_BUFFER_SIZE]u8,
     rx_head: usize,
     rx_count: usize,
+    rx_reserved_count: usize,
     rx_free_head: u16,
     rx_mutex: std.Io.Mutex,
 
@@ -130,6 +137,7 @@ pub const Net = struct {
             .rx_buffer_pool = undefined,
             .rx_head = 0,
             .rx_count = 0,
+            .rx_reserved_count = 0,
             .rx_free_head = 0,
             .rx_mutex = .init,
             .guest_memory = null,
@@ -144,6 +152,7 @@ pub const Net = struct {
                     @intCast(index + 1)
                 else
                     rx_index_none,
+                .reserved = false,
             };
         }
 
@@ -182,7 +191,7 @@ pub const Net = struct {
 
         self.rx_mutex.lockUncancelable(global.io());
         defer self.rx_mutex.unlock(global.io());
-        if (self.rx_count >= self.rx_frames.len) return;
+        if (self.rx_count + self.rx_reserved_count >= self.rx_frames.len) return;
 
         const storage_index = self.takeRxStorage(frame.len) orelse return;
         const storage = self.rx_storage[storage_index].bytes();
@@ -195,13 +204,56 @@ pub const Net = struct {
         self.rx_count += 1;
     }
 
+    /// Reserve exclusive RX slab storage for a producer to fill directly.
+    pub fn reserveRxFrame(self: *Net, frame_len: usize) ?RxReservation {
+        if (frame_len == 0 or frame_len > MAX_FRAME) return null;
+
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
+        if (self.rx_count + self.rx_reserved_count >= self.rx_frames.len) return null;
+
+        const storage_index = self.takeRxStorage(frame_len) orelse return null;
+        const storage = &self.rx_storage[storage_index];
+        assert(!storage.reserved);
+        assert(storage.capacity >= frame_len);
+        storage.reserved = true;
+        self.rx_reserved_count += 1;
+        return .{
+            .bytes = storage.bytes()[0..frame_len],
+            .storage_index = storage_index,
+        };
+    }
+
+    /// Publish a directly-filled RX reservation to the guest queue.
+    pub fn commitRxFrame(self: *Net, reservation: RxReservation) void {
+        assert(reservation.bytes.len > 0);
+        assert(reservation.storage_index < self.rx_storage.len);
+
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
+        const storage = &self.rx_storage[reservation.storage_index];
+        assert(storage.reserved);
+        assert(storage.bytes().ptr == reservation.bytes.ptr);
+        assert(self.rx_reserved_count > 0);
+        assert(self.rx_count < self.rx_frames.len);
+
+        const tail = (self.rx_head + self.rx_count) % self.rx_frames.len;
+        self.rx_frames[tail] = .{
+            .storage_index = @intCast(reservation.storage_index),
+            .len = @intCast(reservation.bytes.len),
+        };
+        storage.reserved = false;
+        self.rx_reserved_count -= 1;
+        self.rx_count += 1;
+    }
+
     /// True while the RX queue has headroom. Frame producers should stop
     /// (leaving data in their own buffers) when this is false, so the
     /// queue never overflows. Thread-safe.
     pub fn rxReady(self: *Net) bool {
         self.rx_mutex.lockUncancelable(global.io());
         defer self.rx_mutex.unlock(global.io());
-        return self.rx_count < RX_BACKPRESSURE;
+        return self.rx_count + self.rx_reserved_count < RX_BACKPRESSURE;
     }
 
     // =========================================================================
@@ -417,6 +469,7 @@ pub const Net = struct {
         assert(self.rx_count > 0);
         const storage_index = self.rx_frames[self.rx_head].storage_index;
         assert(storage_index < self.rx_storage.len);
+        assert(!self.rx_storage[storage_index].reserved);
         assert(self.rx_storage[storage_index].next_free == rx_index_none);
         self.rx_storage[storage_index].next_free = self.rx_free_head;
         self.rx_free_head = storage_index;
@@ -530,6 +583,40 @@ test "Net recycles normal RX buffers" {
     net.queueRxFrame(&frame);
     const recycled_index = net.rx_frames[net.rx_head].storage_index;
     try testing.expectEqual(storage, net.rx_storage[recycled_index].ptr);
+}
+
+test "Net queues directly-filled RX reservation without copying" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+
+    const reservation = net.reserveRxFrame(42).?;
+    @memset(reservation.bytes, 0xA5);
+    const producer_ptr = reservation.bytes.ptr;
+    net.commitRxFrame(reservation);
+
+    const queued = net.queuedFrame(net.rx_head);
+    try testing.expectEqual(producer_ptr, queued.ptr);
+    try testing.expectEqual(@as(usize, 42), queued.len);
+    try testing.expect(std.mem.allEqual(u8, queued, 0xA5));
+    try testing.expectEqual(@as(usize, 0), net.rx_reserved_count);
+}
+
+test "Net RX reservations participate in backpressure" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+
+    var reservations: [Net.RX_BACKPRESSURE]RxReservation = undefined;
+    for (&reservations, 0..) |*reservation, index| {
+        reservation.* = net.reserveRxFrame(1).?;
+        reservation.bytes[0] = @truncate(index);
+        if (index + 1 < reservations.len) try testing.expect(net.rxReady());
+    }
+    try testing.expect(!net.rxReady());
+    try testing.expectEqual(Net.RX_BACKPRESSURE, net.rx_reserved_count);
+
+    for (reservations) |reservation| net.commitRxFrame(reservation);
+    try testing.expectEqual(@as(usize, 0), net.rx_reserved_count);
+    try testing.expectEqual(Net.RX_BACKPRESSURE, net.rx_count);
 }
 
 test "Net allocates oversized RX buffers outside the fixed slab" {
