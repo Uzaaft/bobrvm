@@ -1126,12 +1126,9 @@ pub const GpuDevice = struct {
         has_depth: bool,
         extra_formats: []const metal.MTLPixelFormat,
     ) !metal.RenderPipelineState {
-        const tgsi = virgl.tgsi;
-        const vprog = try tgsi.parse(vs_text);
-        var vmsl = try tgsi.emit(self.alloc, &vprog);
+        var vmsl = try self.translateShader(vs_text);
         defer vmsl.deinit(self.alloc);
-        const fprog = try tgsi.parse(fs_text);
-        var fmsl = try tgsi.emit(self.alloc, &fprog);
+        var fmsl = try self.translateShader(fs_text);
         defer fmsl.deinit(self.alloc);
 
         const vz = try self.alloc.dupeZ(u8, vmsl.source);
@@ -1184,6 +1181,11 @@ pub const GpuDevice = struct {
             }
         }
         return r.buildPipeline(vz, "vs_main", fz, "fs_main", attrs[0..n], layouts[0..n_layouts], format, has_depth, resolveBlend(ctx), extra_formats);
+    }
+
+    noinline fn translateShader(self: *GpuDevice, text: []const u8) !virgl.tgsi.Msl {
+        const program = try virgl.tgsi.parse(text);
+        return virgl.tgsi.emit(self.alloc, &program);
     }
 
     /// Get a context by ID.
