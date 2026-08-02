@@ -2266,6 +2266,8 @@ pub const Machine = struct {
 
     fn registerMmioHandlers(self: *Machine) !void {
         var runner = &self.runner.?;
+        // Two GIC regions, UART, three virtio slots, ECAM, and the PCI BAR.
+        try runner.reserveMmioHandlers(8);
 
         // Register GIC Distributor MMIO handler
         if (self.gic_device) |gic_dev| {

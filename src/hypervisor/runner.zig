@@ -745,6 +745,12 @@ pub const VMRunner = struct {
         try self.mmio_handlers.append(self.alloc, handler);
     }
 
+    pub fn reserveMmioHandlers(self: *VMRunner, count: usize) !void {
+        assert(!self.running.load(.acquire));
+        assert(count >= self.mmio_handlers.items.len);
+        try self.mmio_handlers.ensureTotalCapacityPrecise(self.alloc, count);
+    }
+
     /// Add a vCPU slot to the runner.
     /// The vCPU will be created on its own thread when start() is called.
     pub fn addVcpuSlot(self: *VMRunner, setup_fn: ?VcpuSetupFn, userdata: ?*anyopaque) !void {
@@ -902,4 +908,25 @@ test "MmioAccess struct" {
     try std.testing.expectEqual(@as(u64, 0x40000000), access.address);
     try std.testing.expectEqual(@as(u8, 4), access.size);
     try std.testing.expect(access.is_write);
+}
+
+test "MMIO handler registration reserves startup capacity" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var runner = VMRunner.init(counted.allocator(), undefined);
+    defer runner.deinit();
+    try runner.reserveMmioHandlers(8);
+
+    for (0..8) |index| {
+        try runner.registerMmioHandler(.{
+            .context = undefined,
+            .base = index * 0x1000,
+            .size = 0x1000,
+            .read = undefined,
+            .write = undefined,
+        });
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 320), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), counted.resize_index);
 }
