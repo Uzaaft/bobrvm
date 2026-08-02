@@ -200,6 +200,75 @@ pub const MemEntry = extern struct {
     _padding: u32 = 0,
 };
 
+const BackingEntries = union(enum) {
+    empty,
+    single: MemEntry,
+    multiple: std.ArrayListUnmanaged(MemEntry),
+
+    fn deinit(self: *BackingEntries, alloc: Allocator) void {
+        assert(@sizeOf(MemEntry) == 16);
+        assert(@alignOf(MemEntry) >= @alignOf(u64));
+        if (self.* == .multiple) self.multiple.deinit(alloc);
+        self.* = .empty;
+    }
+
+    fn items(self: *const BackingEntries) []const MemEntry {
+        assert(@sizeOf(MemEntry) == 16);
+        assert(@alignOf(MemEntry) >= @alignOf(u64));
+        return switch (self.*) {
+            .empty => &.{},
+            .single => |*entry| @as(*const [1]MemEntry, @ptrCast(entry))[0..],
+            .multiple => |*list| list.items,
+        };
+    }
+
+    fn replace(
+        self: *BackingEntries,
+        alloc: Allocator,
+        bytes: []const u8,
+        count: u32,
+    ) Allocator.Error!void {
+        assert(count > 0);
+        assert(bytes.len >= @as(usize, count) * @sizeOf(MemEntry));
+        if (count == 1) {
+            const entry = std.mem.bytesToValue(MemEntry, bytes[0..@sizeOf(MemEntry)]);
+            self.deinit(alloc);
+            self.* = .{ .single = entry };
+            return;
+        }
+        switch (self.*) {
+            .multiple => |*list| try fillList(list, alloc, bytes, count),
+            else => {
+                var list: std.ArrayListUnmanaged(MemEntry) = .empty;
+                errdefer list.deinit(alloc);
+                try fillList(&list, alloc, bytes, count);
+                self.deinit(alloc);
+                self.* = .{ .multiple = list };
+            },
+        }
+    }
+
+    fn fillList(
+        list: *std.ArrayListUnmanaged(MemEntry),
+        alloc: Allocator,
+        bytes: []const u8,
+        count: u32,
+    ) Allocator.Error!void {
+        assert(count > 1);
+        assert(bytes.len >= @as(usize, count) * @sizeOf(MemEntry));
+        try list.ensureTotalCapacity(alloc, count);
+        list.clearRetainingCapacity();
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const offset = @as(usize, i) * @sizeOf(MemEntry);
+            list.appendAssumeCapacity(std.mem.bytesToValue(
+                MemEntry,
+                bytes[offset..][0..@sizeOf(MemEntry)],
+            ));
+        }
+    }
+};
+
 pub const ResourceAttachBacking = extern struct {
     header: CtrlHeader,
     resource_id: u32,
@@ -466,7 +535,7 @@ pub const Resource2D = struct {
     /// directly, skipping the per-frame CPU->GPU upload.
     surface: ?iosurface.IOSurface = null,
     /// Guest backing pages (scatter-gather).
-    entries: std.ArrayListUnmanaged(MemEntry),
+    entries: BackingEntries,
 
     pub const BYTES_PER_PIXEL: u32 = 4;
 
@@ -540,7 +609,7 @@ pub const Gpu = struct {
     /// Guest backing pages for 3D resources (buffers/textures), keyed by
     /// resource id. 3D resources live in gpu_device, not self.resources, so
     /// their backing is tracked here rather than on a Resource2D.
-    backing3d: std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)),
+    backing3d: std.AutoHashMap(u32, BackingEntries),
     /// Readback of a 3D-rendered scanout resource's MTLTexture, so the
     /// present path (which serves BGRA host pixels) can display GPU output.
     scanout3d_data: []u8 = &.{},
@@ -660,7 +729,7 @@ pub const Gpu = struct {
             .frame_userdata = null,
             .virgl_enabled = enable_virgl,
             .gpu_device = gpu_module.GpuDevice.init(alloc),
-            .backing3d = std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)).init(alloc),
+            .backing3d = std.AutoHashMap(u32, BackingEntries).init(alloc),
             .scanout3d_data = &.{},
             .transfer3d_staging = &.{},
             .scanout3d_w = 0,
@@ -1497,7 +1566,8 @@ pub const Gpu = struct {
 
         const res = self.resources.getPtr(cmd.resource_id) orelse
             return .resp_err_invalid_resource_id;
-        if (res.entries.items.len == 0) return .resp_err_unspec;
+        const entries = res.entries.items();
+        if (entries.len == 0) return .resp_err_unspec;
 
         const r = cmd.r;
         if (r.x + r.width > res.width or r.y + r.height > res.height) {
@@ -1513,7 +1583,7 @@ pub const Gpu = struct {
             const block_off = @as(u64, r.y) * stride;
             const block_len = @as(usize, r.height) * stride;
             const dst = res.host_data[@intCast(block_off)..][0..block_len];
-            if (!copyFromBacking(res.entries.items, cmd.offset, dst, get_mem)) {
+            if (!copyFromBacking(entries, cmd.offset, dst, get_mem)) {
                 return .resp_err_unspec;
             }
             return .resp_ok_nodata;
@@ -1528,7 +1598,7 @@ pub const Gpu = struct {
             // position within the resource for the transferred region.
             const src_off = cmd.offset + @as(u64, row) * stride;
             const dst = res.host_data[@intCast(line_off)..][0..row_bytes];
-            if (!copyFromBacking(res.entries.items, src_off, dst, get_mem)) {
+            if (!copyFromBacking(entries, src_off, dst, get_mem)) {
                 return .resp_err_unspec;
             }
         }
@@ -1553,7 +1623,8 @@ pub const Gpu = struct {
             // formats only so far (everything mesa uses for scanout/simple
             // texturing); stride 0 means tightly packed.
             const list = self.backing3d.getPtr(cmd.resource_id) orelse return .resp_err_unspec;
-            if (list.items.len == 0) return .resp_err_unspec;
+            const entries = list.items();
+            if (entries.len == 0) return .resp_err_unspec;
             // Partial-upload trace (BOBRVM_GL_STATS=1): sub-rect texture
             // updates are how damage-tracked clients (terminals) push typed
             // glyphs; log the box/offset/stride so a wrong source-offset
@@ -1586,7 +1657,7 @@ pub const Gpu = struct {
             const total_u64 = row_bytes * cmd.box.h;
             if (total_u64 > 512 * 1024 * 1024) return .resp_err_invalid_parameter;
             const upload = self.textureUploadData(
-                list.items,
+                entries,
                 cmd.offset,
                 stride,
                 row_bytes,
@@ -1616,7 +1687,8 @@ pub const Gpu = struct {
         }
 
         const list = self.backing3d.getPtr(cmd.resource_id) orelse return .resp_err_unspec;
-        if (list.items.len == 0) return .resp_err_unspec;
+        const entries = list.items();
+        if (entries.len == 0) return .resp_err_unspec;
 
         const dst_all = self.gpu_device.bufferContents(cmd.resource_id) orelse
             return .resp_err_unspec;
@@ -1627,7 +1699,7 @@ pub const Gpu = struct {
         const len: usize = cmd.box.w;
         if (start + len > dst_all.len) return .resp_err_invalid_parameter;
 
-        if (!copyFromBacking(list.items, cmd.offset, dst_all[start .. start + len], get_mem)) {
+        if (!copyFromBacking(entries, cmd.offset, dst_all[start .. start + len], get_mem)) {
             return .resp_err_unspec;
         }
         return .resp_ok_nodata;
@@ -1734,7 +1806,7 @@ pub const Gpu = struct {
         // Resolve where the backing entries belong: a 2D resource keeps them
         // on its Resource2D; a 3D (virgl) resource lives in gpu_device, so its
         // backing is tracked in backing3d.
-        const dest: *std.ArrayListUnmanaged(MemEntry) = blk: {
+        const dest: *BackingEntries = blk: {
             if (self.resources.getPtr(cmd.resource_id)) |res| break :blk &res.entries;
             if (self.virgl_enabled and self.gpu_device.getResource(cmd.resource_id) != null) {
                 const gop = self.backing3d.getOrPut(cmd.resource_id) catch
@@ -1766,16 +1838,8 @@ pub const Gpu = struct {
         };
         if (entries_mem.len < entries_bytes) return .resp_err_invalid_parameter;
 
-        dest.clearRetainingCapacity();
-        dest.ensureTotalCapacity(self.alloc, cmd.nr_entries) catch
+        dest.replace(self.alloc, entries_mem, cmd.nr_entries) catch
             return .resp_err_out_of_memory;
-
-        var i: u32 = 0;
-        while (i < cmd.nr_entries) : (i += 1) {
-            const off = i * @sizeOf(MemEntry);
-            const entry = std.mem.bytesToValue(MemEntry, entries_mem[off..][0..@sizeOf(MemEntry)]);
-            dest.appendAssumeCapacity(entry);
-        }
 
         return .resp_ok_nodata;
     }
@@ -2103,7 +2167,7 @@ pub const Gpu = struct {
 
         const res = self.resources.getPtr(cmd.resource_id) orelse
             return .resp_err_invalid_resource_id;
-        res.entries.clearAndFree(self.alloc);
+        res.entries.deinit(self.alloc);
         return .resp_ok_nodata;
     }
 
@@ -2143,6 +2207,23 @@ test "CtrlHeader size" {
 
 test "ResourceCreate2D size" {
     try testing.expectEqual(@as(usize, 40), @sizeOf(ResourceCreate2D));
+}
+
+test "BackingEntries stores one entry inline and preserves scatter gather" {
+    var backing: BackingEntries = .empty;
+    defer backing.deinit(testing.allocator);
+
+    const entries = [_]MemEntry{
+        .{ .addr = 0x1000, .length = 4096 },
+        .{ .addr = 0x3000, .length = 8192 },
+    };
+    try backing.replace(testing.allocator, std.mem.asBytes(&entries), entries.len);
+    try testing.expectEqualSlices(MemEntry, &entries, backing.items());
+
+    try backing.replace(testing.allocator, std.mem.asBytes(&entries[1]), 1);
+    try testing.expectEqual(@as(usize, 1), backing.items().len);
+    try testing.expectEqual(entries[1].addr, backing.items()[0].addr);
+    try testing.expectEqual(entries[1].length, backing.items()[0].length);
 }
 
 test "Gpu resource lifecycle via direct command calls" {
@@ -2290,10 +2371,16 @@ test "transfer_to_host_2d full-width fast path matches guest backing" {
         .entry = .{ .addr = 0x1000, .length = @intCast(bytes) },
     };
     var empty_chain = ring.Chain{};
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    gpu.alloc = counted.allocator();
     try testing.expectEqual(
         CmdType.resp_ok_nodata,
         gpu.cmdResourceAttachBacking(std.mem.asBytes(&attach), &empty_chain, Ctx.get),
     );
+    gpu.alloc = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 1), gpu.resources.get(1).?.entries.items().len);
 
     // full-surface transfer (hits the fast path)
     const xfer = TransferToHost2D{
