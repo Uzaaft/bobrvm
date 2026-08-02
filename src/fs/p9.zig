@@ -504,7 +504,10 @@ pub const P9Server = struct {
                 const fid_id = try r.u32v();
                 _ = try r.u64v(); // request_mask: we always fill the basics
                 const fid = try self.getFid(fid_id);
-                const st = self.statRel(fid.rel) catch return error.Stat;
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(fid.rel, &path_storage);
+                var st: std.c.Stat = undefined;
+                if (lstat(path.ptr, &st) != 0) return error.Stat;
 
                 w.u64v(0x000007ff); // valid: P9_GETATTR_BASIC
                 w.qid(qidFromStat(st));
@@ -929,8 +932,13 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p = TestPayload{};
         const req = try tmsg(testing.allocator, Tgetattr, 12, p.u32v(2).u64v(0x7ff).slice());
         defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n], Tgetattr + 1);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
         const size = std.mem.readInt(u64, resp[7 + 8 + 13 + 4 + 4 + 4 + 8 + 8 ..][0..8], .little);
         try testing.expectEqual(@as(u64, 12), size); // "host says hi"
     }
