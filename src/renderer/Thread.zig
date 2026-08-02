@@ -23,6 +23,8 @@ const log = std.log.scoped(.renderer);
 
 /// Mailbox capacity (power of 2 for efficient modulo).
 const MAILBOX_CAPACITY = 64;
+/// Render work is iterative and keeps its large state in RenderThread.
+const stack_size_bytes: usize = 1024 * 1024;
 
 /// Mailbox message types.
 pub const Message = union(enum) {
@@ -377,7 +379,7 @@ pub const RenderThread = struct {
         log.info("starting renderer thread", .{});
 
         self.running.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
+        self.thread = try std.Thread.spawn(.{ .stack_size = stack_size_bytes }, threadMain, .{self});
     }
 
     /// Stop the render thread.
