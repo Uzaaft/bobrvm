@@ -70,6 +70,7 @@ fn make(step: *Step, opts: Step.MakeOptions) !void {
         "-derivedDataPath",
         derived_data_path,
         "CODE_SIGNING_ALLOWED=YES",
+        "ONLY_ACTIVE_ARCH=YES",
         "-quiet",
         "build",
     }, &exit_code, .inherit) catch {
