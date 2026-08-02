@@ -1530,8 +1530,7 @@ pub const Machine = struct {
                         pci_blk.writeConfig(ecam_addr.reg, size, value);
                         // Sync config back to ECAM host for reads
                         if (self.ecam_host) |ecam| {
-                            const idx: usize = 0; // device 0, function 0
-                            @memcpy(&ecam.devices[idx].config, &pci_blk.config);
+                            ecam.updateConfig(0, 0, &pci_blk.config);
                         }
                     } else {
                         const value = pci_blk.readConfig(ecam_addr.reg, size);
@@ -2208,7 +2207,7 @@ pub const Machine = struct {
                 .config = self.pci_block.?.config,
                 .present = true,
             };
-            self.ecam_host.?.addDevice(0, 0, ecam_dev);
+            try self.ecam_host.?.addDevice(0, 0, ecam_dev);
 
             log.info("initialized virtio-pci-blk at PCI 00:00.0, BAR0=0x{x}", .{bar0_addr});
         }
@@ -2387,8 +2386,7 @@ pub const Machine = struct {
                 pci_blk.writeConfig(ecam_addr.reg, size, value);
                 // Sync config back to ECAM host for reads
                 if (self.ecam_host) |ecam| {
-                    const idx: usize = 0;
-                    @memcpy(&ecam.devices[idx].config, &pci_blk.config);
+                    ecam.updateConfig(0, 0, &pci_blk.config);
                 }
                 return;
             }

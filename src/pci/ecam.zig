@@ -258,7 +258,7 @@ pub const EcamHost = struct {
 
     /// Bus 0 devices (we only support bus 0 for now).
     /// Index = device * 8 + function
-    devices: []PciDevice,
+    devices: [MAX_DEVICES * MAX_FUNCTIONS]?*PciDevice,
 
     pub fn init(alloc: Allocator) !*EcamHost {
         const host = try alloc.create(EcamHost);
@@ -266,28 +266,42 @@ pub const EcamHost = struct {
 
         host.* = .{
             .alloc = alloc,
-            .devices = try alloc.alloc(PciDevice, MAX_DEVICES * MAX_FUNCTIONS),
+            .devices = .{null} ** (MAX_DEVICES * MAX_FUNCTIONS),
         };
-
-        // Initialize all slots as absent
-        for (host.devices) |*dev| {
-            dev.* = PciDevice.init();
-        }
 
         log.info("initialized PCIe ECAM host at 0x{x}-0x{x}", .{ ECAM_BASE, ECAM_BASE + ECAM_SIZE });
         return host;
     }
 
     pub fn deinit(self: *EcamHost) void {
-        self.alloc.free(self.devices);
+        for (self.devices) |device| {
+            if (device) |dev| self.alloc.destroy(dev);
+        }
         self.alloc.destroy(self);
     }
 
-    pub fn addDevice(self: *EcamHost, device: u5, function: u3, dev: PciDevice) void {
+    pub fn addDevice(self: *EcamHost, device: u5, function: u3, dev: PciDevice) Allocator.Error!void {
         assert(dev.present);
         const idx = @as(usize, device) * MAX_FUNCTIONS + function;
-        self.devices[idx] = dev;
+        assert(self.devices[idx] == null);
+
+        const stored = try self.alloc.create(PciDevice);
+        stored.* = dev;
+        self.devices[idx] = stored;
         log.debug("added PCI device at 00:{x:0>2}.{}", .{ device, function });
+    }
+
+    pub fn updateConfig(
+        self: *EcamHost,
+        device: u5,
+        function: u3,
+        config: *const [CONFIG_SPACE_SIZE]u8,
+    ) void {
+        const idx = @as(usize, device) * MAX_FUNCTIONS + function;
+        const dev = self.devices[idx] orelse unreachable;
+        assert(dev.present);
+        assert(config.len == CONFIG_SPACE_SIZE);
+        @memcpy(&dev.config, config);
     }
 
     pub fn read(self: *const EcamHost, addr: u64, size: u8) u64 {
@@ -299,9 +313,10 @@ pub const EcamHost = struct {
         }
 
         const idx = @as(usize, ecam.device) * MAX_FUNCTIONS + ecam.function;
-        const value = self.devices[idx].read(ecam.reg, size);
+        const device = self.devices[idx] orelse return 0xFFFFFFFF;
+        const value = device.read(ecam.reg, size);
 
-        if (ecam.reg < 0x40 and self.devices[idx].present) {
+        if (ecam.reg < 0x40) {
             log.debug("ECAM read {any} reg=0x{x} size={d} -> 0x{x}", .{ ecam, ecam.reg, size, value });
         }
 
@@ -314,11 +329,10 @@ pub const EcamHost = struct {
         if (ecam.bus != 0) return;
 
         const idx = @as(usize, ecam.device) * MAX_FUNCTIONS + ecam.function;
-        self.devices[idx].write(ecam.reg, size, value);
+        const device = self.devices[idx] orelse return;
+        device.write(ecam.reg, size, value);
 
-        if (self.devices[idx].present) {
-            log.debug("ECAM write {any} reg=0x{x} size={d} <- 0x{x}", .{ ecam, ecam.reg, size, value });
-        }
+        log.debug("ECAM write {any} reg=0x{x} size={d} <- 0x{x}", .{ ecam, ecam.reg, size, value });
     }
 };
 
@@ -380,7 +394,7 @@ test "EcamHost basic" {
     try std.testing.expectEqual(@as(u64, 0xFFFFFFFF), empty);
 
     // Add a device
-    host.addDevice(0, 0, PciDevice.initVirtioBlock(0x10000000));
+    try host.addDevice(0, 0, PciDevice.initVirtioBlock(0x10000000));
 
     // Now it should return vendor ID
     const vendor = host.read(ECAM_BASE, 2);
