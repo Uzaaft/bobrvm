@@ -301,6 +301,22 @@ pub const P9Server = struct {
         return storage[0..path_len :0];
     }
 
+    fn childRelAlloc(self: *P9Server, parent: []const u8, name: []const u8) Error![]u8 {
+        assert(parent.len <= MSIZE_MAX);
+        assert(validName(name));
+        const separator_len: usize = @intFromBool(parent.len > 0);
+        const prefix_len = std.math.add(usize, parent.len, separator_len) catch
+            return error.Invalid;
+        const rel_len = std.math.add(usize, prefix_len, name.len) catch return error.Invalid;
+        if (rel_len > MSIZE_MAX) return error.Invalid;
+
+        const rel = try self.alloc.alloc(u8, rel_len);
+        @memcpy(rel[0..parent.len], parent);
+        if (parent.len > 0) rel[parent.len] = '/';
+        @memcpy(rel[prefix_len..], name);
+        return rel;
+    }
+
     fn validName(name: []const u8) bool {
         if (name.len == 0) return false;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
@@ -474,15 +490,10 @@ pub const P9Server = struct {
                 if (!validName(name)) return error.Access;
                 const fid = try self.getFid(fid_id);
 
-                const dir_rel = try self.alloc.dupe(u8, fid.rel);
-                defer self.alloc.free(dir_rel);
-                const rel = if (dir_rel.len == 0)
-                    try self.alloc.dupe(u8, name)
-                else
-                    try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ dir_rel, name });
+                const rel = try self.childRelAlloc(fid.rel, name);
                 errdefer self.alloc.free(rel);
-                const path = try self.hostPath(rel);
-                defer self.alloc.free(path);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(rel, &path_storage);
 
                 var oflags = linuxFlagsToDarwin(flags);
                 oflags.CREAT = true;
@@ -909,8 +920,13 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p2 = TestPayload{};
         const req2 = try tmsg(testing.allocator, Tlcreate, 8, p2.u32v(3).str("guest.txt").u32v(0o101101).u32v(0o644).u32v(100).slice());
         defer testing.allocator.free(req2);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n2 = srv.handle(req2, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n2], Tlcreate + 1);
+        try testing.expectEqual(@as(usize, 1), counted.allocations);
+        try testing.expectEqual(@as(usize, 9), counted.allocated_bytes);
 
         var p3 = TestPayload{};
         const req3 = try tmsg(testing.allocator, Twrite, 9, p3.u32v(3).u64v(0).u32v(9).bytes("from vm!!").slice());
