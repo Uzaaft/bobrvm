@@ -14,7 +14,6 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
-const Queue = @import("queue.zig");
 const ring = @import("ring.zig");
 
 /// Input device subtype.
@@ -200,11 +199,6 @@ pub const Input = struct {
     config: Config,
     subtype: Subtype,
 
-    /// Event queue (host → guest).
-    event_queue: Queue.VirtQueue,
-    /// Status queue (guest → host, for LEDs).
-    status_queue: Queue.VirtQueue,
-
     /// Pending events to deliver. Guarded by events_mutex: the host
     /// UI thread appends, the vCPU thread drains via pollEvents.
     pending_events: std.ArrayListUnmanaged(InputEvent),
@@ -239,20 +233,12 @@ pub const Input = struct {
         const transport = try mmio.Transport.init(alloc, 18, virtio_version_1, 2); // 18 = input device ID
         errdefer transport.deinit();
 
-        var event_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer event_queue.deinit();
-
-        var status_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer status_queue.deinit();
-
         const input = try alloc.create(Input);
         input.* = .{
             .alloc = alloc,
             .transport = transport,
             .config = .{},
             .subtype = subtype,
-            .event_queue = event_queue,
-            .status_queue = status_queue,
             .pending_events = .empty,
             .events_mutex = .init,
             .event_last_avail = 0,
@@ -276,8 +262,6 @@ pub const Input = struct {
 
     pub fn deinit(self: *Input) void {
         self.pending_events.deinit(self.alloc);
-        self.status_queue.deinit();
-        self.event_queue.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
     }

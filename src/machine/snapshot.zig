@@ -303,8 +303,8 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
     try serializeTransport(&out, con.transport);
-    try out.int(u16, con.receive_queue.last_avail_idx);
-    try out.int(u16, con.transmit_queue.last_avail_idx);
+    try out.int(u16, con.receive_last_avail);
+    try out.int(u16, con.transmit_last_avail);
     try out.blob(con.input_buffer.items);
     for (con.mp_last_avail) |cursor| try out.int(u16, cursor);
     try out.int(u8, @intCast(con.ports.items.len));
@@ -318,8 +318,8 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
 pub fn deserializeConsole(alloc: Allocator, con: *virtio.Console, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, con.transport);
-    con.receive_queue.last_avail_idx = try cur.int(u16);
-    con.transmit_queue.last_avail_idx = try cur.int(u16);
+    con.receive_last_avail = try cur.int(u16);
+    con.transmit_last_avail = try cur.int(u16);
     const input = try cur.blob();
     con.input_buffer.clearRetainingCapacity();
     try con.input_buffer.appendSlice(alloc, input);
@@ -338,14 +338,14 @@ pub fn serializeBlock(alloc: Allocator, blk: *const virtio.Block) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
     try serializeTransport(&out, blk.transport);
-    try out.int(u16, blk.request_queue.last_avail_idx);
+    try out.int(u16, blk.request_last_avail);
     return out.buf.toOwnedSlice(alloc);
 }
 
 pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, blk.transport);
-    blk.request_queue.last_avail_idx = try cur.int(u16);
+    blk.request_last_avail = try cur.int(u16);
 }
 
 pub fn serializeRng(alloc: Allocator, rng: *const virtio.Rng) ![]u8 {
@@ -539,7 +539,7 @@ test "snapshot: console device roundtrip (multiport)" {
     con.transport.driver_features = 0xdead_beef;
     con.transport.queues[0].ready = true;
     con.transport.queues[0].desc_addr = 0x4000_0000;
-    con.receive_queue.last_avail_idx = 17;
+    con.receive_last_avail = 17;
     try con.queueInput("pending host input");
     try con.queuePortInput(1, "agent bytes");
     con.ports.items[0].guest_open = true;
@@ -554,7 +554,7 @@ test "snapshot: console device roundtrip (multiport)" {
     try testing.expectEqual(@as(u64, 0xdead_beef), con2.transport.driver_features);
     try testing.expect(con2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x4000_0000), con2.transport.queues[0].desc_addr);
-    try testing.expectEqual(@as(u16, 17), con2.receive_queue.last_avail_idx);
+    try testing.expectEqual(@as(u16, 17), con2.receive_last_avail);
     try testing.expectEqualStrings("pending host input", con2.input_buffer.items);
     try testing.expectEqualStrings("agent bytes", con2.ports.items[0].input_buffer.items);
     try testing.expect(con2.ports.items[0].guest_open);

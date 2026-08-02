@@ -14,7 +14,6 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
-const Queue = @import("queue.zig");
 const ring = @import("ring.zig");
 
 const log = std.log.scoped(.virtio_console);
@@ -90,9 +89,9 @@ pub const Console = struct {
     transport: *mmio.Transport,
     config: Config,
 
-    /// Ring buffers for each queue.
-    receive_queue: Queue.VirtQueue,
-    transmit_queue: Queue.VirtQueue,
+    /// Shadow cursors for the guest-owned receive and transmit queues.
+    receive_last_avail: u16,
+    transmit_last_avail: u16,
 
     /// Output buffer (guest → host).
     output_buffer: std.ArrayListUnmanaged(u8),
@@ -114,8 +113,7 @@ pub const Console = struct {
     /// Host→guest control messages awaiting control-rx buffers.
     ctrl_pending: std.ArrayListUnmanaged(PendingCtrl) = .empty,
     /// last_avail cursors for the multiport queues (control + per-port),
-    /// indexed by queue index. Port 0's queues keep using
-    /// receive_queue/transmit_queue.
+    /// indexed by queue index. Port 0 uses the dedicated cursors above.
     mp_last_avail: [mmio.Transport.MAX_QUEUES]u16 = @splat(0),
 
     pub const Error = Allocator.Error;
@@ -143,20 +141,14 @@ pub const Console = struct {
         const transport = try mmio.Transport.init(alloc, 3, features, num_queues);
         errdefer transport.deinit();
 
-        var receive_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer receive_queue.deinit();
-
-        var transmit_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer transmit_queue.deinit();
-
         const console = try alloc.create(Console);
         errdefer alloc.destroy(console);
         console.* = .{
             .alloc = alloc,
             .transport = transport,
             .config = .{ .max_nr_ports = @intCast(1 + port_names.len) },
-            .receive_queue = receive_queue,
-            .transmit_queue = transmit_queue,
+            .receive_last_avail = 0,
+            .transmit_last_avail = 0,
             .output_buffer = .empty,
             .input_buffer = .empty,
             .input_mutex = .init,
@@ -183,8 +175,6 @@ pub const Console = struct {
         self.ctrl_pending.deinit(self.alloc);
         self.output_buffer.deinit(self.alloc);
         self.input_buffer.deinit(self.alloc);
-        self.transmit_queue.deinit();
-        self.receive_queue.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
     }
@@ -494,7 +484,7 @@ pub const Console = struct {
         const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
 
-        var last_avail_idx = self.receive_queue.last_avail_idx;
+        var last_avail_idx = self.receive_last_avail;
         var consumed: usize = 0;
         var delivered: u32 = 0;
 
@@ -544,7 +534,7 @@ pub const Console = struct {
             last_avail_idx +%= 1;
         }
 
-        self.receive_queue.last_avail_idx = last_avail_idx;
+        self.receive_last_avail = last_avail_idx;
 
         if (consumed > 0) {
             self.input_buffer.replaceRangeAssumeCapacity(0, consumed, &.{});
@@ -586,8 +576,8 @@ pub const Console = struct {
                 if (get_mem(qc.device_addr, 6)) |u| used_idx = std.mem.readInt(u16, u[2..4], .little);
             }
             log.debug("q{}: ready={} num={} avail_idx={} used_idx={} last_avail={} desc=0x{x}", .{
-                @intFromEnum(qi),                                                                               qc.ready,     qc.num, avail_idx, used_idx,
-                if (qi == .transmit) self.transmit_queue.last_avail_idx else self.receive_queue.last_avail_idx, qc.desc_addr,
+                @intFromEnum(qi),                                                           qc.ready,     qc.num, avail_idx, used_idx,
+                if (qi == .transmit) self.transmit_last_avail else self.receive_last_avail, qc.desc_addr,
             });
         }
     }
@@ -599,7 +589,7 @@ pub const Console = struct {
         const get_mem = self.guest_memory orelse return false;
         const avail_ring = get_mem(qc.driver_addr, 6) orelse return false;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
-        return avail_idx != self.transmit_queue.last_avail_idx;
+        return avail_idx != self.transmit_last_avail;
     }
 
     fn processTransmitQueue(self: *Console) void {
@@ -619,7 +609,7 @@ pub const Console = struct {
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
 
         // Process all available descriptors
-        var last_avail_idx = self.transmit_queue.last_avail_idx;
+        var last_avail_idx = self.transmit_last_avail;
         var processed: u32 = 0;
         while (last_avail_idx != avail_idx) : (processed += 1) {
             const ring_idx = last_avail_idx % qc.num;
@@ -642,7 +632,7 @@ pub const Console = struct {
             last_avail_idx +%= 1;
         }
 
-        self.transmit_queue.last_avail_idx = last_avail_idx;
+        self.transmit_last_avail = last_avail_idx;
         if (processed > 0) {
             self.transport.signalUsedBuffer();
         }

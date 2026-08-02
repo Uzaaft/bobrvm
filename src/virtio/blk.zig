@@ -17,7 +17,6 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
-const Queue = @import("queue.zig");
 
 /// Block feature bits.
 pub const Features = struct {
@@ -145,8 +144,8 @@ pub const Block = struct {
     transport: *mmio.Transport,
     config: Config,
 
-    /// Request queue.
-    request_queue: Queue.VirtQueue,
+    /// Shadow cursor for the guest-owned request queue.
+    request_last_avail: u16,
 
     /// Backing file.
     file: ?std.Io.File,
@@ -172,9 +171,6 @@ pub const Block = struct {
         const transport = try mmio.Transport.init(alloc, 2, features, 1); // 2 = block device ID
         errdefer transport.deinit();
 
-        var request_queue = try Queue.VirtQueue.init(alloc, QUEUE_SIZE);
-        errdefer request_queue.deinit();
-
         const blk = try alloc.create(Block);
         blk.* = .{
             .alloc = alloc,
@@ -193,7 +189,7 @@ pub const Block = struct {
                 .max_write_zeroes_seg = 1,
                 .write_zeroes_may_unmap = 1,
             },
-            .request_queue = request_queue,
+            .request_last_avail = 0,
             .file = null,
             .capacity_bytes = 0,
             .read_only = false,
@@ -213,7 +209,6 @@ pub const Block = struct {
 
     pub fn deinit(self: *Block) void {
         if (self.file) |f| f.close(global.io());
-        self.request_queue.deinit();
         self.transport.deinit();
         self.alloc.destroy(self);
     }
@@ -340,7 +335,7 @@ pub const Block = struct {
         const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
 
-        var last_avail_idx = self.request_queue.last_avail_idx;
+        var last_avail_idx = self.request_last_avail;
         var processed: u32 = 0;
 
         while (last_avail_idx != avail_idx) : (processed += 1) {
@@ -362,7 +357,7 @@ pub const Block = struct {
             last_avail_idx +%= 1;
         }
 
-        self.request_queue.last_avail_idx = last_avail_idx;
+        self.request_last_avail = last_avail_idx;
         if (processed > 0) {
             self.transport.signalUsedBuffer();
         }
