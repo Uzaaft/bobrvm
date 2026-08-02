@@ -859,14 +859,10 @@ pub const Machine = struct {
             try builder.section("console", data);
         }
         if (self.block) |blk| {
-            const data = try snapshot.serializeBlock(alloc, blk);
-            defer alloc.free(data);
-            try builder.section("blk1", data);
+            try snapshot.appendBlockSection(&builder, alloc, "blk1", blk);
         }
         if (self.block2) |blk| {
-            const data = try snapshot.serializeBlock(alloc, blk);
-            defer alloc.free(data);
-            try builder.section("blk2", data);
+            try snapshot.appendBlockSection(&builder, alloc, "blk2", blk);
         }
         if (self.rng) |rng_dev| {
             const data = try snapshot.serializeRng(alloc, rng_dev);
