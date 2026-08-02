@@ -113,7 +113,15 @@ pub const VMConfig = extern struct {
 
     /// Create owned copy of all string fields.
     pub fn dupe(self: VMConfig, alloc: Allocator) Allocator.Error!OwnedVMConfig {
-        const strings = [_]?[]const u8{
+        const total = try self.stringStorageBytes();
+        const storage: []u8 = if (total > 0) try alloc.alloc(u8, total) else @constCast(&.{});
+        return self.copyOwned(storage);
+    }
+
+    fn ownedStrings(self: VMConfig) [7]?[]const u8 {
+        assert(@sizeOf(@TypeOf(self.firmware_path)) == @sizeOf(?*const anyopaque));
+        assert(@sizeOf(@TypeOf(self.disk2_path)) == @sizeOf(?*const anyopaque));
+        return .{
             optionalString(self.firmware_path),
             optionalString(self.vars_path),
             optionalString(self.kernel_path),
@@ -122,14 +130,34 @@ pub const VMConfig = extern struct {
             optionalString(self.disk_path),
             optionalString(self.disk2_path),
         };
+    }
+
+    fn stringStorageBytes(self: VMConfig) Allocator.Error!usize {
+        const strings = self.ownedStrings();
         var total: usize = 0;
+        var string_count: usize = 0;
         for (strings) |string| {
             if (string) |value| {
                 total = std.math.add(usize, total, value.len) catch return error.OutOfMemory;
+                string_count += 1;
             }
         }
+        assert(string_count <= strings.len);
+        assert((total == 0) == (string_count == 0));
+        return total;
+    }
 
-        const storage: []u8 = if (total > 0) try alloc.alloc(u8, total) else @constCast(&.{});
+    fn copyOwned(self: VMConfig, storage: []u8) OwnedVMConfig {
+        const strings = self.ownedStrings();
+        var expected: usize = 0;
+        for (strings) |string| {
+            if (string) |value| {
+                expected += value.len;
+            }
+        }
+        assert(storage.len == expected);
+        assert(strings.len == 7);
+
         var owned_strings: [strings.len]?[]const u8 = @splat(null);
         var offset: usize = 0;
         for (strings, 0..) |string, index| {
@@ -388,11 +416,14 @@ pub const VM = struct {
         // Pre-condition: app is valid
         assert(cfg.validate());
 
-        const vm = try app.alloc.create(VM);
-        errdefer app.alloc.destroy(vm);
-
-        // Dupe the config to own the string data
-        const owned_config = try cfg.dupe(app.alloc);
+        const string_storage_bytes = try cfg.stringStorageBytes();
+        const allocation_bytes = std.math.add(usize, @sizeOf(VM), string_storage_bytes) catch
+            return error.OutOfMemory;
+        const allocation = try app.alloc.alignedAlloc(u8, .of(VM), allocation_bytes);
+        errdefer app.alloc.free(allocation);
+        const vm: *VM = @ptrCast(allocation.ptr);
+        const string_storage = allocation[@sizeOf(VM)..];
+        const owned_config = cfg.copyOwned(string_storage);
 
         vm.* = .{
             .alloc = app.alloc,
@@ -425,13 +456,16 @@ pub const VM = struct {
         // Then stop and destroy the machine (joins the vCPU thread)
         self.stop();
 
-        // Free owned config strings
-        self.config.deinit(self.alloc);
+        const allocation_bytes = @sizeOf(VM) + self.config.string_storage.len;
+
+        // Reset the config: its string storage is the VM allocation tail.
+        self.config = .{ .memory_bytes = 0, .vcpu_count = 0 };
 
         // Remove from app's VM list
         self.app.removeVM(self);
 
-        self.alloc.destroy(self);
+        const allocation_ptr: [*]align(@alignOf(VM)) u8 = @ptrCast(self);
+        self.alloc.free(allocation_ptr[0..allocation_bytes]);
     }
 
     pub fn tick(self: *VM) void {
@@ -964,6 +998,38 @@ test "App VM registry does not allocate" {
     const vm = try app.createVM(&cfg);
 
     try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    vm.destroy();
+    app.alloc = base_alloc;
+}
+
+test "VM object and configuration storage share one allocation" {
+    var runtime = RuntimeConfig{};
+    const app = try App.create(&runtime);
+    defer app.destroy();
+
+    const base_alloc = app.alloc;
+    var counted = std.testing.FailingAllocator.init(base_alloc, .{});
+    app.alloc = counted.allocator();
+    const cfg = VMConfig{
+        .memory_bytes = 1024,
+        .vcpu_count = 1,
+        .firmware_path = "firmware.fd",
+        .vars_path = "vars.fd",
+        .kernel_path = "kernel",
+        .initrd_path = "initrd",
+        .cmdline = "console=hvc0",
+        .disk_path = "disk.raw",
+        .disk2_path = "install.iso",
+    };
+    const string_bytes = "firmware.fd".len + "vars.fd".len + "kernel".len +
+        "initrd".len + "console=hvc0".len + "disk.raw".len + "install.iso".len;
+    const vm = try app.createVM(&cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@sizeOf(VM) + string_bytes, counted.allocated_bytes);
+    try std.testing.expectEqualStrings("firmware.fd", vm.config.firmware_path.?);
+    try std.testing.expectEqualStrings("console=hvc0", vm.config.cmdline.?);
+    try std.testing.expectEqualStrings("install.iso", vm.config.disk2_path.?);
     vm.destroy();
     app.alloc = base_alloc;
 }
