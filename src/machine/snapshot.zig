@@ -315,18 +315,24 @@ pub fn deserializeTransport(cur: *Cursor, t: *mmio.Transport) !void {
     }
 }
 
+fn transportSerializedBytes(t: *const mmio.Transport) usize {
+    assert(t.queues.len <= std.math.maxInt(u8));
+    assert(t.queues.len <= mmio.Transport.MAX_QUEUES);
+    const queue_state_bytes = @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
+    return @sizeOf(u64) + 5 * @sizeOf(u32) + 2 * @sizeOf(u8) +
+        t.queues.len * queue_state_bytes;
+}
+
 // =============================================================================
 // Devices
 // =============================================================================
 
 pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
-    assert(con.transport.queues.len <= std.math.maxInt(u8));
     assert(con.ports.len <= std.math.maxInt(u8));
-    const queue_state_bytes = @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
-    const transport_state_bytes = @sizeOf(u64) + 5 * @sizeOf(u32) + 2 * @sizeOf(u8) +
-        con.transport.queues.len * queue_state_bytes;
-    var serialized_bytes = transport_state_bytes + 2 * @sizeOf(u16) + @sizeOf(u64) +
-        con.input_buffer.count + con.mp_last_avail.len * @sizeOf(u16) + @sizeOf(u8);
+    assert(con.input_buffer.count <= virtio.Console.INPUT_BUFFER_MAX);
+    var serialized_bytes = transportSerializedBytes(&con.transport) + 2 * @sizeOf(u16) +
+        @sizeOf(u64) + con.input_buffer.count + con.mp_last_avail.len * @sizeOf(u16) +
+        @sizeOf(u8);
     for (con.ports) |port| {
         serialized_bytes += @sizeOf(u8) + @sizeOf(u64) + port.input_buffer.count;
     }
@@ -368,11 +374,17 @@ pub fn deserializeConsole(_: Allocator, con: *virtio.Console, data: []const u8) 
 }
 
 pub fn serializeBlock(alloc: Allocator, blk: *const virtio.Block) ![]u8 {
+    const serialized_bytes = transportSerializedBytes(&blk.transport) + @sizeOf(u16);
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try serializeTransport(&out, &blk.transport);
     try out.int(u16, blk.request_last_avail);
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
@@ -473,13 +485,10 @@ pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void 
 // contexts/resources are NOT captured (reset on restore, per QEMU policy).
 
 pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
-    assert(g.transport.queues.len <= std.math.maxInt(u8));
     assert(g.resources.count() <= std.math.maxInt(u32));
-    const queue_state_bytes = @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
-    const transport_state_bytes = @sizeOf(u64) + 5 * @sizeOf(u32) + 2 * @sizeOf(u8) +
-        g.transport.queues.len * queue_state_bytes;
     const resource_state_bytes = 4 * @sizeOf(u32) + @sizeOf(u64);
-    var serialized_bytes = transport_state_bytes + 2 * @sizeOf(u16) + 5 * @sizeOf(u32);
+    var serialized_bytes = transportSerializedBytes(g.transport) + 2 * @sizeOf(u16) +
+        5 * @sizeOf(u32);
     var size_it = g.resources.valueIterator();
     while (size_it.next()) |resource| {
         serialized_bytes += resource_state_bytes + resource.host_data.len;
@@ -617,6 +626,32 @@ test "snapshot: console device roundtrip (multiport)" {
     try testing.expectEqualStrings("pending host input", con2.input_buffer.firstSlice());
     try testing.expectEqualStrings("agent bytes", con2.ports[0].input_buffer.firstSlice());
     try testing.expect(con2.ports[0].guest_open);
+}
+
+test "snapshot: block device roundtrip" {
+    const blk = try virtio.Block.init(testing.allocator);
+    defer blk.deinit();
+    blk.transport.status = @bitCast(@as(u8, 0x0F));
+    blk.transport.driver_features = 0xfeed_face;
+    blk.transport.queues[0].ready = true;
+    blk.transport.queues[0].device_addr = 0x5000_0000;
+    blk.request_last_avail = 23;
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeBlock(counted.allocator(), blk);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+
+    const blk2 = try virtio.Block.init(testing.allocator);
+    defer blk2.deinit();
+    try deserializeBlock(blk2, data);
+    try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(blk2.transport.status)));
+    try testing.expectEqual(@as(u64, 0xfeed_face), blk2.transport.driver_features);
+    try testing.expect(blk2.transport.queues[0].ready);
+    try testing.expectEqual(@as(u64, 0x5000_0000), blk2.transport.queues[0].device_addr);
+    try testing.expectEqual(@as(u16, 23), blk2.request_last_avail);
 }
 
 test "snapshot: gpu 2D framebuffer survives roundtrip" {
