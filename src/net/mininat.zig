@@ -941,9 +941,11 @@ pub const MiniNat = struct {
         if (icmp_msg.len < 8) return;
         if (icmp_msg[0] != 0) return; // only relay echo replies
 
-        var out: [2048 + 42]u8 = undefined;
         const total = ETH_HDR + 20 + icmp_msg.len;
-        if (total > out.len) return;
+        var fallback: [2048 + 42]u8 = undefined;
+        if (total > fallback.len) return;
+        const reply_buffer = self.acquireReply(&fallback, total) orelse return;
+        const out = reply_buffer.frame;
 
         @memcpy(out[0..6], &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
         @memcpy(out[6..12], &GATEWAY_MAC);
@@ -968,7 +970,7 @@ pub const MiniNat = struct {
         const icmp_csum = checksum(icmp);
         std.mem.writeInt(u16, icmp[2..4], icmp_csum, .big);
 
-        self.reply(out[0..total], self.reply_userdata);
+        self.commitReply(reply_buffer);
     }
 
     // =========================================================================
@@ -1608,6 +1610,9 @@ test "mininat: ICMP echo to a remote host is reframed for the guest" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    test_reply_lease_len = 0;
+    test_reply_lease_committed = false;
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -1632,8 +1637,10 @@ test "mininat: ICMP echo to a remote host is reframed for the guest" {
 
     nat.handleIcmpSocketReply(key, 42, &raw);
 
-    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
-    const rep = test_replies.items[0];
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expect(test_reply_lease_committed);
+    try testing.expectEqual(@as(usize, ETH_HDR + 20 + 13), test_reply_lease_len);
+    const rep = test_reply_lease[0..test_reply_lease_len];
     try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 12 ..][0..4], &remote_ip));
     try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 16 ..][0..4], &GUEST_IP));
     const rep_icmp = rep[ETH_HDR + 20 ..];
