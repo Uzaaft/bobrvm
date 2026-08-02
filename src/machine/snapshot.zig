@@ -473,8 +473,20 @@ pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void 
 // contexts/resources are NOT captured (reset on restore, per QEMU policy).
 
 pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
+    assert(g.transport.queues.len <= std.math.maxInt(u8));
+    assert(g.resources.count() <= std.math.maxInt(u32));
+    const queue_state_bytes = @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
+    const transport_state_bytes = @sizeOf(u64) + 5 * @sizeOf(u32) + 2 * @sizeOf(u8) +
+        g.transport.queues.len * queue_state_bytes;
+    const resource_state_bytes = 4 * @sizeOf(u32) + @sizeOf(u64);
+    var serialized_bytes = transport_state_bytes + 2 * @sizeOf(u16) + 5 * @sizeOf(u32);
+    var size_it = g.resources.valueIterator();
+    while (size_it.next()) |resource| {
+        serialized_bytes += resource_state_bytes + resource.host_data.len;
+    }
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try serializeTransport(&out, g.transport);
     try out.int(u16, g.ctrl_last_avail);
     try out.int(u16, g.cursor_last_avail);
@@ -492,7 +504,11 @@ pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
         try out.int(u32, r.height);
         try out.blob(r.host_data);
     }
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeGpu(g: *virtio.Gpu, data: []const u8) !void {
@@ -616,8 +632,12 @@ test "snapshot: gpu 2D framebuffer survives roundtrip" {
     gpu.setDisplaySize(4, 2);
     gpu.transport.status = @bitCast(@as(u8, 0x0F));
 
-    const data = try serializeGpu(testing.allocator, gpu);
-    defer testing.allocator.free(data);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeGpu(counted.allocator(), gpu);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
 
     const gpu2 = try virtio.Gpu.init(testing.allocator, false);
     defer gpu2.deinit();
