@@ -676,13 +676,10 @@ pub const P9Server = struct {
                 const flags = try r.u32v();
                 if (!validName(name)) return error.Access;
                 const fid = try self.getFid(fid_id);
-                const rel = if (fid.rel.len == 0)
-                    try self.alloc.dupe(u8, name)
-                else
-                    try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ fid.rel, name });
-                defer self.alloc.free(rel);
-                const path = try self.hostPath(rel);
-                defer self.alloc.free(path);
+                var rel_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const rel = try childRelInto(fid.rel, name, &rel_storage);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(rel, &path_storage);
 
                 // Linux AT_REMOVEDIR=0x200; Darwin's is 0x80.
                 const removedir = flags & 0x200 != 0;
@@ -971,8 +968,13 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p2 = TestPayload{};
         const req2 = try tmsg(testing.allocator, Tunlinkat, 11, p2.u32v(1).str("subdir").u32v(0x200).slice());
         defer testing.allocator.free(req2);
+        var counted2 = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted2.allocator();
         const n2 = srv.handle(req2, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n2], Tunlinkat + 1);
+        try testing.expectEqual(@as(usize, 0), counted2.allocations);
+        try testing.expectEqual(@as(usize, 0), counted2.allocated_bytes);
     }
     // TGETATTR on fid 2
     {
