@@ -889,9 +889,11 @@ pub const MiniNat = struct {
 
     /// Build remote → guest UDP frame.
     fn replyUdp(self: *MiniNat, key: UdpKey, payload: []const u8) void {
-        var out: [2048 + 42]u8 = undefined;
         const total = ETH_HDR + 20 + 8 + payload.len;
-        if (total > out.len) return;
+        var fallback: [2048 + 42]u8 = undefined;
+        if (total > fallback.len) return;
+        const reply_buffer = self.acquireReply(&fallback, total) orelse return;
+        const out = reply_buffer.frame;
 
         // Ethernet: to guest
         @memcpy(out[0..6], &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
@@ -917,7 +919,7 @@ pub const MiniNat = struct {
 
         @memcpy(out[ETH_HDR + 28 ..][0..payload.len], payload);
 
-        self.reply(out[0..total], self.reply_userdata);
+        self.commitReply(reply_buffer);
     }
 
     /// Build remote → guest ICMP echo reply frame. `icmp_msg` is whatever
@@ -1430,7 +1432,8 @@ const testing = std.testing;
 
 var test_replies: std.ArrayListUnmanaged([]u8) = .empty;
 var test_alloc: std.mem.Allocator = undefined;
-var test_reply_lease: [ETH_HDR + 28]u8 = undefined;
+var test_reply_lease: [2048 + 42]u8 = undefined;
+var test_reply_lease_len: usize = 0;
 var test_reply_lease_committed: bool = false;
 
 fn testReply(frame: []const u8, _: ?*anyopaque) void {
@@ -1449,6 +1452,7 @@ fn testReplyCommit(lease: ReplyLease, userdata: ?*anyopaque) void {
     assert(userdata == null);
     assert(lease.token == 42);
     assert(lease.frame.ptr == test_reply_lease[0..].ptr);
+    test_reply_lease_len = lease.frame.len;
     test_reply_lease_committed = true;
 }
 
@@ -1463,6 +1467,7 @@ test "mininat: ARP request for gateway gets a reply" {
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
     nat.setReplyLease(testReplyReserve, testReplyCommit);
+    test_reply_lease_len = 0;
     test_reply_lease_committed = false;
     defer {
         nat.udp_flows.deinit();
@@ -1488,9 +1493,39 @@ test "mininat: ARP request for gateway gets a reply" {
     nat.handleFrame(&req);
     try testing.expectEqual(@as(usize, 0), test_replies.items.len);
     try testing.expect(test_reply_lease_committed);
-    const rep = test_reply_lease[0..];
+    try testing.expectEqual(@as(usize, ETH_HDR + 28), test_reply_lease_len);
+    const rep = test_reply_lease[0..test_reply_lease_len];
     try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, rep[20..22], .big)); // ARP reply
     try testing.expect(std.mem.eql(u8, rep[22..28], &GATEWAY_MAC)); // sender hw
+}
+
+test "mininat: UDP reply is built directly in leased RX storage" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    test_reply_lease_len = 0;
+    test_reply_lease_committed = false;
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+    }
+
+    var payload: [1400]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+    const key = UdpKey{
+        .guest_port = 49152,
+        .remote_ip = .{ 1, 1, 1, 1 },
+        .remote_port = 53,
+    };
+    nat.replyUdp(key, &payload);
+
+    const total = ETH_HDR + 20 + 8 + payload.len;
+    try testing.expect(test_reply_lease_committed);
+    try testing.expectEqual(total, test_reply_lease_len);
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expectEqualSlices(u8, &payload, test_reply_lease[ETH_HDR + 28 .. total]);
 }
 
 test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
