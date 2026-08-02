@@ -69,7 +69,7 @@ public final class VMSurfaceView: NSView {
         logger.info("Attaching surface to VM: \(vmInstance.name)")
         self.vmInstance = vmInstance
 
-        let newSurface = try vmInstance.vm.createSurface(
+        let newSurface = try vmInstance.requireVM().createSurface(
             device: device,
             layer: metalLayer,
             queue: commandQueue

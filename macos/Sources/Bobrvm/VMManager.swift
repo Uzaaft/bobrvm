@@ -33,7 +33,7 @@ public final class VMManager: ObservableObject {
     public init() {}
 
     public func loadExistingVMs() {
-        guard let app = app else {
+        guard let app else {
             Self.logger.warning("Cannot load VMs: app not initialized")
             return
         }
@@ -42,23 +42,16 @@ public final class VMManager: ObservableObject {
         Self.logger.info("Found \(storedConfigs.count) stored VM(s)")
 
         for stored in storedConfigs {
-            do {
-                let config = stored.vmConfig
-                let vm = try app.createVM(config: config)
-                let instance = VMInstance(
-                    id: stored.id,
-                    name: stored.name,
-                    config: config,
-                    vm: vm,
-                    isoPath: stored.isoPath,
-                    retinaEnabled: stored.retinaEnabled ?? true
-                )
-                vms.append(instance)
-                Self.logger.info("Loaded VM: \(stored.name)")
-            } catch {
-                Self.logger.error(
-                    "Failed to load VM '\(stored.name)': \(error.localizedDescription)")
-            }
+            let instance = VMInstance(
+                id: stored.id,
+                name: stored.name,
+                config: stored.vmConfig,
+                app: app,
+                isoPath: stored.isoPath,
+                retinaEnabled: stored.retinaEnabled ?? true
+            )
+            vms.append(instance)
+            Self.logger.info("Loaded VM: \(stored.name)")
         }
 
     }
@@ -78,6 +71,7 @@ public final class VMManager: ObservableObject {
             let instance = VMInstance(
                 name: name,
                 config: config,
+                app: app,
                 vm: vm,
                 isoPath: isoPath,
                 retinaEnabled: retinaEnabled
@@ -93,8 +87,7 @@ public final class VMManager: ObservableObject {
     }
 
     public func deleteVM(_ instance: VMInstance) {
-        instance.vm.stop()
-        instance.vm.destroy()
+        instance.destroy()
         vms.removeAll { $0.id == instance.id }
         if selectedVM?.id == instance.id {
             selectedVM = vms.first
@@ -155,6 +148,7 @@ public final class VMManager: ObservableObject {
             id: instance.id,
             name: name,
             config: newConfig,
+            app: app,
             vm: newVM,
             isoPath: isoPath,
             retinaEnabled: retinaEnabled
@@ -167,7 +161,7 @@ public final class VMManager: ObservableObject {
             throw error
         }
 
-        instance.vm.destroy()
+        instance.destroy()
         vms[index] = updatedInstance
         if selectedVM?.id == instance.id {
             selectedVM = updatedInstance
@@ -178,7 +172,7 @@ public final class VMManager: ObservableObject {
 
     public func stopAllVMs() {
         for instance in vms {
-            instance.vm.stop()
+            instance.stop()
         }
     }
 
@@ -215,7 +209,8 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     public let id: UUID
     public let name: String
     public let config: VMConfig
-    public let vm: VM
+    private let app: App
+    private var vm: VM?
     public let isoPath: String?
     public let retinaEnabled: Bool
 
@@ -227,25 +222,24 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         id: UUID = UUID(),
         name: String,
         config: VMConfig,
-        vm: VM,
+        app: App,
+        vm: VM? = nil,
         isoPath: String? = nil,
         retinaEnabled: Bool = true
     ) {
         self.id = id
         self.name = name
         self.config = config
+        self.app = app
         self.vm = vm
         self.isoPath = isoPath
         self.retinaEnabled = retinaEnabled
 
-        // Forward VM state changes to trigger VMInstance updates
-        vmStateCancellable = vm.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }
+        observeVM()
     }
 
     public var state: VMState {
-        vm.state
+        vm?.state ?? .stopped
     }
 
     public var vramMB: Int {
@@ -253,19 +247,45 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
 
     public func start() throws {
+        let vm: VM
+        if let existing = self.vm {
+            vm = existing
+        } else {
+            vm = try app.createVM(config: config)
+            self.vm = vm
+            observeVM()
+        }
         try vm.start()
     }
 
     public func stop() {
-        vm.stop()
+        vm?.stop()
     }
 
     public func pause() {
-        vm.pause()
+        vm?.pause()
     }
 
     public func resume() {
-        vm.resume()
+        vm?.resume()
+    }
+
+    public func requireVM() throws -> VM {
+        guard let vm else { throw BobrvmError.invalidState }
+        return vm
+    }
+
+    public func destroy() {
+        vm?.stop()
+        vm?.destroy()
+        vm = nil
+        vmStateCancellable = nil
+    }
+
+    private func observeVM() {
+        vmStateCancellable = vm?.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
     }
 }
 
