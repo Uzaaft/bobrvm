@@ -399,9 +399,7 @@ pub const Msl = struct {
 
 /// Append formatted text to the buffer.
 fn app(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(alloc, fmt, args);
-    defer alloc.free(s);
-    try w.appendSlice(alloc, s);
+    try w.print(alloc, fmt, args);
 }
 
 /// Write the MSL base name (no swizzle/modifiers) for an operand.
@@ -1058,8 +1056,12 @@ test "emit MSL for passthrough vertex shader" {
         \\  1: END
     ;
     const prog = try parse(src);
-    var msl = try emit(std.testing.allocator, &prog);
-    defer msl.deinit(std.testing.allocator);
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var msl = try emit(counted.allocator(), &prog);
+    defer msl.deinit(counted.allocator());
+    try std.testing.expectEqual(@as(usize, 2), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 639), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 1), counted.resize_index);
 
     try std.testing.expectEqual(Stage.vertex, msl.stage);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "vertex VSOut vs_main") != null);
