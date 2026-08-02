@@ -320,8 +320,19 @@ pub fn deserializeTransport(cur: *Cursor, t: *mmio.Transport) !void {
 // =============================================================================
 
 pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
+    assert(con.transport.queues.len <= std.math.maxInt(u8));
+    assert(con.ports.len <= std.math.maxInt(u8));
+    const queue_state_bytes = @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
+    const transport_state_bytes = @sizeOf(u64) + 5 * @sizeOf(u32) + 2 * @sizeOf(u8) +
+        con.transport.queues.len * queue_state_bytes;
+    var serialized_bytes = transport_state_bytes + 2 * @sizeOf(u16) + @sizeOf(u64) +
+        con.input_buffer.count + con.mp_last_avail.len * @sizeOf(u16) + @sizeOf(u8);
+    for (con.ports) |port| {
+        serialized_bytes += @sizeOf(u8) + @sizeOf(u64) + port.input_buffer.count;
+    }
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try serializeTransport(&out, &con.transport);
     try out.int(u16, con.receive_last_avail);
     try out.int(u16, con.transmit_last_avail);
@@ -332,7 +343,11 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
         try out.int(u8, @intFromBool(port.guest_open));
         try inputBufferBlob(&out, &port.input_buffer);
     }
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeConsole(_: Allocator, con: *virtio.Console, data: []const u8) !void {
@@ -568,8 +583,12 @@ test "snapshot: console device roundtrip (multiport)" {
     try con.queuePortInput(1, "agent bytes");
     con.ports[0].guest_open = true;
 
-    const data = try serializeConsole(testing.allocator, con);
-    defer testing.allocator.free(data);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeConsole(counted.allocator(), con);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
 
     const con2 = try virtio.Console.init(testing.allocator, &.{"org.qemu.guest_agent.0"});
     defer con2.deinit();
