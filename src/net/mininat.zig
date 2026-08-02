@@ -1250,8 +1250,10 @@ pub const MiniNat = struct {
         }
 
         // Echo reply: swap MACs and IPs, flip type, fix checksums.
-        var out: [1600]u8 = undefined;
-        if (frame.len > out.len) return;
+        var fallback: [1600]u8 = undefined;
+        if (frame.len > fallback.len) return;
+        const reply_buffer = self.acquireReply(&fallback, frame.len) orelse return;
+        const out = reply_buffer.frame;
         @memcpy(out[0..frame.len], frame);
 
         @memcpy(out[0..6], frame[6..12]);
@@ -1270,7 +1272,7 @@ pub const MiniNat = struct {
         const icmp_csum = checksum(oicmp);
         std.mem.writeInt(u16, oicmp[2..4], icmp_csum, .big);
 
-        self.reply(out[0..frame.len], self.reply_userdata);
+        self.commitReply(reply_buffer);
     }
 
     // =========================================================================
@@ -1574,6 +1576,9 @@ test "mininat: ICMP echo to gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
     var nat = MiniNat.init(testing.allocator, testReply, null);
+    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    test_reply_lease_len = 0;
+    test_reply_lease_committed = false;
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -1595,11 +1600,15 @@ test "mininat: ICMP echo to gateway gets a reply" {
     icmp[0] = 8; // echo request
 
     nat.handleFrame(&req);
-    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
-    const rep = test_replies.items[0];
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+    try testing.expect(test_reply_lease_committed);
+    try testing.expectEqual(req.len, test_reply_lease_len);
+    const rep = test_reply_lease[0..test_reply_lease_len];
     try testing.expectEqual(@as(u8, 0), rep[ETH_HDR + 20]); // echo reply
     try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 12 ..][0..4], &GATEWAY_IP));
     try testing.expect(std.mem.eql(u8, rep[ETH_HDR + 16 ..][0..4], &GUEST_IP));
+    try testing.expectEqual(@as(u16, 0), MiniNat.checksum(rep[ETH_HDR .. ETH_HDR + 20]));
+    try testing.expectEqual(@as(u16, 0), MiniNat.checksum(rep[ETH_HDR + 20 ..]));
 }
 
 test "mininat: ICMP echo to a remote host is reframed for the guest" {
