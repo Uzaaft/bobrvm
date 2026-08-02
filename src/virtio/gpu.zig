@@ -1677,8 +1677,8 @@ pub const Gpu = struct {
                 cmd.box.y,
                 cmd.box.w,
                 cmd.box.h,
-                upload,
-                @intCast(row_bytes),
+                upload.data,
+                upload.bytes_per_row,
             );
             if (gpu_module.stats.on()) {
                 if (up_ok) gpu_module.stats.tex_uploads_ok += 1 else gpu_module.stats.tex_uploads_fail += 1;
@@ -1705,6 +1705,11 @@ pub const Gpu = struct {
         return .resp_ok_nodata;
     }
 
+    const TextureUpload = struct {
+        data: []const u8,
+        bytes_per_row: u32,
+    };
+
     const TextureUploadError = error{ OutOfMemory, InvalidBacking };
 
     fn textureUploadData(
@@ -1716,11 +1721,16 @@ pub const Gpu = struct {
         height: u32,
         total: usize,
         get_mem: ring.GetMemFn,
-    ) TextureUploadError![]const u8 {
+    ) TextureUploadError!TextureUpload {
         assert(entries.len > 0);
         assert(row_bytes > 0 and height > 0);
-        if (stride == row_bytes) {
-            if (sliceFromBacking(entries, offset, total, get_mem)) |direct| return direct;
+        if (stride < row_bytes) return error.InvalidBacking;
+        const source_len_u64 = std.math.mul(u64, stride, height) catch
+            return error.InvalidBacking;
+        if (stride <= std.math.maxInt(u32) and source_len_u64 <= std.math.maxInt(usize)) {
+            if (sliceFromBacking(entries, offset, @intCast(source_len_u64), get_mem)) |direct| {
+                return .{ .data = direct, .bytes_per_row = @intCast(stride) };
+            }
         }
         if (self.transfer3d_staging.len < total) {
             self.transfer3d_staging = if (self.transfer3d_staging.len == 0)
@@ -1736,7 +1746,7 @@ pub const Gpu = struct {
             const dst_row = staging[dst_offset..][0..@intCast(row_bytes)];
             if (!copyFromBacking(entries, src_off, dst_row, get_mem)) return error.InvalidBacking;
         }
-        return staging;
+        return .{ .data = staging, .bytes_per_row = @intCast(row_bytes) };
     }
 
     fn sliceFromBacking(
@@ -2476,6 +2486,82 @@ test "transfer_to_host_3d uploads guest TEXTURE data via replaceRegion" {
     var out: [nbytes]u8 = undefined;
     try testing.expect(gpu.gpu_device.readbackResource(1, &out));
     try testing.expectEqualSlices(u8, guest, &out);
+}
+
+test "strided contiguous texture upload borrows guest backing" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    var guest: [64]u8 = undefined;
+    for (&guest, 0..) |*byte, index| byte.* = @truncate(index * 7 + 3);
+    const Ctx = struct {
+        var mem: []u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const offset: usize = @intCast(addr - 0x1000);
+            if (offset + len > mem.len) return null;
+            return mem[offset..][0..len];
+        }
+    };
+    Ctx.mem = &guest;
+    const entries = [_]MemEntry{.{ .addr = 0x1000, .length = guest.len }};
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    gpu.alloc = counted.allocator();
+    const upload = try gpu.textureUploadData(&entries, 0, 16, 8, 4, 32, Ctx.get);
+    gpu.alloc = testing.allocator;
+
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 64), upload.data.len);
+    try testing.expectEqual(@as(u32, 16), upload.bytes_per_row);
+    try testing.expectEqual(guest[0..].ptr, upload.data.ptr);
+    for (0..4) |row| {
+        try testing.expectEqualSlices(
+            u8,
+            guest[row * 16 ..][0..8],
+            upload.data[row * upload.bytes_per_row ..][0..8],
+        );
+    }
+}
+
+test "strided fragmented texture upload retains compact staging" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    var guest: [64]u8 = undefined;
+    for (&guest, 0..) |*byte, index| byte.* = @truncate(index * 5 + 1);
+    const Ctx = struct {
+        var mem: []u8 = undefined;
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const offset: usize = @intCast(addr - 0x1000);
+            if (offset + len > mem.len) return null;
+            return mem[offset..][0..len];
+        }
+    };
+    Ctx.mem = &guest;
+    const entries = [_]MemEntry{
+        .{ .addr = 0x1000, .length = 32 },
+        .{ .addr = 0x1020, .length = 32 },
+    };
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    gpu.alloc = counted.allocator();
+    const upload = try gpu.textureUploadData(&entries, 0, 16, 8, 4, 32, Ctx.get);
+    gpu.alloc = testing.allocator;
+
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 32), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 32), upload.data.len);
+    try testing.expectEqual(@as(u32, 8), upload.bytes_per_row);
+    for (0..4) |row| {
+        try testing.expectEqualSlices(
+            u8,
+            guest[row * 16 ..][0..8],
+            upload.data[row * 8 ..][0..8],
+        );
+    }
 }
 
 test "transfer_to_host_3d uploads guest vertex data into the resource's MTLBuffer" {
