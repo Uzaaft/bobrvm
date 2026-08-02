@@ -114,6 +114,8 @@ const DEFAULT_SND_WND: u32 = 65535;
 /// Initial host→guest retransmit timeout and its exponential-backoff ceiling.
 const INITIAL_RTO_NS: i64 = 250 * std.time.ns_per_ms;
 const MAX_RTO_NS: i64 = 4 * std.time.ns_per_s;
+/// Poll work is iterative; its largest packet scratch buffers are under 4 KiB.
+const stack_size_bytes: usize = 1024 * 1024;
 
 const TcpSendBuffer = struct {
     storage: []u8 = &.{},
@@ -291,7 +293,7 @@ pub const MiniNat = struct {
     /// Start the reply-poll thread (forwards socket replies to the guest).
     pub fn start(self: *MiniNat) !void {
         self.running.store(true, .release);
-        self.poll_thread = try std.Thread.spawn(.{}, pollLoop, .{self});
+        self.poll_thread = try std.Thread.spawn(.{ .stack_size = stack_size_bytes }, pollLoop, .{self});
     }
 
     pub fn stop(self: *MiniNat) void {
