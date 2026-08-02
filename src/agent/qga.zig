@@ -45,7 +45,6 @@ pub const Qga = struct {
 
     fn send(self: *Qga, json: []const u8) void {
         self.send_fn(json, self.send_userdata);
-        self.send_fn("\n", self.send_userdata);
     }
 
     /// guest-sync: flushes the guest's parser state; the response echoes
@@ -54,7 +53,7 @@ pub const Qga = struct {
         var buf: [96]u8 = undefined;
         const msg = std.fmt.bufPrint(
             &buf,
-            "{{\"execute\":\"guest-sync\",\"arguments\":{{\"id\":{d}}}}}",
+            "{{\"execute\":\"guest-sync\",\"arguments\":{{\"id\":{d}}}}}\n",
             .{id},
         ) catch return;
         self.send(msg);
@@ -62,7 +61,7 @@ pub const Qga = struct {
 
     /// guest-ping: liveness probe (empty return on success).
     pub fn ping(self: *Qga) void {
-        self.send("{\"execute\":\"guest-ping\"}");
+        self.send("{\"execute\":\"guest-ping\"}\n");
     }
 
     /// Graceful guest shutdown ("powerdown"), reboot ("reboot") or
@@ -72,7 +71,7 @@ pub const Qga = struct {
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(
             &buf,
-            "{{\"execute\":\"guest-shutdown\",\"arguments\":{{\"mode\":\"{s}\"}}}}",
+            "{{\"execute\":\"guest-shutdown\",\"arguments\":{{\"mode\":\"{s}\"}}}}\n",
             .{mode},
         ) catch return;
         self.send(msg);
@@ -85,7 +84,7 @@ pub const Qga = struct {
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(
             &buf,
-            "{{\"execute\":\"guest-set-time\",\"arguments\":{{\"time\":{d}}}}}",
+            "{{\"execute\":\"guest-set-time\",\"arguments\":{{\"time\":{d}}}}}\n",
             .{epoch_ns},
         ) catch return;
         self.send(msg);
@@ -94,7 +93,7 @@ pub const Qga = struct {
     /// Ask for the guest's interfaces; the parsed IPv4 list lands in
     /// guest_ips via feed().
     pub fn queryNetworkInterfaces(self: *Qga) void {
-        self.send("{\"execute\":\"guest-network-get-interfaces\"}");
+        self.send("{\"execute\":\"guest-network-get-interfaces\"}\n");
     }
 
     /// Feed guest→host bytes (console port output). Called on the vCPU
@@ -187,7 +186,9 @@ pub const Qga = struct {
 const testing = std.testing;
 
 var test_sent: std.ArrayListUnmanaged(u8) = .empty;
+var test_send_calls: usize = 0;
 fn testSend(data: []const u8, _: ?*anyopaque) void {
+    test_send_calls += 1;
     test_sent.appendSlice(testing.allocator, data) catch {};
 }
 
@@ -195,6 +196,7 @@ test "qga: commands serialize as newline-delimited JSON" {
     defer {
         test_sent.deinit(testing.allocator);
         test_sent = .empty;
+        test_send_calls = 0;
     }
     var qga = Qga.init(testing.allocator, testSend, null);
     defer qga.deinit();
@@ -208,6 +210,7 @@ test "qga: commands serialize as newline-delimited JSON" {
         "{\"execute\":\"guest-shutdown\",\"arguments\":{\"mode\":\"powerdown\"}}\n" ++
         "{\"execute\":\"guest-set-time\",\"arguments\":{\"time\":1700000000000000000}}\n";
     try testing.expectEqualStrings(expected, test_sent.items);
+    try testing.expectEqual(@as(usize, 3), test_send_calls);
 }
 
 test "qga: feed parses split responses and sync ids" {
