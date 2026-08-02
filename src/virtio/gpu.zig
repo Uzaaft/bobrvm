@@ -203,6 +203,7 @@ pub const MemEntry = extern struct {
 const BackingEntries = union(enum) {
     empty,
     single: MemEntry,
+    pair: [2]MemEntry,
     multiple: std.ArrayListUnmanaged(MemEntry),
 
     fn deinit(self: *BackingEntries, alloc: Allocator) void {
@@ -218,6 +219,7 @@ const BackingEntries = union(enum) {
         return switch (self.*) {
             .empty => &.{},
             .single => |*entry| @as(*const [1]MemEntry, @ptrCast(entry))[0..],
+            .pair => |*entries| entries,
             .multiple => |*list| list.items,
         };
     }
@@ -234,6 +236,15 @@ const BackingEntries = union(enum) {
             const entry = std.mem.bytesToValue(MemEntry, bytes[0..@sizeOf(MemEntry)]);
             self.deinit(alloc);
             self.* = .{ .single = entry };
+            return;
+        }
+        if (count == 2) {
+            const entries = std.mem.bytesToValue(
+                [2]MemEntry,
+                bytes[0 .. 2 * @sizeOf(MemEntry)],
+            );
+            self.deinit(alloc);
+            self.* = .{ .pair = entries };
             return;
         }
         switch (self.*) {
@@ -2226,18 +2237,21 @@ test "ResourceCreate2D size" {
     try testing.expectEqual(@as(usize, 40), @sizeOf(ResourceCreate2D));
 }
 
-test "BackingEntries stores one entry inline and preserves scatter gather" {
+test "BackingEntries stores one or two entries inline and preserves scatter gather" {
     var backing: BackingEntries = .empty;
-    defer backing.deinit(testing.allocator);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    defer backing.deinit(counted.allocator());
 
     const entries = [_]MemEntry{
         .{ .addr = 0x1000, .length = 4096 },
         .{ .addr = 0x3000, .length = 8192 },
     };
-    try backing.replace(testing.allocator, std.mem.asBytes(&entries), entries.len);
+    try backing.replace(counted.allocator(), std.mem.asBytes(&entries), entries.len);
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     try testing.expectEqualSlices(MemEntry, &entries, backing.items());
 
-    try backing.replace(testing.allocator, std.mem.asBytes(&entries[1]), 1);
+    try backing.replace(counted.allocator(), std.mem.asBytes(&entries[1]), 1);
     try testing.expectEqual(@as(usize, 1), backing.items().len);
     try testing.expectEqual(entries[1].addr, backing.items()[0].addr);
     try testing.expectEqual(entries[1].length, backing.items()[0].length);
