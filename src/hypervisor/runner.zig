@@ -400,12 +400,11 @@ pub const VcpuRunner = struct {
 
                     // Handle post/pre-indexed writeback
                     if (ls.writeback_rn) |wb_rn| {
-                        const base_val = try self.vcpu.?.getReg(@enumFromInt(wb_rn));
-                        const new_base = if (ls.writeback_imm >= 0)
-                            base_val +% @as(u64, @intCast(ls.writeback_imm))
-                        else
-                            base_val -% @as(u64, @intCast(-ls.writeback_imm));
-                        try self.vcpu.?.setReg(@enumFromInt(wb_rn), new_base);
+                        try applyLoadStoreWriteback(
+                            self.vcpu.?,
+                            wb_rn,
+                            ls.writeback_imm,
+                        );
                     }
 
                     if (enable_verbose_debug and addr >= 0x3c000000 and
@@ -622,7 +621,7 @@ pub const VcpuRunner = struct {
 };
 
 /// Decoded load/store instruction info
-const LoadStoreInfo = struct {
+pub const LoadStoreInfo = struct {
     is_write: bool,
     size: u8,
     rt: u5,
@@ -632,14 +631,42 @@ const LoadStoreInfo = struct {
 };
 
 /// Result of instruction decode
-const DecodeResult = union(enum) {
+pub const DecodeResult = union(enum) {
     load_store: LoadStoreInfo,
     cache_op, // DC CIVAC, etc. - skip
     unknown,
 };
 
+pub fn applyLoadStoreWriteback(vcpu: *Vcpu, rn: u5, delta: i64) !void {
+    assert(delta >= -256);
+    assert(delta <= 255);
+
+    if (rn == 31) {
+        const pstate = try vcpu.getReg(.cpsr);
+        const sp_register: @import("vcpu.zig").SystemRegister = if (pstate & 1 == 0)
+            .sp_el0
+        else
+            .sp_el1;
+        const base = try vcpu.getSysReg(sp_register);
+        const updated = if (delta >= 0)
+            base +% @as(u64, @intCast(delta))
+        else
+            base -% @as(u64, @intCast(-delta));
+        try vcpu.setSysReg(sp_register, updated);
+        return;
+    }
+
+    const register: @import("vcpu.zig").Register = @enumFromInt(rn);
+    const base = try vcpu.getReg(register);
+    const updated = if (delta >= 0)
+        base +% @as(u64, @intCast(delta))
+    else
+        base -% @as(u64, @intCast(-delta));
+    try vcpu.setReg(register, updated);
+}
+
 /// Decode AArch64 load/store instruction to determine access type
-fn decodeLoadStore(instr: u32) DecodeResult {
+pub fn decodeLoadStore(instr: u32) DecodeResult {
     // Check for system instructions first (MSR/MRS/DC/IC/etc.)
     // System instructions: 1101 0101 xxxx xxxx xxxx xxxx xxxx xxxx
     if ((instr >> 24) & 0xFF == 0xD5) {

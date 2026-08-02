@@ -15,6 +15,7 @@ struct BobrvmApp: SwiftUI.App {
         WindowGroup {
             ContentView()
                 .environmentObject(appDelegate.vmManager)
+                .environmentObject(appDelegate.ghosttyRuntime)
         }
         .defaultSize(width: 1_100, height: 720)
         .commands {
@@ -25,6 +26,15 @@ struct BobrvmApp: SwiftUI.App {
                 .keyboardShortcut("n", modifiers: .command)
             }
         }
+
+        WindowGroup("Virtual Machine", for: UUID.self) { $vmID in
+            if let vmID {
+                VMWindowView(vmID: vmID)
+                    .environmentObject(appDelegate.vmManager)
+                    .environmentObject(appDelegate.ghosttyRuntime)
+            }
+        }
+        .defaultSize(width: 1_280, height: 800)
 
         Settings {
             SettingsView()

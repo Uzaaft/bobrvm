@@ -24,6 +24,7 @@
 		C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */; };
 		1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */; };
 		UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000002 /* QEMU_EFI.fd */; };
+		UEFI00000000000000000004 /* QEMU_VARS.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000005 /* QEMU_VARS.fd */; };
 		B0B000000000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000002 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -48,6 +49,7 @@
 		8260A68E8A704D57966124E6 /* Bobrvm-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Bobrvm-Bridging-Header.h"; sourceTree = "<group>"; };
 		0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
 		UEFI00000000000000000002 /* QEMU_EFI.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_EFI.fd; sourceTree = "<group>"; };
+		UEFI00000000000000000005 /* QEMU_VARS.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_VARS.fd; sourceTree = "<group>"; };
 		B0B000000000000000000002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B0B000000000000000000003 /* Bobrvm-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Bobrvm-Info.plist"; sourceTree = "<group>"; };
 		B0B000000000000000000004 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
@@ -140,6 +142,7 @@
 			isa = PBXGroup;
 			children = (
 				UEFI00000000000000000002 /* QEMU_EFI.fd */,
+				UEFI00000000000000000005 /* QEMU_VARS.fd */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -204,6 +207,7 @@
 			files = (
 				B0B000000000000000000001 /* Assets.xcassets in Resources */,
 				UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */,
+				UEFI00000000000000000004 /* QEMU_VARS.fd in Resources */,
 			);
 		};
 /* End PBXResourcesBuildPhase section */

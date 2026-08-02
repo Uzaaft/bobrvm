@@ -225,7 +225,7 @@ pub const VirtioPciTransport = struct {
     ) void {
         assert(queues.len > 0);
         assert(queues.len <= MAX_QUEUES);
-        @memset(queues, QueueConfig{});
+        @memset(queues, QueueConfig{ .size = MAX_QUEUE_SIZE });
         @memset(device_config, 0);
 
         self.* = .{
@@ -395,7 +395,7 @@ pub const VirtioPciTransport = struct {
             .queue_reset => {
                 if (value != 0) {
                     if (self.currentQueue()) |q| {
-                        q.* = QueueConfig{};
+                        q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
                     }
                 }
             },
@@ -497,7 +497,7 @@ pub const VirtioPciTransport = struct {
         self.isr_status = .{};
 
         for (self.queues) |*q| {
-            q.* = QueueConfig{};
+            q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
         }
     }
 
@@ -626,10 +626,14 @@ pub const VirtioPciDevice = struct {
         self.setConfigU16(0x06, 0x0010);
         // Revision ID
         self.config[0x08] = 0x01;
-        // Class code: Mass Storage (for block)
+        // PCI class code helps firmware and the guest choose the right driver.
         self.config[0x09] = 0x00; // Prog IF
         self.config[0x0A] = 0x00; // Subclass
-        self.config[0x0B] = if (self.transport.device_id == 2) 0x01 else 0x00; // Class
+        self.config[0x0B] = switch (self.transport.device_id) {
+            2 => 0x01, // Mass storage
+            16 => 0x03, // Display controller
+            else => 0x00,
+        };
         // Header type
         self.config[0x0E] = 0x00;
         // BAR0: Memory, 32-bit, non-prefetchable (size set during BAR sizing)
@@ -809,6 +813,15 @@ test "VirtioPciTransport init" {
 
     try std.testing.expectEqual(@as(u32, 2), transport.device_id);
     try std.testing.expectEqual(@as(u16, 1), transport.num_queues);
+}
+
+test "virtio GPU uses the modern device id and display class" {
+    const device = try VirtioPciDevice.init(std.testing.allocator, 16, 16, 0, 2, 16);
+    defer device.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0x50), device.config[0x02]);
+    try std.testing.expectEqual(@as(u8, 0x10), device.config[0x03]);
+    try std.testing.expectEqual(@as(u8, 0x03), device.config[0x0B]);
 }
 
 test "VirtioPciTransport allocation profile" {

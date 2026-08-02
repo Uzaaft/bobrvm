@@ -9,6 +9,11 @@ import Combine
 import Foundation
 import OSLog
 
+enum ConsoleEvent {
+    case output(String)
+    case clear
+}
+
 @MainActor
 public final class VMManager: ObservableObject {
     private static let logger = Logger(
@@ -22,6 +27,11 @@ public final class VMManager: ObservableObject {
     @Published public var consoleOutput: String = ""
 
     private static let maxConsoleLength = 100_000
+    private let consoleEventSubject = PassthroughSubject<ConsoleEvent, Never>()
+
+    var consoleEventPublisher: AnyPublisher<ConsoleEvent, Never> {
+        consoleEventSubject.eraseToAnyPublisher()
+    }
 
     weak var app: App?
 
@@ -182,6 +192,7 @@ public final class VMManager: ObservableObject {
 
     public func appendConsoleOutput(_ text: String) {
         consoleOutput.append(text)
+        consoleEventSubject.send(.output(text))
 
         // Trim if too long
         if consoleOutput.count > Self.maxConsoleLength {
@@ -192,6 +203,7 @@ public final class VMManager: ObservableObject {
 
     public func clearConsoleOutput() {
         consoleOutput = ""
+        consoleEventSubject.send(.clear)
     }
 }
 
@@ -330,7 +342,9 @@ enum VMStorage {
                 "[VMStorage] storedFirmware=\(storedFirmware ?? "nil"), bundledFirmware=\(bundledFirmware ?? "nil"), Bundle.main=\(Bundle.main.bundlePath)\n"
                     .data(using: .utf8)!)
 
-            let effectiveFirmwarePath = storedFirmware ?? bundledFirmware
+            // A configured kernel selects direct Linux boot; firmware and
+            // direct boot are mutually exclusive in the core configuration.
+            let effectiveFirmwarePath = kernelPath == nil ? storedFirmware ?? bundledFirmware : nil
 
             // Generate vars path if not stored
             let effectiveVarsPath: String? =

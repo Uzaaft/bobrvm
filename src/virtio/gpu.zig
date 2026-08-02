@@ -1467,9 +1467,6 @@ pub const Gpu = struct {
         if (cmd.resource_id != 0) {
             if (self.frame_callback) |cb| cb(self.frame_userdata);
         }
-        log.info("set_scanout res={} rect={}x{}+{}+{}", .{
-            cmd.resource_id, cmd.r.width, cmd.r.height, cmd.r.x, cmd.r.y,
-        });
         return .resp_ok_nodata;
     }
 

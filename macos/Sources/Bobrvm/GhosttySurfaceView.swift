@@ -1,9 +1,11 @@
 import AppKit
+import Combine
 import GhosttyKit
 import SwiftUI
 
 final class GhosttySurfaceView: NSView {
     private let app: ghostty_app_t
+    private let outputOnly: Bool
     private var surface: ghostty_surface_t?
     private let commandCString: [CChar]
     private let cwdCString: [CChar]?
@@ -15,8 +17,14 @@ final class GhosttySurfaceView: NSView {
     private var pendingTitle: String?
     private var trackingArea: NSTrackingArea?
 
-    init(app: ghostty_app_t, command: String, workingDirectory: String?) {
+    init(
+        app: ghostty_app_t,
+        command: String,
+        workingDirectory: String?,
+        outputOnly: Bool = false
+    ) {
         self.app = app
+        self.outputOnly = outputOnly
         self.commandCString = Array(command.utf8CString)
         self.cwdCString = workingDirectory.map { Array($0.utf8CString) }
 
@@ -54,7 +62,7 @@ final class GhosttySurfaceView: NSView {
         }
     }
 
-    override var acceptsFirstResponder: Bool { true }
+    override var acceptsFirstResponder: Bool { !outputOnly }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -448,6 +456,75 @@ struct GhosttySurfaceViewRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: GhosttySurfaceView, context: Context) {
         _ = nsView
         _ = context
+    }
+}
+
+struct GhosttyConsoleViewRepresentable: NSViewRepresentable {
+    let app: ghostty_app_t
+    let initialOutput: String
+    let events: AnyPublisher<ConsoleEvent, Never>
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(initialOutput: initialOutput, events: events)
+    }
+
+    func makeNSView(context: Context) -> GhosttySurfaceView {
+        let view = GhosttySurfaceView(
+            app: app,
+            command: "/usr/bin/tail -n +1 -f \(context.coordinator.outputPath)",
+            workingDirectory: nil,
+            outputOnly: true
+        )
+        return view
+    }
+
+    func updateNSView(_ nsView: GhosttySurfaceView, context: Context) {
+        _ = nsView
+        _ = context
+    }
+
+    final class Coordinator {
+        let outputPath: String
+
+        private let outputHandle: FileHandle
+        private var cancellable: AnyCancellable?
+
+        init(initialOutput: String, events: AnyPublisher<ConsoleEvent, Never>) {
+            let path = FileManager.default.temporaryDirectory
+                .appendingPathComponent("bobrvm-console-\(UUID().uuidString)")
+            precondition(FileManager.default.createFile(atPath: path.path, contents: nil))
+            guard let handle = FileHandle(forWritingAtPath: path.path) else {
+                preconditionFailure("Failed to open Ghostty console stream")
+            }
+            outputPath = path.path
+            outputHandle = handle
+            write(initialOutput)
+
+            cancellable = events
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] event in
+                    self?.update(event)
+                }
+        }
+
+        deinit {
+            try? outputHandle.close()
+            try? FileManager.default.removeItem(atPath: outputPath)
+        }
+
+        private func update(_ event: ConsoleEvent) {
+            switch event {
+            case .output(let text):
+                write(text)
+            case .clear:
+                write("\u{1B}[2J\u{1B}[H")
+            }
+        }
+
+        private func write(_ text: String) {
+            guard !text.isEmpty else { return }
+            outputHandle.write(Data(text.utf8))
+        }
     }
 }
 

@@ -314,4 +314,8 @@ public struct VMSurfaceRepresentable: NSViewRepresentable {
             }
         }
     }
+
+    public static func dismantleNSView(_ nsView: VMSurfaceView, coordinator: Void) {
+        nsView.detach()
+    }
 }

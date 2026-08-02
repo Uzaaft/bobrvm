@@ -322,9 +322,9 @@ pub const DtbBuilder = struct {
         };
         try self.prop_u32_array("interrupt-map-mask", &interrupt_map_mask);
 
-        // Interrupt map: route all PCI interrupts to GIC SPI 48-51
+        // Interrupt map: route each device's INTA# to a distinct GIC SPI.
         // Format: child_unit child_irq parent_phandle parent_irq...
-        // We map device slots to SPIs 48-51 (INTA# through INTD#)
+        // GIC SPI 48-50 correspond to interrupt IDs 80-82.
         const interrupt_map = [_]u32{
             // Device 0, INTA# -> SPI 48
             0x0000, 0, 0, 1, 0x8001, 0, 48, 4,
@@ -342,6 +342,8 @@ pub const DtbBuilder = struct {
             0x0800, 0, 0, 3, 0x8001, 0, 51, 4,
             // Device 1, INTD# -> SPI 48
             0x0800, 0, 0, 4, 0x8001, 0, 48, 4,
+            // Device 2, INTA# -> SPI 50
+            0x1000, 0, 0, 1, 0x8001, 0, 50, 4,
         };
         try self.prop_u32_array("interrupt-map", &interrupt_map);
 

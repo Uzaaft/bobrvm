@@ -9,6 +9,7 @@ import SwiftUI
 
 struct VMLibraryHomeView: View {
     @EnvironmentObject private var vmManager: VMManager
+    @Environment(\.openWindow) private var openWindow
     @State private var startError: String?
 
     private let columns = [
@@ -100,6 +101,7 @@ struct VMLibraryHomeView: View {
     private func start(_ vm: VMInstance) {
         do {
             try vm.start()
+            openWindow(value: vm.id)
         } catch {
             startError = error.localizedDescription
         }

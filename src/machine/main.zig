@@ -89,9 +89,13 @@ pub const MemoryLayout = struct {
     /// Initrd load address (after kernel, aligned to 1MB)
     pub const INITRD_BASE: u64 = RAM_BASE + 0x0800_0000; // RAM + 128MB
 
-    /// DTB load address (end of RAM - 2MB)
+    /// DTB load address (end of the low 1GB boot window - 2MB).
     pub fn dtbBase(ram_size: u64) u64 {
-        return RAM_BASE + ram_size - 2 * 1024 * 1024;
+        const dtb_reserve_bytes: u64 = 2 * 1024 * 1024;
+        const boot_window_bytes: u64 = @min(ram_size, 1024 * 1024 * 1024);
+        assert(ram_size >= dtb_reserve_bytes);
+        assert(boot_window_bytes >= dtb_reserve_bytes);
+        return RAM_BASE + boot_window_bytes - dtb_reserve_bytes;
     }
 
     /// Get virtio device MMIO base for a given slot.
@@ -312,6 +316,12 @@ pub const Machine = struct {
     /// Virtio PCI block device (for UEFI boot).
     pci_block: ?*pci.VirtioPciDevice = null,
 
+    /// Secondary virtio PCI block device (typically the installer ISO).
+    pci_block2: ?*pci.VirtioPciDevice = null,
+
+    /// Virtio PCI GPU device (UEFI does not discover virtio-mmio displays).
+    pci_gpu: ?*pci.VirtioPciDevice = null,
+
     /// Console output callback.
     console_output: ?*const fn ([]const u8, ?*anyopaque) void = null,
     console_userdata: ?*anyopaque = null,
@@ -471,6 +481,16 @@ pub const Machine = struct {
         if (self.pci_block) |pci_blk| {
             pci_blk.deinit();
             self.pci_block = null;
+        }
+
+        if (self.pci_block2) |pci_blk| {
+            pci_blk.deinit();
+            self.pci_block2 = null;
+        }
+
+        if (self.pci_gpu) |pci_gpu| {
+            pci_gpu.deinit();
+            self.pci_gpu = null;
         }
 
         if (self.ecam_host) |ecam| {
@@ -1402,21 +1422,19 @@ pub const Machine = struct {
                     break;
                 },
             }
-
-            if (exit_count % 1_000_000 == 0) {
-                log.debug("vCPU exits: {}", .{exit_count});
-            }
         }
 
         log.info("vCPU loop finished after {} exits", .{exit_count});
     }
 
     fn handleMmio(self: *Machine, vcpu: *hypervisor.Vcpu, info: hypervisor.ExitInfo) !void {
-        const iss = info.iss();
-        const is_write = info.isWrite();
-        const sas = info.accessSize();
-        const size: u8 = @as(u8, 1) << sas;
-        const srt: u5 = @truncate(iss >> 16);
+        const access = try self.decodeMmioAccess(vcpu, info) orelse {
+            try vcpu.advancePC(info);
+            return;
+        };
+        const is_write = access.is_write;
+        const size = access.size;
+        const srt = access.srt;
         const addr = info.physical_address;
 
         // Note: ECAM-range logging disabled to reduce noise during UEFI boot
@@ -1531,57 +1549,12 @@ pub const Machine = struct {
 
         // PCIe ECAM (configuration space)
         if (addr >= MemoryLayout.ECAM_BASE and addr < MemoryLayout.ECAM_BASE + MemoryLayout.ECAM_SIZE) {
-            const ecam_addr = pci.EcamAddr.decode(addr);
-
-            if (enable_debug_logs and ecam_addr.bus == 0 and ecam_addr.device == 0 and ecam_addr.reg < 0x40) {
-                log.debug("ECAM access: bus={} dev={} func={} reg=0x{x} pci_block={}", .{
-                    ecam_addr.bus, @as(u8, ecam_addr.device), @as(u8, ecam_addr.function), ecam_addr.reg, self.pci_block != null,
-                });
-            }
-
-            // For device 0 (virtio-pci-blk), forward to VirtioPciDevice directly
-            if (ecam_addr.bus == 0 and ecam_addr.device == 0 and ecam_addr.function == 0) {
-                if (self.pci_block) |pci_blk| {
-                    if (is_write) {
-                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                        if (enable_debug_logs) {
-                            log.debug("ECAM 00:00.0 write reg=0x{x} size={} value=0x{x}", .{ ecam_addr.reg, size, value });
-                        }
-                        pci_blk.writeConfig(ecam_addr.reg, size, value);
-                        // Sync config back to ECAM host for reads
-                        if (self.ecam_host) |ecam| {
-                            ecam.updateConfig(0, 0, &pci_blk.config);
-                        }
-                    } else {
-                        const value = pci_blk.readConfig(ecam_addr.reg, size);
-                        if (enable_debug_logs and ecam_addr.reg < 0x40) {
-                            log.debug("ECAM 00:00.0 read reg=0x{x} size={} -> 0x{x}", .{ ecam_addr.reg, size, value });
-                        }
-                        if (srt != 31) {
-                            try vcpu.setReg(@enumFromInt(srt), value);
-                        }
-                    }
-                    try vcpu.advancePC(info);
-                    return;
-                }
-            }
-
-            // Other devices: use ECAM host
-            if (self.ecam_host) |ecam| {
-                if (is_write) {
-                    const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                    ecam.write(addr, size, value);
-                } else {
-                    const value = ecam.read(addr, size);
-                    if (srt != 31) {
-                        try vcpu.setReg(@enumFromInt(srt), value);
-                    }
-                }
-            } else {
-                // No ECAM host - return 0xFFFFFFFF for reads (no device)
-                if (!is_write and srt != 31) {
-                    try vcpu.setReg(@enumFromInt(srt), 0xFFFFFFFF);
-                }
+            const offset = addr - MemoryLayout.ECAM_BASE;
+            if (is_write) {
+                const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                ecamMmioWrite(self, offset, size, value);
+            } else if (srt != 31) {
+                try vcpu.setReg(@enumFromInt(srt), ecamMmioRead(self, offset, size));
             }
             try vcpu.advancePC(info);
             return;
@@ -1601,13 +1574,55 @@ pub const Machine = struct {
                             log.debug("PCI BAR0 write: offset=0x{x} size={} value=0x{x}", .{ offset, size, value });
                         }
                     } else {
-                        const value = pci_blk.readBar0(offset, size);
+                        const value = self.pciBlockBarRead(
+                            pci_blk,
+                            self.block.?,
+                            offset,
+                            size,
+                        );
                         if (srt != 31) {
                             try vcpu.setReg(@enumFromInt(srt), value);
                         }
                         if (enable_debug_logs) {
                             log.debug("PCI BAR0 read: offset=0x{x} size={} -> 0x{x}", .{ offset, size, value });
                         }
+                    }
+                    try vcpu.advancePC(info);
+                    return;
+                }
+            }
+            if (self.pci_block2) |pci_blk| {
+                const bar0_addr: u64 = pci_blk.getBar0Addr();
+                const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
+                if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
+                    const offset: u32 = @truncate(addr - bar0_addr);
+                    if (is_write) {
+                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                        pci_blk.writeBar0(offset, size, @truncate(value));
+                    } else {
+                        const value = self.pciBlockBarRead(
+                            pci_blk,
+                            self.block2.?,
+                            offset,
+                            size,
+                        );
+                        if (srt != 31) try vcpu.setReg(@enumFromInt(srt), value);
+                    }
+                    try vcpu.advancePC(info);
+                    return;
+                }
+            }
+            if (self.pci_gpu) |pci_gpu| {
+                const bar0_addr: u64 = pci_gpu.getBar0Addr();
+                const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
+                if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
+                    const offset: u32 = @truncate(addr - bar0_addr);
+                    if (is_write) {
+                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                        self.pciGpuBarWrite(pci_gpu, offset, size, @truncate(value));
+                    } else {
+                        const value = self.pciGpuBarRead(pci_gpu, offset, size);
+                        if (srt != 31) try vcpu.setReg(@enumFromInt(srt), value);
                     }
                     try vcpu.advancePC(info);
                     return;
@@ -1627,6 +1642,52 @@ pub const Machine = struct {
             log.debug("unhandled MMIO {s} at 0x{x}", .{ if (is_write) "write" else "read", addr });
         }
         try vcpu.advancePC(info);
+    }
+
+    const MmioAccess = struct {
+        is_write: bool,
+        size: u8,
+        srt: u5,
+    };
+
+    fn decodeMmioAccess(
+        self: *Machine,
+        vcpu: *hypervisor.Vcpu,
+        info: hypervisor.ExitInfo,
+    ) !?MmioAccess {
+        assert(info.isDataAbort());
+        assert(self.hv_vm != null);
+
+        const iss = info.iss();
+        if ((iss >> 24) & 1 != 0) {
+            return .{
+                .is_write = info.isWrite(),
+                .size = @as(u8, 1) << info.accessSize(),
+                .srt = @truncate(iss >> 16),
+            };
+        }
+
+        const pc = try vcpu.getReg(.pc);
+        const instr_ptr = self.hv_vm.?.guestToHost(pc) orelse return error.InvalidAddress;
+        const instr = @as(*align(1) const u32, @ptrCast(instr_ptr)).*;
+        return switch (hypervisor.runner.decodeLoadStore(instr)) {
+            .load_store => |load_store| access: {
+                if (load_store.writeback_rn) |rn| {
+                    try hypervisor.runner.applyLoadStoreWriteback(
+                        vcpu,
+                        rn,
+                        load_store.writeback_imm,
+                    );
+                }
+                break :access .{
+                    .is_write = load_store.is_write,
+                    .size = load_store.size,
+                    .srt = load_store.rt,
+                };
+            },
+            .cache_op => null,
+            .unknown => .{ .is_write = false, .size = 4, .srt = @truncate(instr) },
+        };
     }
 
     fn handlePsci(self: *Machine, vcpu: *hypervisor.Vcpu, _: hypervisor.ExitInfo) !void {
@@ -1761,7 +1822,7 @@ pub const Machine = struct {
         vcpu.setSysReg(.mpidr_el1, @as(u64, cpu_id)) catch |err| {
             log.warn("cpu {}: MPIDR not settable: {}", .{ cpu_id, err });
         };
-        try vcpu.setReg(.cpsr, 0x3c4);
+        try vcpu.setReg(.cpsr, 0x3c5);
         try vcpu.setPC(entry_point);
         try vcpu.setReg(.x0, context_id);
     }
@@ -1923,7 +1984,11 @@ pub const Machine = struct {
         if (self.config.vars_path) |vars_path| {
             const file = std.Io.Dir.cwd().openFile(global.io(), vars_path, .{}) catch |err| {
                 if (err == error.FileNotFound) {
-                    log.info("UEFI vars file not found, will be created on shutdown: {s}", .{vars_path});
+                    if (try self.loadBundledVarsTemplate(pflash_vars)) {
+                        log.info("initialized UEFI vars from bundled template", .{});
+                    } else {
+                        log.info("UEFI vars file not found, starting erased: {s}", .{vars_path});
+                    }
                     return;
                 }
                 return err;
@@ -1935,6 +2000,27 @@ pub const Machine = struct {
             const bytes_read = try file.readPositionalAll(global.io(), pflash_vars[0..vars_size], 0);
             log.info("loaded UEFI vars: {} bytes from {s}", .{ bytes_read, vars_path });
         }
+    }
+
+    fn loadBundledVarsTemplate(self: *Machine, pflash_vars: []u8) !bool {
+        assert(pflash_vars.len == MemoryLayout.PFLASH_VARS_SIZE);
+        assert(self.config.isFirmwareBoot());
+
+        const firmware_path = self.config.firmware_path orelse return false;
+        const firmware_dir = std.fs.path.dirname(firmware_path) orelse return false;
+        const template_path = try std.fs.path.join(self.alloc, &.{ firmware_dir, "QEMU_VARS.fd" });
+        defer self.alloc.free(template_path);
+
+        const file = std.Io.Dir.cwd().openFile(global.io(), template_path, .{}) catch |err| {
+            if (err == error.FileNotFound) return false;
+            return err;
+        };
+        defer file.close(global.io());
+
+        const stat = try file.stat(global.io());
+        const template_size = @min(stat.size, pflash_vars.len);
+        _ = try file.readPositionalAll(global.io(), pflash_vars[0..template_size], 0);
+        return true;
     }
 
     fn generateDtb(self: *Machine) !void {
@@ -2187,73 +2273,253 @@ pub const Machine = struct {
     }
 
     fn initEcam(self: *Machine) !void {
+        assert(self.config.isFirmwareBoot());
+        assert(self.ecam_host == null);
+
         self.ecam_host = try pci.EcamHost.init(self.alloc, self.config.disk_path != null);
         log.debug("initialized PCIe ECAM at 0x{x}-0x{x}", .{
             MemoryLayout.ECAM_BASE,
             MemoryLayout.ECAM_BASE + MemoryLayout.ECAM_SIZE,
         });
 
-        // Create virtio-pci block device if disk is configured
-        if (self.config.disk_path) |_| {
-            // Create virtio-pci device (device_id=2 for block)
-            // Use virtio-blk config size (56 bytes for basic config)
-            const blk_features = virtio.blk.Features.SIZE_MAX |
-                virtio.blk.Features.SEG_MAX |
-                virtio.blk.Features.BLK_SIZE |
-                virtio.blk.Features.FLUSH;
+        if (self.block) |blk| try self.initPciBlock(blk);
+        if (self.block2) |blk| try self.initPciBlock2(blk);
+        if (self.gpu) |gpu_dev| try self.initPciGpu(gpu_dev);
+    }
 
-            self.pci_block = try pci.VirtioPciDevice.init(
-                self.alloc,
-                2, // block device
-                0x0002, // subsystem ID
-                blk_features,
-                1, // num_queues
-                @sizeOf(virtio.blk.Config), // device config size
-            );
+    fn initPciBlock(self: *Machine, blk: *virtio.Block) !void {
+        assert(self.ecam_host != null);
+        assert(self.pci_block == null);
 
-            // Set BAR0 address in PCI MMIO region
-            const bar0_addr: u32 = @truncate(MemoryLayout.PCI_MMIO_BASE);
-            self.pci_block.?.bar0_addr = bar0_addr;
+        const blk_features = virtio.blk.Features.SIZE_MAX |
+            virtio.blk.Features.SEG_MAX |
+            virtio.blk.Features.BLK_SIZE |
+            virtio.blk.Features.FLUSH;
+        self.pci_block = try pci.VirtioPciDevice.init(
+            self.alloc,
+            2,
+            0x0002,
+            blk_features,
+            1,
+            @sizeOf(virtio.blk.Config),
+        );
+        const bar0_addr: u32 = @truncate(MemoryLayout.PCI_MMIO_BASE);
+        self.pci_block.?.bar0_addr = bar0_addr;
+        self.pci_block.?.transport.setDeviceConfig(std.mem.asBytes(&blk.config));
+        self.pci_block.?.transport.setNotifyCallback(pciBlockNotify, self);
+        blk.transport.setIrqCallback(pciBlockBackendIrq, self);
 
-            // Copy block config from the MMIO block device if available
-            if (self.block) |blk| {
-                const config_bytes = std.mem.asBytes(&blk.config);
-                self.pci_block.?.transport.setDeviceConfig(config_bytes);
-            }
+        const ecam_dev = pci.PciDevice{ .config = self.pci_block.?.config, .present = true };
+        try self.ecam_host.?.addDevice(0, 0, ecam_dev);
+        log.info("initialized virtio-pci-blk at PCI 00:00.0, BAR0=0x{x}", .{bar0_addr});
+    }
 
-            // Set up notification callback
-            self.pci_block.?.transport.setNotifyCallback(pciBlockNotify, self);
-            self.pci_block.?.transport.setIrqCallback(pciBlockIrq, self);
+    fn initPciBlock2(self: *Machine, blk: *virtio.Block) !void {
+        assert(self.ecam_host != null);
+        assert(self.pci_block2 == null);
 
-            // Register with ECAM host at device 0, function 0
-            // Create a PciDevice wrapper that forwards to our VirtioPciDevice
-            const ecam_dev = pci.PciDevice{
-                .config = self.pci_block.?.config,
-                .present = true,
-            };
-            try self.ecam_host.?.addDevice(0, 0, ecam_dev);
+        const blk_features = virtio.blk.Features.SIZE_MAX |
+            virtio.blk.Features.SEG_MAX |
+            virtio.blk.Features.BLK_SIZE |
+            virtio.blk.Features.FLUSH;
+        self.pci_block2 = try pci.VirtioPciDevice.init(
+            self.alloc,
+            2,
+            0x0002,
+            blk_features,
+            1,
+            @sizeOf(virtio.blk.Config),
+        );
+        const bar0_addr: u32 = @truncate(
+            MemoryLayout.PCI_MMIO_BASE + pci.virtio_pci.BAR0_SIZE,
+        );
+        self.pci_block2.?.bar0_addr = bar0_addr;
+        self.pci_block2.?.transport.setDeviceConfig(std.mem.asBytes(&blk.config));
+        self.pci_block2.?.transport.setNotifyCallback(pciBlock2Notify, self);
+        blk.transport.setIrqCallback(pciBlock2BackendIrq, self);
 
-            log.info("initialized virtio-pci-blk at PCI 00:00.0, BAR0=0x{x}", .{bar0_addr});
-        }
+        const ecam_dev = pci.PciDevice{ .config = self.pci_block2.?.config, .present = true };
+        try self.ecam_host.?.addDevice(1, 0, ecam_dev);
+        log.info("initialized virtio-pci-blk2 at PCI 00:01.0, BAR0=0x{x}", .{bar0_addr});
+    }
+
+    fn initPciGpu(self: *Machine, gpu_dev: *virtio.Gpu) !void {
+        assert(self.ecam_host != null);
+        assert(self.pci_gpu == null);
+
+        self.pci_gpu = try pci.VirtioPciDevice.init(
+            self.alloc,
+            16,
+            0x0010,
+            gpu_dev.transport.device_features,
+            2,
+            @sizeOf(virtio.gpu.Config),
+        );
+        const bar0_addr: u32 = @truncate(
+            MemoryLayout.PCI_MMIO_BASE + 2 * pci.virtio_pci.BAR0_SIZE,
+        );
+        self.pci_gpu.?.bar0_addr = bar0_addr;
+        self.pci_gpu.?.transport.setDeviceConfig(std.mem.asBytes(&gpu_dev.config));
+        self.pci_gpu.?.transport.setNotifyCallback(pciGpuNotify, self);
+        gpu_dev.transport.setIrqCallback(pciGpuBackendIrq, self);
+
+        const ecam_dev = pci.PciDevice{ .config = self.pci_gpu.?.config, .present = true };
+        try self.ecam_host.?.addDevice(2, 0, ecam_dev);
+        log.info("initialized virtio-pci-gpu at PCI 00:02.0, BAR0=0x{x}", .{bar0_addr});
     }
 
     fn pciBlockNotify(queue_idx: u32, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
         if (self.block) |blk| {
             _ = queue_idx;
+            blk.transport.queues[0].num = self.pci_block.?.transport.queues[0].size;
             blk.transport.queues[0].ready = self.pci_block.?.transport.queues[0].enable;
             blk.transport.queues[0].desc_addr = self.pci_block.?.transport.queues[0].desc_addr;
             blk.transport.queues[0].driver_addr = self.pci_block.?.transport.queues[0].driver_addr;
             blk.transport.queues[0].device_addr = self.pci_block.?.transport.queues[0].device_addr;
+            blk.pollRequests();
         }
     }
 
-    fn pciBlockIrq(userdata: ?*anyopaque) void {
+    fn pciBlockBackendIrq(level: bool, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        // DTB routes PCI INTx to GIC_SPI 48-51 → intid 80-83.
-        if (self.gic_device) |gic_dev| {
-            gic_dev.setSpiPending(80, true);
+        if (self.pci_block) |pci_block| {
+            if (self.block) |blk| {
+                pci_block.transport.isr_status.queue_interrupt =
+                    blk.transport.interrupt_status.used_buffer;
+                pci_block.transport.isr_status.config_change =
+                    blk.transport.interrupt_status.config_change;
+            }
         }
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(80, level);
+        }
+    }
+
+    fn pciBlock2Notify(queue_idx: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.block2) |blk| {
+            _ = queue_idx;
+            const source = self.pci_block2.?.transport.queues[0];
+            blk.transport.queues[0].num = source.size;
+            blk.transport.queues[0].ready = source.enable;
+            blk.transport.queues[0].desc_addr = source.desc_addr;
+            blk.transport.queues[0].driver_addr = source.driver_addr;
+            blk.transport.queues[0].device_addr = source.device_addr;
+            blk.pollRequests();
+        }
+    }
+
+    fn pciBlock2BackendIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.pci_block2) |pci_block| {
+            if (self.block2) |blk| {
+                pci_block.transport.isr_status.queue_interrupt =
+                    blk.transport.interrupt_status.used_buffer;
+                pci_block.transport.isr_status.config_change =
+                    blk.transport.interrupt_status.config_change;
+            }
+        }
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(81, level);
+        }
+    }
+
+    fn pciGpuNotify(queue_idx: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        const gpu_dev = self.gpu orelse return;
+        const pci_gpu = self.pci_gpu orelse return;
+        if (queue_idx >= pci_gpu.transport.queues.len) return;
+        if (queue_idx >= gpu_dev.transport.queues.len) return;
+
+        const source = pci_gpu.transport.queues[queue_idx];
+        const target = &gpu_dev.transport.queues[queue_idx];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        gpu_dev.poll();
+    }
+
+    fn pciGpuBackendIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.pci_gpu) |pci_gpu| {
+            if (self.gpu) |gpu_dev| {
+                pci_gpu.transport.isr_status.queue_interrupt =
+                    gpu_dev.transport.interrupt_status.used_buffer;
+                pci_gpu.transport.isr_status.config_change =
+                    gpu_dev.transport.interrupt_status.config_change;
+            }
+        }
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(82, level);
+        }
+    }
+
+    fn pciGpuBarRead(
+        self: *Machine,
+        pci_gpu: *pci.VirtioPciDevice,
+        offset: u32,
+        size: u8,
+    ) u32 {
+        assert(self.gpu != null);
+        assert(offset < pci.virtio_pci.BAR0_SIZE);
+        const gpu_dev = self.gpu.?;
+
+        if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+            pci_gpu.transport.setDeviceConfig(std.mem.asBytes(&gpu_dev.config));
+        }
+        const value = pci_gpu.readBar0(offset, size);
+        if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+            offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+        {
+            gpu_dev.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), value);
+        }
+        return value;
+    }
+
+    fn pciGpuBarWrite(
+        self: *Machine,
+        pci_gpu: *pci.VirtioPciDevice,
+        offset: u32,
+        size: u8,
+        value: u32,
+    ) void {
+        assert(self.gpu != null);
+        assert(offset < pci.virtio_pci.BAR0_SIZE);
+        const gpu_dev = self.gpu.?;
+
+        if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+            pci_gpu.transport.setDeviceConfig(std.mem.asBytes(&gpu_dev.config));
+        }
+        pci_gpu.writeBar0(offset, size, value);
+        if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+            const config_size = @sizeOf(virtio.gpu.Config);
+            @memcpy(
+                std.mem.asBytes(&gpu_dev.config),
+                pci_gpu.transport.device_config[0..config_size],
+            );
+        }
+    }
+
+    fn pciBlockBarRead(
+        self: *Machine,
+        pci_block: *pci.VirtioPciDevice,
+        block: *virtio.Block,
+        offset: u32,
+        size: u8,
+    ) u32 {
+        assert(self.hv_vm != null);
+        assert(block.transport.device_id == 2);
+        assert(offset < pci.virtio_pci.BAR0_SIZE);
+        const value = pci_block.readBar0(offset, size);
+        if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+            offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+        {
+            block.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), value);
+        }
+        return value;
     }
 
     fn registerMmioHandlers(self: *Machine) !void {
@@ -2326,7 +2592,9 @@ pub const Machine = struct {
         }
 
         // Register PCIe ECAM MMIO handler
-        if (self.ecam_host != null or self.pci_block != null) {
+        if (self.ecam_host != null or self.pci_block != null or
+            self.pci_block2 != null or self.pci_gpu != null)
+        {
             try runner.registerMmioHandler(.{
                 .context = @ptrCast(self),
                 .base = MemoryLayout.ECAM_BASE,
@@ -2337,7 +2605,7 @@ pub const Machine = struct {
         }
 
         // Register PCI BAR0 MMIO handler (virtio-pci devices)
-        if (self.pci_block) |_| {
+        if (self.pci_block != null or self.pci_block2 != null or self.pci_gpu != null) {
             try runner.registerMmioHandler(.{
                 .context = @ptrCast(self),
                 .base = MemoryLayout.PCI_MMIO_BASE,
@@ -2356,9 +2624,9 @@ pub const Machine = struct {
         // PCI config space only supports 1/2/4 byte accesses
         // For 8-byte reads, do two 4-byte reads (if within bounds)
         if (size == 8) {
-            const reg_offset = ecam_addr.reg;
+            const reg_offset: u16 = ecam_addr.reg;
             var result: u64 = 0xFFFFFFFF_FFFFFFFF;
-            if (reg_offset + 4 < 4096) {
+            if (reg_offset + 4 <= 4096) {
                 result = (result & 0xFFFFFFFF_00000000) | ecamMmioRead(ctx, offset, 4);
             }
             if (reg_offset + 8 <= 4096 and offset + 4 < MemoryLayout.ECAM_SIZE) {
@@ -2378,6 +2646,14 @@ pub const Machine = struct {
             }
         }
 
+        if (ecam_addr.bus == 0 and ecam_addr.device == 1 and ecam_addr.function == 0) {
+            if (self.pci_block2) |pci_blk| return pci_blk.readConfig(ecam_addr.reg, size);
+        }
+
+        if (ecam_addr.bus == 0 and ecam_addr.device == 2 and ecam_addr.function == 0) {
+            if (self.pci_gpu) |pci_gpu| return pci_gpu.readConfig(ecam_addr.reg, size);
+        }
+
         // Other devices: use ECAM host
         if (self.ecam_host) |ecam| {
             return ecam.read(addr, size);
@@ -2395,8 +2671,8 @@ pub const Machine = struct {
         // For 8-byte writes, do two 4-byte writes (if within bounds)
         if (size == 8) {
             // Check if second half would be out of bounds for this function's config space
-            const reg_offset = ecam_addr.reg;
-            if (reg_offset + 4 < 4096) {
+            const reg_offset: u16 = ecam_addr.reg;
+            if (reg_offset + 4 <= 4096) {
                 ecamMmioWrite(ctx, offset, 4, value & 0xFFFFFFFF);
             }
             if (reg_offset + 8 <= 4096 and offset + 4 < MemoryLayout.ECAM_SIZE) {
@@ -2418,6 +2694,22 @@ pub const Machine = struct {
             }
         }
 
+        if (ecam_addr.bus == 0 and ecam_addr.device == 1 and ecam_addr.function == 0) {
+            if (self.pci_block2) |pci_blk| {
+                pci_blk.writeConfig(ecam_addr.reg, size, value);
+                if (self.ecam_host) |ecam| ecam.updateConfig(1, 0, &pci_blk.config);
+                return;
+            }
+        }
+
+        if (ecam_addr.bus == 0 and ecam_addr.device == 2 and ecam_addr.function == 0) {
+            if (self.pci_gpu) |pci_gpu| {
+                pci_gpu.writeConfig(ecam_addr.reg, size, value);
+                if (self.ecam_host) |ecam| ecam.updateConfig(2, 0, &pci_gpu.config);
+                return;
+            }
+        }
+
         // Other devices: use ECAM host
         if (self.ecam_host) |ecam| {
             ecam.write(addr, size, value);
@@ -2434,7 +2726,29 @@ pub const Machine = struct {
 
             if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
                 const bar_offset: u32 = @truncate(addr - bar0_addr);
-                return pci_blk.readBar0(bar_offset, size);
+                return self.pciBlockBarRead(pci_blk, self.block.?, bar_offset, size);
+            }
+        }
+
+        if (self.pci_block2) |pci_blk| {
+            const bar0_addr: u64 = pci_blk.getBar0Addr();
+            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
+            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
+
+            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
+                const bar_offset: u32 = @truncate(addr - bar0_addr);
+                return self.pciBlockBarRead(pci_blk, self.block2.?, bar_offset, size);
+            }
+        }
+
+        if (self.pci_gpu) |pci_gpu| {
+            const bar0_addr: u64 = pci_gpu.getBar0Addr();
+            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
+            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
+
+            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
+                const bar_offset: u32 = @truncate(addr - bar0_addr);
+                return self.pciGpuBarRead(pci_gpu, bar_offset, size);
             }
         }
 
@@ -2453,6 +2767,30 @@ pub const Machine = struct {
                 const bar_offset: u32 = @truncate(addr - bar0_addr);
                 pci_blk.writeBar0(bar_offset, size, @truncate(value));
                 log.debug("PCI BAR0 write: offset=0x{x} size={} value=0x{x}", .{ bar_offset, size, value });
+                return;
+            }
+        }
+
+        if (self.pci_block2) |pci_blk| {
+            const bar0_addr: u64 = pci_blk.getBar0Addr();
+            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
+            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
+
+            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
+                const bar_offset: u32 = @truncate(addr - bar0_addr);
+                pci_blk.writeBar0(bar_offset, size, @truncate(value));
+                return;
+            }
+        }
+
+        if (self.pci_gpu) |pci_gpu| {
+            const bar0_addr: u64 = pci_gpu.getBar0Addr();
+            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
+            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
+
+            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
+                const bar_offset: u32 = @truncate(addr - bar0_addr);
+                self.pciGpuBarWrite(pci_gpu, bar_offset, size, @truncate(value));
             }
         }
     }
@@ -2474,8 +2812,8 @@ pub const Machine = struct {
         // Set up SCTLR_EL1 (MMU off, caches off)
         try vcpu.setSysReg(.sctlr_el1, 0);
 
-        // Set up CPSR for EL1t
-        try vcpu.setReg(.cpsr, 0x3c4);
+        // Start in EL1h so firmware and Linux use the initialized SP_EL1.
+        try vcpu.setReg(.cpsr, 0x3c5);
 
         if (id == 0) {
             // Primary vCPU boot configuration
@@ -2772,6 +3110,8 @@ test "MemoryLayout constants" {
 
     try testing.expectEqual(@as(u64, 0x4000_0000), MemoryLayout.RAM_BASE);
     try testing.expectEqual(@as(u64, 0x4020_0000), MemoryLayout.KERNEL_BASE); // 2MB aligned
+    try testing.expectEqual(@as(u64, 0x5fe0_0000), MemoryLayout.dtbBase(512 * 1024 * 1024));
+    try testing.expectEqual(@as(u64, 0x7fe0_0000), MemoryLayout.dtbBase(16 * 1024 * 1024 * 1024));
     try testing.expectEqual(@as(u64, 0x0A00_0000), MemoryLayout.virtioBase(0));
     try testing.expectEqual(@as(u64, 0x0A00_0200), MemoryLayout.virtioBase(1));
 }
@@ -2829,7 +3169,7 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    try testing.expect(@sizeOf(Machine) <= 5752);
+    try testing.expect(@sizeOf(Machine) <= 5768);
 }
 
 test "stop before synchronous thread entry cancels startup" {

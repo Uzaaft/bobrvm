@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 // MARK: - Debug Build Warning
@@ -76,18 +77,7 @@ struct ContentView: View {
                 VMListView()
                     .frame(minWidth: 200)
             } detail: {
-                if let vm = vmManager.selectedVM {
-                    VMDetailView(vmInstance: vm)
-                } else {
-                    VMLibraryHomeView()
-                }
-            }
-            .toolbar {
-                ToolbarItemGroup {
-                    if let vm = vmManager.selectedVM {
-                        VMToolbar(vmInstance: vm)
-                    }
-                }
+                VMLibraryHomeView()
             }
             .sheet(isPresented: $vmManager.showingCreateVM) {
                 CreateVMView()
@@ -100,6 +90,7 @@ struct ContentView: View {
 
 struct VMListView: View {
     @EnvironmentObject var vmManager: VMManager
+    @Environment(\.openWindow) private var openWindow
     @State private var vmToDelete: VMInstance?
     @State private var vmToEdit: VMInstance?
     @State private var showDeleteConfirmation = false
@@ -109,6 +100,9 @@ struct VMListView: View {
         List(vmManager.vms, selection: $vmManager.selectedVM) { vm in
             VMListRow(vmInstance: vm)
                 .tag(vm)
+                .onTapGesture {
+                    openWindow(value: vm.id)
+                }
                 .contextMenu {
                     VMContextMenu(
                         vmInstance: vm,
@@ -166,6 +160,7 @@ struct VMListView: View {
 struct VMContextMenu: View {
     @ObservedObject var vmInstance: VMInstance
     @EnvironmentObject var vmManager: VMManager
+    @Environment(\.openWindow) private var openWindow
     let onEdit: () -> Void
     let onDelete: () -> Void
 
@@ -177,6 +172,7 @@ struct VMContextMenu: View {
                 case .stopped:
                     Button {
                         try? vmInstance.start()
+                        openWindow(value: vmInstance.id)
                     } label: {
                         Label("Start", systemImage: "play.fill")
                     }
@@ -201,6 +197,7 @@ struct VMContextMenu: View {
                     Button {
                         vmInstance.stop()
                         try? vmInstance.start()
+                        openWindow(value: vmInstance.id)
                     } label: {
                         Label("Restart", systemImage: "arrow.clockwise")
                     }
@@ -208,6 +205,7 @@ struct VMContextMenu: View {
                 case .paused:
                     Button {
                         vmInstance.resume()
+                        openWindow(value: vmInstance.id)
                     } label: {
                         Label("Resume", systemImage: "play.fill")
                     }
@@ -374,11 +372,68 @@ struct VMDetailView: View {
             }
         }
         .toolbar {
-            ToolbarItem(placement: .automatic) {
-                Toggle(isOn: $showingConsole) {
+            ToolbarItemGroup(placement: .automatic) {
+                switch vmInstance.state {
+                case .stopped:
+                    Button(action: { try? vmInstance.start() }) {
+                        Label("Start", systemImage: "play.fill")
+                    }
+                    .help("Start VM")
+
+                case .running:
+                    Button(action: { vmInstance.pause() }) {
+                        Label("Pause", systemImage: "pause.fill")
+                    }
+                    .help("Pause VM")
+
+                    Button(action: { vmInstance.stop() }) {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .help("Stop VM")
+
+                case .paused:
+                    Button(action: { vmInstance.resume() }) {
+                        Label("Resume", systemImage: "play.fill")
+                    }
+                    .help("Resume VM")
+
+                    Button(action: { vmInstance.stop() }) {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .help("Stop VM")
+                }
+
+                Button {
+                    showingConsole.toggle()
+                } label: {
                     Image(systemName: "terminal")
+                        .foregroundStyle(showingConsole ? Color.accentColor : Color.primary)
                 }
                 .help("Toggle Console")
+                .accessibilityValue(showingConsole ? "Shown" : "Hidden")
+            }
+        }
+    }
+}
+
+struct VMWindowView: View {
+    @EnvironmentObject private var vmManager: VMManager
+    let vmID: UUID
+
+    var body: some View {
+        Group {
+            if let vm = vmManager.vms.first(where: { $0.id == vmID }) {
+                VMDetailView(vmInstance: vm)
+                    .navigationTitle(vm.name)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                        .font(.system(size: 48))
+                        .foregroundStyle(.secondary)
+                    Text("Virtual Machine Not Found")
+                        .font(.title2)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
@@ -387,7 +442,6 @@ struct VMDetailView: View {
 private struct RunningVMDetail: View {
     @ObservedObject var vmInstance: VMInstance
     let showingConsole: Bool
-    @StateObject private var ghosttyRuntime = GhosttyRuntime()
 
     var body: some View {
         VSplitView {
@@ -395,18 +449,8 @@ private struct RunningVMDetail: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if showingConsole {
-                if let app = ghosttyRuntime.app {
-                    GhosttySurfaceViewRepresentable(
-                        app: app,
-                        command: "/usr/bin/true",
-                        workingDirectory: nil
-                    )
+                ConsoleView()
                     .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
-                } else {
-                    Text("Terminal unavailable")
-                        .foregroundColor(.secondary)
-                        .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
-                }
             }
         }
     }
@@ -416,7 +460,7 @@ private struct RunningVMDetail: View {
 
 struct ConsoleView: View {
     @EnvironmentObject var vmManager: VMManager
-    @State private var autoScroll = true
+    @EnvironmentObject private var ghosttyRuntime: GhosttyRuntime
 
     var body: some View {
         VStack(spacing: 0) {
@@ -425,10 +469,6 @@ struct ConsoleView: View {
                     .font(.headline)
 
                 Spacer()
-
-                Toggle("Auto-scroll", isOn: $autoScroll)
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
 
                 Button(action: { vmManager.clearConsoleOutput() }) {
                     Image(systemName: "trash")
@@ -440,61 +480,16 @@ struct ConsoleView: View {
             .padding(.vertical, 4)
             .background(Color(.windowBackgroundColor))
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(vmManager.consoleOutput)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
-                        .id("console-bottom")
-                }
-                .background(Color(.textBackgroundColor))
-                .onChange(of: vmManager.consoleOutput) { _ in
-                    if autoScroll {
-                        proxy.scrollTo("console-bottom", anchor: .bottom)
-                    }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Toolbar
-
-struct VMToolbar: View {
-    @ObservedObject var vmInstance: VMInstance
-
-    var body: some View {
-        HStack {
-            switch vmInstance.state {
-            case .stopped:
-                Button(action: { try? vmInstance.start() }) {
-                    Label("Start", systemImage: "play.fill")
-                }
-                .help("Start VM")
-
-            case .running:
-                Button(action: { vmInstance.pause() }) {
-                    Label("Pause", systemImage: "pause.fill")
-                }
-                .help("Pause VM")
-
-                Button(action: { vmInstance.stop() }) {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .help("Stop VM")
-
-            case .paused:
-                Button(action: { vmInstance.resume() }) {
-                    Label("Resume", systemImage: "play.fill")
-                }
-                .help("Resume VM")
-
-                Button(action: { vmInstance.stop() }) {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .help("Stop VM")
+            if let app = ghosttyRuntime.app {
+                GhosttyConsoleViewRepresentable(
+                    app: app,
+                    initialOutput: vmManager.consoleOutput,
+                    events: vmManager.consoleEventPublisher
+                )
+            } else {
+                Text("Terminal renderer unavailable")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
