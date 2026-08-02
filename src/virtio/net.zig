@@ -365,6 +365,14 @@ pub const Net = struct {
             }
         }
 
+        self.transmitGathered(chain, get_mem);
+    }
+
+    noinline fn transmitGathered(
+        self: *Net,
+        chain: *const ring.Chain,
+        get_mem: ring.GetMemFn,
+    ) void {
         var frame_buf: [MAX_FRAME]u8 = undefined;
         var frame_len: usize = 0;
         var skip: usize = @sizeOf(NetHeader);
