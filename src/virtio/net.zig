@@ -457,7 +457,8 @@ pub const Net = struct {
         index = self.rx_free_head;
         const storage = &self.rx_storage[index];
         self.removeFreeStorage(rx_index_none, index);
-        const replacement = self.alloc.alloc(u8, @max(frame_len, RX_BUFFER_SIZE)) catch {
+        const capacity = rxStorageGrowth(storage.capacity, frame_len);
+        const replacement = self.alloc.alloc(u8, capacity) catch {
             storage.next_free = self.rx_free_head;
             self.rx_free_head = index;
             return null;
@@ -468,6 +469,17 @@ pub const Net = struct {
         storage.ptr = replacement.ptr;
         storage.capacity = @intCast(replacement.len);
         return index;
+    }
+
+    fn rxStorageGrowth(capacity: u32, frame_len: usize) usize {
+        assert(capacity >= RX_BUFFER_SIZE);
+        assert(frame_len > capacity and frame_len <= MAX_FRAME);
+        const current: usize = capacity;
+        const growth = current + current / 2;
+        const result = @min(MAX_FRAME, @max(frame_len, growth));
+        assert(result >= frame_len);
+        assert(result <= MAX_FRAME);
+        return result;
     }
 
     fn isPooledStorage(self: *const Net, index: u16) bool {
@@ -652,9 +664,26 @@ test "Net allocates oversized RX buffers outside the fixed slab" {
     net.queueRxFrame(&frame);
 
     try testing.expectEqual(@as(usize, 1), counted.allocations);
-    try testing.expectEqual(frame.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 3072), counted.allocated_bytes);
     try testing.expectEqual(@as(usize, 1), net.rx_count);
     try testing.expectEqualSlices(u8, &frame, net.queuedFrame(net.rx_head));
+}
+
+test "Net oversized RX growth allocation profile" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    net.alloc = counted.allocator();
+    var frame: [Net.RX_BUFFER_SIZE + 64]u8 = @splat(0xA5);
+    for (1..65) |extra| {
+        net.queueRxFrame(frame[0 .. Net.RX_BUFFER_SIZE + extra]);
+        net.releaseQueuedFrames();
+    }
+
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 3072), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), net.rx_count);
 }
 
 var test_tx_memory: [1514]u8 = @splat(0xA5);
