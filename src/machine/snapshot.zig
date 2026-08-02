@@ -236,8 +236,15 @@ fn getIrqState(cur: *Cursor, s: anytype) !void {
 }
 
 pub fn serializeGic(alloc: Allocator, gic: *const gic_mod.Gic) ![]u8 {
+    assert(gic.spis.len == gic_mod.MAX_SPI);
+    assert(gic.redists.len == gic.num_cpus);
+    const irq_state_bytes = 3;
+    const redist_state_bytes = @sizeOf(u32) + 32 * irq_state_bytes;
+    const serialized_bytes = 2 * @sizeOf(u32) + gic.spis.len * irq_state_bytes +
+        @sizeOf(u8) + gic.redists.len * redist_state_bytes;
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try out.int(u32, gic.ctlr);
     try out.int(u32, @intCast(gic.spis.len));
     for (gic.spis) |spi| try putIrqState(&out, spi);
@@ -246,7 +253,11 @@ pub fn serializeGic(alloc: Allocator, gic: *const gic_mod.Gic) ![]u8 {
         try out.int(u32, redist.waker);
         for (redist.sgi_ppi) |irq| try putIrqState(&out, irq);
     }
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeGic(gic: *gic_mod.Gic, data: []const u8) !void {
@@ -525,8 +536,12 @@ test "snapshot: gic state roundtrip" {
     gic.redists[1].waker = 7;
     gic.redists[1].sgi_ppi[27].pending = true;
 
-    const data = try serializeGic(testing.allocator, gic);
-    defer testing.allocator.free(data);
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeGic(counted.allocator(), gic);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
 
     const gic2 = try gic_mod.Gic.init(testing.allocator, 2);
     defer gic2.deinit();
