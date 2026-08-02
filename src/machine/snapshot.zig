@@ -394,11 +394,17 @@ pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
 }
 
 pub fn serializeRng(alloc: Allocator, rng: *const virtio.Rng) ![]u8 {
+    const serialized_bytes = transportSerializedBytes(&rng.transport) + @sizeOf(u16);
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try serializeTransport(&out, &rng.transport);
     try out.int(u16, rng.last_avail);
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
@@ -652,6 +658,30 @@ test "snapshot: block device roundtrip" {
     try testing.expect(blk2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x5000_0000), blk2.transport.queues[0].device_addr);
     try testing.expectEqual(@as(u16, 23), blk2.request_last_avail);
+}
+
+test "snapshot: RNG device roundtrip" {
+    const rng = try virtio.Rng.init(testing.allocator);
+    defer rng.deinit();
+    rng.transport.status = @bitCast(@as(u8, 0x0F));
+    rng.transport.queues[0].ready = true;
+    rng.transport.queues[0].driver_addr = 0x6000_0000;
+    rng.last_avail = 29;
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeRng(counted.allocator(), rng);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+
+    const rng2 = try virtio.Rng.init(testing.allocator);
+    defer rng2.deinit();
+    try deserializeRng(rng2, data);
+    try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(rng2.transport.status)));
+    try testing.expect(rng2.transport.queues[0].ready);
+    try testing.expectEqual(@as(u64, 0x6000_0000), rng2.transport.queues[0].driver_addr);
+    try testing.expectEqual(@as(u16, 29), rng2.last_avail);
 }
 
 test "snapshot: gpu 2D framebuffer survives roundtrip" {
