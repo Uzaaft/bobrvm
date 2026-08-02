@@ -12,7 +12,9 @@
 //! - ICC_IGRPEN1_EL1: Group 1 Enable
 
 const std = @import("std");
-const Gic = @import("main.zig").Gic;
+const assert = @import("../quirks.zig").inlineAssert;
+const gic_module = @import("main.zig");
+const Gic = gic_module.Gic;
 
 const log = std.log.scoped(.icc);
 
@@ -105,12 +107,26 @@ pub const IccHandler = struct {
     states: []IccState,
 
     pub fn init(allocator: std.mem.Allocator, gic: *Gic, num_cpus: u8) !*IccHandler {
-        const handler = try allocator.create(IccHandler);
-        errdefer allocator.destroy(handler);
+        assert(num_cpus > 0);
+        assert(num_cpus <= gic_module.MAX_VCPUS);
+
+        comptime assert(@alignOf(IccHandler) >= @alignOf(IccState));
+        const states_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(IccHandler),
+            @alignOf(IccState),
+        );
+        const allocation_len = states_offset + @sizeOf(IccState) * num_cpus;
+        const allocation = try allocator.alignedAlloc(u8, .of(IccHandler), allocation_len);
+
+        const handler: *IccHandler = @ptrCast(allocation.ptr);
+        const states_ptr: [*]IccState = @ptrCast(
+            @alignCast(allocation.ptr + states_offset),
+        );
 
         handler.* = .{
             .gic = gic,
-            .states = try allocator.alloc(IccState, num_cpus),
+            .states = states_ptr[0..num_cpus],
         };
 
         for (handler.states) |*state| {
@@ -121,8 +137,17 @@ pub const IccHandler = struct {
     }
 
     pub fn deinit(self: *IccHandler, allocator: std.mem.Allocator) void {
-        allocator.free(self.states);
-        allocator.destroy(self);
+        assert(self.states.len > 0);
+        assert(self.states.len <= gic_module.MAX_VCPUS);
+
+        const states_offset = std.mem.alignForward(
+            usize,
+            @sizeOf(IccHandler),
+            @alignOf(IccState),
+        );
+        const allocation_len = states_offset + @sizeOf(IccState) * self.states.len;
+        const allocation_ptr: [*]align(@alignOf(IccHandler)) u8 = @ptrCast(self);
+        allocator.free(allocation_ptr[0..allocation_len]);
     }
 
     /// Decode ISS from MSR/MRS trap and extract register encoding.
