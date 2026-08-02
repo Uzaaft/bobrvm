@@ -541,6 +541,9 @@ pub const Gpu = struct {
     /// Readback of a 3D-rendered scanout resource's MTLTexture, so the
     /// present path (which serves BGRA host pixels) can display GPU output.
     scanout3d_data: []u8 = &.{},
+    /// Grow-only scratch storage used to gather scattered guest texture data
+    /// before the synchronous Metal upload.
+    transfer3d_staging: []u8 = &.{},
     scanout3d_w: u32 = 0,
     scanout3d_h: u32 = 0,
     /// True once a flush found the 3D scanout target IOSurface-backed, so the
@@ -655,6 +658,7 @@ pub const Gpu = struct {
             .gpu_device = gpu_module.GpuDevice.init(alloc),
             .backing3d = std.AutoHashMap(u32, std.ArrayListUnmanaged(MemEntry)).init(alloc),
             .scanout3d_data = &.{},
+            .transfer3d_staging = &.{},
             .scanout3d_w = 0,
             .scanout3d_h = 0,
             .submit3d_seen = 0,
@@ -699,6 +703,7 @@ pub const Gpu = struct {
         while (b3d.next()) |list| list.deinit(self.alloc);
         self.backing3d.deinit();
         if (self.scanout3d_data.len > 0) self.alloc.free(self.scanout3d_data);
+        if (self.transfer3d_staging.len > 0) self.alloc.free(self.transfer3d_staging);
         self.venus_contexts.deinit();
         {
             var it = self.venus_blobs.valueIterator();
@@ -1567,8 +1572,14 @@ pub const Gpu = struct {
             const total_u64 = row_bytes * cmd.box.h;
             if (total_u64 > 512 * 1024 * 1024) return .resp_err_invalid_parameter;
             const total: usize = @intCast(total_u64);
-            const staging = self.alloc.alloc(u8, total) catch return .resp_err_out_of_memory;
-            defer self.alloc.free(staging);
+            if (self.transfer3d_staging.len < total) {
+                const staging = if (self.transfer3d_staging.len == 0)
+                    self.alloc.alloc(u8, total) catch return .resp_err_out_of_memory
+                else
+                    self.alloc.realloc(self.transfer3d_staging, total) catch return .resp_err_out_of_memory;
+                self.transfer3d_staging = staging;
+            }
+            const staging = self.transfer3d_staging[0..total];
             var y: u32 = 0;
             while (y < cmd.box.h) : (y += 1) {
                 const src_off = cmd.offset + @as(u64, y) * stride;
@@ -2299,6 +2310,9 @@ test "transfer_to_host_3d uploads guest TEXTURE data via replaceRegion" {
         .layer_stride = 0,
     };
     try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get));
+    const staging_ptr = gpu.transfer3d_staging.ptr;
+    try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost3D(std.mem.asBytes(&xfer), Ctx.get));
+    try testing.expectEqual(staging_ptr, gpu.transfer3d_staging.ptr);
 
     // Read the texture back from the GPU: must match the guest bytes.
     var out: [nbytes]u8 = undefined;
