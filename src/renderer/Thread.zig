@@ -299,10 +299,6 @@ pub const RenderThread = struct {
     // Metal frame renderer
     frame_renderer: metal.FrameRenderer,
 
-    // Frame timing
-    target_fps: u32 = 60,
-    frame_time_ns: u64,
-
     // Surface state
     size: Size = .{ .width = 0, .height = 0 },
     content_scale: ContentScale = .{},
@@ -342,15 +338,12 @@ pub const RenderThread = struct {
         mtl_layer: *anyopaque,
         mtl_queue: *anyopaque,
     ) RenderThread {
-        const target_fps: u32 = 60;
         return .{
             .alloc = alloc,
             .mtl_device = mtl_device,
             .mtl_layer = mtl_layer,
             .mtl_queue = mtl_queue,
             .frame_renderer = metal.FrameRenderer.init(mtl_device, mtl_layer, mtl_queue),
-            .target_fps = target_fps,
-            .frame_time_ns = std.time.ns_per_s / target_fps,
         };
     }
 
@@ -381,7 +374,7 @@ pub const RenderThread = struct {
         // Pre-condition: not already running
         assert(!self.running.load(.acquire));
 
-        log.info("starting renderer thread (target {}fps)", .{self.target_fps});
+        log.info("starting renderer thread", .{});
 
         self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
@@ -450,15 +443,14 @@ pub const RenderThread = struct {
 
     fn runLoop(self: *RenderThread) !void {
         while (self.running.load(.acquire)) {
-            // Wait for wakeup or timeout
-            const frame_ns = self.frame_time_ns;
-            _ = self.wakeup.timedWait(frame_ns);
+            // CVDisplayLink requests frames only when the guest presentation
+            // generation changes; mailbox producers wake us for state changes.
+            self.wakeup.wait();
 
-            // Drain mailbox
             self.drainMailbox();
+            if (!self.running.load(.acquire)) return;
 
-            // Check if we should draw
-            if (self.frame_requested.swap(false, .acquire) or self.visible) {
+            if (self.frame_requested.swap(false, .acquire)) {
                 self.drawFrame();
             }
         }
@@ -470,9 +462,11 @@ pub const RenderThread = struct {
                 .resize => |size| {
                     self.size = size;
                     self.clear_presented = false;
+                    self.frame_requested.store(true, .release);
                 },
                 .content_scale => |scale| {
                     self.content_scale = scale;
+                    self.frame_requested.store(true, .release);
                 },
                 .focus => |focused| {
                     self.focused = focused;
@@ -480,11 +474,15 @@ pub const RenderThread = struct {
                 },
                 .visible => |visible| {
                     self.visible = visible;
-                    if (visible) self.clear_presented = false;
+                    if (visible) {
+                        self.clear_presented = false;
+                        self.frame_requested.store(true, .release);
+                    }
                     self.setQosClass();
                 },
                 .commands_ready => |batch| {
                     self.pending_batch = batch;
+                    self.frame_requested.store(true, .release);
                 },
                 .draw_now => {
                     self.clear_presented = false;
@@ -647,6 +645,17 @@ test "RenderThread init" {
 
     var rt = RenderThread.init(std.testing.allocator, ptr, ptr, ptr);
 
-    try std.testing.expectEqual(@as(u32, 60), rt.target_fps);
     try std.testing.expect(!rt.running.load(.acquire));
+}
+
+test "RenderThread state messages request a frame" {
+    var dummy: u32 = 0;
+    const ptr: *anyopaque = @ptrCast(&dummy);
+    var rt = RenderThread.init(std.testing.allocator, ptr, ptr, ptr);
+
+    rt.mailbox.push(.{ .resize = .{ .width = 800, .height = 600 } });
+    rt.drainMailbox();
+
+    try std.testing.expectEqual(Size{ .width = 800, .height = 600 }, rt.size);
+    try std.testing.expect(rt.frame_requested.load(.acquire));
 }

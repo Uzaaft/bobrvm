@@ -627,6 +627,7 @@ pub const Surface = struct {
     focused: bool,
     render: renderer.Renderer,
     render_started: bool,
+    presentation_generation_seen: u64,
     last_mouse_x: f64 = 0,
     last_mouse_y: f64 = 0,
 
@@ -653,6 +654,7 @@ pub const Surface = struct {
             .focused = false,
             .render = renderer.Renderer.init(vm.alloc, mtl_device, mtl_layer, mtl_queue),
             .render_started = false,
+            .presentation_generation_seen = std.math.maxInt(u64),
         };
 
         // Feed the renderer from the VM's virtio-gpu scanout.
@@ -708,6 +710,7 @@ pub const Surface = struct {
     fn stopRenderer(self: *Surface) void {
         self.render.stop();
         self.render_started = false;
+        self.presentation_generation_seen = std.math.maxInt(u64);
     }
 
     pub fn setSize(self: *Surface, width: u32, height: u32) void {
@@ -761,6 +764,10 @@ pub const Surface = struct {
     pub fn draw(self: *Surface) void {
         // Pre-condition: must have valid size to draw
         if (self.width == 0 or self.height == 0) return;
+        const hw = self.vm.hw_machine orelse return;
+        const gpu = hw.gpu orelse return;
+        const generation = gpu.presentationGeneration();
+        if (generation == self.presentation_generation_seen) return;
 
         // Start renderer on first draw if not started
         if (!self.render_started) {
@@ -768,6 +775,7 @@ pub const Surface = struct {
         }
 
         // Request frame from renderer thread
+        self.presentation_generation_seen = generation;
         self.render.requestFrame();
     }
 

@@ -513,6 +513,9 @@ pub const Gpu = struct {
     /// resource). The renderer compares this to skip re-presenting an
     /// unchanged frame — no upload, no blit, no drawable for idle vsyncs.
     frame_generation: u64,
+    /// Combined framebuffer/cursor generation for the display-link producer.
+    /// Reading this atomic lets an idle display tick avoid waking the renderer.
+    presentation_generation: std.atomic.Value(u64),
 
     /// Display dimensions.
     display_width: u32,
@@ -649,6 +652,7 @@ pub const Gpu = struct {
             .scanout_mutex = .init,
             .scanout_resource_id = 0,
             .frame_generation = 0,
+            .presentation_generation = std.atomic.Value(u64).init(0),
             .display_width = 1280,
             .display_height = 800,
             .guest_memory = null,
@@ -840,6 +844,10 @@ pub const Gpu = struct {
     ) void {
         self.frame_callback = callback;
         self.frame_userdata = userdata;
+    }
+
+    pub fn presentationGeneration(self: *const Gpu) u64 {
+        return self.presentation_generation.load(.acquire);
     }
 
     pub const CursorView = struct {
@@ -1086,11 +1094,13 @@ pub const Gpu = struct {
                 self.cursor_y = std.math.cast(i32, cmd.pos.y) orelse std.math.maxInt(i32);
                 self.cursor_visible = cmd.resource_id != 0;
                 self.cursor_generation +%= 1;
+                _ = self.presentation_generation.fetchAdd(1, .release);
             },
             .move_cursor => {
                 self.cursor_x = std.math.cast(i32, cmd.pos.x) orelse std.math.maxInt(i32);
                 self.cursor_y = std.math.cast(i32, cmd.pos.y) orelse std.math.maxInt(i32);
                 self.cursor_generation +%= 1;
+                _ = self.presentation_generation.fetchAdd(1, .release);
             },
             else => {},
         }
@@ -1369,6 +1379,7 @@ pub const Gpu = struct {
         self.scanout_resource_id = cmd.resource_id;
         self.scanout_rect = cmd.r;
         self.frame_generation +%= 1; // new scanout target: force a present
+        _ = self.presentation_generation.fetchAdd(1, .release);
         // A page flip IS a new frame. Compositors that drive KMS (niri and
         // every other Wayland compositor) flip between buffers with
         // SET_SCANOUT and never call RESOURCE_FLUSH, so without this the
@@ -1401,6 +1412,7 @@ pub const Gpu = struct {
             self.scanout_blob = null;
             self.scanout_resource_id = 0;
             self.frame_generation +%= 1;
+            _ = self.presentation_generation.fetchAdd(1, .release);
             log.info("set_scanout_blob: disable", .{});
             return .resp_ok_nodata;
         }
@@ -1424,6 +1436,7 @@ pub const Gpu = struct {
         self.scanout_resource_id = cmd.resource_id;
         self.scanout_rect = .{ .x = cmd.r.x, .y = cmd.r.y, .width = cmd.r.width, .height = cmd.r.height };
         self.frame_generation +%= 1;
+        _ = self.presentation_generation.fetchAdd(1, .release);
         return .resp_ok_nodata;
     }
 
@@ -1436,6 +1449,7 @@ pub const Gpu = struct {
             // the GPU texture into the host present buffer.
             self.refresh3dScanout();
             self.frame_generation +%= 1; // content changed: renderer should present
+            _ = self.presentation_generation.fetchAdd(1, .release);
             if (self.frame_callback) |cb| {
                 cb(self.frame_userdata);
             }
@@ -2518,6 +2532,8 @@ test "scanout frame generation advances only on flush of the scanout" {
     };
     _ = gpu.cmdSetScanout(std.mem.asBytes(&scan));
     const g_after_scanout = gpu.scanout().?.generation;
+    const present_after_scanout = gpu.presentationGeneration();
+    try testing.expect(present_after_scanout > 0);
 
     // Flushing the scanout resource advances the generation.
     const flush = ResourceFlush{
@@ -2527,6 +2543,7 @@ test "scanout frame generation advances only on flush of the scanout" {
     };
     _ = gpu.cmdResourceFlush(std.mem.asBytes(&flush));
     try testing.expectEqual(g_after_scanout + 1, gpu.scanout().?.generation);
+    try testing.expectEqual(present_after_scanout + 1, gpu.presentationGeneration());
 
     // Flushing a non-scanout resource does not.
     const g = gpu.scanout().?.generation;
@@ -2537,6 +2554,7 @@ test "scanout frame generation advances only on flush of the scanout" {
     };
     _ = gpu.cmdResourceFlush(std.mem.asBytes(&flush_other));
     try testing.expectEqual(g, gpu.scanout().?.generation);
+    try testing.expectEqual(present_after_scanout + 1, gpu.presentationGeneration());
 }
 
 test "hardware cursor: update_cursor sets image+position, move_cursor repositions only" {
@@ -2575,6 +2593,7 @@ test "hardware cursor: update_cursor sets image+position, move_cursor reposition
         .hot_y = 2,
     };
     gpu.handleCursorCommand(std.mem.asBytes(&update));
+    const present_after_update = gpu.presentationGeneration();
 
     const view1 = gpu.cursorView() orelse return error.TestExpectedCursor;
     try testing.expectEqual(@as(u32, 4), view1.width);
@@ -2595,6 +2614,7 @@ test "hardware cursor: update_cursor sets image+position, move_cursor reposition
         .hot_y = 0,
     };
     gpu.handleCursorCommand(std.mem.asBytes(&move));
+    try testing.expectEqual(present_after_update + 1, gpu.presentationGeneration());
 
     const view2 = gpu.cursorView() orelse return error.TestExpectedCursor;
     try testing.expectEqual(@as(i32, 200), view2.x);
@@ -2613,6 +2633,7 @@ test "hardware cursor: update_cursor sets image+position, move_cursor reposition
     };
     gpu.handleCursorCommand(std.mem.asBytes(&hide));
     try testing.expect(gpu.cursorView() == null);
+    try testing.expectEqual(present_after_update + 2, gpu.presentationGeneration());
 }
 
 test "EDID feature advertised" {
