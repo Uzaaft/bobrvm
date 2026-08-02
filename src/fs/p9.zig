@@ -568,8 +568,8 @@ pub const P9Server = struct {
                 _ = try r.u32v(); // gid
                 const size = try r.u64v();
                 const fid = try self.getFid(fid_id);
-                const path = try self.hostPath(fid.rel);
-                defer self.alloc.free(path);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(fid.rel, &path_storage);
 
                 const SETATTR_MODE: u32 = 0x1;
                 const SETATTR_SIZE: u32 = 0x8;
@@ -991,11 +991,25 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         const size = std.mem.readInt(u64, resp[7 + 8 + 13 + 4 + 4 + 4 + 8 + 8 ..][0..8], .little);
         try testing.expectEqual(@as(u64, 12), size); // "host says hi"
     }
+    // TSETATTR mode on fid 2
+    {
+        var p = TestPayload{};
+        const payload = p.u32v(2).u32v(0x1).u32v(0o644).u32v(0).u32v(0).u64v(0).slice();
+        const req = try tmsg(testing.allocator, Tsetattr, 13, payload);
+        defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
+        const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
+        try expectRType(resp[0..n], Tsetattr + 1);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    }
     // TCLUNK everything
     {
         for ([_]u32{ 1, 2, 3 }) |fid| {
             var p = TestPayload{};
-            const req = try tmsg(testing.allocator, Tclunk, 13, p.u32v(fid).slice());
+            const req = try tmsg(testing.allocator, Tclunk, 14, p.u32v(fid).slice());
             defer testing.allocator.free(req);
             const n = srv.handle(req, &resp);
             try expectRType(resp[0..n], Tclunk + 1);
