@@ -1930,7 +1930,8 @@ pub const Machine = struct {
     }
 
     fn generateDtb(self: *Machine) !void {
-        var builder = dtb.DtbBuilder.init(self.alloc);
+        var stack_allocator = std.heap.stackFallback(dtb.DtbBuilder.scratch_bytes, self.alloc);
+        var builder = dtb.DtbBuilder.init(stack_allocator.get());
         defer builder.deinit();
 
         // Count virtio devices: console (slot 0) + block devices + gpu

@@ -86,6 +86,8 @@ pub const DtbBuilder = struct {
     strings_buf: std.ArrayListUnmanaged(u8),
     string_offsets: std.StringHashMapUnmanaged(u32),
 
+    pub const scratch_bytes = 8 * 1024;
+
     pub fn init(alloc: Allocator) DtbBuilder {
         return .{
             .alloc = alloc,
@@ -470,7 +472,8 @@ pub const DtbBuilder = struct {
 
 test "DtbBuilder basic generation" {
     var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const alloc = counted.allocator();
+    var stack_allocator = std.heap.stackFallback(DtbBuilder.scratch_bytes, counted.allocator());
+    const alloc = stack_allocator.get();
     var builder = DtbBuilder.init(alloc);
     defer builder.deinit();
 
@@ -490,7 +493,8 @@ test "DtbBuilder basic generation" {
     try std.testing.expectEqual(FDT_VERSION, std.mem.bigToNative(u32, header.version));
     try std.testing.expectEqual(@as(u32, @intCast(dtb.len)), std.mem.bigToNative(u32, header.totalsize));
     try std.testing.expect(std.mem.bigToNative(u32, header.off_dt_strings) < dtb.len);
-    try std.testing.expectEqual(@as(usize, 9), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
 }
 
 test "DtbConfig defaults" {
@@ -503,4 +507,24 @@ test "DtbConfig defaults" {
 
     try std.testing.expectEqual(@as(u64, 0x0A00_0000), config.virtio_base);
     try std.testing.expectEqual(@as(u8, 1), config.virtio_count);
+}
+
+test "DtbBuilder stack scratch falls back for large configurations" {
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var stack_allocator = std.heap.stackFallback(DtbBuilder.scratch_bytes, counted.allocator());
+    var builder = DtbBuilder.init(stack_allocator.get());
+    defer builder.deinit();
+
+    const cmdline: [12 * 1024]u8 = @splat('x');
+    const config = DtbConfig{
+        .ram_base = 0x40000000,
+        .ram_size = 512 * 1024 * 1024,
+        .vcpu_count = 2,
+        .cmdline = &cmdline,
+    };
+    var output: [20 * 1024]u8 align(@alignOf(FdtHeader)) = undefined;
+    const blob = try builder.generateInto(config, &output);
+
+    try std.testing.expect(blob.len > cmdline.len);
+    try std.testing.expect(counted.allocations > 0);
 }
