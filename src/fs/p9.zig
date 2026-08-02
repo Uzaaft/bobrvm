@@ -317,6 +317,21 @@ pub const P9Server = struct {
         return rel;
     }
 
+    fn childRelInto(parent: []const u8, name: []const u8, storage: []u8) Error![]u8 {
+        assert(storage.len > 0);
+        assert(validName(name));
+        const separator_len: usize = @intFromBool(parent.len > 0);
+        const prefix_len = std.math.add(usize, parent.len, separator_len) catch
+            return error.Invalid;
+        const rel_len = std.math.add(usize, prefix_len, name.len) catch return error.Invalid;
+        if (rel_len > storage.len or rel_len > MSIZE_MAX) return error.Invalid;
+
+        @memcpy(storage[0..parent.len], parent);
+        if (parent.len > 0) storage[parent.len] = '/';
+        @memcpy(storage[prefix_len..rel_len], name);
+        return storage[0..rel_len];
+    }
+
     fn validName(name: []const u8) bool {
         if (name.len == 0) return false;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
@@ -644,16 +659,14 @@ pub const P9Server = struct {
                 const mode = try r.u32v();
                 if (!validName(name)) return error.Access;
                 const fid = try self.getFid(fid_id);
-                const rel = if (fid.rel.len == 0)
-                    try self.alloc.dupe(u8, name)
-                else
-                    try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ fid.rel, name });
-                defer self.alloc.free(rel);
-                const path = try self.hostPath(rel);
-                defer self.alloc.free(path);
+                var rel_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const rel = try childRelInto(fid.rel, name, &rel_storage);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(rel, &path_storage);
 
                 if (std.c.mkdir(path.ptr, @intCast(mode & 0o7777)) != 0) return error.Errno;
-                const st = self.statRel(rel) catch return error.Stat;
+                var st: std.c.Stat = undefined;
+                if (lstat(path.ptr, &st) != 0) return error.Stat;
                 w.qid(qidFromStat(st));
                 return w.finish(Tmkdir + 1, tag);
             },
@@ -947,8 +960,13 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p = TestPayload{};
         const req = try tmsg(testing.allocator, Tmkdir, 10, p.u32v(1).str("subdir").u32v(0o755).u32v(100).slice());
         defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n], Tmkdir + 1);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
 
         var p2 = TestPayload{};
         const req2 = try tmsg(testing.allocator, Tunlinkat, 11, p2.u32v(1).str("subdir").u32v(0x200).slice());
