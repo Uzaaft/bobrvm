@@ -414,12 +414,18 @@ pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
 }
 
 pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
+    const serialized_bytes = transportSerializedBytes(&net.transport) + 2 * @sizeOf(u16);
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
     try serializeTransport(&out, &net.transport);
     try out.int(u16, net.rx_last_avail);
     try out.int(u16, net.tx_last_avail);
-    return out.buf.toOwnedSlice(alloc);
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
 }
 
 pub fn deserializeNet(net: *virtio.Net, data: []const u8) !void {
@@ -682,6 +688,34 @@ test "snapshot: RNG device roundtrip" {
     try testing.expect(rng2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x6000_0000), rng2.transport.queues[0].driver_addr);
     try testing.expectEqual(@as(u16, 29), rng2.last_avail);
+}
+
+test "snapshot: network device roundtrip" {
+    const net = try virtio.Net.init(testing.allocator);
+    defer net.deinit();
+    net.transport.status = @bitCast(@as(u8, 0x0F));
+    net.transport.queues[0].ready = true;
+    net.transport.queues[1].ready = true;
+    net.transport.queues[1].desc_addr = 0x7000_0000;
+    net.rx_last_avail = 31;
+    net.tx_last_avail = 37;
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const data = try serializeNet(counted.allocator(), net);
+    defer counted.allocator().free(data);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(data.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+
+    const net2 = try virtio.Net.init(testing.allocator);
+    defer net2.deinit();
+    try deserializeNet(net2, data);
+    try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(net2.transport.status)));
+    try testing.expect(net2.transport.queues[0].ready);
+    try testing.expect(net2.transport.queues[1].ready);
+    try testing.expectEqual(@as(u64, 0x7000_0000), net2.transport.queues[1].desc_addr);
+    try testing.expectEqual(@as(u16, 31), net2.rx_last_avail);
+    try testing.expectEqual(@as(u16, 37), net2.tx_last_avail);
 }
 
 test "snapshot: gpu 2D framebuffer survives roundtrip" {
