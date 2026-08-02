@@ -49,6 +49,17 @@ pub const Config = extern struct {
 /// the vCPU thread; backends queue replies via queueRxFrame.
 pub const TxCallback = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
 
+const RxFrame = struct {
+    storage: []u8,
+    len: usize,
+
+    fn bytes(self: RxFrame) []const u8 {
+        assert(self.len > 0);
+        assert(self.len <= self.storage.len);
+        return self.storage[0..self.len];
+    }
+};
+
 /// Network device.
 pub const Net = struct {
     alloc: Allocator,
@@ -61,7 +72,11 @@ pub const Net = struct {
 
     /// Frames waiting for guest RX buffers. Guarded by rx_mutex: backend
     /// threads append, the vCPU thread drains via pollRx.
-    rx_frames: std.ArrayListUnmanaged([]u8),
+    rx_frames: [MAX_RX_QUEUED]RxFrame,
+    rx_head: usize,
+    rx_count: usize,
+    rx_free: [MAX_RX_QUEUED][]u8,
+    rx_free_count: usize,
     rx_mutex: std.Io.Mutex,
 
     /// Guest memory accessor.
@@ -75,6 +90,7 @@ pub const Net = struct {
     pub const QUEUE_SIZE: u16 = 256;
     pub const MAX_FRAME: usize = 65550;
     pub const MAX_RX_QUEUED: usize = 1024;
+    pub const RX_BUFFER_SIZE: usize = 2048;
     /// Back-pressure threshold: a frame source (e.g. the NAT TCP relay)
     /// should stop producing while the queue is at/above this, so it never
     /// overflows and drops — dropping a TCP segment in a proxy with no
@@ -98,7 +114,11 @@ pub const Net = struct {
             .config = .{ .mac = GUEST_MAC },
             .rx_last_avail = 0,
             .tx_last_avail = 0,
-            .rx_frames = .empty,
+            .rx_frames = undefined,
+            .rx_head = 0,
+            .rx_count = 0,
+            .rx_free = undefined,
+            .rx_free_count = 0,
             .rx_mutex = .init,
             .guest_memory = null,
             .tx_callback = null,
@@ -113,8 +133,8 @@ pub const Net = struct {
     }
 
     pub fn deinit(self: *Net) void {
-        for (self.rx_frames.items) |frame| self.alloc.free(frame);
-        self.rx_frames.deinit(self.alloc);
+        self.releaseQueuedFrames();
+        for (self.rx_free[0..self.rx_free_count]) |storage| self.alloc.free(storage);
         self.transport.deinit();
         self.alloc.destroy(self);
     }
@@ -132,17 +152,16 @@ pub const Net = struct {
     /// is copied. Drops when the queue is full (like a real NIC).
     pub fn queueRxFrame(self: *Net, frame: []const u8) void {
         if (frame.len == 0 or frame.len > MAX_FRAME) return;
-        const copy = self.alloc.dupe(u8, frame) catch return;
 
         self.rx_mutex.lockUncancelable(global.io());
         defer self.rx_mutex.unlock(global.io());
-        if (self.rx_frames.items.len >= MAX_RX_QUEUED) {
-            self.alloc.free(copy);
-            return;
-        }
-        self.rx_frames.append(self.alloc, copy) catch {
-            self.alloc.free(copy);
-        };
+        if (self.rx_count >= self.rx_frames.len) return;
+
+        const storage = self.takeRxStorage(frame.len) orelse return;
+        @memcpy(storage[0..frame.len], frame);
+        const tail = (self.rx_head + self.rx_count) % self.rx_frames.len;
+        self.rx_frames[tail] = .{ .storage = storage, .len = frame.len };
+        self.rx_count += 1;
     }
 
     /// True while the RX queue has headroom. Frame producers should stop
@@ -151,7 +170,7 @@ pub const Net = struct {
     pub fn rxReady(self: *Net) bool {
         self.rx_mutex.lockUncancelable(global.io());
         defer self.rx_mutex.unlock(global.io());
-        return self.rx_frames.items.len < RX_BACKPRESSURE;
+        return self.rx_count < RX_BACKPRESSURE;
     }
 
     // =========================================================================
@@ -270,16 +289,17 @@ pub const Net = struct {
 
         self.rx_mutex.lockUncancelable(global.io());
         defer self.rx_mutex.unlock(global.io());
-        if (self.rx_frames.items.len == 0) return;
+        if (self.rx_count == 0) return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
         var last_avail = self.rx_last_avail;
         var delivered: usize = 0;
 
-        while (last_avail != avail_idx and delivered < self.rx_frames.items.len) {
+        while (last_avail != avail_idx and delivered < self.rx_count) {
             const head = ring.availEntry(qc, last_avail, get_mem) orelse break;
             const chain = ring.Chain.collect(qc, head, get_mem);
-            const frame = self.rx_frames.items[delivered];
+            const frame_index = (self.rx_head + delivered) % self.rx_frames.len;
+            const frame = self.rx_frames[frame_index].bytes();
 
             const written = deliverFrame(&chain, frame, get_mem) orelse break;
             ring.pushUsed(qc, head, written, get_mem);
@@ -290,10 +310,40 @@ pub const Net = struct {
 
         self.rx_last_avail = last_avail;
         if (delivered > 0) {
-            for (self.rx_frames.items[0..delivered]) |frame| self.alloc.free(frame);
-            self.rx_frames.replaceRangeAssumeCapacity(0, delivered, &.{});
+            for (0..delivered) |_| self.releaseRxFrame();
             self.transport.signalUsedBuffer();
         }
+    }
+
+    fn takeRxStorage(self: *Net, frame_len: usize) ?[]u8 {
+        assert(frame_len > 0);
+        assert(frame_len <= MAX_FRAME);
+        var index = self.rx_free_count;
+        while (index > 0) {
+            index -= 1;
+            if (self.rx_free[index].len < frame_len) continue;
+            const storage = self.rx_free[index];
+            self.rx_free_count -= 1;
+            self.rx_free[index] = self.rx_free[self.rx_free_count];
+            return storage;
+        }
+        return self.alloc.alloc(u8, @max(frame_len, RX_BUFFER_SIZE)) catch null;
+    }
+
+    fn releaseRxFrame(self: *Net) void {
+        assert(self.rx_count > 0);
+        assert(self.rx_free_count < self.rx_free.len);
+        self.rx_free[self.rx_free_count] = self.rx_frames[self.rx_head].storage;
+        self.rx_free_count += 1;
+        self.rx_head = (self.rx_head + 1) % self.rx_frames.len;
+        self.rx_count -= 1;
+    }
+
+    fn releaseQueuedFrames(self: *Net) void {
+        assert(self.rx_count <= self.rx_frames.len);
+        assert(self.rx_free_count <= self.rx_free.len);
+        while (self.rx_count > 0) self.releaseRxFrame();
+        self.rx_head = 0;
     }
 
     /// Scatter header + frame into a writable RX chain; returns bytes
@@ -366,5 +416,18 @@ test "Net queues and drops rx frames at capacity" {
     while (i < Net.MAX_RX_QUEUED + 10) : (i += 1) {
         net.queueRxFrame(&[_]u8{ 1, 2, 3, 4 });
     }
-    try testing.expectEqual(Net.MAX_RX_QUEUED, net.rx_frames.items.len);
+    try testing.expectEqual(Net.MAX_RX_QUEUED, net.rx_count);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, net.rx_frames[net.rx_head].bytes());
+}
+
+test "Net recycles normal RX buffers" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+
+    var frame: [1514]u8 = @splat(0xA5);
+    net.queueRxFrame(&frame);
+    const storage = net.rx_frames[net.rx_head].storage.ptr;
+    net.releaseQueuedFrames();
+    net.queueRxFrame(&frame);
+    try testing.expectEqual(storage, net.rx_frames[net.rx_head].storage.ptr);
 }
