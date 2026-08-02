@@ -367,7 +367,8 @@ pub const VM = struct {
     app_next: ?*VM,
     config: OwnedVMConfig,
     state: State,
-    surfaces: std.ArrayListUnmanaged(*Surface),
+    surfaces_head: ?*Surface,
+    surface_count: usize,
 
     /// The actual machine (hypervisor + devices).
     hw_machine: ?*machine.Machine = null,
@@ -400,29 +401,29 @@ pub const VM = struct {
             .app_next = null,
             .config = owned_config,
             .state = .stopped,
-            .surfaces = .empty,
+            .surfaces_head = null,
+            .surface_count = 0,
         };
 
         // Post-condition: VM starts stopped with no surfaces
         assert(vm.state == .stopped);
-        assert(vm.surfaces.items.len == 0);
+        assert(vm.surfaces_head == null);
+        assert(vm.surface_count == 0);
 
         return vm;
     }
 
     pub fn destroy(self: *VM) void {
         // Pre-condition: reasonable surface count
-        assert(self.surfaces.items.len <= 16);
+        assert(self.surface_count <= 16);
 
         // Destroy surfaces first: their renderer threads read the GPU
         // scanout owned by the machine.
-        while (self.surfaces.items.len > 0) {
-            self.surfaces.items[self.surfaces.items.len - 1].destroy();
-        }
+        while (self.surfaces_head) |surface| surface.destroy();
+        assert(self.surface_count == 0);
 
         // Then stop and destroy the machine (joins the vCPU thread)
         self.stop();
-        self.surfaces.deinit(self.alloc);
 
         // Free owned config strings
         self.config.deinit(self.alloc);
@@ -524,7 +525,12 @@ pub const VM = struct {
         // before destroying the machine so no surface can retain a pointer to
         // GPU memory during teardown. The surfaces themselves remain alive and
         // restart their renderers on the next draw after a VM restart.
-        for (self.surfaces.items) |surface| surface.stopRenderer();
+        var surface = self.surfaces_head;
+        while (surface) |current| {
+            const next = current.vm_next;
+            current.stopRenderer();
+            surface = next;
+        }
 
         if (self.hw_machine) |hw| {
             hw.stop();
@@ -622,24 +628,33 @@ pub const VM = struct {
         mtl_queue: *anyopaque,
     ) !*Surface {
         const surface = try Surface.create(self, mtl_device, mtl_layer, mtl_queue);
-        errdefer surface.destroy();
 
-        try self.surfaces.append(self.alloc, surface);
+        surface.vm_next = self.surfaces_head;
+        if (self.surfaces_head) |head| head.vm_prev = surface;
+        self.surfaces_head = surface;
+        self.surface_count += 1;
 
         // Post-condition: surface added
-        assert(self.surfaces.items.len > 0);
+        assert(self.surfaces_head == surface);
+        assert(self.surface_count > 0);
 
         return surface;
     }
 
     /// Remove surface from VM's list (called by Surface.destroy).
     fn removeSurface(self: *VM, surface: *Surface) void {
-        for (self.surfaces.items, 0..) |s, i| {
-            if (s == surface) {
-                _ = self.surfaces.swapRemove(i);
-                return;
-            }
+        assert(surface.vm == self);
+        assert(self.surface_count > 0);
+        if (surface.vm_prev) |previous| {
+            previous.vm_next = surface.vm_next;
+        } else {
+            assert(self.surfaces_head == surface);
+            self.surfaces_head = surface.vm_next;
         }
+        if (surface.vm_next) |next| next.vm_prev = surface.vm_prev;
+        surface.vm_prev = null;
+        surface.vm_next = null;
+        self.surface_count -= 1;
     }
 };
 
@@ -648,6 +663,8 @@ pub const VM = struct {
 pub const Surface = struct {
     alloc: Allocator,
     vm: *VM,
+    vm_prev: ?*Surface,
+    vm_next: ?*Surface,
     mtl_device: *anyopaque,
     mtl_layer: *anyopaque,
     mtl_queue: *anyopaque,
@@ -675,6 +692,8 @@ pub const Surface = struct {
         surface.* = .{
             .alloc = vm.alloc,
             .vm = vm,
+            .vm_prev = null,
+            .vm_next = null,
             .mtl_device = mtl_device,
             .mtl_layer = mtl_layer,
             .mtl_queue = mtl_queue,
@@ -969,4 +988,46 @@ test "App VM registry unlinks arbitrary entries" {
     last.destroy();
     try std.testing.expectEqual(@as(usize, 0), app.vm_count);
     try std.testing.expect(app.vms_head == null);
+}
+
+test "VM surface registry does not allocate" {
+    var runtime = RuntimeConfig{};
+    const app = try App.create(&runtime);
+    defer app.destroy();
+    const cfg = VMConfig{ .memory_bytes = 1024, .vcpu_count = 1 };
+    const vm = try app.createVM(&cfg);
+
+    const base_alloc = vm.alloc;
+    var counted = std.testing.FailingAllocator.init(base_alloc, .{});
+    vm.alloc = counted.allocator();
+    const dummy: *anyopaque = @ptrFromInt(1);
+    const surface = try vm.createSurface(dummy, dummy, dummy);
+
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    surface.destroy();
+    vm.alloc = base_alloc;
+}
+
+test "VM surface registry unlinks arbitrary entries" {
+    var runtime = RuntimeConfig{};
+    const app = try App.create(&runtime);
+    defer app.destroy();
+    const cfg = VMConfig{ .memory_bytes = 1024, .vcpu_count = 1 };
+    const vm = try app.createVM(&cfg);
+    const dummy: *anyopaque = @ptrFromInt(1);
+
+    const first = try vm.createSurface(dummy, dummy, dummy);
+    const middle = try vm.createSurface(dummy, dummy, dummy);
+    const last = try vm.createSurface(dummy, dummy, dummy);
+    try std.testing.expectEqual(@as(usize, 3), vm.surface_count);
+
+    middle.destroy();
+    try std.testing.expectEqual(@as(usize, 2), vm.surface_count);
+    try std.testing.expect(last.vm_next == first);
+    try std.testing.expect(first.vm_prev == last);
+
+    first.destroy();
+    last.destroy();
+    try std.testing.expectEqual(@as(usize, 0), vm.surface_count);
+    try std.testing.expect(vm.surfaces_head == null);
 }
