@@ -145,8 +145,8 @@ pub const P9Server = struct {
         errdefer self.alloc.free(owned);
         var fid = Fid{ .rel = owned, .open_linux_flags = open_flags };
         if (open_flags) |flags| {
-            const path = try self.hostPath(owned);
-            defer self.alloc.free(path);
+            var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try self.hostPathInto(owned, &path_storage);
             const fd = std.c.open(path.ptr, linuxFlagsToDarwin(flags));
             if (fd >= 0) fid.fd = fd;
         }
@@ -1056,6 +1056,30 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
             try expectRType(resp[0..n], Tclunk + 1);
         }
     }
+}
+
+test "p9: restore reopens saved fid" {
+    const io = @import("../global.zig").io();
+    const root = ".zig-cache/p9-test-restore";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, root ++ "/saved.txt", .{});
+        file.close(io);
+    }
+
+    var srv = try P9Server.init(testing.allocator, root);
+    defer srv.deinit();
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    srv.alloc = counted.allocator();
+    try srv.restoreFid(testing.allocator, 7, "saved.txt", 0);
+    srv.alloc = testing.allocator;
+
+    const restored = srv.fids.get(7).?;
+    try testing.expect(restored.fd != null);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 9), counted.allocated_bytes);
 }
 
 test "p9: path escapes and unknown ops are rejected" {
