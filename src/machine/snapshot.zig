@@ -337,14 +337,14 @@ pub fn deserializeConsole(alloc: Allocator, con: *virtio.Console, data: []const 
 pub fn serializeBlock(alloc: Allocator, blk: *const virtio.Block) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
-    try serializeTransport(&out, blk.transport);
+    try serializeTransport(&out, &blk.transport);
     try out.int(u16, blk.request_last_avail);
     return out.buf.toOwnedSlice(alloc);
 }
 
 pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
-    try deserializeTransport(&cur, blk.transport);
+    try deserializeTransport(&cur, &blk.transport);
     blk.request_last_avail = try cur.int(u16);
 }
 

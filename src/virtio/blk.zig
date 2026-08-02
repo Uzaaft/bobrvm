@@ -141,7 +141,8 @@ const PUNCH_ALIGN: u64 = 4096;
 /// Block device.
 pub const Block = struct {
     alloc: Allocator,
-    transport: *mmio.Transport,
+    transport: mmio.Transport,
+    transport_queues: [1]mmio.QueueConfig,
     config: Config,
 
     /// Shadow cursor for the guest-owned request queue.
@@ -168,13 +169,12 @@ pub const Block = struct {
         const virtio_version_1: u64 = 1 << 32;
         const features = Features.SIZE_MAX | Features.SEG_MAX | Features.BLK_SIZE |
             Features.FLUSH | Features.DISCARD | Features.WRITE_ZEROES | virtio_version_1;
-        const transport = try mmio.Transport.init(alloc, 2, features, 1); // 2 = block device ID
-        errdefer transport.deinit();
-
         const blk = try alloc.create(Block);
+        errdefer alloc.destroy(blk);
         blk.* = .{
             .alloc = alloc,
-            .transport = transport,
+            .transport = undefined,
+            .transport_queues = undefined,
             .config = .{
                 .size_max = 4096,
                 .seg_max = 128,
@@ -199,7 +199,8 @@ pub const Block = struct {
         };
 
         // Set up notification callback
-        transport.setNotifyCallback(handleNotify, blk);
+        blk.transport.initEmbedded(alloc, 2, features, &blk.transport_queues);
+        blk.transport.setNotifyCallback(handleNotify, blk);
 
         // Post-condition
         assert(blk.transport.device_id == 2); // block device ID
@@ -209,7 +210,6 @@ pub const Block = struct {
 
     pub fn deinit(self: *Block) void {
         if (self.file) |f| f.close(global.io());
-        self.transport.deinit();
         self.alloc.destroy(self);
     }
 
