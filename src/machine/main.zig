@@ -878,9 +878,7 @@ pub const Machine = struct {
             try snapshot.appendP9Section(&builder, alloc, p9_dev);
         }
         if (self.gpu) |gpu_dev| {
-            const data = try snapshot.serializeGpu(alloc, gpu_dev);
-            defer alloc.free(data);
-            try builder.section("gpu", data);
+            try snapshot.appendGpuSection(&builder, gpu_dev);
         }
 
         return try builder.finish();

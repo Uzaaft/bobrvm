@@ -130,6 +130,20 @@ pub const Builder = struct {
         try self.buf.appendSlice(self.alloc, data);
     }
 
+    fn prepareSection(self: *Builder, name: []const u8, data_len: usize) !void {
+        assert(name.len > 0);
+        assert(name.len <= std.math.maxInt(u8));
+        assert(data_len <= std.math.maxInt(u64));
+        const header_len = @sizeOf(u8) + name.len + @sizeOf(u64);
+        const section_len = try std.math.add(usize, header_len, data_len);
+        try self.buf.ensureUnusedCapacity(self.alloc, section_len);
+        self.buf.appendAssumeCapacity(@intCast(name.len));
+        self.buf.appendSliceAssumeCapacity(name);
+        var size_bytes: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &size_bytes, data_len, .little);
+        self.buf.appendSliceAssumeCapacity(&size_bytes);
+    }
+
     /// Take ownership of the finished snapshot bytes.
     pub fn finish(self: *Builder) ![]u8 {
         return self.buf.toOwnedSlice(self.alloc);
@@ -620,19 +634,29 @@ pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void 
 // intact instead of a black frame until the guest's next redraw. virgl 3D
 // contexts/resources are NOT captured (reset on restore, per QEMU policy).
 
-pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
+fn gpuSerializedBytes(g: *const virtio.Gpu) !usize {
     assert(g.resources.count() <= std.math.maxInt(u32));
+    assert(g.transport.queues.len <= mmio.Transport.MAX_QUEUES);
     const resource_state_bytes = 4 * @sizeOf(u32) + @sizeOf(u64);
     var serialized_bytes = transportSerializedBytes(g.transport) + 2 * @sizeOf(u16) +
         5 * @sizeOf(u32);
     var size_it = g.resources.valueIterator();
     while (size_it.next()) |resource| {
-        serialized_bytes += resource_state_bytes + resource.host_data.len;
+        const resource_bytes = try std.math.add(
+            usize,
+            resource_state_bytes,
+            resource.host_data.len,
+        );
+        serialized_bytes = try std.math.add(usize, serialized_bytes, resource_bytes);
     }
-    var out = Out{ .alloc = alloc };
-    errdefer out.buf.deinit(alloc);
-    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
-    try serializeTransport(&out, g.transport);
+    return serialized_bytes;
+}
+
+fn writeGpu(out: *Out, g: *const virtio.Gpu, serialized_bytes: usize) !void {
+    assert(g.resources.count() <= std.math.maxInt(u32));
+    assert(serialized_bytes > 0);
+    const start = out.buf.items.len;
+    try serializeTransport(out, g.transport);
     try out.int(u16, g.ctrl_last_avail);
     try out.int(u16, g.cursor_last_avail);
     try out.int(u32, g.config.events_read);
@@ -641,19 +665,45 @@ pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
     try out.int(u32, g.scanout_resource_id);
     try out.int(u32, g.resources.count());
     var it = g.resources.iterator();
-    while (it.next()) |e| {
-        const r = e.value_ptr;
-        try out.int(u32, r.id);
-        try out.int(u32, r.format);
-        try out.int(u32, r.width);
-        try out.int(u32, r.height);
-        try out.blob(r.host_data);
+    while (it.next()) |entry| {
+        const resource = entry.value_ptr;
+        try out.int(u32, resource.id);
+        try out.int(u32, resource.format);
+        try out.int(u32, resource.width);
+        try out.int(u32, resource.height);
+        try out.blob(resource.host_data);
     }
+    assert(out.buf.items.len - start == serialized_bytes);
+}
+
+pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
+    assert(g.resources.count() <= std.math.maxInt(u32));
+    assert(g.transport.queues.len <= mmio.Transport.MAX_QUEUES);
+    const serialized_bytes = try gpuSerializedBytes(g);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try writeGpu(&out, g, serialized_bytes);
     assert(out.buf.items.len == serialized_bytes);
     assert(out.buf.items.len == out.buf.capacity);
     const result = out.buf.items;
     out.buf = .empty;
     return result;
+}
+
+pub fn appendGpuSection(builder: *Builder, g: *const virtio.Gpu) !void {
+    assert(g.resources.count() <= std.math.maxInt(u32));
+    assert(g.transport.queues.len <= mmio.Transport.MAX_QUEUES);
+    const serialized_bytes = try gpuSerializedBytes(g);
+    try builder.prepareSection("gpu", serialized_bytes);
+    var out = Out{ .alloc = builder.alloc, .buf = builder.buf };
+    builder.buf = .empty;
+    defer {
+        assert(builder.buf.items.len == 0);
+        builder.buf = out.buf;
+        out.buf = .empty;
+    }
+    try writeGpu(&out, g, serialized_bytes);
 }
 
 pub fn deserializeGpu(g: *virtio.Gpu, data: []const u8) !void {
@@ -1072,6 +1122,35 @@ test "snapshot: gpu 2D framebuffer survives roundtrip" {
     const view = gpu2.scanout().?;
     try testing.expectEqual(@as(u32, 4), view.width);
     try testing.expectEqualSlices(u8, res.host_data, view.data);
+}
+
+test "snapshot: GPU section assembly allocation profile" {
+    const gpu = try virtio.Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+    const pattern: [32]u8 = @splat(0xA5);
+    try gpu.restore2dResource(7, 2, 4, 2, &pattern);
+    gpu.scanout_resource_id = 7;
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendGpuSection(&builder, gpu);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    const section = reader.section("gpu").?;
+    try testing.expectEqual(@as(usize, 3), counted.allocations);
+    try testing.expectEqual(@as(usize, 738), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 164), section.len);
+
+    const restored = try virtio.Gpu.init(testing.allocator, false);
+    defer restored.deinit();
+    try deserializeGpu(restored, section);
+    const restored_resource = restored.resources.getPtr(7).?;
+    try testing.expectEqualSlices(u8, &pattern, restored_resource.host_data);
 }
 
 test "snapshot: VcpuState is a stable extern layout" {
