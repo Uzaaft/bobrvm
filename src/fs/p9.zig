@@ -72,6 +72,7 @@ const L_O_APPEND: u32 = 0o2000;
 const L_O_DIRECTORY: u32 = 0o200000;
 
 pub const MSIZE_MAX: u32 = 128 * 1024;
+const walk_scratch_bytes: usize = 8 * 1024;
 
 /// One guest file handle.
 const Fid = struct {
@@ -274,8 +275,14 @@ pub const P9Server = struct {
 
     /// Absolute, NUL-terminated host path for a fid-relative path.
     fn hostPath(self: *P9Server, rel: []const u8) ![:0]u8 {
-        if (rel.len == 0) return self.alloc.dupeZ(u8, self.root);
-        return std.fmt.allocPrintSentinel(self.alloc, "{s}/{s}", .{ self.root, rel }, 0);
+        return self.hostPathAlloc(self.alloc, rel);
+    }
+
+    fn hostPathAlloc(self: *P9Server, alloc: Allocator, rel: []const u8) ![:0]u8 {
+        assert(rel.len <= MSIZE_MAX);
+        assert(self.root.len <= std.math.maxInt(u32));
+        if (rel.len == 0) return alloc.dupeZ(u8, self.root);
+        return std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ self.root, rel }, 0);
     }
 
     fn validName(name: []const u8) bool {
@@ -287,8 +294,14 @@ pub const P9Server = struct {
     }
 
     fn statRel(self: *P9Server, rel: []const u8) !std.c.Stat {
-        const path = try self.hostPath(rel);
-        defer self.alloc.free(path);
+        return self.statRelAlloc(self.alloc, rel);
+    }
+
+    fn statRelAlloc(self: *P9Server, alloc: Allocator, rel: []const u8) !std.c.Stat {
+        assert(rel.len <= MSIZE_MAX);
+        assert(self.root.len <= std.math.maxInt(u32));
+        const path = try self.hostPathAlloc(alloc, rel);
+        defer alloc.free(path);
         var st: std.c.Stat = undefined;
         if (lstat(path.ptr, &st) != 0) return error.Stat;
         return st;
@@ -371,12 +384,14 @@ pub const P9Server = struct {
                 const nwname = try r.u16v();
                 const src = try self.getFid(fid);
 
+                var stack_allocator = std.heap.stackFallback(walk_scratch_bytes, self.alloc);
+                const temp_alloc = stack_allocator.get();
                 var rel = std.ArrayListUnmanaged(u8).empty;
-                defer rel.deinit(self.alloc);
-                try rel.appendSlice(self.alloc, src.rel);
+                defer rel.deinit(temp_alloc);
+                try rel.appendSlice(temp_alloc, src.rel);
 
                 var qids = std.ArrayListUnmanaged(Qid).empty;
-                defer qids.deinit(self.alloc);
+                defer qids.deinit(temp_alloc);
 
                 var i: u16 = 0;
                 while (i < nwname) : (i += 1) {
@@ -386,13 +401,13 @@ pub const P9Server = struct {
                         break;
                     }
                     const prev_len = rel.items.len;
-                    if (rel.items.len > 0) try rel.append(self.alloc, '/');
-                    try rel.appendSlice(self.alloc, name);
-                    const st = self.statRel(rel.items) catch {
+                    if (rel.items.len > 0) try rel.append(temp_alloc, '/');
+                    try rel.appendSlice(temp_alloc, name);
+                    const st = self.statRelAlloc(temp_alloc, rel.items) catch {
                         rel.shrinkRetainingCapacity(prev_len);
                         break;
                     };
-                    try qids.append(self.alloc, qidFromStat(st));
+                    try qids.append(temp_alloc, qidFromStat(st));
                 }
 
                 // Only a FULL walk moves/creates newfid (9p semantics).
@@ -808,9 +823,14 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p = TestPayload{};
         const req = try tmsg(testing.allocator, Twalk, 2, p.u32v(1).u32v(2).u16v(1).str("hello.txt").slice());
         defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n], Twalk + 1);
         try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[7..9], .little));
+        try testing.expectEqual(@as(usize, 1), counted.allocations);
+        try testing.expectEqual(@as(usize, 9), counted.allocated_bytes);
     }
     // TLOPEN fid2 rdonly + TREAD
     {
