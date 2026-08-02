@@ -285,6 +285,22 @@ pub const P9Server = struct {
         return std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ self.root, rel }, 0);
     }
 
+    fn hostPathInto(self: *P9Server, rel: []const u8, storage: []u8) Error![:0]u8 {
+        assert(storage.len > 0);
+        assert(rel.len <= MSIZE_MAX);
+        const separator_len: usize = @intFromBool(rel.len > 0);
+        const prefix_len = std.math.add(usize, self.root.len, separator_len) catch
+            return error.Invalid;
+        const path_len = std.math.add(usize, prefix_len, rel.len) catch return error.Invalid;
+        if (path_len >= storage.len) return error.Invalid;
+
+        @memcpy(storage[0..self.root.len], self.root);
+        if (rel.len > 0) storage[self.root.len] = '/';
+        @memcpy(storage[prefix_len..path_len], rel);
+        storage[path_len] = 0;
+        return storage[0..path_len :0];
+    }
+
     fn validName(name: []const u8) bool {
         if (name.len == 0) return false;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
@@ -431,8 +447,8 @@ pub const P9Server = struct {
                 const fid_id = try r.u32v();
                 const flags = try r.u32v();
                 const fid = try self.getFid(fid_id);
-                const path = try self.hostPath(fid.rel);
-                defer self.alloc.free(path);
+                var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+                const path = try self.hostPathInto(fid.rel, &path_storage);
 
                 const fd = std.c.open(path.ptr, linuxFlagsToDarwin(flags));
                 if (fd < 0) return error.Errno;
@@ -837,8 +853,13 @@ test "p9: full session — attach/walk/open/read/readdir/create/write/mkdir/unli
         var p = TestPayload{};
         const req = try tmsg(testing.allocator, Tlopen, 3, p.u32v(2).u32v(0).slice());
         defer testing.allocator.free(req);
+        var counted = testing.FailingAllocator.init(testing.allocator, .{});
+        srv.alloc = counted.allocator();
         const n = srv.handle(req, &resp);
+        srv.alloc = testing.allocator;
         try expectRType(resp[0..n], Tlopen + 1);
+        try testing.expectEqual(@as(usize, 0), counted.allocations);
+        try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
 
         var p2 = TestPayload{};
         const req2 = try tmsg(testing.allocator, Tread, 4, p2.u32v(2).u64v(0).u32v(100).slice());
