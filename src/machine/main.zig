@@ -868,9 +868,7 @@ pub const Machine = struct {
             try snapshot.appendRngSection(&builder, alloc, rng_dev);
         }
         if (self.net) |net| {
-            const data = try snapshot.serializeNet(alloc, net);
-            defer alloc.free(data);
-            try builder.section("net", data);
+            try snapshot.appendNetSection(&builder, alloc, net);
         }
         if (self.keyboard) |kbd| {
             const data = try snapshot.serializeInput(alloc, kbd);

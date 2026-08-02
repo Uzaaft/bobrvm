@@ -29,6 +29,7 @@ pub const MAGIC = "BBRSNAP1";
 pub const VERSION: u32 = 1;
 const block_section_scratch_bytes = 128;
 const gic_section_scratch_bytes = 2 * 1024;
+const net_section_scratch_bytes = 128;
 const rng_section_scratch_bytes = 128;
 
 // =============================================================================
@@ -474,6 +475,20 @@ pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
     return result;
 }
 
+pub fn appendNetSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    net: *const virtio.Net,
+) !void {
+    assert(net.transport.queues.len > 0);
+    assert(net.transport.queues.len <= mmio.Transport.MAX_QUEUES);
+    var stack_allocator = std.heap.stackFallback(net_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeNet(scratch_alloc, net);
+    defer scratch_alloc.free(data);
+    try builder.section("net", data);
+}
+
 pub fn deserializeNet(net: *virtio.Net, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &net.transport);
@@ -836,6 +851,25 @@ test "snapshot: network device roundtrip" {
     try testing.expectEqual(@as(u64, 0x7000_0000), net2.transport.queues[1].desc_addr);
     try testing.expectEqual(@as(u16, 31), net2.rx_last_avail);
     try testing.expectEqual(@as(u16, 37), net2.tx_last_avail);
+}
+
+test "snapshot: network section assembly allocation profile" {
+    const net = try virtio.Net.init(testing.allocator);
+    defer net.deinit();
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendNetSection(&builder, alloc, net);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(usize, 2), counted.allocations);
+    try testing.expectEqual(@as(usize, 252), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try testing.expectEqual(@as(usize, 88), reader.section("net").?.len);
 }
 
 test "snapshot: input device roundtrip" {
