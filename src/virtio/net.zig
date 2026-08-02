@@ -85,6 +85,7 @@ pub const Net = struct {
     /// threads append, the vCPU thread drains via pollRx.
     rx_frames: [MAX_RX_QUEUED]RxFrame,
     rx_storage: [MAX_RX_QUEUED]RxStorage,
+    rx_buffer_pool: [MAX_RX_QUEUED][RX_BUFFER_SIZE]u8,
     rx_head: usize,
     rx_count: usize,
     rx_free_head: u16,
@@ -126,6 +127,7 @@ pub const Net = struct {
             .tx_last_avail = 0,
             .rx_frames = undefined,
             .rx_storage = undefined,
+            .rx_buffer_pool = undefined,
             .rx_head = 0,
             .rx_count = 0,
             .rx_free_head = 0,
@@ -136,8 +138,8 @@ pub const Net = struct {
         };
         for (&net.rx_storage, 0..) |*storage, index| {
             storage.* = .{
-                .ptr = null,
-                .capacity = 0,
+                .ptr = net.rx_buffer_pool[index][0..].ptr,
+                .capacity = RX_BUFFER_SIZE,
                 .next_free = if (index + 1 < MAX_RX_QUEUED)
                     @intCast(index + 1)
                 else
@@ -156,8 +158,10 @@ pub const Net = struct {
     }
 
     pub fn deinit(self: *Net) void {
-        for (&self.rx_storage) |*storage| {
-            if (storage.ptr != null) self.alloc.free(storage.bytes());
+        for (&self.rx_storage, 0..) |*storage, index| {
+            if (storage.ptr != null and !self.isPooledStorage(@intCast(index))) {
+                self.alloc.free(storage.bytes());
+            }
         }
         self.alloc.destroy(self);
     }
@@ -383,10 +387,18 @@ pub const Net = struct {
             self.rx_free_head = index;
             return null;
         };
-        if (storage.ptr != null) self.alloc.free(storage.bytes());
+        if (storage.ptr != null and !self.isPooledStorage(index)) {
+            self.alloc.free(storage.bytes());
+        }
         storage.ptr = replacement.ptr;
         storage.capacity = @intCast(replacement.len);
         return index;
+    }
+
+    fn isPooledStorage(self: *const Net, index: u16) bool {
+        assert(index < self.rx_storage.len);
+        assert(self.rx_storage[index].ptr != null);
+        return self.rx_storage[index].ptr.? == self.rx_buffer_pool[index][0..].ptr;
     }
 
     fn removeFreeStorage(self: *Net, previous: u16, index: u16) void {
@@ -493,10 +505,15 @@ test "Net queues and drops rx frames at capacity" {
     const net = try Net.init(testing.allocator);
     defer net.deinit();
 
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    net.alloc = counted.allocator();
     var i: usize = 0;
     while (i < Net.MAX_RX_QUEUED + 10) : (i += 1) {
         net.queueRxFrame(&[_]u8{ 1, 2, 3, 4 });
     }
+    net.alloc = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), counted.allocations);
+    try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     try testing.expectEqual(Net.MAX_RX_QUEUED, net.rx_count);
     try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, net.queuedFrame(net.rx_head));
 }
@@ -513,6 +530,21 @@ test "Net recycles normal RX buffers" {
     net.queueRxFrame(&frame);
     const recycled_index = net.rx_frames[net.rx_head].storage_index;
     try testing.expectEqual(storage, net.rx_storage[recycled_index].ptr);
+}
+
+test "Net allocates oversized RX buffers outside the fixed slab" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    net.alloc = counted.allocator();
+    var frame: [Net.RX_BUFFER_SIZE + 1]u8 = @splat(0x5A);
+    net.queueRxFrame(&frame);
+
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(frame.len, counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 1), net.rx_count);
+    try testing.expectEqualSlices(u8, &frame, net.queuedFrame(net.rx_head));
 }
 
 var test_tx_memory: [1514]u8 = @splat(0xA5);
