@@ -121,6 +121,7 @@ const TcpSendBuffer = struct {
     storage: []u8 = &.{},
     head: usize = 0,
     len: usize = 0,
+    pool_index: ?u16 = null,
 
     fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!TcpSendBuffer {
         const storage = try alloc.alloc(u8, SND_BUF_MAX);
@@ -132,8 +133,15 @@ const TcpSendBuffer = struct {
     fn deinit(self: *TcpSendBuffer, alloc: std.mem.Allocator) void {
         assert(self.head < self.storage.len or self.storage.len == 0);
         assert(self.len <= self.storage.len);
+        assert(self.pool_index == null);
         if (self.storage.len > 0) alloc.free(self.storage);
         self.* = .{};
+    }
+
+    fn initPooled(storage: []u8, pool_index: u16) TcpSendBuffer {
+        assert(storage.len == SND_BUF_MAX);
+        assert(pool_index < MiniNat.TCP_FLOW_MAX);
+        return .{ .storage = storage, .pool_index = pool_index };
     }
 
     fn append(self: *TcpSendBuffer, data: []const u8) bool {
@@ -235,6 +243,10 @@ pub const MiniNat = struct {
     /// Host→guest port-forward listeners. Populated by addForward()
     /// BEFORE start(); immutable afterwards (pollLoop reads unlocked).
     listeners: std.ArrayListUnmanaged(Listener) = .empty,
+    /// One startup allocation divided into fixed per-flow retransmit buffers.
+    tcp_send_pool: []u8 = &.{},
+    tcp_send_free: [TCP_FLOW_MAX]u16 = undefined,
+    tcp_send_free_count: u16 = 0,
     /// Ephemeral "remote" port allocator for inbound flows (the guest
     /// sees forwarded connections as coming from GATEWAY_IP:ephemeral).
     next_inbound_port: u16 = 49152,
@@ -257,6 +269,58 @@ pub const MiniNat = struct {
             .tcp_flows = std.AutoHashMap(TcpKey, TcpFlow).init(alloc),
             .icmp_flows = std.AutoHashMap(IcmpKey, IcmpFlow).init(alloc),
         };
+    }
+
+    fn initTcpSendPool(self: *MiniNat) std.mem.Allocator.Error!void {
+        assert(self.tcp_send_pool.len == 0);
+        assert(self.tcp_send_free_count == 0);
+        self.tcp_send_pool = try self.alloc.alloc(u8, TCP_FLOW_MAX * SND_BUF_MAX);
+        errdefer self.tcp_send_pool = &.{};
+        for (&self.tcp_send_free, 0..) |*slot, index| slot.* = @intCast(index);
+        self.tcp_send_free_count = TCP_FLOW_MAX;
+    }
+
+    fn deinitTcpSendPool(self: *MiniNat) void {
+        assert(self.tcp_send_free_count <= TCP_FLOW_MAX);
+        assert(self.tcp_send_pool.len == 0 or
+            self.tcp_send_pool.len == TCP_FLOW_MAX * SND_BUF_MAX);
+        if (self.tcp_send_pool.len > 0) {
+            assert(self.tcp_send_free_count == TCP_FLOW_MAX);
+            self.alloc.free(self.tcp_send_pool);
+        }
+        self.tcp_send_pool = &.{};
+        self.tcp_send_free_count = 0;
+    }
+
+    fn createTcpSendBuffer(self: *MiniNat) std.mem.Allocator.Error!TcpSendBuffer {
+        assert(self.tcp_send_free_count <= TCP_FLOW_MAX);
+        assert(self.tcp_send_pool.len == 0 or
+            self.tcp_send_pool.len == TCP_FLOW_MAX * SND_BUF_MAX);
+        if (self.tcp_send_pool.len == 0) return TcpSendBuffer.init(self.alloc);
+        if (self.tcp_send_free_count == 0) return error.OutOfMemory;
+        self.tcp_send_free_count -= 1;
+        const index = self.tcp_send_free[self.tcp_send_free_count];
+        const offset = @as(usize, index) * SND_BUF_MAX;
+        return TcpSendBuffer.initPooled(
+            self.tcp_send_pool[offset..][0..SND_BUF_MAX],
+            index,
+        );
+    }
+
+    fn releaseTcpSendBuffer(self: *MiniNat, buffer: *TcpSendBuffer) void {
+        assert(self.tcp_send_free_count <= TCP_FLOW_MAX);
+        assert(buffer.storage.len == SND_BUF_MAX);
+        if (buffer.pool_index) |index| {
+            assert(index < TCP_FLOW_MAX);
+            const offset = @as(usize, index) * SND_BUF_MAX;
+            assert(buffer.storage.ptr == self.tcp_send_pool[offset..].ptr);
+            assert(self.tcp_send_free_count < TCP_FLOW_MAX);
+            self.tcp_send_free[self.tcp_send_free_count] = index;
+            self.tcp_send_free_count += 1;
+            buffer.* = .{};
+            return;
+        }
+        buffer.deinit(self.alloc);
     }
 
     /// Set the RX back-pressure predicate (see rx_ready).
@@ -292,7 +356,10 @@ pub const MiniNat = struct {
 
     /// Start the reply-poll thread (forwards socket replies to the guest).
     pub fn start(self: *MiniNat) !void {
+        try self.initTcpSendPool();
+        errdefer self.deinitTcpSendPool();
         self.running.store(true, .release);
+        errdefer self.running.store(false, .release);
         self.poll_thread = try std.Thread.spawn(.{ .stack_size = stack_size_bytes }, pollLoop, .{self});
     }
 
@@ -308,7 +375,7 @@ pub const MiniNat = struct {
         var titer = self.tcp_flows.valueIterator();
         while (titer.next()) |flow| {
             net_compat.socketClose(flow.socket);
-            flow.deinit(self.alloc);
+            self.releaseTcpSendBuffer(&flow.snd_buf);
         }
         self.tcp_flows.deinit();
         var iiter = self.icmp_flows.valueIterator();
@@ -316,6 +383,7 @@ pub const MiniNat = struct {
         self.icmp_flows.deinit();
         for (self.listeners.items) |l| net_compat.socketClose(l.socket);
         self.listeners.deinit(self.alloc);
+        self.deinitTcpSendPool();
     }
 
     /// Handle one guest → host Ethernet frame.
@@ -701,7 +769,7 @@ pub const MiniNat = struct {
             if (self.tcp_flows.fetchRemove(key)) |entry| {
                 var v = entry.value;
                 net_compat.socketClose(v.socket);
-                v.deinit(self.alloc);
+                self.releaseTcpSendBuffer(&v.snd_buf);
             }
         }
         return work;
@@ -731,12 +799,12 @@ pub const MiniNat = struct {
                     .rcv_nxt = 0, // learned from the guest's SYN-ACK
                     .last_used = nowSeconds(),
                 };
-                flow.snd_buf = TcpSendBuffer.init(self.alloc) catch {
+                flow.snd_buf = self.createTcpSendBuffer() catch {
                     net_compat.socketClose(sock);
                     break;
                 };
                 self.tcp_flows.put(key, flow) catch {
-                    flow.deinit(self.alloc);
+                    self.releaseTcpSendBuffer(&flow.snd_buf);
                     net_compat.socketClose(sock);
                     break;
                 };
@@ -907,7 +975,7 @@ pub const MiniNat = struct {
             net_compat.socketClose(flow.socket);
             if (self.tcp_flows.fetchRemove(key)) |entry| {
                 var v = entry.value;
-                v.deinit(self.alloc);
+                self.releaseTcpSendBuffer(&v.snd_buf);
             }
             return;
         }
@@ -1033,12 +1101,12 @@ pub const MiniNat = struct {
             .rcv_nxt = guest_seq +% 1, // SYN consumes a sequence number
             .last_used = nowSeconds(),
         };
-        flow.snd_buf = TcpSendBuffer.init(self.alloc) catch {
+        flow.snd_buf = self.createTcpSendBuffer() catch {
             net_compat.socketClose(sock);
             return;
         };
         self.tcp_flows.put(key, flow) catch {
-            flow.deinit(self.alloc);
+            self.releaseTcpSendBuffer(&flow.snd_buf);
             net_compat.socketClose(sock);
             return;
         };
@@ -1698,4 +1766,48 @@ test "TcpSendBuffer preserves retransmit order across wrap" {
     try testing.expectEqual(@as(usize, MiniNat.TCP_MSS), prefix.len);
     try testing.expectEqualSlices(u8, initial[65_000..], prefix[0..535]);
     try testing.expectEqualSlices(u8, appended[0..865], prefix[535..]);
+}
+
+test "TcpSendBuffer allocation profile" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var buffer = try TcpSendBuffer.init(counted.allocator());
+    defer buffer.deinit(counted.allocator());
+
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(SND_BUF_MAX, counted.allocated_bytes);
+}
+
+test "MiniNat TCP send slab checks out and recycles without allocation" {
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    var nat = MiniNat.init(counted.allocator(), testReply, null);
+    defer {
+        nat.deinitTcpSendPool();
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+    }
+    try nat.initTcpSendPool();
+
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(MiniNat.TCP_FLOW_MAX * SND_BUF_MAX, counted.allocated_bytes);
+    var first = try nat.createTcpSendBuffer();
+    var second = try nat.createTcpSendBuffer();
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expect(first.pool_index != second.pool_index);
+
+    const recycled_index = first.pool_index.?;
+    nat.releaseTcpSendBuffer(&first);
+    var recycled = try nat.createTcpSendBuffer();
+    try testing.expectEqual(recycled_index, recycled.pool_index.?);
+    nat.releaseTcpSendBuffer(&recycled);
+    nat.releaseTcpSendBuffer(&second);
+    try testing.expectEqual(@as(u16, MiniNat.TCP_FLOW_MAX), nat.tcp_send_free_count);
+
+    var all: [MiniNat.TCP_FLOW_MAX]TcpSendBuffer = undefined;
+    for (&all) |*buffer| buffer.* = try nat.createTcpSendBuffer();
+    try testing.expectEqual(@as(u16, 0), nat.tcp_send_free_count);
+    try testing.expectError(error.OutOfMemory, nat.createTcpSendBuffer());
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    for (&all) |*buffer| nat.releaseTcpSendBuffer(buffer);
+    try testing.expectEqual(@as(u16, MiniNat.TCP_FLOW_MAX), nat.tcp_send_free_count);
 }
