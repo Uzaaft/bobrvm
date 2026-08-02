@@ -939,15 +939,19 @@ pub const Renderer = struct {
             return self.fan_indices;
         }
         const tris: u32 = vertex_count - 2;
-        const idx = self.alloc.alloc(u32, @as(usize, tris) * 3) catch return null;
-        defer self.alloc.free(idx);
+        const index_count: usize = @as(usize, tris) * 3;
+        const buf = self.device.newBufferWithLength(index_count * @sizeOf(u32)) orelse return null;
+        const bytes = buf.contents() orelse {
+            buf.release();
+            return null;
+        };
+        const idx: [*]u32 = @ptrCast(@alignCast(bytes));
         var t: u32 = 0;
         while (t < tris) : (t += 1) {
             idx[t * 3 + 0] = 0;
             idx[t * 3 + 1] = t + 1;
             idx[t * 3 + 2] = t + 2;
         }
-        const buf = self.device.newBufferWithBytes(std.mem.sliceAsBytes(idx)) orelse return null;
         if (self.fan_indices) |old_buf| old_buf.release();
         self.fan_indices = buf;
         self.fan_index_capacity = vertex_count;
@@ -1022,6 +1026,27 @@ pub const Renderer = struct {
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "fan index growth does not allocate CPU staging memory" {
+    const alloc = std.testing.allocator;
+    var r = Renderer.init(alloc) catch |err| {
+        if (err == Error.NoMetalDevice) return error.SkipZigTest;
+        return err;
+    };
+    defer r.deinit();
+
+    var counted = std.testing.FailingAllocator.init(alloc, .{});
+    r.alloc = counted.allocator();
+    const fan_indices = r.ensureFanIndices(6);
+    r.alloc = alloc;
+
+    try std.testing.expect(fan_indices != null);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    const bytes = fan_indices.?.contents() orelse return error.SkipZigTest;
+    const actual: [*]const u32 = @ptrCast(@alignCast(bytes));
+    const expected = [_]u32{ 0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5 };
+    try std.testing.expectEqualSlices(u32, &expected, actual[0..expected.len]);
+}
 
 test "clear render target produces exact pixels" {
     const alloc = std.testing.allocator;
