@@ -4,6 +4,7 @@
 //! to the appropriate handlers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
 const proto = @import("protocol.zig");
@@ -88,6 +89,8 @@ pub const Decoder = struct {
     bytes: []const u8,
     /// Length in whole u32 words.
     word_len: usize,
+    /// Direct word view for the common aligned, little-endian command buffer.
+    aligned_words: ?[]const u32,
     /// Current position, in words.
     pos: usize,
     /// Inline scratch for the common (small) payload. Kept modest because a
@@ -95,15 +98,27 @@ pub const Decoder = struct {
     scratch: [4096]u32 = undefined,
 
     pub fn init(data: []const u8) Decoder {
+        comptime assert(builtin.cpu.arch.endian() == .little);
+        const word_len = data.len / @sizeOf(u32);
+        const word_bytes = data[0 .. word_len * @sizeOf(u32)];
+        const aligned_words: ?[]const u32 = if (std.mem.isAligned(
+            @intFromPtr(word_bytes.ptr),
+            @alignOf(u32),
+        )) blk: {
+            const aligned: []align(@alignOf(u32)) const u8 = @alignCast(word_bytes);
+            break :blk std.mem.bytesAsSlice(u32, aligned);
+        } else null;
         return .{
             .bytes = data,
-            .word_len = data.len / @sizeOf(u32),
+            .word_len = word_len,
+            .aligned_words = aligned_words,
             .pos = 0,
         };
     }
 
     /// Read word `i` with no alignment requirement.
     fn wordAt(self: *const Decoder, i: usize) u32 {
+        if (self.aligned_words) |words| return words[i];
         return std.mem.readInt(u32, self.bytes[i * 4 ..][0..4], .little);
     }
 
@@ -140,6 +155,11 @@ pub const Decoder = struct {
     pub fn payload(self: *Decoder, length: u16) DecodeError![]const u32 {
         if (self.pos + length > self.word_len) {
             return DecodeError.UnexpectedEnd;
+        }
+        if (self.aligned_words) |words| {
+            const result = words[self.pos..][0..length];
+            self.pos += length;
+            return result;
         }
         const dst: []u32 = if (length <= self.scratch.len)
             self.scratch[0..length]
@@ -361,7 +381,7 @@ test "Decoder clear command" {
 
 test "Decoder tolerates an unaligned guest buffer" {
     // A guest command buffer at an odd offset must not trip @alignCast.
-    var raw: [12]u8 = undefined;
+    var raw: [12]u8 align(@alignOf(u32)) = undefined;
     // header word at offset 1: opcode=nop(0), len=1
     const hdr = (proto.CommandHeader{ .opcode = .nop, .object_type = .null, .length = 1 }).encode();
     std.mem.writeInt(u32, raw[1..5], hdr, .little);
@@ -396,13 +416,24 @@ test "Decoder skip is bounded and readU32 stops at end" {
 }
 
 test "Decoder payload copies words without alignment assumptions" {
-    var raw: [13]u8 = undefined;
+    var raw: [13]u8 align(@alignOf(u32)) = undefined;
     std.mem.writeInt(u32, raw[1..5], 0x11111111, .little);
     std.mem.writeInt(u32, raw[5..9], 0x22222222, .little);
     std.mem.writeInt(u32, raw[9..13], 0x33333333, .little);
 
     var dec = Decoder.init(raw[1..13]); // misaligned, 3 words
     const p = try dec.payload(3);
+    try std.testing.expect(@intFromPtr(p.ptr) != @intFromPtr(&raw[1]));
     try std.testing.expectEqual(@as(u32, 0x11111111), p[0]);
     try std.testing.expectEqual(@as(u32, 0x33333333), p[2]);
+}
+
+test "Decoder aligned payload staging profile" {
+    const words = [_]u32{ 0x11111111, 0x22222222, 0x33333333 };
+    const bytes = std.mem.sliceAsBytes(&words);
+    var dec = Decoder.init(bytes);
+    const payload = try dec.payload(words.len);
+
+    try std.testing.expectEqual(@intFromPtr(bytes.ptr), @intFromPtr(payload.ptr));
+    try std.testing.expectEqualSlices(u32, &words, payload);
 }
