@@ -351,14 +351,14 @@ pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
 pub fn serializeRng(alloc: Allocator, rng: *const virtio.Rng) ![]u8 {
     var out = Out{ .alloc = alloc };
     errdefer out.buf.deinit(alloc);
-    try serializeTransport(&out, rng.transport);
+    try serializeTransport(&out, &rng.transport);
     try out.int(u16, rng.last_avail);
     return out.buf.toOwnedSlice(alloc);
 }
 
 pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
-    try deserializeTransport(&cur, rng.transport);
+    try deserializeTransport(&cur, &rng.transport);
     rng.last_avail = try cur.int(u16);
 }
 

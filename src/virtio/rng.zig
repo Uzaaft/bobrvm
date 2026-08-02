@@ -35,7 +35,8 @@ const log = std.log.scoped(.virtio_rng);
 
 pub const Rng = struct {
     alloc: Allocator,
-    transport: *mmio.Transport,
+    transport: mmio.Transport,
+    transport_queues: [1]mmio.QueueConfig,
     last_avail: u16,
 
     /// Guest memory accessor.
@@ -46,25 +47,24 @@ pub const Rng = struct {
     pub fn init(alloc: Allocator) Error!*Rng {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
-        const transport = try mmio.Transport.init(alloc, 4, virtio_version_1, 1); // 4 = entropy
-        errdefer transport.deinit(alloc);
-
         const rng = try alloc.create(Rng);
+        errdefer alloc.destroy(rng);
         rng.* = .{
             .alloc = alloc,
-            .transport = transport,
+            .transport = undefined,
+            .transport_queues = undefined,
             .last_avail = 0,
             .guest_memory = null,
         };
 
-        transport.setNotifyCallback(handleNotify, rng);
+        rng.transport.initEmbedded(4, virtio_version_1, &rng.transport_queues);
+        rng.transport.setNotifyCallback(handleNotify, rng);
 
         assert(rng.transport.device_id == 4);
         return rng;
     }
 
     pub fn deinit(self: *Rng) void {
-        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
