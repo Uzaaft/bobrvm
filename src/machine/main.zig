@@ -301,7 +301,7 @@ pub const Machine = struct {
     vdagent: ?agent.Vdagent = null,
 
     /// UART device (PL011 for earlycon).
-    uart: ?*virtio.Uart = null,
+    uart: virtio.Uart = .{},
 
     /// GIC (interrupt controller).
     gic_device: ?*gic.Gic = null,
@@ -443,11 +443,6 @@ pub const Machine = struct {
             self.vdagent = null;
         }
 
-        if (self.uart) |uart| {
-            self.alloc.destroy(uart);
-            self.uart = null;
-        }
-
         if (self.icc_handler) |handler| {
             handler.deinit(self.alloc);
             self.icc_handler = null;
@@ -497,7 +492,7 @@ pub const Machine = struct {
     /// are drained on the vCPU thread.
     pub fn injectConsoleInput(self: *Machine, data: []const u8) void {
         self.machine_lock.lockUncancelable(global.io());
-        if (self.uart) |uart| uart.queueInput(data);
+        self.uart.queueInput(data);
         self.machine_lock.unlock(global.io());
         if (self.console) |console| console.queueInput(data) catch {};
         self.kickCpu(0);
@@ -1447,16 +1442,14 @@ pub const Machine = struct {
 
         // UART (PL011)
         if (addr >= MemoryLayout.UART_BASE and addr < MemoryLayout.UART_BASE + MemoryLayout.UART_SIZE) {
-            if (self.uart) |uart| {
-                const offset: u12 = @truncate(addr - MemoryLayout.UART_BASE);
-                if (is_write) {
-                    const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                    uart.write(offset, @truncate(value));
-                } else {
-                    const value = uart.read(offset);
-                    if (srt != 31) {
-                        try vcpu.setReg(@enumFromInt(srt), value);
-                    }
+            const offset: u12 = @truncate(addr - MemoryLayout.UART_BASE);
+            if (is_write) {
+                const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                self.uart.write(offset, @truncate(value));
+            } else {
+                const value = self.uart.read(offset);
+                if (srt != 31) {
+                    try vcpu.setReg(@enumFromInt(srt), value);
                 }
             }
             try vcpu.advancePC(info);
@@ -1990,12 +1983,11 @@ pub const Machine = struct {
 
     fn initVirtioDevices(self: *Machine) !void {
         // Initialize UART (PL011 for earlycon)
-        self.uart = try self.alloc.create(virtio.Uart);
-        self.uart.?.* = virtio.Uart.init();
+        self.uart = virtio.Uart.init();
         if (self.console_output) |cb| {
-            self.uart.?.setOutputCallback(cb, self.console_userdata);
+            self.uart.setOutputCallback(cb, self.console_userdata);
         }
-        self.uart.?.setIrqCallback(uartIrqCallback, self);
+        self.uart.setIrqCallback(uartIrqCallback, self);
         log.debug("initialized UART at 0x{x}", .{MemoryLayout.UART_BASE});
 
         // Initialize console (slot 0). The extra multiport ports are the
@@ -2267,15 +2259,13 @@ pub const Machine = struct {
         }
 
         // Register UART MMIO handler (PL011)
-        if (self.uart) |uart| {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(uart),
-                .base = MemoryLayout.UART_BASE,
-                .size = MemoryLayout.UART_SIZE,
-                .read = virtio.uart.mmioRead,
-                .write = virtio.uart.mmioWrite,
-            });
-        }
+        try runner.registerMmioHandler(.{
+            .context = @ptrCast(&self.uart),
+            .base = MemoryLayout.UART_BASE,
+            .size = MemoryLayout.UART_SIZE,
+            .read = virtio.uart.mmioRead,
+            .write = virtio.uart.mmioWrite,
+        });
 
         // Register console MMIO handler (slot 0)
         if (self.console) |console| {
