@@ -31,6 +31,7 @@ const block_section_scratch_bytes = 128;
 const gic_section_scratch_bytes = 2 * 1024;
 const input_section_scratch_bytes = 128;
 const net_section_scratch_bytes = 128;
+const p9_section_scratch_bytes = 256;
 const rng_section_scratch_bytes = 128;
 
 // =============================================================================
@@ -561,6 +562,20 @@ pub fn serializeP9(alloc: Allocator, dev: *const virtio.P9) ![]u8 {
     return result;
 }
 
+pub fn appendP9Section(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    dev: *const virtio.P9,
+) !void {
+    assert(dev.server.fids.count() <= std.math.maxInt(u32));
+    assert(dev.transport.queues.len <= mmio.Transport.MAX_QUEUES);
+    var stack_allocator = std.heap.stackFallback(p9_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeP9(scratch_alloc, dev);
+    defer scratch_alloc.free(data);
+    try builder.section("p9", data);
+}
+
 pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, dev.transport);
@@ -962,6 +977,27 @@ test "snapshot: P9 device roundtrip with fids" {
     try testing.expectEqual(@as(usize, 2), dev2.server.fids.count());
     try testing.expectEqualStrings("src", dev2.server.fids.get(3).?.rel);
     try testing.expectEqualStrings("src/machine", dev2.server.fids.get(9).?.rel);
+}
+
+test "snapshot: P9 section assembly allocation profile" {
+    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    defer dev.deinit();
+    try dev.server.restoreFid(testing.allocator, 3, "src", null);
+    try dev.server.restoreFid(testing.allocator, 9, "src/machine", null);
+
+    var counted = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counted.allocator();
+    var builder = try Builder.init(alloc);
+    defer builder.deinit();
+    try appendP9Section(&builder, alloc, dev);
+    const bytes = try builder.finish();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(usize, 1), counted.allocations);
+    try testing.expectEqual(@as(usize, 140), counted.allocated_bytes);
+    try testing.expectEqual(@as(usize, 1), counted.resize_index);
+    try testing.expectEqual(@as(usize, 113), reader.section("p9").?.len);
 }
 
 test "snapshot: gpu 2D framebuffer survives roundtrip" {

@@ -877,9 +877,7 @@ pub const Machine = struct {
             try snapshot.appendInputSection(&builder, alloc, "mouse", mouse);
         }
         if (self.p9) |p9_dev| {
-            const data = try snapshot.serializeP9(alloc, p9_dev);
-            defer alloc.free(data);
-            try builder.section("p9", data);
+            try snapshot.appendP9Section(&builder, alloc, p9_dev);
         }
         if (self.gpu) |gpu_dev| {
             const data = try snapshot.serializeGpu(alloc, gpu_dev);
