@@ -29,7 +29,8 @@ pub const BALLOON_PAGE_SIZE: usize = 1 << PFN_SHIFT;
 
 pub const Balloon = struct {
     alloc: Allocator,
-    transport: *mmio.Transport,
+    transport: mmio.Transport,
+    transport_queues: [2]mmio.QueueConfig,
     /// Per-queue avail cursor: [inflateq, deflateq].
     last_avail: [2]u16,
     config: Config,
@@ -52,26 +53,25 @@ pub const Balloon = struct {
         // VIRTIO_F_VERSION_1 (bit 32) only; no MUST_TELL_HOST / DEFLATE_ON_OOM
         // / STATS_VQ, so exactly two queues.
         const virtio_version_1: u64 = 1 << 32;
-        const transport = try mmio.Transport.init(alloc, 5, virtio_version_1, 2); // 5 = balloon
-        errdefer transport.deinit(alloc);
-
         const balloon = try alloc.create(Balloon);
+        errdefer alloc.destroy(balloon);
         balloon.* = .{
             .alloc = alloc,
-            .transport = transport,
+            .transport = undefined,
+            .transport_queues = undefined,
             .last_avail = .{ 0, 0 },
             .config = .{},
             .guest_memory = null,
         };
 
-        transport.setNotifyCallback(handleNotify, balloon);
+        balloon.transport.initEmbedded(5, virtio_version_1, &balloon.transport_queues);
+        balloon.transport.setNotifyCallback(handleNotify, balloon);
 
         assert(balloon.transport.device_id == 5);
         return balloon;
     }
 
     pub fn deinit(self: *Balloon) void {
-        self.transport.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
