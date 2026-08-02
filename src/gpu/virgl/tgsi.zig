@@ -105,6 +105,7 @@ pub const Program = struct {
 };
 
 pub const MAX_IMM = 64;
+const emit_scratch_bytes = 4 * 1024;
 
 fn parseFile(s: []const u8) RegFile {
     if (std.mem.eql(u8, s, "IN")) return .in;
@@ -796,17 +797,21 @@ fn emitLocals(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Pro
 /// Translate a parsed program to MSL. Only the MOV subset is emitted;
 /// unsupported opcodes become comments so the shader still compiles.
 pub fn emit(alloc: Allocator, prog: *const Program) Error!Msl {
+    std.debug.assert(prog.n_instr <= MAX_INSTRS);
+    std.debug.assert(prog.n_in <= MAX_DECLS and prog.n_out <= MAX_DECLS);
+    var stack_allocator = std.heap.stackFallback(emit_scratch_bytes, alloc);
+    const temp_alloc = stack_allocator.get();
     var w: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer w.deinit(alloc);
+    defer w.deinit(temp_alloc);
 
-    try app(&w, alloc, "#include <metal_stdlib>\nusing namespace metal;\n", .{});
+    try app(&w, temp_alloc, "#include <metal_stdlib>\nusing namespace metal;\n", .{});
 
     if (prog.stage == .vertex) {
-        try emitVertex(&w, alloc, prog);
-        return .{ .source = try w.toOwnedSlice(alloc), .entry = "vs_main", .stage = .vertex };
+        try emitVertex(&w, temp_alloc, prog);
+        return .{ .source = try alloc.dupe(u8, w.items), .entry = "vs_main", .stage = .vertex };
     } else if (prog.stage == .fragment) {
-        try emitFragment(&w, alloc, prog);
-        return .{ .source = try w.toOwnedSlice(alloc), .entry = "fs_main", .stage = .fragment };
+        try emitFragment(&w, temp_alloc, prog);
+        return .{ .source = try alloc.dupe(u8, w.items), .entry = "fs_main", .stage = .fragment };
     }
     return Error.Malformed;
 }
@@ -1059,13 +1064,32 @@ test "emit MSL for passthrough vertex shader" {
     var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var msl = try emit(counted.allocator(), &prog);
     defer msl.deinit(counted.allocator());
-    try std.testing.expectEqual(@as(usize, 2), counted.allocations);
-    try std.testing.expectEqual(@as(usize, 639), counted.allocated_bytes);
-    try std.testing.expectEqual(@as(usize, 1), counted.resize_index);
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 307), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), counted.resize_index);
+    try std.testing.expectEqual(@as(usize, 307), msl.source.len);
 
     try std.testing.expectEqual(Stage.vertex, msl.stage);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "vertex VSOut vs_main") != null);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position.xyzw = (in.a0.xyzw).xyzw;") != null);
+}
+
+test "MSL emission spills beyond bounded stack scratch" {
+    const src =
+        \\VERT
+        \\DCL OUT[0], POSITION
+        \\DCL TEMP[255]
+        \\  0: MOV OUT[0], TEMP[255]
+        \\  1: END
+    ;
+    const prog = try parse(src);
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var msl = try emit(counted.allocator(), &prog);
+    defer msl.deinit(counted.allocator());
+
+    try std.testing.expect(msl.source.len > emit_scratch_bytes);
+    try std.testing.expect(counted.allocations > 1);
+    try std.testing.expect(std.mem.indexOf(u8, msl.source, "float4 t255") != null);
 }
 
 test "IMM UINT32 carrying a float bit pattern survives as that float" {
