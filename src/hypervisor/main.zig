@@ -24,6 +24,7 @@ pub const runner = @import("runner.zig");
 pub const VM = vm.VM;
 pub const Vcpu = vcpu.Vcpu;
 pub const MemoryFlags = vm.MemoryFlags;
+pub const FileOverlay = vm.FileOverlay;
 pub const VMRunner = runner.VMRunner;
 pub const VcpuRunner = runner.VcpuRunner;
 pub const MmioHandler = runner.MmioHandler;

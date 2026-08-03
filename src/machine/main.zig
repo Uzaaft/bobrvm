@@ -369,6 +369,7 @@ pub const Machine = struct {
             KernelTooLarge,
             InitrdTooLarge,
             FirmwareTooLarge,
+            EmptyBootImage,
             RestoreFailed,
             StartCancelled,
         };
@@ -689,11 +690,7 @@ pub const Machine = struct {
         }
 
         // Map guest RAM
-        self.ram = try vm.map(
-            MemoryLayout.RAM_BASE,
-            self.config.ram_size,
-            hypervisor.MEM_READ_WRITE_EXEC,
-        );
+        try self.mapGuestRam(vm);
         log.debug("mapped RAM: 0x{x} - 0x{x}", .{
             MemoryLayout.RAM_BASE,
             MemoryLayout.RAM_BASE + self.config.ram_size,
@@ -702,15 +699,6 @@ pub const Machine = struct {
         // Load kernel/initrd/DTB only when booting fresh — a restore
         // overwrites all of RAM from the suspend image anyway.
         if (self.config.restore_path == null) {
-            if (!self.config.isFirmwareBoot()) {
-                if (self.config.kernel_path) |kernel_path| {
-                    try self.loadKernel(kernel_path);
-                }
-                if (self.config.initrd_path) |initrd_path| {
-                    try self.loadInitrd(initrd_path);
-                }
-            }
-
             // Generate and load DTB
             try self.generateDtb();
         }
@@ -1177,6 +1165,12 @@ pub const Machine = struct {
         return self.startSyncPrepared();
     }
 
+    /// Perform every startup step through primary vCPU register setup, then return.
+    pub fn benchmarkStartupSync(self: *Machine) Error!void {
+        self.prepareStart();
+        return self.startSyncPreparedMode(.setup_only);
+    }
+
     pub fn prepareStart(self: *Machine) void {
         assert(!self.running.load(.acquire));
         assert(self.hv_vm == null);
@@ -1185,6 +1179,12 @@ pub const Machine = struct {
     }
 
     pub fn startSyncPrepared(self: *Machine) Error!void {
+        return self.startSyncPreparedMode(.run);
+    }
+
+    const SyncStartMode = enum { run, setup_only };
+
+    fn startSyncPreparedMode(self: *Machine, mode: SyncStartMode) Error!void {
         assert(!self.running.load(.acquire));
         assert(self.hv_vm == null);
         try self.checkStartupCancelled();
@@ -1209,11 +1209,7 @@ pub const Machine = struct {
         }
 
         // Map guest RAM
-        self.ram = try vm.map(
-            MemoryLayout.RAM_BASE,
-            self.config.ram_size,
-            hypervisor.MEM_READ_WRITE_EXEC,
-        );
+        try self.mapGuestRam(vm);
         try self.checkStartupCancelled();
         log.debug("mapped RAM: 0x{x} - 0x{x}", .{
             MemoryLayout.RAM_BASE,
@@ -1223,15 +1219,6 @@ pub const Machine = struct {
         // Load kernel/initrd/DTB only when booting fresh — a restore
         // overwrites all of RAM from the suspend image anyway.
         if (self.config.restore_path == null) {
-            if (!self.config.isFirmwareBoot()) {
-                if (self.config.kernel_path) |kernel_path| {
-                    try self.loadKernel(kernel_path);
-                }
-                if (self.config.initrd_path) |initrd_path| {
-                    try self.loadInitrd(initrd_path);
-                }
-            }
-
             // Generate and load DTB
             try self.generateDtb();
             try self.checkStartupCancelled();
@@ -1266,6 +1253,12 @@ pub const Machine = struct {
 
         self.running.store(true, .release);
         log.info("machine started, running vCPU loop", .{});
+
+        if (mode == .setup_only) {
+            self.running.store(false, .release);
+            current_machine = null;
+            return;
+        }
 
         // Run vCPU loop on this thread
         self.runVcpuLoop(vcpu, 0) catch |err| {
@@ -1820,62 +1813,80 @@ pub const Machine = struct {
     // Private Methods
     // =========================================================================
 
-    fn loadKernel(self: *Machine, path: []const u8) !void {
-        log.info("loading kernel: {s}", .{path});
+    fn mapGuestRam(self: *Machine, vm: *hypervisor.VM) !void {
+        var files: [2]std.Io.File = undefined;
+        var files_len: u8 = 0;
+        defer for (files[0..files_len]) |file| file.close(global.io());
 
-        const file = try std.Io.Dir.cwd().openFile(global.io(), path, .{});
-        defer file.close(global.io());
-
-        const stat = try file.stat(global.io());
-        const kernel_size = stat.size;
-
-        if (kernel_size > self.config.ram_size / 2) {
-            log.err("kernel too large: {} bytes", .{kernel_size});
-            return error.KernelTooLarge;
+        var overlays: [2]hypervisor.FileOverlay = undefined;
+        var overlays_len: u8 = 0;
+        if (self.config.restore_path == null and !self.config.isFirmwareBoot()) {
+            if (self.config.kernel_path) |path| {
+                overlays[overlays_len] = try self.openBootOverlay(
+                    path,
+                    MemoryLayout.KERNEL_BASE,
+                    .kernel,
+                    &files,
+                    &files_len,
+                );
+                overlays_len += 1;
+            }
+            if (self.config.initrd_path) |path| {
+                overlays[overlays_len] = try self.openBootOverlay(
+                    path,
+                    MemoryLayout.INITRD_BASE,
+                    .initrd,
+                    &files,
+                    &files_len,
+                );
+                overlays_len += 1;
+            }
         }
 
-        // Calculate offset into RAM
-        const ram_offset = MemoryLayout.KERNEL_BASE - MemoryLayout.RAM_BASE;
-        const ram = self.ram.?;
-
-        // Read kernel into RAM. Bounded to the file's own size (not the
-        // whole remaining RAM slice, which can be multiple GB) — some Io
-        // backends reject a single positional read that large with EINVAL.
-        const bytes_read = try file.readPositionalAll(global.io(), ram[ram_offset..][0..kernel_size], 0);
-        log.info("loaded kernel: {} bytes at 0x{x}", .{ bytes_read, MemoryLayout.KERNEL_BASE });
+        self.ram = try vm.mapWithFileOverlays(
+            MemoryLayout.RAM_BASE,
+            self.config.ram_size,
+            hypervisor.MEM_READ_WRITE_EXEC,
+            overlays[0..overlays_len],
+        );
     }
 
-    fn loadInitrd(self: *Machine, path: []const u8) !void {
-        log.info("loading initrd: {s}", .{path});
+    const BootOverlayKind = enum { kernel, initrd };
+
+    fn openBootOverlay(
+        self: *Machine,
+        path: []const u8,
+        guest_addr: u64,
+        kind: BootOverlayKind,
+        files: *[2]std.Io.File,
+        files_len: *u8,
+    ) !hypervisor.FileOverlay {
+        assert(files_len.* < files.len);
+        assert(guest_addr >= MemoryLayout.RAM_BASE);
 
         const file = try std.Io.Dir.cwd().openFile(global.io(), path, .{});
-        defer file.close(global.io());
-
-        const stat = try file.stat(global.io());
-        const initrd_size = stat.size;
-
-        // Calculate offset into RAM
-        const ram_offset = MemoryLayout.INITRD_BASE - MemoryLayout.RAM_BASE;
-        const ram = self.ram.?;
-
-        if (ram_offset + initrd_size > ram.len) {
-            log.err("initrd too large: {} bytes", .{initrd_size});
+        files[files_len.*] = file;
+        files_len.* += 1;
+        const size_u64 = (try file.stat(global.io())).size;
+        const offset_u64 = guest_addr - MemoryLayout.RAM_BASE;
+        if (size_u64 == 0) return error.EmptyBootImage;
+        if (kind == .kernel and size_u64 > self.config.ram_size / 2) {
+            return error.KernelTooLarge;
+        }
+        if (offset_u64 > self.config.ram_size or
+            size_u64 > self.config.ram_size - offset_u64)
+        {
             return error.InitrdTooLarge;
         }
+        const size: usize = @intCast(size_u64);
+        const offset: usize = @intCast(offset_u64);
 
-        // Read initrd into RAM. Bounded to the file's own size (see
-        // loadKernel for why we don't just pass the whole RAM slice).
-        const bytes_read = try file.readPositionalAll(global.io(), ram[ram_offset..][0..initrd_size], 0);
-
-        // Track initrd location for DTB
-        self.initrd_start = MemoryLayout.INITRD_BASE;
-        self.initrd_end = MemoryLayout.INITRD_BASE + bytes_read;
-
-        log.info("loaded initrd: {} bytes at 0x{x}-0x{x}", .{
-            bytes_read,
-            self.initrd_start,
-            self.initrd_end,
-        });
+        if (kind == .initrd) {
+            self.initrd_start = guest_addr;
+            self.initrd_end = guest_addr + size;
+        }
+        log.info("mapped {s}: {} bytes at 0x{x}", .{ @tagName(kind), size, guest_addr });
+        return .{ .fd = file.handle, .memory_offset = offset, .size = size };
     }
 
     fn mapPflashRegions(self: *Machine, vm: *hypervisor.VM) !void {

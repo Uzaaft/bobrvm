@@ -25,6 +25,12 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     global.state.init();
     defer global.state.deinit();
 
+    const allocation_benchmark = std.c.getenv("BOBRVM_BENCHMARK_ALLOCATIONS") != null;
+    const startup_benchmark = allocation_benchmark or
+        std.c.getenv("BOBRVM_BENCHMARK_STARTUP") != null;
+    var allocation_counter = AllocationCounter.init(alloc);
+    const machine_alloc = if (allocation_benchmark) allocation_counter.allocator() else alloc;
+
     // --restore <snapshot dir>: revert disks (clonefile the snapshot's
     // copies back over the originals) and point the machine at the
     // directory's state.img. A plain file path is used as-is.
@@ -81,7 +87,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     }
     if (config.kernel_path) |p| log.info("kernel: {s}", .{p});
 
-    const hw = machine.Machine.init(alloc, machine_config) catch |err| {
+    const hw = machine.Machine.init(machine_alloc, machine_config) catch |err| {
         log.err("failed to create machine: {}", .{err});
         return err;
     };
@@ -132,6 +138,18 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             const t = std.Thread.spawn(.{}, testTypeLoop, .{ hw, text, delay_s }) catch null;
             if (t) |thread| thread.detach();
         }
+    }
+
+    if (startup_benchmark) {
+        log.info("benchmarking VM startup through vCPU setup", .{});
+        try hw.benchmarkStartupSync();
+        if (allocation_benchmark) {
+            log.info("startup allocations: {} calls, {} bytes", .{
+                allocation_counter.allocations,
+                allocation_counter.allocated_bytes,
+            });
+        }
+        return;
     }
 
     // Debug: exercise the qemu-guest-agent channel after a delay
@@ -222,6 +240,66 @@ var saved_termios: ?std.posix.termios = null;
 var frame_dump_dir: ?[]const u8 = null;
 var frame_machine: ?*machine.Machine = null;
 var frame_count: u32 = 0;
+
+const AllocationCounter = struct {
+    backing: Allocator,
+    allocations: usize = 0,
+    allocated_bytes: usize = 0,
+
+    fn init(backing: Allocator) AllocationCounter {
+        return .{ .backing = backing };
+    }
+
+    fn allocator(self: *AllocationCounter) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *AllocationCounter = @ptrCast(@alignCast(ctx));
+        const memory = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.allocations += 1;
+        self.allocated_bytes += len;
+        return memory;
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) bool {
+        const self: *AllocationCounter = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(memory, alignment, new_len, ra)) return false;
+        if (new_len > memory.len) self.allocated_bytes += new_len - memory.len;
+        return true;
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) ?[*]u8 {
+        const self: *AllocationCounter = @ptrCast(@alignCast(ctx));
+        const result = self.backing.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        if (new_len > memory.len) self.allocated_bytes += new_len - memory.len;
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *AllocationCounter = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
 
 /// Inject 'a' key presses every second (BOBRVM_TEST_KEYS debug hook).
 fn testKeyLoop(hw: *machine.Machine) void {

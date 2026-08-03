@@ -31,8 +31,8 @@ pub const MEM_READ_WRITE = MemoryFlags{ .read = true, .write = true };
 pub const MEM_READ_EXEC = MemoryFlags{ .read = true, .exec = true };
 pub const MEM_READ_WRITE_EXEC = MemoryFlags{ .read = true, .write = true, .exec = true };
 
-/// Page size constant - use minimum page size for alignment.
-const PAGE_SIZE = 4096; // Standard page size on ARM64/x86_64
+const PAGE_SIZE = 4096;
+const MMAP_ALIGNMENT = std.heap.page_size_min;
 
 /// Memory region tracking.
 pub const MemoryRegion = struct {
@@ -44,6 +44,13 @@ pub const MemoryRegion = struct {
     /// False for mapExisting regions where the host memory is caller-owned
     /// (e.g. Venus blob memory owned by virglrenderer).
     owned: bool = true,
+};
+
+pub const FileOverlay = struct {
+    /// Open, read-only file mapped privately over an anonymous guest range.
+    fd: std.posix.fd_t,
+    memory_offset: usize,
+    size: usize,
 };
 
 /// Virtual Machine instance.
@@ -119,6 +126,16 @@ pub const VM = struct {
         size: usize,
         flags: MemoryFlags,
     ) Error![]align(PAGE_SIZE) u8 {
+        return self.mapWithFileOverlays(guest_addr, size, flags, &.{});
+    }
+
+    pub fn mapWithFileOverlays(
+        self: *VM,
+        guest_addr: u64,
+        size: usize,
+        flags: MemoryFlags,
+        overlays: []const FileOverlay,
+    ) Error![]align(PAGE_SIZE) u8 {
         // Pre-conditions
         assert(self.created);
         assert(size > 0);
@@ -136,6 +153,29 @@ pub const VM = struct {
             0,
         );
         errdefer std.posix.munmap(host_mem);
+
+        // MAP_PRIVATE makes immutable boot files directly guest-readable while
+        // preserving guest writes as copy-on-write pages. This removes the
+        // eager host copy without adding an allocator or changing RAM layout.
+        for (overlays) |overlay| {
+            assert(overlay.size > 0);
+            assert(overlay.memory_offset % std.heap.pageSize() == 0);
+            assert(overlay.memory_offset <= size);
+            assert(overlay.size <= size - overlay.memory_offset);
+
+            const target: [*]align(MMAP_ALIGNMENT) u8 = @ptrCast(@alignCast(
+                host_mem.ptr + overlay.memory_offset,
+            ));
+            const mapped = try std.posix.mmap(
+                target,
+                overlay.size,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .FIXED = true },
+                overlay.fd,
+                0,
+            );
+            assert(mapped.ptr == target);
+        }
 
         // Map into guest
         const ret = c.hv_vm_map(
