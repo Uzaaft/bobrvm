@@ -63,6 +63,8 @@ pub const DtbConfig = struct {
     virtio_size: u64 = 0x200,
     /// UART base address.
     uart_base: u64 = 0x0900_0000,
+    /// PL031 RTC base address.
+    rtc_base: u64 = 0x0901_0000,
     /// GIC distributor base.
     gic_dist_base: u64 = 0x0800_0000,
     /// GIC redistributor base.
@@ -248,6 +250,16 @@ pub const DtbBuilder = struct {
         try self.prop_u32("#clock-cells", 0);
         try self.prop_u32("clock-frequency", 24000000);
         try self.prop_u32("phandle", 0x8002);
+        try self.endNode();
+
+        // PL031 real-time clock
+        try self.beginNode("pl031@9010000");
+        try self.prop_string("compatible", "arm,pl031\x00arm,primecell");
+        try self.prop_reg64(config.rtc_base, 0x1000);
+        const rtc_irqs = [_]u32{ 0, 2, 4 };
+        try self.prop_u32_array("interrupts", &rtc_irqs);
+        try self.prop_u32_array("clocks", &[_]u32{0x8002});
+        try self.prop_string("clock-names", "apb_pclk");
         try self.endNode();
 
         // Virtio MMIO devices

@@ -28,6 +28,8 @@ pub const Net = @import("net.zig").Net;
 pub const gpu = @import("gpu.zig");
 pub const Uart = @import("uart.zig").Uart;
 pub const uart = @import("uart.zig");
+pub const Rtc = @import("rtc.zig").Rtc;
+pub const rtc = @import("rtc.zig");
 pub const Rng = @import("rng.zig").Rng;
 pub const rng = @import("rng.zig");
 pub const Balloon = @import("balloon.zig").Balloon;
@@ -96,6 +98,7 @@ test {
     _ = @import("net.zig");
     _ = @import("balloon.zig");
     _ = @import("snd.zig");
+    _ = @import("rtc.zig");
 }
 
 test "DeviceId values" {

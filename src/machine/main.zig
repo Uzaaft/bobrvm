@@ -304,6 +304,9 @@ pub const Machine = struct {
     /// UART device (PL011 for earlycon).
     uart: virtio.Uart = .{},
 
+    /// Wall clock (PL031 for UEFI and Linux).
+    rtc: virtio.Rtc = .{},
+
     /// GIC (interrupt controller).
     gic_device: ?*gic.Gic = null,
 
@@ -1494,6 +1497,22 @@ pub const Machine = struct {
             return;
         }
 
+        // RTC (PL031)
+        if (addr >= MemoryLayout.RTC_BASE and addr < MemoryLayout.RTC_BASE + MemoryLayout.RTC_SIZE) {
+            const offset: u12 = @truncate(addr - MemoryLayout.RTC_BASE);
+            if (is_write) {
+                const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                self.rtc.write(offset, @truncate(value));
+            } else {
+                const value = self.rtc.read(offset);
+                if (srt != 31) {
+                    try vcpu.setReg(@enumFromInt(srt), value);
+                }
+            }
+            try vcpu.advancePC(info);
+            return;
+        }
+
         // Virtio MMIO devices (console/blk/gpu, slot-addressed)
         const virtio_end = MemoryLayout.VIRTIO_BASE + MemoryLayout.VIRTIO_SIZE * VIRTIO_SLOT_COUNT;
         if (addr >= MemoryLayout.VIRTIO_BASE and addr < virtio_end) {
@@ -1986,6 +2005,7 @@ pub const Machine = struct {
             .virtio_base = MemoryLayout.VIRTIO_BASE,
             .virtio_size = MemoryLayout.VIRTIO_SIZE,
             .uart_base = MemoryLayout.UART_BASE,
+            .rtc_base = MemoryLayout.RTC_BASE,
             .gic_dist_base = MemoryLayout.GIC_DIST_BASE,
             .gic_redist_base = MemoryLayout.GIC_REDIST_BASE,
             .pcie_enabled = self.config.isFirmwareBoot(),
@@ -2035,6 +2055,9 @@ pub const Machine = struct {
         }
         self.uart.setIrqCallback(uartIrqCallback, self);
         log.debug("initialized UART at 0x{x}", .{MemoryLayout.UART_BASE});
+
+        self.rtc = virtio.Rtc.init();
+        log.debug("initialized RTC at 0x{x}", .{MemoryLayout.RTC_BASE});
 
         // Initialize console (slot 0). The extra multiport ports are the
         // guest-agent substrate: stock spice-vdagent and qemu-guest-agent
@@ -2515,8 +2538,8 @@ pub const Machine = struct {
 
     fn registerMmioHandlers(self: *Machine) !void {
         var runner = &self.runner.?;
-        // Two GIC regions, UART, three virtio slots, ECAM, and the PCI BAR.
-        try runner.reserveMmioHandlers(8);
+        // Two GIC regions, UART, RTC, three virtio slots, ECAM, and the PCI BAR.
+        try runner.reserveMmioHandlers(9);
 
         // Register GIC Distributor MMIO handler
         if (self.gic_device) |gic_dev| {
@@ -2547,6 +2570,15 @@ pub const Machine = struct {
             .size = MemoryLayout.UART_SIZE,
             .read = virtio.uart.mmioRead,
             .write = virtio.uart.mmioWrite,
+        });
+
+        // Register RTC MMIO handler (PL031)
+        try runner.registerMmioHandler(.{
+            .context = @ptrCast(&self.rtc),
+            .base = MemoryLayout.RTC_BASE,
+            .size = MemoryLayout.RTC_SIZE,
+            .read = virtio.rtc.mmioRead,
+            .write = virtio.rtc.mmioWrite,
         });
 
         // Register console MMIO handler (slot 0)
