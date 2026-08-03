@@ -22,7 +22,10 @@ fn copyFromBacking(offset: u64, dst: []u8) void {
     var skip = offset;
     for (entries) |e| {
         if (remaining.len == 0) break;
-        if (skip >= e.length) { skip -= e.length; continue; }
+        if (skip >= e.length) {
+            skip -= e.length;
+            continue;
+        }
         const avail = e.length - @as(u32, @intCast(skip));
         const n: usize = @min(remaining.len, avail);
         @memcpy(remaining[0..n], guest[@intCast(e.addr + skip)..][0..n]);
@@ -56,11 +59,17 @@ pub fn main() !void {
     const iters = 300;
 
     timer.reset();
-    for (0..iters) |_| { rowByRow(); sink +%= host[total - 1]; }
+    for (0..iters) |_| {
+        rowByRow();
+        sink +%= host[total - 1];
+    }
     const t_row = timer.read();
 
     timer.reset();
-    for (0..iters) |_| { fastPath(); sink +%= host[total - 1]; }
+    for (0..iters) |_| {
+        fastPath();
+        sink +%= host[total - 1];
+    }
     const t_fast = timer.read();
 
     std.debug.print("1920x1080 XRGB, {} 4KB entries, {} iters (sink={}):\n", .{ n_pages, iters, sink });
