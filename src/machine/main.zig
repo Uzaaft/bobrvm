@@ -2228,39 +2228,30 @@ pub const Machine = struct {
     fn initPciBlock(self: *Machine, blk: *virtio.Block) !void {
         assert(self.ecam_host != null);
         assert(self.pci_block == null);
-
-        const blk_features = virtio.blk.Features.SIZE_MAX |
-            virtio.blk.Features.SEG_MAX |
-            virtio.blk.Features.BLK_SIZE |
-            virtio.blk.Features.FLUSH;
-        self.pci_block = try pci.VirtioPciDevice.init(
-            self.alloc,
-            2,
-            0x0002,
-            blk_features,
-            1,
-            @sizeOf(virtio.blk.Config),
-        );
-        const bar0_addr: u32 = @truncate(MemoryLayout.PCI_MMIO_BASE);
-        self.pci_block.?.bar0_addr = bar0_addr;
-        self.pci_block.?.transport.setDeviceConfig(std.mem.asBytes(&blk.config));
-        self.pci_block.?.transport.setNotifyCallback(pciBlockNotify, self);
-        blk.transport.setIrqCallback(pciBlockBackendIrq, self);
-
-        const ecam_dev = pci.PciDevice{ .config = self.pci_block.?.config, .present = true };
-        try self.ecam_host.?.addDevice(0, 0, ecam_dev);
-        log.info("initialized virtio-pci-blk at PCI 00:00.0, BAR0=0x{x}", .{bar0_addr});
+        self.pci_block = try self.createPciBlock(blk, 0, pciBlockNotify, pciBlockBackendIrq);
     }
 
     fn initPciBlock2(self: *Machine, blk: *virtio.Block) !void {
         assert(self.ecam_host != null);
         assert(self.pci_block2 == null);
 
+        self.pci_block2 = try self.createPciBlock(blk, 1, pciBlock2Notify, pciBlock2BackendIrq);
+    }
+
+    fn createPciBlock(
+        self: *Machine,
+        blk: *virtio.Block,
+        slot: u5,
+        notify: *const fn (u32, ?*anyopaque) void,
+        irq: *const fn (bool, ?*anyopaque) void,
+    ) !*pci.VirtioPciDevice {
+        assert(self.ecam_host != null);
+        assert(slot < 2);
         const blk_features = virtio.blk.Features.SIZE_MAX |
             virtio.blk.Features.SEG_MAX |
             virtio.blk.Features.BLK_SIZE |
             virtio.blk.Features.FLUSH;
-        self.pci_block2 = try pci.VirtioPciDevice.init(
+        const device = try pci.VirtioPciDevice.init(
             self.alloc,
             2,
             0x0002,
@@ -2268,17 +2259,19 @@ pub const Machine = struct {
             1,
             @sizeOf(virtio.blk.Config),
         );
+        errdefer device.deinit();
         const bar0_addr: u32 = @truncate(
-            MemoryLayout.PCI_MMIO_BASE + pci.virtio_pci.BAR0_SIZE,
+            MemoryLayout.PCI_MMIO_BASE + @as(u64, slot) * pci.virtio_pci.BAR0_SIZE,
         );
-        self.pci_block2.?.bar0_addr = bar0_addr;
-        self.pci_block2.?.transport.setDeviceConfig(std.mem.asBytes(&blk.config));
-        self.pci_block2.?.transport.setNotifyCallback(pciBlock2Notify, self);
-        blk.transport.setIrqCallback(pciBlock2BackendIrq, self);
+        device.bar0_addr = bar0_addr;
+        device.transport.setDeviceConfig(std.mem.asBytes(&blk.config));
+        device.transport.setNotifyCallback(notify, self);
+        blk.transport.setIrqCallback(irq, self);
 
-        const ecam_dev = pci.PciDevice{ .config = self.pci_block2.?.config, .present = true };
-        try self.ecam_host.?.addDevice(1, 0, ecam_dev);
-        log.info("initialized virtio-pci-blk2 at PCI 00:01.0, BAR0=0x{x}", .{bar0_addr});
+        const ecam_device = pci.PciDevice{ .config = device.config, .present = true };
+        try self.ecam_host.?.addDevice(slot, 0, ecam_device);
+        log.info("initialized virtio-pci-blk at PCI 00:0{}.0, BAR0=0x{x}", .{ slot, bar0_addr });
+        return device;
     }
 
     fn initPciGpu(self: *Machine, gpu_dev: *virtio.Gpu) !void {
@@ -2308,59 +2301,62 @@ pub const Machine = struct {
 
     fn pciBlockNotify(queue_idx: u32, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        if (self.block) |blk| {
-            _ = queue_idx;
-            blk.transport.queues[0].num = self.pci_block.?.transport.queues[0].size;
-            blk.transport.queues[0].ready = self.pci_block.?.transport.queues[0].enable;
-            blk.transport.queues[0].desc_addr = self.pci_block.?.transport.queues[0].desc_addr;
-            blk.transport.queues[0].driver_addr = self.pci_block.?.transport.queues[0].driver_addr;
-            blk.transport.queues[0].device_addr = self.pci_block.?.transport.queues[0].device_addr;
-            blk.pollRequests();
-        }
+        syncPciBlockQueue(self.pci_block, self.block, queue_idx);
     }
 
     fn pciBlockBackendIrq(level: bool, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        if (self.pci_block) |pci_block| {
-            if (self.block) |blk| {
-                pci_block.transport.isr_status.queue_interrupt =
-                    blk.transport.interrupt_status.used_buffer;
-                pci_block.transport.isr_status.config_change =
-                    blk.transport.interrupt_status.config_change;
-            }
-        }
-        if (self.gic_device) |gic_dev| {
-            gic_dev.setSpiPending(80, level);
-        }
+        self.setPciBlockIrq(self.pci_block, self.block, 80, level);
     }
 
     fn pciBlock2Notify(queue_idx: u32, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        if (self.block2) |blk| {
-            _ = queue_idx;
-            const source = self.pci_block2.?.transport.queues[0];
-            blk.transport.queues[0].num = source.size;
-            blk.transport.queues[0].ready = source.enable;
-            blk.transport.queues[0].desc_addr = source.desc_addr;
-            blk.transport.queues[0].driver_addr = source.driver_addr;
-            blk.transport.queues[0].device_addr = source.device_addr;
-            blk.pollRequests();
-        }
+        syncPciBlockQueue(self.pci_block2, self.block2, queue_idx);
     }
 
     fn pciBlock2BackendIrq(level: bool, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        if (self.pci_block2) |pci_block| {
-            if (self.block2) |blk| {
-                pci_block.transport.isr_status.queue_interrupt =
+        self.setPciBlockIrq(self.pci_block2, self.block2, 81, level);
+    }
+
+    fn syncPciBlockQueue(
+        pci_block: ?*pci.VirtioPciDevice,
+        block: ?*virtio.Block,
+        queue_idx: u32,
+    ) void {
+        if (queue_idx != 0) return;
+        const device = pci_block orelse return;
+        const blk = block orelse return;
+        assert(device.transport.queues.len == 1);
+        assert(blk.transport.queues.len == 1);
+        const source = device.transport.queues[queue_idx];
+        const target = &blk.transport.queues[queue_idx];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        blk.pollRequests();
+        assert(target.num == source.size);
+    }
+
+    fn setPciBlockIrq(
+        self: *Machine,
+        pci_block: ?*pci.VirtioPciDevice,
+        block: ?*virtio.Block,
+        intid: u32,
+        level: bool,
+    ) void {
+        assert(intid == 80 or intid == 81);
+        if (pci_block) |device| {
+            if (block) |blk| {
+                device.transport.isr_status.queue_interrupt =
                     blk.transport.interrupt_status.used_buffer;
-                pci_block.transport.isr_status.config_change =
+                device.transport.isr_status.config_change =
                     blk.transport.interrupt_status.config_change;
             }
         }
-        if (self.gic_device) |gic_dev| {
-            gic_dev.setSpiPending(81, level);
-        }
+        if (self.gic_device) |gic_dev| gic_dev.setSpiPending(intid, level);
     }
 
     fn pciGpuNotify(queue_idx: u32, userdata: ?*anyopaque) void {
