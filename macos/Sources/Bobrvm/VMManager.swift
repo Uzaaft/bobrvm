@@ -9,7 +9,7 @@ import Combine
 import Foundation
 import OSLog
 
-enum ConsoleEvent {
+enum ConsoleEvent: Sendable {
     case output(String)
     case clear
 }
@@ -23,9 +23,10 @@ public final class VMManager: ObservableObject {
 
     @Published public var vms: [VMInstance] = []
     @Published public var showingCreateVM = false
-    @Published public var consoleOutput: String = ""
+    public private(set) var consoleOutput = ""
 
-    private static let maxConsoleLength = 100_000
+    private static let consoleRetainedLength = 100_000
+    private static let consoleTrimThreshold = 125_000
     private let consoleEventSubject = PassthroughSubject<ConsoleEvent, Never>()
 
     var consoleEventPublisher: AnyPublisher<ConsoleEvent, Never> {
@@ -34,12 +35,14 @@ public final class VMManager: ObservableObject {
 
     weak var app: App?
 
-    private var frameReadySubject = PassthroughSubject<Void, Never>()
+    private let frameReadySubject = PassthroughSubject<Void, Never>()
     public var frameReadyPublisher: AnyPublisher<Void, Never> {
         frameReadySubject.eraseToAnyPublisher()
     }
 
-    public init() {}
+    public init() {
+        consoleOutput.reserveCapacity(Self.consoleTrimThreshold)
+    }
 
     public func loadExistingVMs() {
         guard let app else {
@@ -185,11 +188,8 @@ public final class VMManager: ObservableObject {
         consoleOutput.append(text)
         consoleEventSubject.send(.output(text))
 
-        // Trim if too long
-        if consoleOutput.count > Self.maxConsoleLength {
-            let dropCount = consoleOutput.count - Self.maxConsoleLength
-            consoleOutput = String(consoleOutput.dropFirst(dropCount))
-        }
+        guard consoleOutput.count > Self.consoleTrimThreshold else { return }
+        consoleOutput = String(consoleOutput.suffix(Self.consoleRetainedLength))
     }
 
     public func clearConsoleOutput() {
