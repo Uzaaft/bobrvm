@@ -753,8 +753,6 @@ pub const Surface = struct {
     render: renderer.Renderer,
     render_started: bool,
     presentation_generation_seen: u64,
-    last_mouse_x: f64 = 0,
-    last_mouse_y: f64 = 0,
 
     pub const CreateError = Allocator.Error || std.Thread.SpawnError;
 
@@ -930,14 +928,12 @@ pub const Surface = struct {
 
     pub fn handleMousePos(self: *Surface, x: f64, y: f64) void {
         const hw = self.vm.hw_machine orelse return;
-        // Relative device: convert absolute view coords to deltas.
-        const dx: i32 = @intFromFloat(x - self.last_mouse_x);
-        const dy: i32 = @intFromFloat(y - self.last_mouse_y);
-        self.last_mouse_x = x;
-        self.last_mouse_y = y;
-        if (dx != 0 or dy != 0) {
-            hw.injectMouseMove(dx, dy);
-        }
+        if (self.width == 0 or self.height == 0) return;
+        if (!std.math.isFinite(x) or !std.math.isFinite(y)) return;
+
+        const abs_x = pointerAxis(x, self.content_scale.x, self.width);
+        const abs_y = pointerAxis(y, self.content_scale.y, self.height);
+        hw.injectMousePosition(abs_x, abs_y);
     }
 
     pub fn handleMouseScroll(self: *Surface, dx: f64, dy: f64) void {
@@ -945,6 +941,16 @@ pub const Surface = struct {
         hw.injectScroll(@intFromFloat(dx), @intFromFloat(dy));
     }
 };
+
+fn pointerAxis(value: f64, content_scale: f64, surface_pixels: u32) i32 {
+    assert(content_scale > 0.0);
+    assert(surface_pixels > 0);
+
+    const extent_points = @as(f64, @floatFromInt(surface_pixels)) / content_scale;
+    const clamped = @max(0.0, @min(value, extent_points));
+    const axis_max = 32767.0;
+    return @intFromFloat(clamped * axis_max / extent_points);
+}
 
 // =============================================================================
 // Tests
@@ -957,6 +963,13 @@ test "App lifecycle" {
     defer app.destroy();
 
     app.tick();
+}
+
+test "pointer axis maps view points through backing scale" {
+    try std.testing.expectEqual(@as(i32, 0), pointerAxis(-20, 2, 2000));
+    try std.testing.expectEqual(@as(i32, 16383), pointerAxis(500, 2, 2000));
+    try std.testing.expectEqual(@as(i32, 32767), pointerAxis(1000, 2, 2000));
+    try std.testing.expectEqual(@as(i32, 32767), pointerAxis(1200, 2, 2000));
 }
 
 test "VM lifecycle" {

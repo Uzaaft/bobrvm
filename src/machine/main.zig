@@ -549,10 +549,10 @@ pub const Machine = struct {
         self.kickCpu(0);
     }
 
-    /// Inject relative mouse motion. Thread-safe.
-    pub fn injectMouseMove(self: *Machine, dx: i32, dy: i32) void {
+    /// Inject an absolute pointer position. Thread-safe.
+    pub fn injectMousePosition(self: *Machine, x: i32, y: i32) void {
         const mouse = self.mouse orelse return;
-        mouse.injectRelative(dx, dy) catch {};
+        mouse.injectAbsolute(x, y) catch {};
         self.kickCpu(0);
     }
 
@@ -2171,7 +2171,7 @@ pub const Machine = struct {
             self.keyboard.?.transport.setIrqCallback(keyboardIrqCallback, self);
 
             self.mouse_slot = self.gpu_slot + 2;
-            self.mouse = try virtio.Input.init(self.alloc, .mouse);
+            self.mouse = try virtio.Input.init(self.alloc, .tablet);
             self.mouse.?.setGuestMemory(getGuestMemoryWrapper);
             self.mouse.?.transport.setIrqCallback(mouseIrqCallback, self);
 

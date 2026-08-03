@@ -16,6 +16,15 @@ import SwiftUI
 private let logger = Logger(subsystem: "com.bobrvm.app", category: "VMSurfaceView")
 
 public final class VMSurfaceView: NSView {
+    private static let guestCursor = NSCursor(
+        image: NSImage(
+            size: NSSize(width: 1, height: 1),
+            flipped: false,
+            drawingHandler: { _ in true }
+        ),
+        hotSpot: .zero
+    )
+
     private var metalLayer: CAMetalLayer!
     private var device: MTLDevice!
     private var commandQueue: MTLCommandQueue!
@@ -83,6 +92,7 @@ public final class VMSurfaceView: NSView {
 
         updateSurfaceSize()
         updateContentScale()
+        window?.invalidateCursorRects(for: self)
 
         startDisplayLink()
         logger.info("Display link started")
@@ -96,6 +106,7 @@ public final class VMSurfaceView: NSView {
         surface = nil
         vmInstance?.surface = nil
         vmInstance = nil
+        window?.invalidateCursorRects(for: self)
     }
 
     // MARK: - Layer
@@ -122,6 +133,12 @@ public final class VMSurfaceView: NSView {
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         updateContentScale()
+    }
+
+    public override func resetCursorRects() {
+        super.resetCursorRects()
+        guard surface != nil else { return }
+        addCursorRect(bounds, cursor: Self.guestCursor)
     }
 
     private func updateSurfaceSize() {
@@ -263,6 +280,7 @@ public final class VMSurfaceView: NSView {
 
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        sendMousePosition(event)
         surface?.sendMouseButton(.left, pressed: true)
     }
 
@@ -271,6 +289,7 @@ public final class VMSurfaceView: NSView {
     }
 
     public override func rightMouseDown(with event: NSEvent) {
+        sendMousePosition(event)
         surface?.sendMouseButton(.right, pressed: true)
     }
 
@@ -279,6 +298,7 @@ public final class VMSurfaceView: NSView {
     }
 
     public override func otherMouseDown(with event: NSEvent) {
+        sendMousePosition(event)
         surface?.sendMouseButton(.middle, pressed: true)
     }
 
@@ -286,14 +306,17 @@ public final class VMSurfaceView: NSView {
         surface?.sendMouseButton(.middle, pressed: false)
     }
 
-    public override func mouseMoved(with event: NSEvent) {
+    private func sendMousePosition(_ event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
         surface?.sendMousePos(x: location.x, y: bounds.height - location.y)
     }
 
+    public override func mouseMoved(with event: NSEvent) {
+        sendMousePosition(event)
+    }
+
     public override func mouseDragged(with event: NSEvent) {
-        let location = convert(event.locationInWindow, from: nil)
-        surface?.sendMousePos(x: location.x, y: bounds.height - location.y)
+        sendMousePosition(event)
     }
 
     public override func rightMouseDragged(with event: NSEvent) {

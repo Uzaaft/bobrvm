@@ -513,14 +513,22 @@ pub const Input = struct {
             },
             .tablet => switch (subsel) {
                 .key => {
-                    const code: u16 = 0x110; // BTN_LEFT
-                    self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
-                    return 0x110 / 8 + 1;
+                    inline for ([_]u16{ 0x110, 0x111, 0x112 }) |code| {
+                        self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
+                    }
+                    return 0x113 / 8 + 1;
                 },
                 .abs => {
                     // ABS_X, ABS_Y
                     self.config.data[0] = 0x3;
                     return 1;
+                },
+                .rel => {
+                    // REL_HWHEEL, REL_WHEEL
+                    inline for ([_]u16{ 0x06, 0x08 }) |code| {
+                        self.config.data[code / 8] |= @as(u8, 1) << @intCast(code % 8);
+                    }
+                    return 2;
                 },
                 else => return 0,
             },
@@ -636,6 +644,29 @@ test "Input init mouse" {
     try std.testing.expectEqual(Subtype.mouse, input.subtype);
 }
 
+test "Input tablet advertises absolute axes, buttons, and wheels" {
+    const input = try Input.init(std.testing.allocator, .tablet);
+    defer input.deinit();
+
+    input.config.subsel = @intFromEnum(EventType.abs);
+    try std.testing.expectEqual(@as(u8, 1), input.getEvBits());
+    try std.testing.expectEqual(@as(u8, 0x03), input.config.data[0]);
+
+    input.config.subsel = @intFromEnum(EventType.key);
+    _ = input.getEvBits();
+    inline for ([_]u16{ 0x110, 0x111, 0x112 }) |code| {
+        try std.testing.expect(input.config.data[code / 8] &
+            (@as(u8, 1) << @intCast(code % 8)) != 0);
+    }
+
+    input.config.subsel = @intFromEnum(EventType.rel);
+    _ = input.getEvBits();
+    inline for ([_]u16{ 0x06, 0x08 }) |code| {
+        try std.testing.expect(input.config.data[code / 8] &
+            (@as(u8, 1) << @intCast(code % 8)) != 0);
+    }
+}
+
 test "InputEvent size" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(InputEvent));
 }
@@ -653,6 +684,26 @@ test "Input inject key" {
     try std.testing.expectEqual(@as(usize, 0), counted.allocations);
     try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     try std.testing.expectEqual(@as(usize, 2), input.pending_count);
+}
+
+test "Input inject absolute position without allocation" {
+    const input = try Input.init(std.testing.allocator, .tablet);
+    defer input.deinit();
+
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    input.alloc = counted.allocator();
+    try input.injectAbsolute(123, 456);
+    input.alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
+    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 3), input.pending_count);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(EventType.abs)), input.pending_events[0].type);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(AbsCode.x)), input.pending_events[0].code);
+    try std.testing.expectEqual(@as(i32, 123), input.pending_events[0].value);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(AbsCode.y)), input.pending_events[1].code);
+    try std.testing.expectEqual(@as(i32, 456), input.pending_events[1].value);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(EventType.syn)), input.pending_events[2].type);
 }
 
 test "Input pending event ring wraps without allocation" {

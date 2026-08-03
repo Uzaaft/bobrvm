@@ -36,6 +36,9 @@ final class MetalView: NSView {
         NSCursor.hide()
         virtualX = bounds.midX
         virtualY = bounds.midY
+        if let surface {
+            bobrvm_surface_mouse_pos(surface, virtualX, virtualY)
+        }
         window?.title = "bobrvm (mouse captured — ⌃⌥ to release)"
     }
 
@@ -222,6 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func requestGuestResize() {
         guard let surface else { return }
         let (w, h) = guestSize()
+        let scale = hidpi ? window.backingScaleFactor : 1.0
+        bobrvm_surface_set_content_scale(surface, scale, scale)
         bobrvm_surface_request_display_size(surface, w, h)
         bobrvm_surface_set_size(surface, w, h)
     }
@@ -416,6 +421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
         guard surface != nil else { fatalError("bobrvm_surface_new failed") }
         let (gw, gh) = guestSize()
+        let scale = hidpi ? window.backingScaleFactor : 1.0
+        bobrvm_surface_set_content_scale(surface, scale, scale)
         bobrvm_surface_set_size(surface, gw, gh)
 
         // Route input events from the view to the guest.
