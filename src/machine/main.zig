@@ -2627,26 +2627,10 @@ pub const Machine = struct {
             return result;
         }
 
-        // For device 0 (virtio-pci-blk), use VirtioPciDevice directly
-        if (ecam_addr.bus == 0 and ecam_addr.device == 0 and ecam_addr.function == 0) {
-            if (self.pci_block) |pci_blk| {
-                const value = pci_blk.readConfig(ecam_addr.reg, size);
-                if (ecam_addr.reg < 0x40) {
-                    log.debug("ECAM 00:00.0 read reg=0x{x} size={} -> 0x{x}", .{ ecam_addr.reg, size, value });
-                }
-                return value;
-            }
+        if (self.pciDeviceAt(ecam_addr)) |entry| {
+            return entry.device.readConfig(ecam_addr.reg, size);
         }
 
-        if (ecam_addr.bus == 0 and ecam_addr.device == 1 and ecam_addr.function == 0) {
-            if (self.pci_block2) |pci_blk| return pci_blk.readConfig(ecam_addr.reg, size);
-        }
-
-        if (ecam_addr.bus == 0 and ecam_addr.device == 2 and ecam_addr.function == 0) {
-            if (self.pci_gpu) |pci_gpu| return pci_gpu.readConfig(ecam_addr.reg, size);
-        }
-
-        // Other devices: use ECAM host
         if (self.ecam_host) |ecam| {
             return ecam.read(addr, size);
         }
@@ -2673,39 +2657,34 @@ pub const Machine = struct {
             return;
         }
 
-        // For device 0 (virtio-pci-blk), use VirtioPciDevice directly
-        if (ecam_addr.bus == 0 and ecam_addr.device == 0 and ecam_addr.function == 0) {
-            if (self.pci_block) |pci_blk| {
-                log.debug("ECAM 00:00.0 write reg=0x{x} size={} value=0x{x}", .{ ecam_addr.reg, size, value });
-                pci_blk.writeConfig(ecam_addr.reg, size, value);
-                // Sync config back to ECAM host for reads
-                if (self.ecam_host) |ecam| {
-                    ecam.updateConfig(0, 0, &pci_blk.config);
-                }
-                return;
+        if (self.pciDeviceAt(ecam_addr)) |entry| {
+            entry.device.writeConfig(ecam_addr.reg, size, value);
+            if (self.ecam_host) |ecam| {
+                ecam.updateConfig(entry.slot, 0, &entry.device.config);
             }
+            return;
         }
 
-        if (ecam_addr.bus == 0 and ecam_addr.device == 1 and ecam_addr.function == 0) {
-            if (self.pci_block2) |pci_blk| {
-                pci_blk.writeConfig(ecam_addr.reg, size, value);
-                if (self.ecam_host) |ecam| ecam.updateConfig(1, 0, &pci_blk.config);
-                return;
-            }
-        }
-
-        if (ecam_addr.bus == 0 and ecam_addr.device == 2 and ecam_addr.function == 0) {
-            if (self.pci_gpu) |pci_gpu| {
-                pci_gpu.writeConfig(ecam_addr.reg, size, value);
-                if (self.ecam_host) |ecam| ecam.updateConfig(2, 0, &pci_gpu.config);
-                return;
-            }
-        }
-
-        // Other devices: use ECAM host
         if (self.ecam_host) |ecam| {
             ecam.write(addr, size, value);
         }
+    }
+
+    const PciDeviceAt = struct {
+        device: *pci.VirtioPciDevice,
+        slot: u5,
+    };
+
+    fn pciDeviceAt(self: *Machine, address: pci.EcamAddr) ?PciDeviceAt {
+        if (address.bus != 0) return null;
+        if (address.function != 0) return null;
+
+        return switch (address.device) {
+            0 => if (self.pci_block) |device| .{ .device = device, .slot = 0 } else null,
+            1 => if (self.pci_block2) |device| .{ .device = device, .slot = 1 } else null,
+            2 => if (self.pci_gpu) |device| .{ .device = device, .slot = 2 } else null,
+            else => null,
+        };
     }
 
     fn pciBarMmioRead(ctx: *anyopaque, offset: u64, size: u8) u64 {
