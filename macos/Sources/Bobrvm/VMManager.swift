@@ -22,7 +22,6 @@ public final class VMManager: ObservableObject {
     )
 
     @Published public var vms: [VMInstance] = []
-    @Published public var selectedVM: VMInstance?
     @Published public var showingCreateVM = false
     @Published public var consoleOutput: String = ""
 
@@ -87,7 +86,6 @@ public final class VMManager: ObservableObject {
             )
             try VMStorage.saveVM(instance)
             vms.append(instance)
-            selectedVM = instance
             Self.logger.info("Saved VM configuration: \(name)")
         } catch {
             vm.destroy()
@@ -98,9 +96,6 @@ public final class VMManager: ObservableObject {
     public func deleteVM(_ instance: VMInstance) {
         instance.destroy()
         vms.removeAll { $0.id == instance.id }
-        if selectedVM?.id == instance.id {
-            selectedVM = vms.first
-        }
 
         VMStorage.deleteVM(id: instance.id)
     }
@@ -172,9 +167,6 @@ public final class VMManager: ObservableObject {
 
         instance.destroy()
         vms[index] = updatedInstance
-        if selectedVM?.id == instance.id {
-            selectedVM = updatedInstance
-        }
 
         Self.logger.info("Updated VM configuration: \(name)")
     }

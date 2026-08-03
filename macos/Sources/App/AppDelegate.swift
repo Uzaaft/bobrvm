@@ -21,9 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
     private var app: App?
     private var libraryWindowController: NSWindowController?
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = notification
-
+    func applicationDidFinishLaunching(_: Notification) {
         do {
             let app = try App()
             app.delegate = self
@@ -39,16 +37,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        _ = notification
+    func applicationWillTerminate(_: Notification) {
         vmManager.stopAllVMs()
     }
 
     func applicationShouldHandleReopen(
-        _ sender: NSApplication,
+        _: NSApplication,
         hasVisibleWindows flag: Bool
     ) -> Bool {
-        _ = sender
         if !flag {
             bringWindowsOnScreen()
         }
@@ -67,39 +63,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
 
     private func bringWindowsOnScreen() {
         NSApp.setActivationPolicy(.regular)
-        let visibleWindows = NSApp.windows.filter { window in
+        var visibleWindows = NSApp.windows.filter { window in
             window.isVisible && !window.isMiniaturized && window.canBecomeKey
         }
         if visibleWindows.isEmpty {
-            let content = ContentView()
-                .environmentObject(vmManager)
-                .environmentObject(ghosttyRuntime)
-            let hostingController = NSHostingController(rootView: content)
-            let window = NSWindow(contentViewController: hostingController)
-            window.title = "Library"
-            window.setContentSize(NSSize(width: 1_100, height: 720))
-            window.center()
-            let controller = NSWindowController(window: window)
-            libraryWindowController = controller
-            controller.showWindow(nil)
-            Self.logger.info("Created fallback library window")
+            visibleWindows = [createLibraryWindow()]
         }
 
-        for window in NSApp.windows {
-            window.collectionBehavior.insert(.moveToActiveSpace)
-            let screen = NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main
-            if let screen {
-                let frame = screen.visibleFrame
-                let origin = NSPoint(
-                    x: frame.midX - window.frame.width / 2,
-                    y: frame.midY - window.frame.height / 2
-                )
-                window.setFrameOrigin(origin)
-            }
+        for window in visibleWindows {
+            positionOnPrimaryScreen(window)
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
         }
         NSApp.activate(ignoringOtherApps: true)
-        Self.logger.info("Presented \(NSApp.windows.count) application windows")
+        Self.logger.info("Presented \(visibleWindows.count) application windows")
+    }
+
+    private func createLibraryWindow() -> NSWindow {
+        let content = ContentView()
+            .environmentObject(vmManager)
+            .environmentObject(ghosttyRuntime)
+        let hostingController = NSHostingController(rootView: content)
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "Library"
+        window.setContentSize(NSSize(width: 1_100, height: 720))
+        let controller = NSWindowController(window: window)
+        libraryWindowController = controller
+        controller.showWindow(nil)
+        Self.logger.info("Created fallback library window")
+        return window
+    }
+
+    private func positionOnPrimaryScreen(_ window: NSWindow) {
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero })
+            ?? NSScreen.main
+        else { return }
+
+        let frame = screen.visibleFrame
+        window.setFrameOrigin(NSPoint(
+            x: frame.midX - window.frame.width / 2,
+            y: frame.midY - window.frame.height / 2
+        ))
     }
 }

@@ -15,49 +15,44 @@ struct DebugBuildWarningView: View {
     @State private var isPopover = false
 
     var body: some View {
-        HStack {
-            Spacer()
-
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.yellow)
-
-            Text("Debug build – performance may be degraded")
-                .font(.callout)
-                .padding(.vertical, 8)
-                .popover(isPresented: $isPopover, arrowEdge: .bottom) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Debug Build")
-                            .font(.headline)
-
-                        Text(
-                            """
-                            Debug builds of Bobrvm include additional safety \
-                            checks and logging that may impact performance.
-
-                            For production use, build with:
-                            """)
-
-                        Text("zig build -Doptimize=ReleaseFast")
-                            .font(.system(.body, design: .monospaced))
-                            .padding(8)
-                            .background(Color(.textBackgroundColor))
-                            .cornerRadius(4)
-                    }
-                    .padding()
-                    .frame(width: 320)
-                }
-
-            Spacer()
+        Button {
+            isPopover = true
+        } label: {
+            HStack {
+                Spacer()
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text("Debug build – performance may be degraded")
+                    .font(.callout)
+                    .padding(.vertical, 8)
+                Spacer()
+            }
         }
+        .buttonStyle(.plain)
         .background(Color(.windowBackgroundColor).opacity(0.95))
         .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Debug build warning")
-        .accessibilityValue("Debug builds may have degraded performance")
-        .accessibilityAddTraits(.isStaticText)
-        .onTapGesture {
-            isPopover = true
+        .popover(isPresented: $isPopover, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Debug Build")
+                    .font(.headline)
+                Text(
+                    """
+                    Debug builds of Bobrvm include additional safety checks and logging that may \
+                    impact performance.
+
+                    For production use, build with:
+                    """)
+                Text("zig build -Doptimize=ReleaseFast")
+                    .font(.system(.body, design: .monospaced))
+                    .padding(8)
+                    .background(Color(.textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+            .padding()
+            .frame(width: 320)
         }
+        .accessibilityLabel("Debug build warning")
+        .accessibilityHint("Shows build performance details")
     }
 }
 
@@ -96,7 +91,7 @@ struct VMListView: View {
     @State private var showEditSheet = false
 
     var body: some View {
-        List(vmManager.vms, selection: $vmManager.selectedVM) { vm in
+        List(vmManager.vms) { vm in
             VMListRow(vmInstance: vm)
                 .tag(vm)
                 .onTapGesture {
@@ -475,34 +470,6 @@ struct ConsoleView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-    }
-}
-
-// MARK: - Empty State
-
-struct EmptyStateView: View {
-    @EnvironmentObject var vmManager: VMManager
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 64))
-                .foregroundColor(.secondary)
-
-            Text("No VM Selected")
-                .font(.title2)
-
-            Text("Create a new virtual machine or select one from the sidebar")
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-
-            Button("Create VM") {
-                vmManager.showingCreateVM = true
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
     }
 }
 
