@@ -655,18 +655,7 @@ pub const VirtioPciDevice = struct {
             self.config[0x09],
         });
 
-        // Build capability list starting at 0x40
         self.buildCapabilities();
-
-        // Debug: verify vendor/device ID at config[0:4]
-        const vendor_check = @as(u16, self.config[0x00]) | (@as(u16, self.config[0x01]) << 8);
-        const device_check = @as(u16, self.config[0x02]) | (@as(u16, self.config[0x03]) << 8);
-        log.debug("PCI config verify: vendor=0x{x} device=0x{x} status=0x{x} cap_ptr=0x{x}", .{
-            vendor_check,
-            device_check,
-            @as(u16, self.config[0x06]) | (@as(u16, self.config[0x07]) << 8),
-            self.config[0x34],
-        });
     }
 
     fn buildCapabilities(self: *VirtioPciDevice) void {

@@ -1562,77 +1562,12 @@ pub const Machine = struct {
 
         // PCI MMIO region (BAR space) - virtio-pci devices
         if (addr >= MemoryLayout.PCI_MMIO_BASE and addr < MemoryLayout.PCI_MMIO_BASE + MemoryLayout.PCI_MMIO_SIZE) {
-            if (self.pci_block) |pci_blk| {
-                const bar0_addr: u64 = pci_blk.getBar0Addr();
-                const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-                if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                    const offset: u32 = @truncate(addr - bar0_addr);
-                    if (is_write) {
-                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                        pci_blk.writeBar0(offset, size, @truncate(value));
-                        if (enable_debug_logs) {
-                            log.debug("PCI BAR0 write: offset=0x{x} size={} value=0x{x}", .{ offset, size, value });
-                        }
-                    } else {
-                        const value = self.pciBlockBarRead(
-                            pci_blk,
-                            self.block.?,
-                            offset,
-                            size,
-                        );
-                        if (srt != 31) {
-                            try vcpu.setReg(@enumFromInt(srt), value);
-                        }
-                        if (enable_debug_logs) {
-                            log.debug("PCI BAR0 read: offset=0x{x} size={} -> 0x{x}", .{ offset, size, value });
-                        }
-                    }
-                    try vcpu.advancePC(info);
-                    return;
-                }
-            }
-            if (self.pci_block2) |pci_blk| {
-                const bar0_addr: u64 = pci_blk.getBar0Addr();
-                const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-                if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                    const offset: u32 = @truncate(addr - bar0_addr);
-                    if (is_write) {
-                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                        pci_blk.writeBar0(offset, size, @truncate(value));
-                    } else {
-                        const value = self.pciBlockBarRead(
-                            pci_blk,
-                            self.block2.?,
-                            offset,
-                            size,
-                        );
-                        if (srt != 31) try vcpu.setReg(@enumFromInt(srt), value);
-                    }
-                    try vcpu.advancePC(info);
-                    return;
-                }
-            }
-            if (self.pci_gpu) |pci_gpu| {
-                const bar0_addr: u64 = pci_gpu.getBar0Addr();
-                const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-                if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                    const offset: u32 = @truncate(addr - bar0_addr);
-                    if (is_write) {
-                        const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
-                        self.pciGpuBarWrite(pci_gpu, offset, size, @truncate(value));
-                    } else {
-                        const value = self.pciGpuBarRead(pci_gpu, offset, size);
-                        if (srt != 31) try vcpu.setReg(@enumFromInt(srt), value);
-                    }
-                    try vcpu.advancePC(info);
-                    return;
-                }
-            }
-            if (enable_debug_logs) {
-                log.debug("unhandled PCI MMIO {s} at 0x{x}", .{ if (is_write) "write" else "read", addr });
-            }
-            if (!is_write and srt != 31) {
-                try vcpu.setReg(@enumFromInt(srt), 0xFFFFFFFF);
+            if (is_write) {
+                const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                _ = self.pciBarWriteAt(addr, size, @truncate(value));
+            } else if (srt != 31) {
+                const value = self.pciBarReadAt(addr, size) orelse 0xFFFFFFFF;
+                try vcpu.setReg(@enumFromInt(srt), value);
             }
             try vcpu.advancePC(info);
             return;
@@ -2522,6 +2457,63 @@ pub const Machine = struct {
         return value;
     }
 
+    fn pciBarOffset(device: *pci.VirtioPciDevice, addr: u64) ?u32 {
+        assert(addr >= MemoryLayout.PCI_MMIO_BASE);
+        assert(addr < MemoryLayout.PCI_MMIO_BASE + MemoryLayout.PCI_MMIO_SIZE);
+
+        const bar_addr: u64 = device.getBar0Addr();
+        if (bar_addr == 0) return null;
+        if (addr < bar_addr or addr >= bar_addr + pci.virtio_pci.BAR0_SIZE) return null;
+        return @truncate(addr - bar_addr);
+    }
+
+    fn pciBarReadAt(self: *Machine, addr: u64, size: u8) ?u32 {
+        assert(size == 1 or size == 2 or size == 4 or size == 8);
+        assert(addr >= MemoryLayout.PCI_MMIO_BASE);
+
+        if (self.pci_block) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                return self.pciBlockBarRead(device, self.block.?, offset, size);
+            }
+        }
+        if (self.pci_block2) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                return self.pciBlockBarRead(device, self.block2.?, offset, size);
+            }
+        }
+        if (self.pci_gpu) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                return self.pciGpuBarRead(device, offset, size);
+            }
+        }
+        return null;
+    }
+
+    fn pciBarWriteAt(self: *Machine, addr: u64, size: u8, value: u32) bool {
+        assert(size == 1 or size == 2 or size == 4 or size == 8);
+        assert(addr >= MemoryLayout.PCI_MMIO_BASE);
+
+        if (self.pci_block) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                device.writeBar0(offset, size, value);
+                return true;
+            }
+        }
+        if (self.pci_block2) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                device.writeBar0(offset, size, value);
+                return true;
+            }
+        }
+        if (self.pci_gpu) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                self.pciGpuBarWrite(device, offset, size, value);
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn registerMmioHandlers(self: *Machine) !void {
         var runner = &self.runner.?;
         // Two GIC regions, UART, three virtio slots, ECAM, and the PCI BAR.
@@ -2718,81 +2710,12 @@ pub const Machine = struct {
 
     fn pciBarMmioRead(ctx: *anyopaque, offset: u64, size: u8) u64 {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-
-        if (self.pci_block) |pci_blk| {
-            const bar0_addr: u64 = pci_blk.getBar0Addr();
-            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
-
-            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                const bar_offset: u32 = @truncate(addr - bar0_addr);
-                return self.pciBlockBarRead(pci_blk, self.block.?, bar_offset, size);
-            }
-        }
-
-        if (self.pci_block2) |pci_blk| {
-            const bar0_addr: u64 = pci_blk.getBar0Addr();
-            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
-
-            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                const bar_offset: u32 = @truncate(addr - bar0_addr);
-                return self.pciBlockBarRead(pci_blk, self.block2.?, bar_offset, size);
-            }
-        }
-
-        if (self.pci_gpu) |pci_gpu| {
-            const bar0_addr: u64 = pci_gpu.getBar0Addr();
-            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
-
-            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                const bar_offset: u32 = @truncate(addr - bar0_addr);
-                return self.pciGpuBarRead(pci_gpu, bar_offset, size);
-            }
-        }
-
-        return 0xFFFFFFFF;
+        return self.pciBarReadAt(MemoryLayout.PCI_MMIO_BASE + offset, size) orelse 0xFFFFFFFF;
     }
 
     fn pciBarMmioWrite(ctx: *anyopaque, offset: u64, size: u8, value: u64) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-
-        if (self.pci_block) |pci_blk| {
-            const bar0_addr: u64 = pci_blk.getBar0Addr();
-            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
-
-            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                const bar_offset: u32 = @truncate(addr - bar0_addr);
-                pci_blk.writeBar0(bar_offset, size, @truncate(value));
-                log.debug("PCI BAR0 write: offset=0x{x} size={} value=0x{x}", .{ bar_offset, size, value });
-                return;
-            }
-        }
-
-        if (self.pci_block2) |pci_blk| {
-            const bar0_addr: u64 = pci_blk.getBar0Addr();
-            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
-
-            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                const bar_offset: u32 = @truncate(addr - bar0_addr);
-                pci_blk.writeBar0(bar_offset, size, @truncate(value));
-                return;
-            }
-        }
-
-        if (self.pci_gpu) |pci_gpu| {
-            const bar0_addr: u64 = pci_gpu.getBar0Addr();
-            const bar0_size: u64 = pci.virtio_pci.BAR0_SIZE;
-            const addr = MemoryLayout.PCI_MMIO_BASE + offset;
-
-            if (bar0_addr != 0 and addr >= bar0_addr and addr < bar0_addr + bar0_size) {
-                const bar_offset: u32 = @truncate(addr - bar0_addr);
-                self.pciGpuBarWrite(pci_gpu, bar_offset, size, @truncate(value));
-            }
-        }
+        _ = self.pciBarWriteAt(MemoryLayout.PCI_MMIO_BASE + offset, size, @truncate(value));
     }
 
     /// Set up initial state for a single vCPU.
