@@ -263,28 +263,12 @@ private struct StateBadge: View {
     let state: VMState
 
     var body: some View {
-        Text(label)
+        Text(state.presentationName)
             .font(.caption2.weight(.medium))
-            .foregroundStyle(color)
+            .foregroundStyle(state.presentationColor)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(color.opacity(0.12))
+            .background(state.presentationColor.opacity(0.12))
             .clipShape(Capsule())
-    }
-
-    private var label: String {
-        switch state {
-        case .running: return "Running"
-        case .paused: return "Paused"
-        case .stopped: return "Stopped"
-        }
-    }
-
-    private var color: Color {
-        switch state {
-        case .running: return .green
-        case .paused: return .orange
-        case .stopped: return .secondary
-        }
     }
 }

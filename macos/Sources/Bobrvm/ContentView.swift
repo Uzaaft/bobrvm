@@ -68,7 +68,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Debug build warning banner
             if bobrvm_is_debug() {
                 DebugBuildWarningView()
             }
@@ -309,34 +308,18 @@ struct VMListRow: View {
     var body: some View {
         HStack {
             Image(systemName: "desktopcomputer")
-                .foregroundColor(stateColor)
+                .foregroundColor(vmInstance.state.presentationColor)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(vmInstance.name)
                     .font(.headline)
 
-                Text(stateText)
+                Text(vmInstance.state.presentationName)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
         }
         .padding(.vertical, 4)
-    }
-
-    private var stateColor: Color {
-        switch vmInstance.state {
-        case .running: return .green
-        case .paused: return .orange
-        case .stopped: return .gray
-        }
-    }
-
-    private var stateText: String {
-        switch vmInstance.state {
-        case .running: return "Running"
-        case .paused: return "Paused"
-        case .stopped: return "Stopped"
-        }
     }
 }
 
@@ -520,6 +503,24 @@ struct EmptyStateView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+}
+
+extension VMState {
+    var presentationName: String {
+        switch self {
+        case .running: return "Running"
+        case .paused: return "Paused"
+        case .stopped: return "Stopped"
+        }
+    }
+
+    var presentationColor: Color {
+        switch self {
+        case .running: return .green
+        case .paused: return .orange
+        case .stopped: return .secondary
+        }
     }
 }
 

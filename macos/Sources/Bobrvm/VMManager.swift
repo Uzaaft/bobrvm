@@ -63,7 +63,6 @@ public final class VMManager: ObservableObject {
             vms.append(instance)
             Self.logger.info("Loaded VM: \(stored.name)")
         }
-
     }
 
     public func createVM(
@@ -72,7 +71,7 @@ public final class VMManager: ObservableObject {
         isoPath: String? = nil,
         retinaEnabled: Bool = true
     ) throws {
-        guard let app = app else {
+        guard let app else {
             throw BobrvmError.invalidArgument
         }
 
@@ -327,8 +326,6 @@ enum VMStorage {
         let retinaEnabled: Bool?
 
         var vmConfig: VMConfig {
-            // Use stored firmware path, or fall back to bundled firmware
-            // Treat empty or stale paths as nil.
             let storedFirmware: String? = firmwarePath.flatMap { path -> String? in
                 guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
                     return nil
@@ -337,16 +334,10 @@ enum VMStorage {
             }
             let bundledFirmware = Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd")
 
-            // Debug: print to stderr so it shows in zig build run output
-            FileHandle.standardError.write(
-                "[VMStorage] storedFirmware=\(storedFirmware ?? "nil"), bundledFirmware=\(bundledFirmware ?? "nil"), Bundle.main=\(Bundle.main.bundlePath)\n"
-                    .data(using: .utf8)!)
-
             // A configured kernel selects direct Linux boot; firmware and
             // direct boot are mutually exclusive in the core configuration.
             let effectiveFirmwarePath = kernelPath == nil ? storedFirmware ?? bundledFirmware : nil
 
-            // Generate vars path if not stored
             let effectiveVarsPath: String? =
                 varsPath
                 ?? {

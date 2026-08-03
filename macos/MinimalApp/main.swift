@@ -3,7 +3,7 @@
 // Scaffolding for verifying the guest scanout pipeline end-to-end while
 // the full SwiftUI app comes together: one window, one CAMetalLayer,
 // frames drawn by the Zig renderer thread (Swift owns the window and
-// Metal context only, per the ghostty pattern).
+// Metal context only).
 //
 // Build: ./macos/MinimalApp/build.sh
 // Run:   BobrvmDisplay --kernel Image --initrd initrd [--disk d.img] \

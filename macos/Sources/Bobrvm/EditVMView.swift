@@ -55,13 +55,11 @@ struct EditVMView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Running VM banner
             if isRunning {
                 RunningVMBanner(state: vmInstance.state)
             }
 
             Form {
-                // General - always editable
                 Section("General") {
                     TextField("Name", text: $name)
                         .onChange(of: name) { _ in hasChanges = true }
@@ -69,17 +67,9 @@ struct EditVMView: View {
                     LabeledContent("Status") {
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(stateColor)
+                                .fill(vmInstance.state.presentationColor)
                                 .frame(width: 8, height: 8)
-                            Text(stateText)
-
-                            if isRunning {
-                                Text("•")
-                                    .foregroundColor(.secondary)
-                                Text(uptimeText)
-                                    .foregroundColor(.secondary)
-                                    .font(.caption)
-                            }
+                            Text(vmInstance.state.presentationName)
                         }
                     }
                 }
@@ -308,27 +298,6 @@ struct EditVMView: View {
         } message: {
             Text(errorMessage)
         }
-    }
-
-    private var stateColor: Color {
-        switch vmInstance.state {
-        case .running: return .green
-        case .paused: return .orange
-        case .stopped: return .gray
-        }
-    }
-
-    private var stateText: String {
-        switch vmInstance.state {
-        case .running: return "Running"
-        case .paused: return "Paused"
-        case .stopped: return "Stopped"
-        }
-    }
-
-    private var uptimeText: String {
-        // Placeholder - would need actual uptime tracking
-        "since launch"
     }
 
     private var isValid: Bool {
