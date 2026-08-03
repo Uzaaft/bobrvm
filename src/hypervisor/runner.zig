@@ -33,10 +33,11 @@ const c = @import("c.zig");
 const Vcpu = @import("vcpu.zig").Vcpu;
 const ExitInfo = @import("vcpu.zig").ExitInfo;
 const ExceptionClass = @import("vcpu.zig").ExceptionClass;
+const Register = @import("vcpu.zig").Register;
+const SystemRegister = @import("vcpu.zig").SystemRegister;
 const VM = @import("vm.zig").VM;
 
 const enable_debug_logs = builtin.mode == .Debug;
-const enable_verbose_debug = builtin.mode == .Debug and builtin.mode != .ReleaseFast;
 
 /// MMIO access type.
 pub const MmioAccess = struct {
@@ -407,7 +408,7 @@ pub const VcpuRunner = struct {
                         );
                     }
 
-                    if (enable_verbose_debug and addr >= 0x3c000000 and
+                    if (enable_debug_logs and addr >= 0x3c000000 and
                         (addr < 0x3c001000 or self.exit_count % 100000 == 0))
                     {
                         std.log.debug("MMIO ISV=0 load_store: pc=0x{x} addr=0x{x} instr=0x{x} is_write={} size={} rt={} wb={?}", .{
@@ -418,28 +419,18 @@ pub const VcpuRunner = struct {
                 .cache_op => {
                     // Cache maintenance instruction - just advance PC and continue
                     // Log if we see lots of cache ops at same address (potential loop)
-                    if (enable_verbose_debug and self.exit_count % 100000 == 0 and addr >= 0x3c000000) {
+                    if (enable_debug_logs and self.exit_count % 100000 == 0 and addr >= 0x3c000000) {
                         std.log.debug("cache_op at pc=0x{x} addr=0x{x} instr=0x{x}", .{ pc, addr, instr });
                     }
                     try self.vcpu.?.advancePC(info);
                     return;
                 },
                 .unknown => {
-                    // Log first occurrence at each unique PC
-                    if (enable_debug_logs) {
-                        std.log.warn("ISV=0 unknown instruction at pc=0x{x} addr=0x{x}: 0x{x}", .{ pc, addr, instr });
-                    }
-                    // For unknown instructions, assume it's a read and return 0xFFFFFFFF
-                    if (enable_verbose_debug and self.exit_count < 20) {
-                        std.log.debug("Treating unknown as read, returning 0xFFFFFFFF", .{});
-                    }
-                    // Set result register to 0xFFFFFFFF and advance
-                    const guess_rt: u5 = @truncate(instr); // Rt is usually in bits 4:0
-                    if (guess_rt != 31) {
-                        try self.vcpu.?.setReg(@enumFromInt(guess_rt), 0xFFFFFFFF);
-                    }
-                    try self.vcpu.?.advancePC(info);
-                    return;
+                    std.log.err(
+                        "unsupported MMIO instruction at pc=0x{x} addr=0x{x}: 0x{x}",
+                        .{ pc, addr, instr },
+                    );
+                    return error.UnsupportedMmioInstruction;
                 },
             }
         }
@@ -643,7 +634,7 @@ pub fn applyLoadStoreWriteback(vcpu: *Vcpu, rn: u5, delta: i64) !void {
 
     if (rn == 31) {
         const pstate = try vcpu.getReg(.cpsr);
-        const sp_register: @import("vcpu.zig").SystemRegister = if (pstate & 1 == 0)
+        const sp_register: SystemRegister = if (pstate & 1 == 0)
             .sp_el0
         else
             .sp_el1;
@@ -656,7 +647,7 @@ pub fn applyLoadStoreWriteback(vcpu: *Vcpu, rn: u5, delta: i64) !void {
         return;
     }
 
-    const register: @import("vcpu.zig").Register = @enumFromInt(rn);
+    const register: Register = @enumFromInt(rn);
     const base = try vcpu.getReg(register);
     const updated = if (delta >= 0)
         base +% @as(u64, @intCast(delta))
@@ -725,10 +716,6 @@ pub fn decodeLoadStore(instr: u32) DecodeResult {
         return .{ .load_store = .{ .is_write = !is_load, .size = size, .rt = rt } };
     }
 
-    // Default: unknown
-    if (enable_debug_logs) {
-        std.log.warn("Unknown instruction: 0x{x}", .{instr});
-    }
     return .unknown;
 }
 
@@ -956,4 +943,12 @@ test "MMIO handler registration reserves startup capacity" {
     try std.testing.expectEqual(@as(usize, 1), counted.allocations);
     try std.testing.expectEqual(@as(usize, 320), counted.allocated_bytes);
     try std.testing.expectEqual(@as(usize, 0), counted.resize_index);
+}
+
+test "load-store decoder rejects unrelated instructions" {
+    try std.testing.expectEqual(DecodeResult.unknown, decodeLoadStore(0x14000000));
+}
+
+test "load-store decoder identifies system instructions" {
+    try std.testing.expectEqual(DecodeResult.cache_op, decodeLoadStore(0xD50B7E20));
 }

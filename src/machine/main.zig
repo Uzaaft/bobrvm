@@ -1621,7 +1621,10 @@ pub const Machine = struct {
                 };
             },
             .cache_op => null,
-            .unknown => .{ .is_write = false, .size = 4, .srt = @truncate(instr) },
+            .unknown => {
+                log.err("unsupported MMIO instruction at pc=0x{x}: 0x{x}", .{ pc, instr });
+                return error.UnsupportedMmioInstruction;
+            },
         };
     }
 
