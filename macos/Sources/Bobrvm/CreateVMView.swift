@@ -175,6 +175,7 @@ struct CreateVMView: View {
             displayWidth: resolution.width,
             displayHeight: resolution.height,
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+            networkEnabled: true,
             firmwarePath: Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd"),
             varsPath: varsPath,
             diskPath: diskPath,

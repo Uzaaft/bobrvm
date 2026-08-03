@@ -129,6 +129,7 @@ public final class VMManager: ObservableObject {
             displayWidth: UInt32(displayWidth),
             displayHeight: UInt32(displayHeight),
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+            networkEnabled: instance.config.networkEnabled,
             firmwarePath: instance.config.firmwarePath,
             varsPath: instance.config.varsPath,
             kernelPath: instance.config.kernelPath,
@@ -316,6 +317,7 @@ enum VMStorage {
         let displayWidth: UInt32?
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
+        let networkEnabled: Bool?
 
         var vmConfig: VMConfig {
             let storedFirmware: String? = firmwarePath.flatMap { path -> String? in
@@ -345,6 +347,7 @@ enum VMStorage {
                 displayWidth: displayWidth ?? 1280,
                 displayHeight: displayHeight ?? 800,
                 gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+                networkEnabled: networkEnabled ?? true,
                 firmwarePath: effectiveFirmwarePath,
                 varsPath: effectiveVarsPath,
                 kernelPath: kernelPath,
@@ -375,6 +378,7 @@ enum VMStorage {
             self.displayWidth = instance.config.displayWidth
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled
+            self.networkEnabled = instance.config.networkEnabled
         }
     }
 

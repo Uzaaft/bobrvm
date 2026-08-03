@@ -102,6 +102,7 @@ public struct VMConfig {
     public var displayWidth: UInt32
     public var displayHeight: UInt32
     public var gpuMemoryBytes: UInt64
+    public var networkEnabled: Bool
     /// UEFI firmware path (e.g., QEMU_EFI.fd). If set, boots via firmware.
     public var firmwarePath: String?
     /// UEFI variables file path. Created if doesn't exist.
@@ -122,6 +123,7 @@ public struct VMConfig {
         displayWidth: UInt32? = nil,
         displayHeight: UInt32? = nil,
         gpuMemoryBytes: UInt64? = nil,
+        networkEnabled: Bool? = nil,
         firmwarePath: String? = nil,
         varsPath: String? = nil,
         kernelPath: String? = nil,
@@ -138,6 +140,7 @@ public struct VMConfig {
         self.displayWidth = displayWidth ?? defaults.display_width
         self.displayHeight = displayHeight ?? defaults.display_height
         self.gpuMemoryBytes = gpuMemoryBytes ?? defaults.gpu_memory_bytes
+        self.networkEnabled = networkEnabled ?? defaults.enable_net
         self.firmwarePath = firmwarePath
         self.varsPath = varsPath
         self.kernelPath = kernelPath
@@ -156,6 +159,7 @@ public struct VMConfig {
         config.display_width = displayWidth
         config.display_height = displayHeight
         config.gpu_memory_bytes = gpuMemoryBytes
+        config.enable_net = networkEnabled
         config.disk_read_only = diskReadOnly
         config.disk2_read_only = isoReadOnly
 
