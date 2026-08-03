@@ -56,11 +56,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
         vmManager.notifyFrameReady()
     }
 
-    func app(_ app: App, didReceiveConsoleOutput text: String) {
-        _ = app
-        vmManager.appendConsoleOutput(text)
-    }
-
     private func bringWindowsOnScreen() {
         NSApp.setActivationPolicy(.regular)
         var visibleWindows = NSApp.windows.filter { window in

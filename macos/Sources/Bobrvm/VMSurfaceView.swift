@@ -23,6 +23,8 @@ public final class VMSurfaceView: NSView {
     private var surface: Surface?
     private weak var vmInstance: VMInstance?
     private var cancellables = Set<AnyCancellable>()
+    private var guestResizeWorkItem: DispatchWorkItem?
+    private var lastGuestDisplaySize = CGSize.zero
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -59,6 +61,7 @@ public final class VMSurfaceView: NSView {
     }
 
     deinit {
+        guestResizeWorkItem?.cancel()
         stopDisplayLink()
     }
 
@@ -86,6 +89,9 @@ public final class VMSurfaceView: NSView {
     }
 
     public func detach() {
+        guestResizeWorkItem?.cancel()
+        guestResizeWorkItem = nil
+        lastGuestDisplaySize = .zero
         stopDisplayLink()
         surface = nil
         vmInstance?.surface = nil
@@ -121,6 +127,7 @@ public final class VMSurfaceView: NSView {
     private func updateSurfaceSize() {
         let size = metalLayer.drawableSize
         surface?.setSize(width: UInt32(size.width), height: UInt32(size.height))
+        scheduleGuestResize()
     }
 
     private func updateContentScale() {
@@ -135,6 +142,39 @@ public final class VMSurfaceView: NSView {
         )
         surface?.setContentScale(x: scale, y: scale)
         updateSurfaceSize()
+    }
+
+    private func scheduleGuestResize() {
+        guard surface != nil, let vmInstance else { return }
+
+        let drawableSize = metalLayer.drawableSize
+        guard drawableSize.width >= 320, drawableSize.height >= 240 else { return }
+
+        let maximumSize = CGSize(
+            width: CGFloat(vmInstance.config.displayWidth),
+            height: CGFloat(vmInstance.config.displayHeight)
+        )
+        let scale = min(
+            1,
+            maximumSize.width / drawableSize.width,
+            maximumSize.height / drawableSize.height
+        )
+        let width = floor(drawableSize.width * scale / 2) * 2
+        let height = floor(drawableSize.height * scale / 2) * 2
+        let requestedSize = CGSize(width: width, height: height)
+        guard requestedSize != lastGuestDisplaySize else { return }
+
+        guestResizeWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, let surface = self.surface else { return }
+            surface.requestDisplaySize(
+                width: UInt32(requestedSize.width),
+                height: UInt32(requestedSize.height)
+            )
+            self.lastGuestDisplaySize = requestedSize
+        }
+        guestResizeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
     }
 
     // MARK: - Display Link

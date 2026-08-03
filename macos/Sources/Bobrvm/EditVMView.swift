@@ -193,7 +193,7 @@ struct EditVMView: View {
                             icon: "gpu"
                         )
                         ReadOnlyConfigRow(
-                            label: "Resolution",
+                            label: "Maximum Resolution",
                             value: resolution.label,
                             icon: "display"
                         )
@@ -217,7 +217,7 @@ struct EditVMView: View {
                                 .onChange(of: vramMB) { _ in hasChanges = true }
                         }
 
-                        Picker("Guest Resolution", selection: $resolution) {
+                        Picker("Maximum Guest Resolution", selection: $resolution) {
                             ForEach(DisplayResolution.presets) { preset in
                                 Text(preset.label).tag(preset)
                             }

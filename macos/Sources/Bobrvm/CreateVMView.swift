@@ -349,9 +349,9 @@ private struct HardwareStepView: View {
             )
             Divider()
             HStack {
-                Text("Guest resolution")
+                Text("Maximum guest resolution")
                 Spacer()
-                Picker("Guest resolution", selection: $resolution) {
+                Picker("Maximum guest resolution", selection: $resolution) {
                     ForEach(DisplayResolution.presets) { preset in
                         Text(preset.label).tag(preset)
                     }
@@ -359,6 +359,9 @@ private struct HardwareStepView: View {
                 .labelsHidden()
                 .frame(width: 160)
             }
+            Text("The guest display follows the VM window up to this framebuffer size.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("Use full resolution for Retina display", isOn: $retinaEnabled)
             Text(
                 retinaEnabled

@@ -52,7 +52,12 @@ pub const RuntimeConfig = extern struct {
 
     /// Console output from VM.
     /// Called on vCPU thread - Swift should dispatch to main if needed.
-    console_output: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+    console_output: ?*const fn (
+        ?*anyopaque,
+        *anyopaque,
+        [*]const u8,
+        usize,
+    ) callconv(.c) void = null,
 };
 
 /// VM configuration (C API struct - pointers are temporary).
@@ -379,9 +384,9 @@ pub const App = struct {
     }
 
     /// Send console output to Swift.
-    pub fn sendConsoleOutput(self: *App, data: []const u8) void {
+    pub fn sendConsoleOutput(self: *App, vm: *VM, data: []const u8) void {
         if (self.runtime.console_output) |cb| {
-            cb(self.runtime.userdata, data.ptr, data.len);
+            cb(self.runtime.userdata, vm, data.ptr, data.len);
         }
     }
 };
@@ -691,7 +696,7 @@ pub const VM = struct {
     fn consoleOutputCallback(data: []const u8, userdata: ?*anyopaque) void {
         const vm: *VM = @ptrCast(@alignCast(userdata orelse return));
         // Route to Swift via App callback
-        vm.app.sendConsoleOutput(data);
+        vm.app.sendConsoleOutput(vm, data);
     }
 
     pub fn createSurface(

@@ -5,6 +5,7 @@
 //  Swift wrappers around the C API with type safety.
 //
 
+import Combine
 import Foundation
 import Metal
 import QuartzCore
@@ -92,6 +93,11 @@ public enum MouseButton: Int32 {
     case left = 0
     case right = 1
     case middle = 2
+}
+
+enum ConsoleEvent: Sendable {
+    case output(String)
+    case clear
 }
 
 // MARK: - VM Configuration
@@ -304,15 +310,16 @@ public final class App {
             let app = Unmanaged<App>.fromOpaque(userdata).takeUnretainedValue()
             app.delegate?.appGPUFrameReady(app)
         }
-        runtimeConfig.console_output = { userdata, data, len in
-            guard let userdata = userdata, let data = data, len > 0 else { return }
+        runtimeConfig.console_output = { userdata, vmHandle, data, len in
+            guard let userdata = userdata, let vmHandle, let data = data, len > 0 else { return }
             let app = Unmanaged<App>.fromOpaque(userdata).takeUnretainedValue()
-            // Rebind from CChar (Int8) to UInt8 for String decoding
             let uint8Ptr = UnsafeRawPointer(data).bindMemory(to: UInt8.self, capacity: len)
             let buffer = UnsafeBufferPointer(start: uint8Ptr, count: len)
             let text = String(decoding: buffer, as: UTF8.self)
             DispatchQueue.main.async {
-                app.delegate?.app(app, didReceiveConsoleOutput: text)
+                guard let vm = app.vms.first(where: { $0.matches(vmHandle) }) else { return }
+                vm.appendConsoleOutput(text)
+                app.delegate?.app(app, vm: vm, didReceiveConsoleOutput: text)
             }
         }
 
@@ -367,7 +374,7 @@ public protocol BobrvmAppDelegate: AnyObject {
     func appReadClipboard(_ app: App) -> String?
     func app(_ app: App, didRequestWriteClipboard text: String)
     func appGPUFrameReady(_ app: App)
-    func app(_ app: App, didReceiveConsoleOutput text: String)
+    func app(_ app: App, vm: VM, didReceiveConsoleOutput text: String)
 }
 
 extension BobrvmAppDelegate {
@@ -376,7 +383,7 @@ extension BobrvmAppDelegate {
     public func appReadClipboard(_ app: App) -> String? { nil }
     public func app(_ app: App, didRequestWriteClipboard text: String) {}
     public func appGPUFrameReady(_ app: App) {}
-    public func app(_ app: App, didReceiveConsoleOutput text: String) {}
+    public func app(_ app: App, vm: VM, didReceiveConsoleOutput text: String) {}
 }
 
 // MARK: - VM
@@ -385,14 +392,37 @@ extension BobrvmAppDelegate {
 public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
     @Published public private(set) var isStopping = false
+    public private(set) var consoleOutput = ""
 
     private var handle: bobrvm_vm_t?
     private weak var app: App?
     private var surfaces: [Surface] = []
+    private let consoleEventSubject = PassthroughSubject<ConsoleEvent, Never>()
+
+    var consoleEventPublisher: AnyPublisher<ConsoleEvent, Never> {
+        consoleEventSubject.eraseToAnyPublisher()
+    }
 
     init(handle: bobrvm_vm_t, app: App) {
         self.handle = handle
         self.app = app
+    }
+
+    func matches(_ candidate: bobrvm_vm_t) -> Bool {
+        handle == candidate
+    }
+
+    func appendConsoleOutput(_ text: String) {
+        consoleOutput.append(text)
+        consoleEventSubject.send(.output(text))
+
+        guard consoleOutput.count > 125_000 else { return }
+        consoleOutput = String(consoleOutput.suffix(100_000))
+    }
+
+    public func clearConsoleOutput() {
+        consoleOutput = ""
+        consoleEventSubject.send(.clear)
     }
 
     deinit {
@@ -514,6 +544,11 @@ public final class Surface {
     public func setContentScale(x: Double, y: Double) {
         guard let h = handle else { return }
         bobrvm_surface_set_content_scale(h, x, y)
+    }
+
+    public func requestDisplaySize(width: UInt32, height: UInt32) {
+        guard let h = handle else { return }
+        bobrvm_surface_request_display_size(h, width, height)
     }
 
     public func setFocus(_ focused: Bool) {

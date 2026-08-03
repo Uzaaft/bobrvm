@@ -9,11 +9,6 @@ import Combine
 import Foundation
 import OSLog
 
-enum ConsoleEvent: Sendable {
-    case output(String)
-    case clear
-}
-
 @MainActor
 public final class VMManager: ObservableObject {
     private static let logger = Logger(
@@ -23,15 +18,6 @@ public final class VMManager: ObservableObject {
 
     @Published public var vms: [VMInstance] = []
     @Published public var showingCreateVM = false
-    public private(set) var consoleOutput = ""
-
-    private static let consoleRetainedLength = 100_000
-    private static let consoleTrimThreshold = 125_000
-    private let consoleEventSubject = PassthroughSubject<ConsoleEvent, Never>()
-
-    var consoleEventPublisher: AnyPublisher<ConsoleEvent, Never> {
-        consoleEventSubject.eraseToAnyPublisher()
-    }
 
     weak var app: App?
 
@@ -40,9 +26,7 @@ public final class VMManager: ObservableObject {
         frameReadySubject.eraseToAnyPublisher()
     }
 
-    public init() {
-        consoleOutput.reserveCapacity(Self.consoleTrimThreshold)
-    }
+    public init() {}
 
     public func loadExistingVMs() {
         guard let app else {
@@ -185,18 +169,6 @@ public final class VMManager: ObservableObject {
         frameReadySubject.send()
     }
 
-    public func appendConsoleOutput(_ text: String) {
-        consoleOutput.append(text)
-        consoleEventSubject.send(.output(text))
-
-        guard consoleOutput.count > Self.consoleTrimThreshold else { return }
-        consoleOutput = String(consoleOutput.suffix(Self.consoleRetainedLength))
-    }
-
-    public func clearConsoleOutput() {
-        consoleOutput = ""
-        consoleEventSubject.send(.clear)
-    }
 }
 
 // MARK: - VM Instance
@@ -248,6 +220,10 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
 
     public var vramMB: Int {
         Int(config.gpuMemoryBytes / (1024 * 1024))
+    }
+
+    var runtimeVM: VM? {
+        vm
     }
 
     public func start() throws {

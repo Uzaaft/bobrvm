@@ -101,7 +101,7 @@ struct VMLibraryHomeView: View {
     private func start(_ vm: VMInstance) {
         do {
             try vm.start()
-            openWindow(value: vm.id)
+            openWindow(id: "vm-display", value: vm.id)
         } catch {
             startError = error.localizedDescription
         }
@@ -220,7 +220,7 @@ private struct VMLibraryCard: View {
     }
 
     private var displayText: String {
-        "\(vmInstance.config.displayWidth) × \(vmInstance.config.displayHeight)"
+        "Up to \(vmInstance.config.displayWidth) × \(vmInstance.config.displayHeight)"
     }
 
     private var opticalDriveText: String {

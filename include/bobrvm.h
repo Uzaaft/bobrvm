@@ -166,7 +166,7 @@ typedef struct {
     void (*gpu_frame_ready)(void* userdata);
 
     /** Console output from VM. Called on vCPU thread - dispatch to main if needed. */
-    void (*console_output)(void* userdata, const char* data, size_t len);
+    void (*console_output)(void* userdata, bobrvm_vm_t vm, const char* data, size_t len);
 } bobrvm_runtime_config_s;
 
 /* -------------------------------------------------------------------------- */

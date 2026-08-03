@@ -95,7 +95,7 @@ struct VMListView: View {
             VMListRow(vmInstance: vm)
                 .tag(vm)
                 .onTapGesture {
-                    openWindow(value: vm.id)
+                    openWindow(id: "vm-display", value: vm.id)
                 }
                 .contextMenu {
                     VMContextMenu(
@@ -166,7 +166,7 @@ struct VMContextMenu: View {
                 case .stopped:
                     Button {
                         try? vmInstance.start()
-                        openWindow(value: vmInstance.id)
+                        openWindow(id: "vm-display", value: vmInstance.id)
                     } label: {
                         Label("Start", systemImage: "play.fill")
                     }
@@ -191,7 +191,7 @@ struct VMContextMenu: View {
                     Button {
                         vmInstance.stop()
                         try? vmInstance.start()
-                        openWindow(value: vmInstance.id)
+                        openWindow(id: "vm-display", value: vmInstance.id)
                     } label: {
                         Label("Restart", systemImage: "arrow.clockwise")
                     }
@@ -199,7 +199,7 @@ struct VMContextMenu: View {
                 case .paused:
                     Button {
                         vmInstance.resume()
-                        openWindow(value: vmInstance.id)
+                        openWindow(id: "vm-display", value: vmInstance.id)
                     } label: {
                         Label("Resume", systemImage: "play.fill")
                     }
@@ -322,12 +322,12 @@ struct VMListRow: View {
 
 struct VMDetailView: View {
     @ObservedObject var vmInstance: VMInstance
-    @State private var showingConsole = true
 
     var body: some View {
         VStack(spacing: 0) {
             if vmInstance.state == .running || vmInstance.state == .paused {
-                RunningVMDetail(vmInstance: vmInstance, showingConsole: showingConsole)
+                VMSurfaceRepresentable(vmInstance: vmInstance)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 16) {
                     Image(systemName: "desktopcomputer")
@@ -381,14 +381,6 @@ struct VMDetailView: View {
                     .help("Stop VM")
                 }
 
-                Button {
-                    showingConsole.toggle()
-                } label: {
-                    Image(systemName: "terminal")
-                        .foregroundStyle(showingConsole ? Color.accentColor : Color.primary)
-                }
-                .help("Toggle Console")
-                .accessibilityValue(showingConsole ? "Shown" : "Hidden")
             }
         }
     }
@@ -414,30 +406,45 @@ struct VMWindowView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .focusedSceneValue(\.vmID, vmID)
     }
 }
 
-private struct RunningVMDetail: View {
-    @ObservedObject var vmInstance: VMInstance
-    let showingConsole: Bool
+struct VMConsoleWindowView: View {
+    @EnvironmentObject private var vmManager: VMManager
+    let vmID: UUID
 
     var body: some View {
-        VSplitView {
-            VMSurfaceRepresentable(vmInstance: vmInstance)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if showingConsole {
-                ConsoleView()
-                    .frame(minHeight: 100, idealHeight: 200, maxHeight: 400)
+        Group {
+            if let vmInstance = vmManager.vms.first(where: { $0.id == vmID }) {
+                if let vm = vmInstance.runtimeVM {
+                    ConsoleView(vm: vm)
+                        .navigationTitle("\(vmInstance.name) Console")
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "terminal")
+                            .font(.system(size: 48))
+                            .foregroundStyle(.secondary)
+                        Text("Console Unavailable")
+                            .font(.title2)
+                        Text("Start the virtual machine to open its console.")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else {
+                Text("Virtual Machine Not Found")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .focusedSceneValue(\.vmID, vmID)
     }
 }
 
 // MARK: - Console View
 
 struct ConsoleView: View {
-    @EnvironmentObject var vmManager: VMManager
+    @ObservedObject var vm: VM
     @EnvironmentObject private var ghosttyRuntime: GhosttyRuntime
 
     var body: some View {
@@ -448,7 +455,7 @@ struct ConsoleView: View {
 
                 Spacer()
 
-                Button(action: { vmManager.clearConsoleOutput() }) {
+                Button(action: { vm.clearConsoleOutput() }) {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.borderless)
@@ -461,8 +468,8 @@ struct ConsoleView: View {
             if let app = ghosttyRuntime.app {
                 GhosttyConsoleViewRepresentable(
                     app: app,
-                    initialOutput: vmManager.consoleOutput,
-                    events: vmManager.consoleEventPublisher
+                    initialOutput: vm.consoleOutput,
+                    events: vm.consoleEventPublisher
                 )
             } else {
                 Text("Terminal renderer unavailable")
@@ -470,6 +477,17 @@ struct ConsoleView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+}
+
+private struct VMIDFocusedValueKey: FocusedValueKey {
+    typealias Value = UUID
+}
+
+extension FocusedValues {
+    var vmID: UUID? {
+        get { self[VMIDFocusedValueKey.self] }
+        set { self[VMIDFocusedValueKey.self] = newValue }
     }
 }
 
