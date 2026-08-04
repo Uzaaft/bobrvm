@@ -13,6 +13,7 @@ const id = objc.c.id;
 const BOOL = objc.c.BOOL;
 const NSInteger = isize;
 const NSUInteger = usize;
+const ObjectError = error{FrameworkObjectCreationFailed};
 
 pub const MacOSConfig = extern struct {
     memory_bytes: u64,
@@ -30,6 +31,7 @@ pub const MacOSConfig = extern struct {
 pub const Backend = struct {
     vm: Object,
     view: Object,
+    installer: ?Object = null,
 
     pub const Config = MacOSConfig;
     pub const InitError = error{
@@ -39,8 +41,14 @@ pub const Backend = struct {
         ConfigurationValidationFailed,
     };
     pub const StartError = error{ InvalidState, StartFailed };
+    pub const InstallError = error{ InvalidState, FrameworkObjectCreationFailed };
+    pub const InstallCallback = *const fn (?*anyopaque, bool) callconv(.c) void;
 
     const CompletionBlock = objc.Block(struct {}, .{id}, void);
+    const InstallCompletionBlock = objc.Block(struct {
+        userdata: ?*anyopaque,
+        callback: InstallCallback,
+    }, .{id}, void);
 
     pub fn init(config: *const Config) InitError!Backend {
         if (comptime builtin.cpu.arch != .aarch64) return error.UnsupportedHost;
@@ -62,7 +70,9 @@ pub const Backend = struct {
         }
         view.msgSend(void, "setVirtualMachine:", .{vm.value});
         view.msgSend(void, "setCapturesSystemKeys:", .{boolParam(true)});
-        if (view.getClass().?.respondsToSelector(objc.sel("setAutomaticallyReconfiguresDisplay:"))) {
+        if (boolResult(view.msgSend(BOOL, "respondsToSelector:", .{
+            objc.sel("setAutomaticallyReconfiguresDisplay:"),
+        }))) {
             view.msgSend(void, "setAutomaticallyReconfiguresDisplay:", .{boolParam(true)});
         }
 
@@ -73,6 +83,7 @@ pub const Backend = struct {
         assert(self.vm.value != null);
         assert(self.view.value != null);
         self.view.msgSend(void, "setVirtualMachine:", .{@as(id, null)});
+        if (self.installer) |installer| installer.release();
         self.view.release();
         self.vm.release();
         self.* = undefined;
@@ -108,43 +119,109 @@ pub const Backend = struct {
         return @ptrCast(self.view.value);
     }
 
+    pub fn install(
+        self: *Backend,
+        restore_path: [*:0]const u8,
+        userdata: ?*anyopaque,
+        callback: InstallCallback,
+    ) InstallError!void {
+        if (self.installer != null) return error.InvalidState;
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+
+        const restore_url = fileURL(restore_path) catch return error.FrameworkObjectCreationFailed;
+        const installer = try initObject(
+            "VZMacOSInstaller",
+            "initWithVirtualMachine:restoringFromImageAtURL:",
+            .{ self.vm.value, restore_url.value },
+        );
+        self.installer = installer.retain();
+        var block = InstallCompletionBlock.init(.{
+            .userdata = userdata,
+            .callback = callback,
+        }, installCompletion);
+        installer.msgSend(void, "installWithCompletionHandler:", .{&block});
+    }
+
+    pub fn installProgress(self: *const Backend) f64 {
+        const installer = self.installer orelse return 0;
+        const progress = installer.msgSend(Object, "progress", .{});
+        if (progress.value == null) return 0;
+        return progress.msgSend(f64, "fractionCompleted", .{});
+    }
+
     fn perform(self: *Backend, comptime selector: [:0]const u8, _: runtime.State) void {
         var block = CompletionBlock.init(.{}, completion);
         self.vm.msgSend(void, selector, .{&block});
     }
 
     fn completion(_: *const CompletionBlock.Context, _: id) callconv(.c) void {}
+
+    fn installCompletion(block: *const InstallCompletionBlock.Context, error_object: id) callconv(.c) void {
+        block.callback(block.userdata, error_object == null);
+    }
 };
 
 pub const MacRuntime = runtime.Runtime(Backend);
 
 fn createConfiguration(config: *const MacOSConfig) Backend.InitError!Object {
-    const disk_path = config.disk_path orelse return error.InvalidConfig;
+    if (config.memory_bytes == 0 or config.vcpu_count == 0) return error.InvalidConfig;
+    if (config.display_width == 0 or config.display_height == 0) return error.InvalidConfig;
+
+    const platform = try createPlatform(config);
+    const configuration = try newObject("VZVirtualMachineConfiguration");
+    configuration.msgSend(void, "setBootLoader:", .{(try newObject("VZMacOSBootLoader")).value});
+    configuration.msgSend(void, "setPlatform:", .{platform.value});
+    configureCompute(configuration, config);
+    try configureStorageAndGraphics(configuration, config);
+    try configureInputAndNetwork(configuration, config);
+    try configureAudio(configuration);
+
+    var error_object: id = null;
+    if (!boolResult(configuration.msgSend(BOOL, "validateWithError:", .{&error_object}))) {
+        return error.ConfigurationValidationFailed;
+    }
+    return configuration.retain();
+}
+
+fn createPlatform(config: *const MacOSConfig) Backend.InitError!Object {
     const auxiliary_path = config.auxiliary_storage_path orelse return error.InvalidConfig;
     const hardware_base64 = config.hardware_model_base64 orelse return error.InvalidConfig;
     const identifier_base64 = config.machine_identifier_base64 orelse return error.InvalidConfig;
-    const mac_string = config.mac_address orelse return error.InvalidConfig;
-    if (config.memory_bytes == 0 or config.vcpu_count == 0) return error.InvalidConfig;
-
     const hardware_data = try dataFromBase64(hardware_base64);
     const identifier_data = try dataFromBase64(identifier_base64);
     const hardware = try initObject("VZMacHardwareModel", "initWithDataRepresentation:", .{hardware_data.value});
+    if (!boolResult(hardware.msgSend(BOOL, "isSupported", .{}))) return error.InvalidConfig;
     const identifier = try initObject("VZMacMachineIdentifier", "initWithDataRepresentation:", .{identifier_data.value});
     const auxiliary_url = try fileURL(auxiliary_path);
     const auxiliary = try initObject("VZMacAuxiliaryStorage", "initWithURL:", .{auxiliary_url.value});
-    const mac = try initObject("VZMACAddress", "initWithString:", .{string(mac_string).value});
-
     const platform = try newObject("VZMacPlatformConfiguration");
     platform.msgSend(void, "setHardwareModel:", .{hardware.value});
     platform.msgSend(void, "setMachineIdentifier:", .{identifier.value});
     platform.msgSend(void, "setAuxiliaryStorage:", .{auxiliary.value});
+    return platform;
+}
 
-    const configuration = try newObject("VZVirtualMachineConfiguration");
-    configuration.msgSend(void, "setBootLoader:", .{(try newObject("VZMacOSBootLoader")).value});
-    configuration.msgSend(void, "setPlatform:", .{platform.value});
-    configuration.msgSend(void, "setCPUCount:", .{@as(NSUInteger, config.vcpu_count)});
-    configuration.msgSend(void, "setMemorySize:", .{config.memory_bytes});
+fn configureCompute(configuration: Object, config: *const MacOSConfig) void {
+    const configuration_class = objc.getClass("VZVirtualMachineConfiguration").?;
+    const cpu_min = configuration_class.msgSend(NSUInteger, "minimumAllowedCPUCount", .{});
+    const cpu_max = configuration_class.msgSend(NSUInteger, "maximumAllowedCPUCount", .{});
+    const memory_min = configuration_class.msgSend(u64, "minimumAllowedMemorySize", .{});
+    const memory_max = configuration_class.msgSend(u64, "maximumAllowedMemorySize", .{});
+    configuration.msgSend(void, "setCPUCount:", .{std.math.clamp(
+        @as(NSUInteger, config.vcpu_count),
+        cpu_min,
+        cpu_max,
+    )});
+    configuration.msgSend(void, "setMemorySize:", .{std.math.clamp(
+        config.memory_bytes,
+        memory_min,
+        memory_max,
+    )});
+}
 
+fn configureStorageAndGraphics(configuration: Object, config: *const MacOSConfig) Backend.InitError!void {
+    const disk_path = config.disk_path orelse return error.InvalidConfig;
     const disk_attachment = try createDiskAttachment(disk_path);
     const disk = try initObject("VZVirtioBlockDeviceConfiguration", "initWithAttachment:", .{disk_attachment.value});
     configuration.msgSend(void, "setStorageDevices:", .{array(&.{disk}).value});
@@ -157,27 +234,42 @@ fn createConfiguration(config: *const MacOSConfig) Backend.InitError!Object {
     const graphics = try newObject("VZMacGraphicsDeviceConfiguration");
     graphics.msgSend(void, "setDisplays:", .{array(&.{display}).value});
     configuration.msgSend(void, "setGraphicsDevices:", .{array(&.{graphics}).value});
+}
 
+fn configureInputAndNetwork(configuration: Object, config: *const MacOSConfig) Backend.InitError!void {
     const keyboard = try newObject("VZUSBKeyboardConfiguration");
-    configuration.msgSend(void, "setKeyboards:", .{array(&.{keyboard}).value});
+    if (objc.getClass("VZMacKeyboardConfiguration")) |_| {
+        const mac_keyboard = try newObject("VZMacKeyboardConfiguration");
+        configuration.msgSend(void, "setKeyboards:", .{array(&.{ keyboard, mac_keyboard }).value});
+    } else {
+        configuration.msgSend(void, "setKeyboards:", .{array(&.{keyboard}).value});
+    }
     const pointer = try newObject("VZUSBScreenCoordinatePointingDeviceConfiguration");
     const trackpad = try newObject("VZMacTrackpadConfiguration");
     configuration.msgSend(void, "setPointingDevices:", .{array(&.{ pointer, trackpad }).value});
 
+    const mac_string = config.mac_address orelse return error.InvalidConfig;
+    const mac = try initObject("VZMACAddress", "initWithString:", .{string(mac_string).value});
     const network = try newObject("VZVirtioNetworkDeviceConfiguration");
     network.msgSend(void, "setAttachment:", .{(try newObject("VZNATNetworkDeviceAttachment")).value});
     network.msgSend(void, "setMACAddress:", .{mac.value});
     configuration.msgSend(void, "setNetworkDevices:", .{array(&.{network}).value});
     configuration.msgSend(void, "setEntropyDevices:", .{array(&.{try newObject("VZVirtioEntropyDeviceConfiguration")}).value});
-
-    var error_object: id = null;
-    if (!boolResult(configuration.msgSend(BOOL, "validateWithError:", .{&error_object}))) {
-        return error.ConfigurationValidationFailed;
-    }
-    return configuration.retain();
 }
 
-fn createDiskAttachment(path: [*:0]const u8) Backend.InitError!Object {
+fn configureAudio(configuration: Object) Backend.InitError!void {
+    const input = try newObject("VZVirtioSoundDeviceInputStreamConfiguration");
+    input.msgSend(void, "setSource:", .{(try newObject("VZHostAudioInputStreamSource")).value});
+
+    const output = try newObject("VZVirtioSoundDeviceOutputStreamConfiguration");
+    output.msgSend(void, "setSink:", .{(try newObject("VZHostAudioOutputStreamSink")).value});
+
+    const sound = try newObject("VZVirtioSoundDeviceConfiguration");
+    sound.msgSend(void, "setStreams:", .{array(&.{ input, output }).value});
+    configuration.msgSend(void, "setAudioDevices:", .{array(&.{sound}).value});
+}
+
+fn createDiskAttachment(path: [*:0]const u8) ObjectError!Object {
     var error_object: id = null;
     const result = (try allocObject("VZDiskImageStorageDeviceAttachment")).msgSend(
         Object,
@@ -185,10 +277,10 @@ fn createDiskAttachment(path: [*:0]const u8) Backend.InitError!Object {
         .{ (try fileURL(path)).value, boolParam(false), &error_object },
     );
     if (result.value == null) return error.FrameworkObjectCreationFailed;
-    return result;
+    return result.msgSend(Object, "autorelease", .{});
 }
 
-fn dataFromBase64(value: [*:0]const u8) Backend.InitError!Object {
+fn dataFromBase64(value: [*:0]const u8) ObjectError!Object {
     return initObject("NSData", "initWithBase64EncodedString:options:", .{
         string(value).value,
         @as(NSUInteger, 0),
@@ -199,7 +291,7 @@ fn string(value: [*:0]const u8) Object {
     return objc.getClass("NSString").?.msgSend(Object, "stringWithUTF8String:", .{value});
 }
 
-fn fileURL(path: [*:0]const u8) Backend.InitError!Object {
+fn fileURL(path: [*:0]const u8) ObjectError!Object {
     const result = objc.getClass("NSURL").?.msgSend(Object, "fileURLWithPath:", .{string(path).value});
     if (result.value == null) return error.FrameworkObjectCreationFailed;
     return result;
@@ -215,14 +307,14 @@ fn array(objects: []const Object) Object {
     });
 }
 
-fn allocObject(comptime name: [:0]const u8) Backend.InitError!Object {
+fn allocObject(comptime name: [:0]const u8) ObjectError!Object {
     const class = objc.getClass(name) orelse return error.FrameworkObjectCreationFailed;
     const result = class.msgSend(Object, "alloc", .{});
     if (result.value == null) return error.FrameworkObjectCreationFailed;
     return result;
 }
 
-fn newObject(comptime name: [:0]const u8) Backend.InitError!Object {
+fn newObject(comptime name: [:0]const u8) ObjectError!Object {
     const result = (try allocObject(name)).msgSend(Object, "init", .{});
     if (result.value == null) return error.FrameworkObjectCreationFailed;
     return result.msgSend(Object, "autorelease", .{});
@@ -232,7 +324,7 @@ fn initObject(
     comptime name: [:0]const u8,
     comptime selector: [:0]const u8,
     args: anytype,
-) Backend.InitError!Object {
+) ObjectError!Object {
     const result = (try allocObject(name)).msgSend(Object, selector, args);
     if (result.value == null) return error.FrameworkObjectCreationFailed;
     return result.msgSend(Object, "autorelease", .{});

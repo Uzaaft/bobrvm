@@ -51,135 +51,17 @@ enum MacVirtualMachineError: LocalizedError {
   }
 }
 
-enum MacOSVirtualMachineFactory {
-  static func configuration(
-    config: VMConfig,
-    metadata: MacOSPlatformMetadata,
-    retinaEnabled: Bool
-  ) throws -> VZVirtualMachineConfiguration {
-    #if !arch(arm64)
-      throw MacVirtualMachineError.appleSiliconRequired
-    #else
-      guard let hardwareData = Data(base64Encoded: metadata.hardwareModel),
-        let hardwareModel = VZMacHardwareModel(dataRepresentation: hardwareData),
-        hardwareModel.isSupported
-      else {
-        throw MacVirtualMachineError.invalidHardwareModel
-      }
-      guard let identifierData = Data(base64Encoded: metadata.machineIdentifier),
-        let machineIdentifier = VZMacMachineIdentifier(
-          dataRepresentation: identifierData
-        )
-      else {
-        throw MacVirtualMachineError.invalidMachineIdentifier
-      }
-      guard let macAddress = VZMACAddress(string: metadata.macAddress) else {
-        throw MacVirtualMachineError.invalidMACAddress
-      }
-      guard let diskPath = config.diskPath else {
-        throw BobrvmError.invalidArgument
-      }
-
-      let platform = VZMacPlatformConfiguration()
-      platform.hardwareModel = hardwareModel
-      platform.machineIdentifier = machineIdentifier
-      platform.auxiliaryStorage = VZMacAuxiliaryStorage(
-        url: URL(fileURLWithPath: metadata.auxiliaryStoragePath)
-      )
-
-      let result = VZVirtualMachineConfiguration()
-      result.bootLoader = VZMacOSBootLoader()
-      result.platform = platform
-      result.cpuCount = min(
-        max(Int(config.vcpuCount), VZVirtualMachineConfiguration.minimumAllowedCPUCount),
-        VZVirtualMachineConfiguration.maximumAllowedCPUCount
-      )
-      result.memorySize = min(
-        max(config.memoryBytes, VZVirtualMachineConfiguration.minimumAllowedMemorySize),
-        VZVirtualMachineConfiguration.maximumAllowedMemorySize
-      )
-      result.storageDevices = [
-        try storageDevice(path: diskPath)
-      ]
-      result.graphicsDevices = [graphicsDevice(config: config, retinaEnabled: retinaEnabled)]
-      result.keyboards = keyboardDevices()
-      result.pointingDevices = pointingDevices()
-      result.networkDevices = [networkDevice(macAddress: macAddress)]
-      result.audioDevices = [audioDevice()]
-      result.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-
-      try result.validate()
-      return result
-    #endif
-  }
-
-  #if arch(arm64)
-    private static func storageDevice(path: String) throws -> VZStorageDeviceConfiguration {
-      let attachment = try VZDiskImageStorageDeviceAttachment(
-        url: URL(fileURLWithPath: path),
-        readOnly: false,
-        cachingMode: .automatic,
-        synchronizationMode: .full
-      )
-      return VZVirtioBlockDeviceConfiguration(attachment: attachment)
-    }
-
-    private static func graphicsDevice(
-      config: VMConfig,
-      retinaEnabled: Bool
-    ) -> VZGraphicsDeviceConfiguration {
-      let graphics = VZMacGraphicsDeviceConfiguration()
-      graphics.displays = [
-        VZMacGraphicsDisplayConfiguration(
-          widthInPixels: Int(config.displayWidth),
-          heightInPixels: Int(config.displayHeight),
-          pixelsPerInch: retinaEnabled ? 144 : 80
-        )
-      ]
-      return graphics
-    }
-
-    private static func keyboardDevices() -> [VZKeyboardConfiguration] {
-      if #available(macOS 14, *) {
-        return [VZUSBKeyboardConfiguration(), VZMacKeyboardConfiguration()]
-      }
-      return [VZUSBKeyboardConfiguration()]
-    }
-
-    private static func pointingDevices() -> [VZPointingDeviceConfiguration] {
-      [
-        VZUSBScreenCoordinatePointingDeviceConfiguration(),
-        VZMacTrackpadConfiguration(),
-      ]
-    }
-
-    private static func networkDevice(macAddress: VZMACAddress) -> VZNetworkDeviceConfiguration {
-      let network = VZVirtioNetworkDeviceConfiguration()
-      network.attachment = VZNATNetworkDeviceAttachment()
-      network.macAddress = macAddress
-      return network
-    }
-
-    private static func audioDevice() -> VZAudioDeviceConfiguration {
-      let sound = VZVirtioSoundDeviceConfiguration()
-      let input = VZVirtioSoundDeviceInputStreamConfiguration()
-      input.source = VZHostAudioInputStreamSource()
-      let output = VZVirtioSoundDeviceOutputStreamConfiguration()
-      output.sink = VZHostAudioOutputStreamSink()
-      sound.streams = [input, output]
-      return sound
-    }
-  #endif
-}
-
-final class MacVirtualMachine: NSObject, ObservableObject, VZVirtualMachineDelegate {
+@MainActor
+final class MacVirtualMachine: ObservableObject {
   @Published private(set) var state: VMState = .stopped
   @Published private(set) var lastError: Error?
 
-  private(set) var virtualMachine: VZVirtualMachine?
+  private(set) var displayView: NSView?
   private let config: VMConfig
   private let metadata: MacOSPlatformMetadata
   private let retinaEnabled: Bool
+  private var runtime: MacVM?
+  private var stateCancellable: AnyCancellable?
 
   init(config: VMConfig, metadata: MacOSPlatformMetadata, retinaEnabled: Bool) {
     self.config = config
@@ -187,91 +69,49 @@ final class MacVirtualMachine: NSObject, ObservableObject, VZVirtualMachineDeleg
     self.retinaEnabled = retinaEnabled
   }
 
-  @MainActor
   func start() throws {
     guard state == .stopped else { return }
-    let configuration = try MacOSVirtualMachineFactory.configuration(
-      config: config,
-      metadata: metadata,
-      retinaEnabled: retinaEnabled
+    guard let diskPath = config.diskPath else { throw BobrvmError.invalidArgument }
+    let runtime = try MacVM(
+      config: MacVMConfig(
+        memoryBytes: config.memoryBytes,
+        vcpuCount: config.vcpuCount,
+        displayWidth: config.displayWidth,
+        displayHeight: config.displayHeight,
+        retinaEnabled: retinaEnabled,
+        diskPath: diskPath,
+        auxiliaryStoragePath: metadata.auxiliaryStoragePath,
+        hardwareModel: metadata.hardwareModel,
+        machineIdentifier: metadata.machineIdentifier,
+        macAddress: metadata.macAddress
+      )
     )
-    let machine = VZVirtualMachine(configuration: configuration)
-    machine.delegate = self
-    virtualMachine = machine
-    state = .running
+    self.runtime = runtime
+    displayView = runtime.displayView
+    stateCancellable = runtime.$state.sink { [weak self] state in
+      self?.state = state
+    }
     lastError = nil
-
-    machine.start { [weak self] result in
-      DispatchQueue.main.async {
-        guard let self else { return }
-        if case .failure(let error) = result {
-          self.lastError = error
-          self.state = .stopped
-          self.virtualMachine = nil
-        }
-      }
-    }
+    try runtime.start()
   }
 
-  @MainActor
   func stop() {
-    guard let machine = virtualMachine else { return }
-    Task { @MainActor [weak self] in
-      do {
-        try await machine.stop()
-        self?.state = .stopped
-        self?.virtualMachine = nil
-      } catch {
-        self?.lastError = error
-      }
-    }
+    runtime?.stop()
   }
 
-  @MainActor
   func pause() {
-    guard let machine = virtualMachine, state == .running else { return }
-    Task { @MainActor [weak self] in
-      do {
-        try await machine.pause()
-        self?.state = .paused
-      } catch {
-        self?.lastError = error
-      }
-    }
+    runtime?.pause()
   }
 
-  @MainActor
   func resume() {
-    guard let machine = virtualMachine, state == .paused else { return }
-    Task { @MainActor [weak self] in
-      do {
-        try await machine.resume()
-        self?.state = .running
-      } catch {
-        self?.lastError = error
-      }
-    }
+    runtime?.resume()
   }
 
-  @MainActor
   func destroy() {
-    stop()
-    virtualMachine = nil
-  }
-
-  func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-    DispatchQueue.main.async { [weak self] in
-      self?.state = .stopped
-      self?.virtualMachine = nil
-    }
-  }
-
-  func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-    DispatchQueue.main.async { [weak self] in
-      self?.lastError = error
-      self?.state = .stopped
-      self?.virtualMachine = nil
-    }
+    runtime?.destroy()
+    runtime = nil
+    displayView = nil
+    stateCancellable = nil
   }
 }
 
@@ -333,25 +173,22 @@ enum MacOSRestoreService {
         auxiliaryStoragePath: auxiliaryStorageURL.path,
         macAddress: macAddress.string
       )
-      let configuration = try MacOSVirtualMachineFactory.configuration(
-        config: config,
-        metadata: metadata,
-        retinaEnabled: retinaEnabled
+      let runtime = try MacVM(
+        config: MacVMConfig(
+          memoryBytes: config.memoryBytes,
+          vcpuCount: config.vcpuCount,
+          displayWidth: config.displayWidth,
+          displayHeight: config.displayHeight,
+          retinaEnabled: retinaEnabled,
+          diskPath: diskURL.path,
+          auxiliaryStoragePath: metadata.auxiliaryStoragePath,
+          hardwareModel: metadata.hardwareModel,
+          machineIdentifier: metadata.machineIdentifier,
+          macAddress: metadata.macAddress
+        )
       )
-      let machine = VZVirtualMachine(configuration: configuration)
-      let installer = VZMacOSInstaller(
-        virtualMachine: machine,
-        restoringFromImageAt: restoreURL
-      )
-      let observation = installer.progress.observe(\.fractionCompleted) { observed, _ in
-        Task { @MainActor in
-          progress(0.70 + observed.fractionCompleted * 0.30)
-        }
-      }
-      defer { observation.invalidate() }
-
-      try await withCheckedThrowingContinuation { continuation in
-        installer.install { result in continuation.resume(with: result) }
+      try await runtime.install(restorePath: restoreURL.path) { fraction in
+        progress(0.70 + fraction * 0.30)
       }
       progress(1)
       return Result(config: config, metadata: metadata)
@@ -504,17 +341,9 @@ private final class RestoreImageDownloader: NSObject, URLSessionDownloadDelegate
 struct MacVirtualMachineView: NSViewRepresentable {
   @ObservedObject var machine: MacVirtualMachine
 
-  func makeNSView(context: Context) -> VZVirtualMachineView {
-    let view = VZVirtualMachineView()
-    view.capturesSystemKeys = true
-    if #available(macOS 14, *) {
-      view.automaticallyReconfiguresDisplay = true
-    }
-    view.virtualMachine = machine.virtualMachine
-    return view
+  func makeNSView(context: Context) -> NSView {
+    machine.displayView ?? NSView()
   }
 
-  func updateNSView(_ view: VZVirtualMachineView, context: Context) {
-    view.virtualMachine = machine.virtualMachine
-  }
+  func updateNSView(_ view: NSView, context: Context) {}
 }

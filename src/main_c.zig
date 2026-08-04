@@ -345,6 +345,24 @@ pub export fn bobrvm_macos_vm_display_view(vm: ?*macos_runtime.MacRuntime) ?*any
     return handle.displayView();
 }
 
+pub export fn bobrvm_macos_vm_install(
+    vm: ?*macos_runtime.MacRuntime,
+    restore_path: ?[*:0]const u8,
+    userdata: ?*anyopaque,
+    callback: ?macos_runtime.Backend.InstallCallback,
+) c_int {
+    const handle = vm orelse return 1;
+    const path = restore_path orelse return 1;
+    const completion = callback orelse return 1;
+    handle.backend.install(path, userdata, completion) catch return 3;
+    return 0;
+}
+
+pub export fn bobrvm_macos_vm_install_progress(vm: ?*macos_runtime.MacRuntime) f64 {
+    const handle = vm orelse return 0;
+    return handle.backend.installProgress();
+}
+
 // --------------------------------------------------------------------------
 // Surface
 // --------------------------------------------------------------------------

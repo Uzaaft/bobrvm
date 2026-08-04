@@ -317,6 +317,14 @@ void bobrvm_macos_vm_pause(bobrvm_macos_vm_t vm);
 void bobrvm_macos_vm_resume(bobrvm_macos_vm_t vm);
 bobrvm_vm_state_e bobrvm_macos_vm_state(bobrvm_macos_vm_t vm);
 void* bobrvm_macos_vm_display_view(bobrvm_macos_vm_t vm);
+typedef void (*bobrvm_macos_install_callback_f)(void* userdata, bool success);
+bobrvm_error_e bobrvm_macos_vm_install(
+    bobrvm_macos_vm_t vm,
+    const char* restore_path,
+    void* userdata,
+    bobrvm_macos_install_callback_f callback
+);
+double bobrvm_macos_vm_install_progress(bobrvm_macos_vm_t vm);
 
 /* -------------------------------------------------------------------------- */
 /* Surface (Display)                                                          */

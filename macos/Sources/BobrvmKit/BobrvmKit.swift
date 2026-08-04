@@ -6,6 +6,7 @@
 //
 
 import Combine
+import AppKit
 import Foundation
 import Metal
 import QuartzCore
@@ -512,6 +513,206 @@ public enum VMState: String, CaseIterable {
     case stopped
     case running
     case paused
+}
+
+public struct MacVMConfig {
+    public let memoryBytes: UInt64
+    public let vcpuCount: UInt8
+    public let displayWidth: UInt32
+    public let displayHeight: UInt32
+    public let retinaEnabled: Bool
+    public let diskPath: String
+    public let auxiliaryStoragePath: String
+    public let hardwareModel: String
+    public let machineIdentifier: String
+    public let macAddress: String
+
+    public init(
+        memoryBytes: UInt64,
+        vcpuCount: UInt8,
+        displayWidth: UInt32,
+        displayHeight: UInt32,
+        retinaEnabled: Bool,
+        diskPath: String,
+        auxiliaryStoragePath: String,
+        hardwareModel: String,
+        machineIdentifier: String,
+        macAddress: String
+    ) {
+        self.memoryBytes = memoryBytes
+        self.vcpuCount = vcpuCount
+        self.displayWidth = displayWidth
+        self.displayHeight = displayHeight
+        self.retinaEnabled = retinaEnabled
+        self.diskPath = diskPath
+        self.auxiliaryStoragePath = auxiliaryStoragePath
+        self.hardwareModel = hardwareModel
+        self.machineIdentifier = machineIdentifier
+        self.macAddress = macAddress
+    }
+
+    fileprivate func withCConfig<T>(
+        _ body: (UnsafePointer<bobrvm_macos_vm_config_s>) throws -> T
+    ) rethrows -> T {
+        try diskPath.withCString { disk in
+            try auxiliaryStoragePath.withCString { auxiliary in
+                try hardwareModel.withCString { hardware in
+                    try machineIdentifier.withCString { identifier in
+                        try macAddress.withCString { mac in
+                            var config = bobrvm_macos_vm_config_s(
+                                memory_bytes: memoryBytes,
+                                vcpu_count: vcpuCount,
+                                display_width: displayWidth,
+                                display_height: displayHeight,
+                                retina: retinaEnabled,
+                                disk_path: disk,
+                                auxiliary_storage_path: auxiliary,
+                                hardware_model_base64: hardware,
+                                machine_identifier_base64: identifier,
+                                mac_address: mac
+                            )
+                            return try withUnsafePointer(to: &config, body)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+public final class MacVM: ObservableObject {
+    @Published public private(set) var state: VMState = .stopped
+    public var displayView: NSView? {
+        guard let handle, let pointer = bobrvm_macos_vm_display_view(handle) else { return nil }
+        return Unmanaged<NSView>.fromOpaque(pointer).takeUnretainedValue()
+    }
+
+    private var handle: bobrvm_macos_vm_t?
+    private var stateTimer: DispatchSourceTimer?
+
+    public init(config: MacVMConfig) throws {
+        handle = try config.withCConfig { pointer in
+            guard let handle = bobrvm_macos_vm_new(pointer) else {
+                throw BobrvmError.vmCreateFailed
+            }
+            return handle
+        }
+    }
+
+    deinit {
+        stateTimer?.cancel()
+        if let handle { bobrvm_macos_vm_destroy(handle) }
+    }
+
+    public func start() throws {
+        guard let handle else { throw BobrvmError.invalidState }
+        let code = bobrvm_macos_vm_start(handle)
+        guard code.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+        state = .running
+        beginStatePolling()
+    }
+
+    public func stop() {
+        guard let handle else { return }
+        bobrvm_macos_vm_stop(handle)
+        beginStatePolling()
+    }
+
+    public func pause() {
+        guard let handle else { return }
+        bobrvm_macos_vm_pause(handle)
+        beginStatePolling()
+    }
+
+    public func resume() {
+        guard let handle else { return }
+        bobrvm_macos_vm_resume(handle)
+        beginStatePolling()
+    }
+
+    public func install(
+        restorePath: String,
+        progress: @escaping @MainActor (Double) -> Void
+    ) async throws {
+        guard let handle else { throw BobrvmError.invalidState }
+        let progressTask = Task { @MainActor in
+            while !Task.isCancelled {
+                progress(bobrvm_macos_vm_install_progress(handle))
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        defer { progressTask.cancel() }
+
+        try await withCheckedThrowingContinuation { continuation in
+            let box = MacInstallContinuation(continuation)
+            let userdata = Unmanaged.passRetained(box).toOpaque()
+            let code = restorePath.withCString {
+                bobrvm_macos_vm_install(handle, $0, userdata, macInstallCompletion)
+            }
+            guard code.rawValue != BOBRVM_OK.rawValue else { return }
+            Unmanaged<MacInstallContinuation>.fromOpaque(userdata).release()
+            continuation.resume(throwing: BobrvmError(code: Int32(code.rawValue)))
+        }
+        progress(1)
+    }
+
+    public func destroy() {
+        stateTimer?.cancel()
+        stateTimer = nil
+        if let handle {
+            bobrvm_macos_vm_destroy(handle)
+            self.handle = nil
+        }
+        state = .stopped
+    }
+
+    private func beginStatePolling() {
+        guard stateTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(50), leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.pollState() }
+        }
+        stateTimer = timer
+        timer.resume()
+    }
+
+    private func pollState() {
+        guard let handle else { return }
+        switch bobrvm_macos_vm_state(handle) {
+        case BOBRVM_VM_STATE_RUNNING:
+            state = .running
+        case BOBRVM_VM_STATE_PAUSED:
+            state = .paused
+        case BOBRVM_VM_STATE_STOPPED, BOBRVM_VM_STATE_FAILED:
+            state = .stopped
+            stateTimer?.cancel()
+            stateTimer = nil
+        default:
+            break
+        }
+    }
+}
+
+private final class MacInstallContinuation: @unchecked Sendable {
+    let value: CheckedContinuation<Void, Error>
+
+    init(_ value: CheckedContinuation<Void, Error>) {
+        self.value = value
+    }
+}
+
+private func macInstallCompletion(_ userdata: UnsafeMutableRawPointer?, _ success: Bool) {
+    guard let userdata else { return }
+    let box = Unmanaged<MacInstallContinuation>.fromOpaque(userdata).takeRetainedValue()
+    if success {
+        box.value.resume()
+    } else {
+        box.value.resume(throwing: BobrvmError.vmCreateFailed)
+    }
 }
 
 private struct SendableVMHandle: @unchecked Sendable {
