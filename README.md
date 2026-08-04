@@ -14,6 +14,9 @@ The legacy virgl translator is a GL 2.x fallback.
 macOS guests support IPSW installation, persistent hardware identity, and
 native display, input, networking, and audio devices.
 
+Automated Apple Silicon builds of the latest commit on `main` are published to
+the prerelease tagged [`tip`](https://github.com/polymath-as/bobrvm/releases/tag/tip).
+
 ## Requirements
 
 - Apple Silicon Mac running macOS 13 or later
