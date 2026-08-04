@@ -14,6 +14,7 @@ const BOOL = objc.c.BOOL;
 const NSInteger = isize;
 const NSUInteger = usize;
 const ObjectError = error{FrameworkObjectCreationFailed};
+const log = std.log.scoped(.macos_runtime);
 
 pub const MacOSConfig = extern struct {
     memory_bytes: u64,
@@ -55,12 +56,18 @@ pub const Backend = struct {
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
-        const configuration = try createConfiguration(config);
+        const configuration = createConfiguration(config) catch |err| {
+            log.err("configuration creation failed: {s}", .{@errorName(err)});
+            return err;
+        };
         defer configuration.release();
 
         const vm_alloc = try allocObject("VZVirtualMachine");
         const vm = vm_alloc.msgSend(Object, "initWithConfiguration:", .{configuration.value});
-        if (vm.value == null) return error.FrameworkObjectCreationFailed;
+        if (vm.value == null) {
+            log.err("VZVirtualMachine initialization returned nil", .{});
+            return error.FrameworkObjectCreationFailed;
+        }
 
         const view_alloc = try allocObject("VZVirtualMachineView");
         const view = view_alloc.msgSend(Object, "init", .{});
@@ -90,7 +97,12 @@ pub const Backend = struct {
     }
 
     pub fn start(self: *Backend) StartError!void {
-        if (!boolResult(self.vm.msgSend(BOOL, "canStart", .{}))) return error.InvalidState;
+        if (!boolResult(self.vm.msgSend(BOOL, "canStart", .{}))) {
+            log.err("VZVirtualMachine rejected start in state {d}", .{
+                self.vm.msgSend(NSInteger, "state", .{}),
+            });
+            return error.InvalidState;
+        }
         self.perform("startWithCompletionHandler:", .running);
     }
 
@@ -155,7 +167,9 @@ pub const Backend = struct {
         self.vm.msgSend(void, selector, .{&block});
     }
 
-    fn completion(_: *const CompletionBlock.Context, _: id) callconv(.c) void {}
+    fn completion(_: *const CompletionBlock.Context, error_object: id) callconv(.c) void {
+        if (error_object != null) logNSError("VM lifecycle operation failed", error_object);
+    }
 
     fn installCompletion(block: *const InstallCompletionBlock.Context, error_object: id) callconv(.c) void {
         block.callback(block.userdata, error_object == null);
@@ -179,6 +193,7 @@ fn createConfiguration(config: *const MacOSConfig) Backend.InitError!Object {
 
     var error_object: id = null;
     if (!boolResult(configuration.msgSend(BOOL, "validateWithError:", .{&error_object}))) {
+        logNSError("configuration validation failed", error_object);
         return error.ConfigurationValidationFailed;
     }
     return configuration.retain();
@@ -357,6 +372,20 @@ fn boolResult(value: BOOL) bool {
         i8 => value == 1,
         else => @compileError("unexpected Objective-C BOOL type"),
     };
+}
+
+fn logNSError(message: []const u8, error_object: id) void {
+    if (error_object == null) {
+        log.err("{s}: unknown framework error", .{message});
+        return;
+    }
+    const error_value = Object.fromId(error_object);
+    const description = error_value.msgSend(Object, "localizedDescription", .{});
+    const bytes = description.msgSend(?[*:0]const u8, "UTF8String", .{}) orelse {
+        log.err("{s}: NSError has no description", .{message});
+        return;
+    };
+    log.err("{s}: {s}", .{ message, std.mem.span(bytes) });
 }
 
 test "Virtualization framework reports host support" {
