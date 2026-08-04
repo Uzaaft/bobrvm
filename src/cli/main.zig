@@ -1,11 +1,4 @@
-//! CLI subcommand dispatcher and config management.
-//!
-//! Subcommands:
-//!   run      Run a VM directly with options
-//!   create   Create a named VM configuration
-//!   list     List saved VM configurations
-//!   start    Start a saved VM by name
-//!   delete   Delete a saved VM configuration
+//! CLI subcommand dispatcher.
 
 const std = @import("std");
 const builtin = @import("builtin");

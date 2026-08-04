@@ -1,37 +1,19 @@
-//! Venus host backend — thin wrapper over virglrenderer's Venus (Vulkan) path.
+//! Thin bindings for virglrenderer's Venus host backend.
 //!
-//! This is the forward-looking GPU backend (see docs/gpu-venus-moltenvk.md): the
-//! guest runs Zink (OpenGL→Vulkan) and the Venus Mesa driver, which serializes
-//! Vulkan over virtio-gpu; virglrenderer decodes it and replays onto host Vulkan
-//! (MoltenVK → Metal). We link the system `libvirglrenderer` rather than
-//! reimplementing the Venus decoder — that is the whole point of the pivot away
-//! from the hand-rolled `src/gpu/virgl` TGSI→MSL translator.
-//!
-//! Only a tiny slice of the virglrenderer C API is declared here (matching the
-//! codebase's `extern "c"` convention instead of `@cImport`). The bridge that
-//! routes virtio-gpu 3D commands into `virgl_renderer_submit_cmd` etc. builds on
-//! top of this in later milestones.
+//! Guest Vulkan travels through virtio-gpu and virglrenderer to a host Vulkan
+//! driver backed by Metal. See `docs/gpu-venus-moltenvk.md`.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const log = std.log.scoped(.venus);
 
-// --- virglrenderer flags (virglrenderer.h) ---
 pub const RENDERER_USE_EGL: c_int = 1;
 pub const RENDERER_THREAD_SYNC: c_int = 2;
 pub const RENDERER_VENUS: c_int = 1 << 6;
 pub const RENDERER_NO_VIRGL: c_int = 1 << 7;
 pub const RENDERER_RENDER_SERVER: c_int = 1 << 9;
 
-/// Init flags for macOS (see docs/gpu-venus-moltenvk.md):
-///  - VENUS: enable the Vulkan transport.
-///  - NO_VIRGL: skip the virgl-GL (vrend) winsys — it needs an EGL/ANGLE display
-///    that doesn't init on macOS, and without it init fails "invalid vrend
-///    callbacks".
-///  - RENDER_SERVER: upstream virglrenderer (>= the 2026 macOS support MRs)
-///    spawns per-context workers via posix_spawn() on macOS, not fork() —
-///    Metal survives that, so the forked-KosmicKrisp-sees-0-GPUs problem the
-///    old in-process patch (src/venus_inproc.c) worked around is gone.
+/// Enable Venus and its render server without the EGL-dependent virgl winsys.
 pub const INIT_FLAGS: c_int = RENDERER_VENUS | RENDERER_NO_VIRGL | RENDERER_RENDER_SERVER;
 
 /// Point virglrenderer at the `virgl_render_server` binary. Must be called
@@ -43,7 +25,7 @@ pub fn setRenderServerPath(path: [:0]const u8) void {
 }
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) callconv(.c) c_int;
 
-/// Capset ids (mesa/virglrenderer): VIRGL=1, VIRGL2=2, GFXSTREAM=3, VENUS=4.
+/// Venus capset ID from virglrenderer.
 pub const CAPSET_VIRGL: u32 = 1;
 pub const CAPSET_VIRGL2: u32 = 2;
 pub const CAPSET_VENUS: u32 = 4;

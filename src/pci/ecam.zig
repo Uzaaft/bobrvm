@@ -1,17 +1,7 @@
-//! PCIe ECAM (Enhanced Configuration Access Mechanism) host bridge.
+//! QEMU-virt-compatible GPEX host bridge used by the UEFI boot path.
 //!
-//! Implements a GPEX-compatible PCIe host bridge for UEFI boot support.
-//! ECAM provides memory-mapped access to PCI configuration space.
-//!
-//! Memory layout (QEMU virt compatible):
-//! - ECAM config space: 0x3c000000-0x40000000 (64MB)
-//! - PCI MMIO: 0x10000000-0x3c000000 (768MB)
-//!
-//! ECAM address decoding:
-//! - bits[27:20]: bus number (0-255)
-//! - bits[19:15]: device number (0-31)
-//! - bits[14:12]: function number (0-7)
-//! - bits[11:0]: register offset (0-4095)
+//! ECAM addresses encode bus, device, function, and register in bits 27:20,
+//! 19:15, 14:12, and 11:0 respectively.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,31 +9,24 @@ const assert = @import("../quirks.zig").inlineAssert;
 
 const log = std.log.scoped(.pci_ecam);
 
-/// ECAM base address (QEMU virt compatible).
 pub const ECAM_BASE: u64 = 0x3c00_0000;
 
-/// ECAM size: 256 buses * 32 devices * 8 functions * 4KB = 64MB
+/// 256 buses * 32 devices * 8 functions * 4 KiB.
 pub const ECAM_SIZE: u64 = 64 * 1024 * 1024;
 
-/// PCI MMIO base for BAR allocations.
 pub const PCI_MMIO_BASE: u64 = 0x1000_0000;
 
-/// PCI MMIO size (768MB).
 pub const PCI_MMIO_SIZE: u64 = 0x2c00_0000;
 
-/// PCI I/O port base (not used on ARM64, but defined for completeness).
+/// ARM64 does not use the I/O-port aperture, but firmware expects it in ACPI.
 pub const PCI_IO_BASE: u64 = 0x0;
 
-/// PCI I/O size.
 pub const PCI_IO_SIZE: u64 = 0x10000;
 
-/// Maximum devices per bus.
 pub const MAX_DEVICES: usize = 32;
 
-/// Maximum functions per device.
 pub const MAX_FUNCTIONS: usize = 8;
 
-/// PCI configuration space size per function.
 pub const CONFIG_SPACE_SIZE: u64 = 4096;
 
 /// PCI vendor/device IDs.
@@ -118,10 +101,7 @@ pub const EcamAddr = struct {
 
 /// PCI device configuration space (4KB).
 pub const PciDevice = struct {
-    /// Configuration space data.
     config: [CONFIG_SPACE_SIZE]u8,
-
-    /// Whether device exists.
     present: bool,
 
     pub fn init() PciDevice {
@@ -414,10 +394,6 @@ pub fn ecamMmioWrite(ctx: *anyopaque, addr: u64, size: u8, value: u64) void {
     const host: *EcamHost = @ptrCast(@alignCast(ctx));
     host.write(addr, size, value);
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "EcamAddr decode" {
     // Bus 0, device 0, function 0, register 0

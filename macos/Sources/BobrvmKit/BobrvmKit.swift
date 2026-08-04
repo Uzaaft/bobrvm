@@ -1,10 +1,3 @@
-//
-//  BobrvmKit.swift
-//  Bobrvm
-//
-//  Swift wrappers around the C API with type safety.
-//
-
 import Combine
 import AppKit
 import Foundation
@@ -434,7 +427,7 @@ public final class VM: ObservableObject {
 
     public func start() throws {
         guard !isStopping, state == .stopped || state == .paused else {
-            return  // Already running or invalid state
+            return
         }
         guard let h = handle else {
             throw BobrvmError.invalidArgument

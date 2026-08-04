@@ -1,9 +1,4 @@
-//! C API exports for libbobrvm.
-//!
-//! This file exports all public C functions defined in include/bobrvm.h.
-//! Swift calls these functions via the C FFI.
-//!
-//! Also provides custom logging infrastructure for the entire library.
+//! C API implementation for `include/bobrvm.h`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,10 +12,6 @@ const macos_runtime = lib.runtime.macos;
 
 const log = std.log.scoped(.main);
 
-// ---------------------------------------------------------------------------
-// Logging Configuration
-// ---------------------------------------------------------------------------
-
 /// Custom log function for all std.log calls in the library.
 /// Routes to stderr and/or macOS unified logging based on configuration.
 pub fn logFn(
@@ -29,15 +20,12 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    // Get logging config
     const cfg = global.state.logging;
 
-    // Log to stderr if enabled
     if (cfg.stderr) {
         logToStderr(level, scope, format, args);
     }
 
-    // Log to macOS unified logging if enabled
     if (builtin.os.tag.isDarwin() and cfg.macos) {
         logToMacOS(level, scope, format, args);
     }
@@ -54,7 +42,6 @@ fn logToStderr(
     const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
     const prefix = level_txt ++ ": " ++ scope_prefix;
 
-    // Thread-safe stderr access
     const stderr = std.posix.STDERR_FILENO;
     var buf: [4096]u8 = undefined;
     const msg = nosuspend std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
@@ -71,7 +58,6 @@ fn logToMacOS(
     const logger = os.log.scopedLogger(scope) orelse return;
     const log_type = os.log.LogType.fromStdLevel(level);
 
-    // Use temporary allocator for formatting
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
@@ -88,10 +74,6 @@ pub const std_options: std.Options = .{
     .logFn = logFn,
 };
 
-// ---------------------------------------------------------------------------
-// Library Initialization
-// ---------------------------------------------------------------------------
-
 /// Called automatically when library is loaded (or call manually).
 pub export fn bobrvm_init() void {
     global.state.init();
@@ -103,10 +85,6 @@ pub export fn bobrvm_deinit() void {
     log.debug("bobrvm deinitializing", .{});
     global.state.deinit();
 }
-
-// ---------------------------------------------------------------------------
-// Version and Build Info
-// ---------------------------------------------------------------------------
 
 pub export fn bobrvm_version() [*:0]const u8 {
     return lib.version;

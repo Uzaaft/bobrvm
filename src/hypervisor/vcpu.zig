@@ -287,7 +287,6 @@ pub const Vcpu = struct {
             .created = true,
         };
 
-        // Post-condition: vCPU is created
         assert(vcpu.created);
 
         return vcpu;
@@ -304,7 +303,6 @@ pub const Vcpu = struct {
 
     /// Run the vCPU until it exits.
     pub fn run(self: *Vcpu) Error!ExitInfo {
-        // Pre-condition: vCPU is valid
         assert(self.created);
 
         const ret = c.hv_vcpu_run(self.handle);
@@ -317,10 +315,6 @@ pub const Vcpu = struct {
             .physical_address = self.exit.exception.physical_address,
         };
     }
-
-    // -------------------------------------------------------------------------
-    // General Purpose Registers
-    // -------------------------------------------------------------------------
 
     /// Get a general-purpose register value.
     pub fn getReg(self: *Vcpu, reg: Register) Error!u64 {
@@ -338,10 +332,6 @@ pub const Vcpu = struct {
         try c.check(ret);
     }
 
-    // -------------------------------------------------------------------------
-    // System Registers
-    // -------------------------------------------------------------------------
-
     /// Get a system register value.
     pub fn getSysReg(self: *Vcpu, reg: SystemRegister) Error!u64 {
         assert(self.created);
@@ -357,10 +347,6 @@ pub const Vcpu = struct {
         const ret = c.hv_vcpu_set_sys_reg(self.handle, @intFromEnum(reg), value);
         try c.check(ret);
     }
-
-    // -------------------------------------------------------------------------
-    // SIMD/FP Registers
-    // -------------------------------------------------------------------------
 
     /// Get a SIMD/FP register value (128-bit).
     pub fn getSimdFpReg(self: *Vcpu, reg: SimdFpRegister) Error![16]u8 {
@@ -378,10 +364,6 @@ pub const Vcpu = struct {
         try c.check(ret);
     }
 
-    // -------------------------------------------------------------------------
-    // Interrupts
-    // -------------------------------------------------------------------------
-
     /// Check if an interrupt is pending.
     pub fn getPendingInterrupt(self: *Vcpu, int_type: InterruptType) Error!bool {
         assert(self.created);
@@ -398,10 +380,6 @@ pub const Vcpu = struct {
         try c.check(ret);
     }
 
-    // -------------------------------------------------------------------------
-    // Virtual Timer
-    // -------------------------------------------------------------------------
-
     /// Get virtual timer mask state.
     pub fn getVTimerMask(self: *Vcpu) Error!bool {
         assert(self.created);
@@ -417,10 +395,6 @@ pub const Vcpu = struct {
         const ret = c.hv_vcpu_set_vtimer_mask(self.handle, masked);
         try c.check(ret);
     }
-
-    // -------------------------------------------------------------------------
-    // Convenience Methods
-    // -------------------------------------------------------------------------
 
     /// Get program counter.
     pub fn getPC(self: *Vcpu) Error!u64 {

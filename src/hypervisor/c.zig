@@ -1,7 +1,6 @@
-//! Raw C bindings for Apple Hypervisor.framework.
+//! Raw Apple Hypervisor.framework bindings.
 //!
-//! Direct extern declarations for the Hypervisor.framework C API.
-//! These are low-level; prefer the Zig wrappers in vm.zig and vcpu.zig.
+//! Prefer the wrappers in `vm.zig` and `vcpu.zig`.
 
 const std = @import("std");
 

@@ -1,13 +1,8 @@
-//! Virtio Input Device.
-//!
-//! Implements virtio-input per virtio 1.2 spec section 5.8.
-//! Provides keyboard and mouse input to guest using evdev format.
+//! Virtio input device using the evdev wire format (virtio 1.2 section 5.8).
 //!
 //! Queues:
 //!   0: eventq (host → guest, input events)
 //!   1: statusq (guest → host, LED status feedback)
-//!
-//! Events use Linux evdev format (input_event struct).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -1,10 +1,3 @@
-//
-//  SettingsView.swift
-//  Bobrvm
-//
-//  Application settings.
-//
-
 import SwiftUI
 
 struct SettingsView: View {

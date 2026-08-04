@@ -1,13 +1,9 @@
-//! Optimization quirks and workarounds.
-//!
-//! Central location for platform-specific optimizations.
+//! Platform and optimization workarounds.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Custom inline assert that avoids function call overhead in release builds.
-/// In debug mode, uses std.debug.assert.
-/// In release modes, compiles to unreachable for better optimization.
+/// Uses `std.debug.assert` in Debug and an optimization assumption in releases.
 pub const inlineAssert = switch (builtin.mode) {
     .Debug => std.debug.assert,
     .ReleaseSmall, .ReleaseSafe, .ReleaseFast => (struct {
@@ -17,12 +13,10 @@ pub const inlineAssert = switch (builtin.mode) {
     }).assert,
 };
 
-/// Compiler fence to prevent reordering.
 pub inline fn compilerFence() void {
     asm volatile ("" ::: .memory);
 }
 
-/// Check if running on Apple Silicon.
 pub fn isAppleSilicon() bool {
     return builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos;
 }

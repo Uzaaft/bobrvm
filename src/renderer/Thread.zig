@@ -1,13 +1,4 @@
-//! Renderer thread implementation.
-//!
-//! Handles the render loop and Metal command encoding.
-//! Communicates with main thread via mailbox.
-//!
-//! The design uses:
-//! - Fixed-capacity mailbox for message passing
-//! - Wakeup mechanism for low-latency notifications
-//! - VSync coordination via CVDisplayLink (from Swift)
-//! - QoS class adjustment based on visibility/focus
+//! Metal render loop and its main-thread mailbox.
 
 const Thread = @This();
 
@@ -21,43 +12,26 @@ const thread_compat = @import("../compat/thread.zig");
 
 const log = std.log.scoped(.renderer);
 
-/// Mailbox capacity (power of 2 for efficient modulo).
+/// Power of two so wrapping compiles to a mask.
 const MAILBOX_CAPACITY = 64;
 /// Render work is iterative and keeps its large state in RenderThread.
 const stack_size_bytes: usize = 1024 * 1024;
 
-/// Mailbox message types.
 pub const Message = union(enum) {
-    /// Surface resize.
     resize: Size,
-
-    /// Content scale change (HiDPI).
     content_scale: ContentScale,
-
-    /// Focus state change.
     focus: bool,
-
-    /// Visibility change.
     visible: bool,
-
-    /// GPU command buffer ready for encoding.
-    /// Contains a pointer to the command batch from the GPU module.
     commands_ready: *CommandBatch,
-
-    /// Force immediate frame draw (called from CVDisplayLink).
     draw_now: void,
-
-    /// Shutdown the renderer thread.
     shutdown: void,
 };
 
-/// Surface size.
 pub const Size = struct {
     width: u32,
     height: u32,
 };
 
-/// Content scale for HiDPI.
 /// A guest framebuffer view (BGRA, 4 bytes per pixel).
 pub const Scanout = struct {
     data: []const u8,
@@ -95,21 +69,14 @@ pub const ContentScale = struct {
     y: f64 = 1.0,
 };
 
-/// Batch of GPU commands to encode.
-/// This is a placeholder; actual implementation will reference gpu.Context state.
+/// Pending GPU work. This remains a placeholder until commands reference `gpu.Context` state.
 pub const CommandBatch = struct {
-    /// Number of draw calls.
     draw_count: u32 = 0,
-    /// Clear color (RGBA).
     clear_color: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 },
-    /// Resource handle of framebuffer to present.
     framebuffer: u32 = 0,
 };
 
-/// Fixed-capacity mailbox for thread communication.
-///
-/// Uses a circular buffer with mutex protection.
-/// SPSC-optimized: single producer (main thread), single consumer (render thread).
+/// Mutex-protected SPSC circular buffer between the main and render threads.
 pub const Mailbox = struct {
     const Bounds = std.math.Log2Int(u32);
 
@@ -131,7 +98,6 @@ pub const Mailbox = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
-        // Wait for space
         while (self.len.load(.acquire) >= MAILBOX_CAPACITY) {
             self.cond.waitUncancelable(io, &self.mutex);
         }
@@ -204,12 +170,10 @@ pub const Mailbox = struct {
         return msg;
     }
 
-    /// Check if mailbox has pending messages.
     pub fn hasMessages(self: *Mailbox) bool {
         return self.len.load(.acquire) > 0;
     }
 
-    /// Wake up a waiting consumer.
     pub fn wakeup(self: *Mailbox) void {
         const io = global.io();
         self.mutex.lockUncancelable(io);
@@ -315,14 +279,10 @@ pub const RenderThread = struct {
     clear_color: metal.MTLClearColor = .{ .red = 0.0, .green = 0.0, .blue = 0.1, .alpha = 1.0 },
     clear_presented: bool = false,
 
-    // Last scanout generation presented; skip re-upload when unchanged.
-    // maxInt = "nothing presented yet" so the first frame always draws.
+    // maxInt guarantees the first frame draws.
     last_generation: u64 = std.math.maxInt(u64),
-    // Same idea for the cursor: redraw on cursor-only movement even when
-    // the framebuffer itself (last_generation) hasn't changed.
     last_cursor_generation: u64 = std.math.maxInt(u64),
 
-    // Callback to Swift for frame presentation
     present_callback: ?*const fn (?*anyopaque) callconv(.c) void = null,
     present_userdata: ?*anyopaque = null,
 
@@ -349,7 +309,6 @@ pub const RenderThread = struct {
         };
     }
 
-    /// Set presentation callback (called from Swift).
     /// Set the guest scanout source. Must be set before start().
     pub fn setScanoutSource(
         self: *RenderThread,
@@ -371,9 +330,7 @@ pub const RenderThread = struct {
         self.present_userdata = userdata;
     }
 
-    /// Start the render thread.
     pub fn start(self: *RenderThread) !void {
-        // Pre-condition: not already running
         assert(!self.running.load(.acquire));
 
         log.info("starting renderer thread", .{});
@@ -382,18 +339,15 @@ pub const RenderThread = struct {
         self.thread = try std.Thread.spawn(.{ .stack_size = stack_size_bytes }, threadMain, .{self});
     }
 
-    /// Stop the render thread.
     pub fn stop(self: *RenderThread) void {
         if (!self.running.load(.acquire)) return;
 
         log.info("stopping renderer thread", .{});
 
-        // Signal shutdown
         self.running.store(false, .release);
         self.mailbox.push(.shutdown);
         self.wakeup.notify();
 
-        // Wait for thread
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -402,7 +356,6 @@ pub const RenderThread = struct {
         log.debug("renderer thread stopped", .{});
     }
 
-    /// Send a message to the render thread.
     pub fn send(self: *RenderThread, msg: Message) void {
         self.mailbox.push(msg);
         self.wakeup.notify();
@@ -423,19 +376,13 @@ pub const RenderThread = struct {
         self.wakeup.notify();
     }
 
-    // =========================================================================
-    // Thread Entry
-    // =========================================================================
-
     fn threadMain(self: *RenderThread) void {
         log.debug("renderer thread started", .{});
 
-        // Set thread name for debugging
         if (comptime builtin.os.tag == .macos) {
             // Thread naming would go here via pthread
         }
 
-        // Thread main loop
         self.runLoop() catch |err| {
             log.err("renderer thread error: {}", .{err});
         };
@@ -499,18 +446,13 @@ pub const RenderThread = struct {
     }
 
     fn drawFrame(self: *RenderThread) void {
-        // Skip if invisible or no size
         if (!self.visible) return;
         if (self.size.width == 0 or self.size.height == 0) return;
 
-        // Present the guest scanout when one exists.
         if (self.scanout_lock) |lock_fn| {
             if (lock_fn(self.scanout_userdata)) |scan| {
                 const cursor_gen = if (scan.cursor) |c| c.generation else 0;
-                // Skip the upload+blit+present entirely when neither the
-                // framebuffer nor the cursor has changed since our last
-                // frame (idle-screen case) — cursor-only motion still needs
-                // a redraw even though the framebuffer generation is static.
+                // Cursor movement must redraw even when the framebuffer is unchanged.
                 if (scan.generation == self.last_generation and cursor_gen == self.last_cursor_generation) {
                     if (self.scanout_unlock) |unlock_fn| unlock_fn(self.scanout_userdata);
                     self.pending_batch = null;
@@ -563,13 +505,8 @@ pub const RenderThread = struct {
             };
         }
 
-        // Render frame using Metal
         const success = self.frame_renderer.renderFrame(clear_color);
-
-        // Clear pending batch after encoding
         self.pending_batch = null;
-
-        // Notify Swift that frame was presented
         if (success) {
             self.clear_presented = true;
             if (self.present_callback) |cb| {
@@ -581,19 +518,11 @@ pub const RenderThread = struct {
     fn setQosClass(self: *const RenderThread) void {
         if (comptime builtin.os.tag != .macos) return;
 
-        // QoS class adjustment based on visibility/focus
-        // - Hidden: utility (background)
-        // - Visible, unfocused: user_initiated
-        // - Visible, focused: user_interactive
         _ = self;
 
         // TODO: Call pthread_set_qos_class_self_np
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "Mailbox push and pop" {
     var mailbox = Mailbox.init();
@@ -633,10 +562,7 @@ test "Mailbox hasMessages" {
 test "Wakeup notify and wait" {
     var wakeup = Wakeup{};
 
-    // Notify before wait
     wakeup.notify();
-
-    // Timed wait should return immediately
     const got = wakeup.timedWait(1_000_000);
     try std.testing.expect(got);
 }

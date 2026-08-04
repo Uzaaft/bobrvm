@@ -1,14 +1,4 @@
-//! GPU translation layer.
-//!
-//! Translates guest GPU commands to Metal:
-//! - virgl: OpenGL 4.3 → Metal (via Gallium3D command stream)
-//! - venus: Vulkan 1.3 → Metal (via MoltenVK or custom) [future]
-//!
-//! Architecture:
-//! 1. Guest Mesa driver sends virgl/venus commands via virtio-gpu
-//! 2. This module parses the command stream
-//! 3. Commands are translated to Metal API calls
-//! 4. Rendered frames are presented via IOSurface to Swift
+//! Translates guest virgl and Venus command streams to Metal.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,12 +7,10 @@ const global = @import("../global.zig");
 
 const log = std.log.scoped(.gpu);
 
-// ---------------------------------------------------------------------------
 // GL pipeline statistics (opt in with BOBRVM_GL_STATS=1). Diagnostics for the
 // "guest renders but the pixels are wrong" case: they show whether guest
 // textures actually reach us, and whether draws have a texture bound at all —
 // an unbound sampler is the classic cause of solid-white output.
-// ---------------------------------------------------------------------------
 pub const stats = struct {
     var enabled_checked: bool = false;
     var enabled: bool = false;

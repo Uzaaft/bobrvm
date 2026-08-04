@@ -1,10 +1,3 @@
-//
-//  CreateVMView.swift
-//  Bobrvm
-//
-//  Guided virtual machine creation assistant.
-//
-
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers

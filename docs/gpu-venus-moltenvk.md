@@ -1,291 +1,100 @@
-# GPU rearchitecture: Venus + MoltenVK (the path to real GL 4.3)
+# Venus host stack
 
-Status: **adopted** (2026-07-24). Supersedes the hand-rolled virgl→Metal
-TGSI-to-MSL translator (`src/gpu/virgl/`) as the strategy for high OpenGL
-versions. The old translator stays in-tree as a fallback until the new path
-boots a desktop, then is retired.
+The filename is retained for existing links. The active Vulkan-on-Metal driver
+is KosmicKrisp, not MoltenVK.
 
-## Why we pivoted
-
-bobrvm needs OpenGL 4.3 in the guest to be a daily driver. The renderer we had
-been building — guest Mesa `virgl` → TGSI → our Metal shader translator —
-**cannot reach it**, and the reason is structural, not effort:
-
-- The virgl GL backend only reaches GL 4.3 when the *host* has a real GL 4.3
-  driver to forward to. On macOS the host has no such thing: Apple's OpenGL is
-  frozen at 4.1 and deprecated, and Metal is not OpenGL. We were effectively
-  reimplementing all of virglrenderer *and* a GL 4.3 driver on top of Metal, by
-  hand, in Zig.
-- The features that gate GL ≥3.2/4.0 (geometry shaders, fp64, transform
-  feedback) have no native Metal equivalent, so hand-rolling them means writing
-  the software-lowering passes ourselves.
-
-VMware Fusion solves this with a *proprietary* in-house guest GL driver plus its
-own host translation to Metal — the same shape of work, done at industrial
-scale behind closed doors. The open-source equivalent, which the whole
-ecosystem (Collabora, QEMU, UTM) converged on, is:
+## Architecture
 
 ```
-guest GL app
-  → Zink            (Mesa: OpenGL → Vulkan; implements up to GL 4.6)
-  → Venus           (virtio-gpu transport: guest Vulkan → host, SPIR-V passthrough)
-  → virglrenderer   (host: Venus decoder → host Vulkan calls)
-  → MoltenVK        (Vulkan → Metal)
-  → Metal           (Apple GPU)
+guest Zink/Venus
+  → bobrvm virtio-gpu
+  → virglrenderer Venus decoder
+  → virgl render server
+  → KosmicKrisp
+  → Metal
 ```
 
-The win: we stop hand-writing GL translation. Zink is Mesa's mature GL-on-Vulkan
-driver; MoltenVK is a mature Vulkan-on-Metal layer; Venus is a thin transport.
-bobrvm's remaining job is the **host bridge**: wire virtio-gpu to
-`virgl_renderer_*`, plumb blob/shared-memory resources and fences, and present
-the result through the existing IOSurface zero-copy scanout.
+bobrvm owns virtio-gpu commands, blob mappings, fences, and scanout. It passes
+Vulkan protocol work to upstream virglrenderer. The render server runs out of
+process and is started with `posix_spawn` on macOS; do not replace this with a
+post-Metal `fork()` path.
 
-## Empirical ceiling on this hardware (measured, not assumed)
+The Venus backend is opt-in so the default binary does not link the host GPU
+stack.
 
-Probe: link `libMoltenVK.dylib` directly, enumerate the physical device.
-**Apple M3 Max, MoltenVK 1.4.1, Vulkan 1.3.334** (reproduce with `tools/mvk_probe.c`:
-`clang -I/opt/homebrew/opt/vulkan-headers/include tools/mvk_probe.c -o /tmp/mvk_probe
--L/opt/homebrew/opt/molten-vk/lib -lMoltenVK -rpath /opt/homebrew/opt/molten-vk/lib && /tmp/mvk_probe`):
+## Host requirements
 
-Present (Zink builds GL 4.3 on these):
-- Vulkan 1.3, tessellation shaders, compute (32 KiB shared mem, 1024
-  invocations), SSBOs (31/stage), `multiDrawIndirect` + first-instance,
-  descriptor indexing, `VK_KHR_dynamic_rendering`, `create_renderpass2`,
-  `imageCubeArray`, 8 color attachments, dual-source + independent blend,
-  precise occlusion queries, `shaderInt64`, `maxImageDimension2D` 16384,
-  `vertex_attribute_divisor`, `line_rasterization`, `shader_viewport_index_layer`.
+- Apple Silicon and macOS 26 or newer.
+- Upstream virglrenderer with Venus and process render-server support.
+- The bobrvm host-pointer shared-memory import patch from
+  `third_party/patches/virglrenderer/0001-vkr-host-pointer-shm-import.patch`
+  until an equivalent is upstream.
+- KosmicKrisp and its Vulkan ICD manifest.
+- The Vulkan loader and KosmicKrisp runtime libraries.
 
-Metal-fundamental gaps (identical walls whichever renderer we build):
-- `shaderFloat64` = **0** — Metal has no doubles; true fp64 unavailable.
-- `geometryShader` = **0** — Metal has no geometry-shader stage.
-- `VK_EXT_transform_feedback` = **missing** on this MoltenVK build.
+Use the repository scripts to install compatible components:
 
-Why the pivot still reaches a usable GL 4.3 despite those gaps: **Mesa/Zink
-lowers them in software** — `softfp64` (NIR fp64 emulation), geometry-shader
-emulation, and transform-feedback emulation — down to the Vulkan feature set
-MoltenVK does expose. These are exactly the passes we would otherwise have to
-write and maintain ourselves. Caveat to stay honest about: fp64/GS/TF-heavy
-apps run slow (software paths) or degrade; the common desktop/GTK/Qt/compositing
-workload does not lean on them and runs on native features.
-
-## ⚠ Host Vulkan driver: KosmicKrisp, not MoltenVK (corrected 2026-07-24)
-
-The `startergo/virglrenderer` venus build targets **KosmicKrisp** — LunarG's
-Mesa-based Vulkan-on-Metal driver (Vulkan 1.3 conformant, merged into Mesa 26.0,
-Oct 2025; requires **Metal 4 → macOS 26+**, satisfied here on macOS 27). Evidence:
-the dylib imports guest memory via `VK_EXT_external_memory_metal` /
-`vkr_context_import_resource_metal`, and the tap README says "Venus support via
-KosmicKrisp". MoltenVK does **not** expose Metal external memory, so venus can't
-share resources through it: `virgl_renderer_init(VENUS|NO_VIRGL)` succeeds and
-the Venus capset reports present, but `context_create_with_flags(capset=VENUS)`
-returns **EINVAL (22)** against the MoltenVK ICD.
-
-Consequence: the earlier `tools/mvk_probe.c` ceiling numbers were measured
-against the *wrong* driver. The real Venus ceiling is **KosmicKrisp's** Vulkan
-1.3 feature set (reported ~MoltenVK parity as of Mesa 26.0). Re-probe once
-KosmicKrisp is installed.
-
-**KosmicKrisp built** (Mesa 26.3-devel, `tools/`-style script in scratchpad):
-`meson setup -Dplatforms=macos -Dvulkan-drivers=kosmickrisp -Dgallium-drivers=
--Dopengl=false -Dzstd=disabled -Dvideo-codecs= -Dllvm=enabled --prefer-static`.
-Deps: `libclc` + `llvm` (KosmicKrisp forces `with_driver_using_cl` for its
-precompiled shaders) + `spirv-llvm-translator` (must match LLVM major.minor:
-22.1) + `spirv-tools`/`spirv-headers`. Produces `libvulkan_kosmickrisp.dylib` +
-`kosmickrisp_mesa_icd.aarch64.json` (library_path `/opt/homebrew/lib/…`, so
-symlink the built dylib there). **Measured ceiling** (`tools/mvk_probe.c` via the
-loader with `VK_ICD_FILENAMES` = KK ICD): Vulkan **1.4**, tessellation, compute,
-huge SSBO limits, `logicOp`/`shaderCullDistance`/`conditional_rendering`/
-`multi_draw` (all better than MoltenVK); still no fp64/geometryShader/
-`VK_EXT_transform_feedback` (Metal-fundamental → Zink lowers).
-
-## ⛔ BLOCKER: Venus render-server transport is broken on macOS
-
-Venus in this virglrenderer build runs in a **render-server subprocess**
-(`virgl_render_server`), and that proxy sets up its control channel with
-`socketpair(AF_UNIX, SOCK_SEQPACKET, …)`. **macOS has no `AF_UNIX`/`SOCK_SEQPACKET`**
-→ `errno 43 EPROTONOSUPPORT` → `failed to initialize venus renderer`. In-process
-venus (init without `RENDER_SERVER`) returns **EINVAL** at
-`context_create_with_flags(VENUS)` — this build's venus is render-server-only.
-Net: neither venus path works on macOS as shipped.
-
-**Fix step 1 (DONE, works):** the tap's `virglrenderer-macos-unified.patch`
-*already* implements length-prefixed framing for non-SEQPACKET sockets
-(`render_context_socket_header`, `ntohl(hdr.length)`, gated on `is_seqpacket`)
-but left the socket type as `SOCK_SEQPACKET` on the `__APPLE__` branch in **both**
-`server/render_socket.c` **and** `src/proxy/proxy_socket.c`. Rebuilding
-virglrenderer 1.3.0 from source with the tap's 20-patch stack plus both
-`__APPLE__` branches → `SOCK_STREAM` (see `tools/build-virglrenderer-macos.sh`)
-gets the render server to **fork and `virgl_renderer_init` to return 0**. Installs
-to `scratchpad/virgl-fixed`.
-
-**Fix step 2 (DONE, works):** the "worker jail" failure was a red herring — its
-real cause was `create_sigchld_fd()` calling `fcntl(kq, F_SETFL, O_NONBLOCK)` on
-a **kqueue fd**, which macOS rejects (kqueue is polled via `kevent()`, not
-`read()`; reaping uses `waitid(WNOHANG)`). That -1 cascaded to "failed to create
-worker jail". Dropping the fcntl block (`server/render_worker.c`, `__APPLE__`
-path) fixes it. See `tools/build-virglrenderer-macos.sh` STAGE 3b.
-
-**✅ RESULT: Venus context creation works end-to-end on macOS.** With both fixes,
-`context_create_with_flags(VENUS)` returns 0 against the KosmicKrisp ICD in
-render-server mode: guest Venus → virglrenderer (fixed) → forked
-`virgl_render_server` (jail via kqueue) → KosmicKrisp → Metal. Init flags:
-`VENUS | NO_VIRGL | RENDER_SERVER` (0x2C0), `RENDER_SERVER_EXEC_PATH` =
-`virgl-fixed/libexec/virgl_render_server`.
-
-Known follow-up (not yet blocking context create): a teardown-time
-`virgl_render_server: failed to receive message: truncated or incomplete` log —
-appears after the context is created+destroyed (likely a disconnect/EOF framing
-edge on SOCK_STREAM); verify it doesn't bite real command submission.
-
-## ⛔ CURRENT BLOCKER: opaque render-server Venus enumeration failure
-
-The full stack runs end to end — bobrvm's virtio-gpu is **complete and correct**
-(Venus capset, `ctx_create`, blob create/map/unmap, the HOST_VISIBLE memory window,
-16 KiB alignment, fences, and the render-server SOCK_STREAM framing all deliver the
-Venus protocol faithfully). Verified by booting a NixOS guest with Mesa venus+zink:
-the guest negotiates `VK_MESA_venus_protocol`, `vkCreateInstance` succeeds, and reaches
-`vkEnumeratePhysicalDevices` — which fails `VK_ERROR_INITIALIZATION_FAILED`.
-
-**⚠ Correction:** an earlier version of this doc claimed KosmicKrisp can't export
-external memory. That was **wrong — a bug in the probe** (`tools/kk_extbuf.c` used
-`0x1000` for `VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT`; the real value is
-`0x40000`, gated behind `VK_ENABLE_BETA_EXTENSIONS`). With the correct value the M3
-Max reports **MTLHEAP `features=0x6, exportTypes=0x40000 → EXPORTABLE`** (confirmed by
-instrumenting KosmicKrisp's own `kk_GetPhysicalDeviceExternalBufferProperties`).
-
-So the host stack is capable: KosmicKrisp exports Metal-heap memory, and vkr
-(`vkr_physical_device.c`) has dma-buf **emulation** for exactly this case —
-`is_dma_buf_emulated = !EXT_dma_buf && EXT_metal` (true here) translates the guest's
-dma-buf queries ↔ KosmicKrisp's MTLHEAP. In principle the guest should accept the
-device. Yet it still fails at enumeration.
-
-**Where it's stuck now:** the failure is *inside the forked `virgl_render_server`*,
-and that process is **opaque in this headless/captured setup** — its logs go via
-`vsyslog`/`os_log` (only mirrors to stderr under a TTY), and instrumenting
-`vkr_log`/`render_log`/`vkr_physical_device` init to write a file produced **nothing**
-(the vkr physical-device init path apparently isn't reached, suggesting the render
-server errors before enumeration, or can't `fopen` in its context). Without
-render-server observability the exact venus-internal failure can't be pinned.
-
-**Next step (best done interactively):** get render-server visibility — run bobrvm in
-a real terminal so `os_log` mirrors, `log stream` the render server while it runs, or
-attach lldb to the forked `virgl_render_server`. Likely suspects once visible: the
-render server can't create a Metal device in its forked context, or a venus
-device-init step (features/formats) fails against KosmicKrisp. bobrvm's side needs no
-further work.
-
-## Remaining bridge work (bobrvm side)
-
-The host stack is proven. Progress:
-1. ✅ `venus.zig` render-server mode (`INIT_FLAGS` += `RENDER_SERVER`,
-   `setRenderServerPath`); `build.zig` `-Dvirgl-prefix` → `~/.local/opt/virgl-macos`.
-2. ✅ `src/virtio/gpu.zig` dispatch wired behind `-Dgpu-venus` (jj pending):
-   advertises the Venus capset (index 2 / id 4, `num_capsets`→3, `F_CONTEXT_INIT`),
-   fills it via `venus.Host.fillCaps`, and routes `CTX_CREATE`(context_init capset
-   == venus) / `SUBMIT_3D` / `CTX_DESTROY` to `venus.Host` (tracking venus ctx_ids
-   in a set). All comptime-gated on `gpu_venus`; the default build is byte-identical
-   and does not link virglrenderer. Both `zig build` and `zig build -Dgpu-venus`
-   compile; the venus `-Dgpu-venus` CLI links the fixed virglrenderer and is signed
-   with `cli-venus.entitlements` (hypervisor + disable-library-validation).
-   **Not runtime-tested** — needs a guest + HVF. The `venus.Host` calls it makes
-   are the same ones verified standalone in `venus_smoke`.
-3. ✅ Runtime env self-config: `venus.ensureHost()` sets `RENDER_SERVER_EXEC_PATH`
-   + `VK_ICD_FILENAMES` from the build prefix (user env still wins). Only
-   `DYLD_LIBRARY_PATH` must be set pre-launch (dyld reads it at exec).
-4. TODO: present — map the venus output blob → IOSurface/Metal for scanout
-   (needed to *see* the desktop; NOT needed for the glxinfo version proof).
-5. TODO: verify real command submission + `glxinfo` ≥ 4.3 — user-machine handoff.
-
-## Handoff: testing `glxinfo` ≥ 4.3 on a real machine
-
-The version proof needs the Venus capset + context creation (both done), not the
-present path. On a Mac with the built stack:
-
-```
-# 1. (re)build the macOS-patched virglrenderer + KosmicKrisp if needed:
-tools/build-virglrenderer-macos.sh        # → ~/.local/opt/virgl-macos
-tools/build-kosmickrisp.sh                # → KK dylib in /opt/homebrew/lib
-
-# 2. build bobrvm with the venus backend:
+```sh
+tools/build-virglrenderer-macos.sh
+tools/build-kosmickrisp.sh
 zig build -Dgpu-venus
-
-# 3. run with the vulkan-loader on DYLD path (the only env still required):
-export DYLD_LIBRARY_PATH=/opt/homebrew/opt/vulkan-loader/lib:/opt/homebrew/opt/spirv-tools/lib:/opt/homebrew/opt/angle/lib:/opt/homebrew/lib
-zig-out/bin/bobrvm --kernel <k> --gpu ...   # boot a guest whose Mesa has venus + zink
-
-# 4. in the guest (needs kernel virtio-gpu + Mesa ≥ recent with venus & zink):
-MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink glxinfo | grep "OpenGL version"
 ```
 
-If the bridge is correct this reports GL ≥ 4.3. Not yet run — no venus+zink guest
-image on hand, and the CI sandbox blocks HVF.
+Override the virglrenderer install location with
+`-Dvirgl-prefix=<prefix>`. `src/gpu/venus.zig` derives the render-server and ICD
+paths from the configured prefix unless the user has already set them.
 
-## Host components
+`DYLD_LIBRARY_PATH` must be correct before launching bobrvm because dyld reads
+it at process startup.
 
-- `molten-vk` (Homebrew 1.4.1): `/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib`.
-- `vulkan-headers` (Homebrew): `/opt/homebrew/opt/vulkan-headers/include`.
-- `virglrenderer` **with Venus enabled** (Homebrew tap
-  `startergo/virglrenderer` 1.0.41, built `-Dvenus=true`; pulls
-  `startergo/angle` + `startergo/libepoxy` + `startergo/gn`):
-  `/opt/homebrew/opt/virglrenderer/{lib/libvirglrenderer.dylib,include/virgl/virglrenderer.h}`.
-- `vulkan-loader` (Homebrew): `libvulkan.dylib`. virglrenderer's Venus backend
-  `dlopen`s `libvulkan.dylib`, so the loader is required; it discovers MoltenVK
-  via the ICD manifest at `/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`.
-- ANGLE (`libEGL`/`libGLESv2`) at `/opt/homebrew/opt/angle/lib` — only the
-  legacy virgl-GL winsys uses it; the Venus path does not.
-- Guest: Mesa with the `venus` Vulkan driver + `zink` GL driver; kernel with
-  `virtio-gpu` + `VIRTIO_GPU_CAPSET_VENUS`. Guest env:
-  `MESA_LOADER_DRIVER_OVERRIDE=zink`, `GALLIUM_DRIVER=zink`,
-  and the venus ICD selected for Vulkan.
+## Runtime contract
 
-## Phased plan (loop executes top-down)
+virglrenderer is initialized with:
 
-1. **Host Vulkan foundation** ✅ done: MoltenVK + headers installed; capability
-   probe green (VkInstance, physical device, feature/extension enumeration).
-2. **virglrenderer(venus) building + linked** ✅ done (host side proven).
-   `tools/virgl_smoke.c` calls `virgl_renderer_init` and enumerates capsets.
-   Result on M3 Max: init returns 0 and the **Venus capset (id 4, size 160)**
-   is PRESENT (VIRGL/VIRGL2 also present). Key facts for the bridge:
-   - Init flags **must** be `VIRGL_RENDERER_VENUS | VIRGL_RENDERER_NO_VIRGL`
-     (0xC0; `THREAD_SYNC` 0x02 optional). `VENUS` alone fails with "invalid
-     renderer vrend callbacks"; adding `USE_EGL` fails with "EGL is not
-     supported on this platform" (the ANGLE/vrend GL winsys, which Venus skips).
-   - Callbacks: `version = 1` with a non-NULL `write_fence` suffices to init.
-   - Runtime env: `VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`,
-     and `DYLD_LIBRARY_PATH` must include angle, vulkan-loader, molten-vk,
-     `/opt/homebrew/lib`.
-   - `build.zig` linkage done: `zig build venus-smoke` builds `tools/venus_smoke.zig`
-     (imports `src/gpu/venus.zig`), links `-lvirglrenderer` with rpath, and
-     codesigns with `venus.entitlements` (disable-library-validation + jit).
-     **Runs standalone** (no lldb): init OK, VENUS capset present, context
-     create+destroy OK.
-   - ⚠ **THE SIGKILL GOTCHA (resolved):** for a long time the venus binaries were
-     SIGKILLed before `main`, only running under lldb — I misattributed this to
-     the shell sandbox. The real cause: **`libepoxy.0.dylib` had an invalid code
-     signature.** The startergo libepoxy formula runs `install_name_tool -add_rpath`
-     *after* codesigning, invalidating the ad-hoc signature; AMFI then silently
-     SIGKILLs (no log entry) any process that faults in its pages — and
-     virglrenderer links libepoxy. Fix: `codesign --force --sign - libepoxy.0.dylib`
-     (now done automatically in STAGE 6 of `tools/build-virglrenderer-macos.sh`,
-     which re-signs any load-chain dylib failing `codesign --verify --strict`).
-     Diagnose with `codesign --verify --strict <dylib>`. `venus.zig` stays isolated
-     from the unit-test binary (not imported by `src/lib.zig`), so `zig build test`
-     is unaffected.
-3. **virtio-gpu ↔ virglrenderer bridge** — route `CTX_CREATE` (venus capset),
-   `SUBMIT_3D`, `RESOURCE_CREATE_BLOB`, `RESOURCE_MAP_BLOB`, and fences into the
-   `virgl_renderer_*` C API from `src/virtio/gpu.zig` / `src/gpu/`. Keep the 2D
-   scanout path.
-4. **Blob resources + present** — map virgl's output resource to an IOSurface /
-   `MTLTexture` for the existing zero-copy scanout; wire fence signalling into
-   the device's used-buffer IRQ path.
-5. **Guest bring-up** — a NixOS guest image with Mesa venus+zink; `glxinfo`
-   reports GL ≥4.3; verify with the event-driven `gltest.sh` harness.
-6. **Retire** the hand-rolled `src/gpu/virgl/` translator once Zink boots a
-   desktop; keep it behind a `--gpu-legacy` flag for one release.
+```
+VENUS | NO_VIRGL | RENDER_SERVER
+```
 
-## Verification discipline (unchanged)
+Do not add EGL flags to the Venus-only path. The legacy virgl renderer and its
+ANGLE dependencies are separate from this backend.
 
-Every claim is backed by something that runs: probes for host features, MSL/
-SPIR-V compile checks where relevant, and live `glxinfo`/`gltest.sh` against
-real Mesa in the guest for the version headline. No advertising a capability the
-stack does not actually honor.
+Guest-visible blobs must remain shared with the render server. The current
+virglrenderer patch imports their host pointers through
+`VK_EXT_external_memory_host`, avoiding a copy. Apple Silicon also requires the
+guest-side 16 KiB alignment described in
+[gpu-venus-guest-requirements.md](gpu-venus-guest-requirements.md).
+
+## Verification
+
+Use the small host probes before booting a guest:
+
+- `tools/host_vk_probe.c` checks Vulkan instance and device creation.
+- `tools/host_vk_mem_probe.m` checks the external-memory path.
+- `venus-smoke` checks virglrenderer initialization and Venus context creation.
+
+Then run `tests/integration/gl/gltest-venus.sh`. A successful result must cover
+real rendering and readback through the complete stack, not only capability
+enumeration.
+
+When diagnosing startup failures, check dynamic-library loading and signatures
+before the protocol. A missing KosmicKrisp dependency may appear as “no
+drivers,” and macOS may terminate a process that loads an invalidly signed
+dylib.
+
+## Constraints
+
+- Metal lacks native geometry shaders, transform feedback, and fp64. Zink and
+  the Mesa compiler stack must lower or emulate them.
+- Keep capability claims tied to integration or conformance tests.
+- Keep local Mesa and virglrenderer patches isolated and removable.
+- Presentation should preserve shared-memory/IOSurface paths; do not add a
+  frame copy to simplify bring-up.
+
+## References
+
+- [Mesa Venus](https://docs.mesa3d.org/drivers/venus.html)
+- [Mesa Zink](https://docs.mesa3d.org/drivers/zink.html)
+- [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer)
+- [Vulkan external memory host extension][external-memory-host]
+
+[external-memory-host]: https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_external_memory_host.html

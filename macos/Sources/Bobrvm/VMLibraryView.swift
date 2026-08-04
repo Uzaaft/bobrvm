@@ -1,10 +1,3 @@
-//
-//  VMLibraryView.swift
-//  Bobrvm
-//
-//  Virtual machine chooser shown when no VM is selected.
-//
-
 import SwiftUI
 
 struct VMLibraryHomeView: View {

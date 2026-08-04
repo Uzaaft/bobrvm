@@ -1,15 +1,4 @@
-//! bobrvm CLI entry point.
-//!
-//! Usage: bobrvm <command> [options]
-//!
-//! Commands:
-//!   run              Run a VM directly with options
-//!   create <name>    Create a named VM configuration
-//!   list             List saved VM configurations
-//!   start <name>     Start a saved VM by name
-//!   delete <name>    Delete a saved VM configuration
-//!
-//! Run 'bobrvm --help' for more information.
+//! CLI entry point.
 
 const std = @import("std");
 const builtin = @import("builtin");

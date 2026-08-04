@@ -1,7 +1,4 @@
-//! Device Tree Blob (DTB) generator for ARM64 Linux.
-//!
-//! Generates a Flattened Device Tree (FDT) that describes the virtual
-//! hardware to the Linux kernel. Based on QEMU virt machine layout.
+//! ARM64 Linux flattened device tree using the QEMU virt layout.
 //!
 //! References:
 //! - Devicetree Specification v0.4

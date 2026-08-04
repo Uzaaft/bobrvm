@@ -1,45 +1,13 @@
-//! Virtio MMIO Transport.
-//!
-//! Implements virtio-mmio transport per virtio 1.2 spec section 4.2.
-//! Each device maps a 0x200 byte region to guest physical memory.
-//!
-//! Register layout (all 32-bit little-endian):
-//!   0x000: MagicValue (read-only) = 0x74726976 ("virt")
-//!   0x004: Version (read-only) = 2
-//!   0x008: DeviceID (read-only)
-//!   0x00c: VendorID (read-only)
-//!   0x010: DeviceFeatures (read-only, selected by DeviceFeaturesSel)
-//!   0x014: DeviceFeaturesSel (write-only)
-//!   0x020: DriverFeatures (write-only)
-//!   0x024: DriverFeaturesSel (write-only)
-//!   0x030: QueueSel (write-only)
-//!   0x034: QueueNumMax (read-only)
-//!   0x038: QueueNum (write-only)
-//!   0x044: QueueReady (read-write)
-//!   0x050: QueueNotify (write-only)
-//!   0x060: InterruptStatus (read-only)
-//!   0x064: InterruptACK (write-only)
-//!   0x070: Status (read-write)
-//!   0x080: QueueDescLow (write-only)
-//!   0x084: QueueDescHigh (write-only)
-//!   0x090: QueueDriverLow (write-only)
-//!   0x094: QueueDriverHigh (write-only)
-//!   0x0a0: QueueDeviceLow (write-only)
-//!   0x0a4: QueueDeviceHigh (write-only)
-//!   0x0fc: ConfigGeneration (read-only)
-//!   0x100+: Config space (device-specific)
+//! Virtio MMIO transport from virtio 1.2 section 4.2.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 
-/// MMIO region size.
 pub const REGION_SIZE: usize = 0x200;
 
-/// Magic value "virt".
 pub const MAGIC: u32 = 0x74726976;
 
-/// Version 2 (virtio 1.0+).
 pub const VERSION: u32 = 2;
 
 /// MMIO register offsets.
@@ -429,10 +397,6 @@ pub const Transport = struct {
         return self.status.driver_ok and self.status.features_ok;
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "Transport init and magic" {
     const transport = try Transport.init(std.testing.allocator, 3, 0, 2);

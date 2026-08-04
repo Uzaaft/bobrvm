@@ -1,10 +1,8 @@
-//! Virtio GPU Device (2D scanout).
+//! Virtio GPU 2D scanout from virtio 1.2 section 5.7.
 //!
-//! Implements virtio-gpu per virtio 1.2 spec section 5.7, processing
-//! descriptor chains directly from guest memory. 2D only for now: the
+//! The device processes descriptor chains directly from guest memory. The
 //! guest DRM driver renders into resources backed by guest pages,
-//! transfers them to a host copy, and flushes; the host presents the
-//! scanout resource. 3D (virgl) arrives with the Metal backend.
+//! transfers them to a host copy, and flushes; the host presents the scanout.
 //!
 //! Queues:
 //!   0: controlq (commands and responses)

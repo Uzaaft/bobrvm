@@ -1,7 +1,4 @@
-//! Virtqueue implementation.
-//!
-//! Implements split virtqueue layout per virtio 1.2 spec section 2.7.
-//! The virtqueue is a lock-free ring buffer for guest↔host communication.
+//! Split virtqueue layout from virtio 1.2 section 2.7.
 //!
 //! Memory layout (split virtqueue):
 //!   Descriptor Table: 16 bytes × queue_size

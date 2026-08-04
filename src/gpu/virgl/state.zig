@@ -1,16 +1,9 @@
-//! Virgl State Objects.
-//!
-//! OpenGL state machine objects that get created via CREATE_OBJECT
-//! and bound via BIND_OBJECT.
+//! Virgl state objects created and bound by the guest command stream.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
 pub const proto = @import("protocol.zig");
-
-// =============================================================================
-// Blend State
-// =============================================================================
 
 /// Blend state object (VIRGL_OBJECT_BLEND).
 pub const BlendState = struct {
@@ -69,10 +62,6 @@ pub const BlendState = struct {
         return state;
     }
 };
-
-// =============================================================================
-// Rasterizer State
-// =============================================================================
 
 /// Fill mode (PIPE_POLYGON_MODE_*).
 pub const FillMode = enum(u2) {
@@ -200,10 +189,6 @@ pub const RasterizerState = struct {
     }
 };
 
-// =============================================================================
-// Depth-Stencil-Alpha State
-// =============================================================================
-
 /// Stencil state for one face.
 pub const StencilFaceState = struct {
     enabled: bool,
@@ -281,10 +266,6 @@ pub const DepthStencilAlphaState = struct {
         return state;
     }
 };
-
-// =============================================================================
-// Sampler State
-// =============================================================================
 
 /// Texture wrap mode (PIPE_TEX_WRAP_*).
 pub const WrapMode = enum(u3) {
@@ -374,10 +355,6 @@ pub const SamplerState = struct {
     }
 };
 
-// =============================================================================
-// Vertex Elements
-// =============================================================================
-
 /// Single vertex element (attribute).
 pub const VertexElement = struct {
     src_offset: u16,
@@ -424,10 +401,6 @@ pub const VertexElementsState = struct {
         return state;
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "BlendState parse" {
     // S0: independent=1, S1: logicop=0, S2: rt0 blend state

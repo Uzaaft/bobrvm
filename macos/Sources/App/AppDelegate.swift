@@ -1,10 +1,3 @@
-//
-//  AppDelegate.swift
-//  Bobrvm
-//
-//  Minimal NSApplicationDelegate for SwiftUI app wiring.
-//
-
 import AppKit
 import OSLog
 import SwiftUI

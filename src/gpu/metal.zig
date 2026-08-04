@@ -1,15 +1,7 @@
-//! Metal bindings for GPU rendering.
-//!
-//! Provides Zig wrappers around Metal Objective-C API using
-//! direct message passing. This allows command buffer encoding
-//! without external dependencies.
+//! Dependency-free Metal bindings using direct Objective-C message dispatch.
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
-
-// =============================================================================
-// Objective-C Runtime Bindings
-// =============================================================================
 
 pub const id = *anyopaque;
 pub const SEL = *anyopaque;
@@ -28,26 +20,22 @@ extern "objc" fn objc_autoreleasePoolPop(pool: ?*anyopaque) callconv(.c) void;
 /// Works headlessly — no window/display required.
 extern "c" fn MTLCreateSystemDefaultDevice() callconv(.c) ?id;
 
-/// Send a message with no return value.
 pub fn msgSendVoid(target: id, selector: SEL) void {
     const func: *const fn (id, SEL) callconv(.c) void = @ptrCast(&objc_msgSend);
     func(target, selector);
 }
 
-/// Send a message returning an object.
 pub fn msgSendId(target: id, selector: SEL) ?id {
     const func: *const fn (id, SEL) callconv(.c) ?id = @ptrCast(&objc_msgSend);
     return func(target, selector);
 }
 
-/// Send a message with one argument returning an object.
 pub fn msgSendId1(target: id, selector: SEL, arg: anytype) ?id {
     const ArgType = @TypeOf(arg);
     const func: *const fn (id, SEL, ArgType) callconv(.c) ?id = @ptrCast(&objc_msgSend);
     return func(target, selector, arg);
 }
 
-/// Get a selector.
 pub fn sel(name: [*:0]const u8) SEL {
     return sel_registerName(name);
 }
@@ -60,14 +48,9 @@ pub fn nsString(c_str: [*:0]const u8) ?id {
     return func(nsstring, s, c_str);
 }
 
-/// Get a class.
 pub fn cls(name: [*:0]const u8) ?Class {
     return objc_getClass(name);
 }
-
-// =============================================================================
-// Metal Types
-// =============================================================================
 
 /// Metal pixel format.
 pub const MTLPixelFormat = enum(NSUInteger) {

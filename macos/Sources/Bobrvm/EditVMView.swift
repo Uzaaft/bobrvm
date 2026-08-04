@@ -1,10 +1,3 @@
-//
-//  EditVMView.swift
-//  Bobrvm
-//
-//  VM configuration editor - modify settings of existing VMs.
-//
-
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -74,7 +67,6 @@ struct EditVMView: View {
                     }
                 }
 
-                // Storage
                 Section {
                     if let diskPath = vmInstance.config.diskPath {
                         LabeledContent("Disk Image") {
@@ -129,7 +121,6 @@ struct EditVMView: View {
                     .foregroundColor(.secondary)
                 }
 
-                // CPU & Memory - show read-only when running
                 if isRunning {
                     Section {
                         ReadOnlyConfigRow(
@@ -186,7 +177,6 @@ struct EditVMView: View {
                     }
                 }
 
-                // GPU - show read-only when running
                 if isRunning {
                     Section {
                         if vmInstance.guestSystem == .macOS {
@@ -248,7 +238,6 @@ struct EditVMView: View {
                     }
                 }
 
-                // Info
                 Section("Information") {
                     LabeledContent("VM ID") {
                         Text(vmInstance.id.uuidString)
@@ -273,7 +262,6 @@ struct EditVMView: View {
 
             Divider()
 
-            // Footer
             HStack {
                 Button("Cancel") {
                     dismiss()

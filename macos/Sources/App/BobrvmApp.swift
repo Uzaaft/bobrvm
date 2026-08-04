@@ -1,10 +1,3 @@
-//
-//  BobrvmApp.swift
-//  Bobrvm
-//
-//  Main SwiftUI application entry point.
-//
-
 import SwiftUI
 
 @main

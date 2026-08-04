@@ -1,8 +1,6 @@
-//! Virtio Network Device.
+//! Virtio network device from virtio 1.2 section 5.1.
 //!
-//! Implements virtio-net per virtio 1.2 section 5.1 over guest-memory
-//! virtqueues. Frames go to/come from a pluggable backend (built-in
-//! NAT responder today, vmnet.framework later).
+//! Frames cross guest-memory virtqueues and a pluggable host backend.
 //!
 //! Queues:
 //!   0: receiveq (host → guest frames)
@@ -256,10 +254,6 @@ pub const Net = struct {
         return self.rx_count + self.rx_reserved_count < RX_BACKPRESSURE;
     }
 
-    // =========================================================================
-    // MMIO Interface
-    // =========================================================================
-
     pub fn read(self: *Net, offset: u12) u32 {
         if (offset >= @intFromEnum(mmio.Reg.config)) {
             return self.readConfig(offset - @intFromEnum(mmio.Reg.config));
@@ -306,10 +300,6 @@ pub const Net = struct {
         self.processTx();
         self.processRx();
     }
-
-    // =========================================================================
-    // TX: guest → host
-    // =========================================================================
 
     fn processTx(self: *Net) void {
         const qc = self.transport.queues[1];
@@ -397,10 +387,6 @@ pub const Net = struct {
             cb(frame_buf[0..frame_len], self.tx_userdata);
         }
     }
-
-    // =========================================================================
-    // RX: host → guest
-    // =========================================================================
 
     fn processRx(self: *Net) void {
         const qc = self.transport.queues[0];
@@ -568,10 +554,6 @@ pub const Net = struct {
         return mmio.REGION_SIZE;
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 const testing = std.testing;
 

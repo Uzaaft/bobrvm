@@ -1,7 +1,4 @@
-//! Virtio Console Device.
-//!
-//! Implements virtio-console per virtio 1.2 spec section 5.3.
-//! Provides serial console I/O between guest and host.
+//! Virtio console device from virtio 1.2 section 5.3.
 //!
 //! Queues:
 //!   0: receiveq (host → guest, input to guest)
@@ -787,10 +784,6 @@ const DeviceId = enum(u32) {
 const mmioDeviceId = struct {
     pub const console: u32 = 3;
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "Console init" {
     const console = try Console.init(std.testing.allocator, &.{});

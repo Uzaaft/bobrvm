@@ -1,16 +1,8 @@
-//! Minimal IOSurface bindings for zero-copy scanout.
+//! IOSurface bindings for zero-copy scanout.
 //!
-//! An IOSurface is a device-independent, CPU+GPU-shareable pixel buffer. We
-//! create one on the vCPU thread (no Metal device required) to back a 2D
-//! scanout resource's pixels, then the render thread wraps an `MTLTexture`
-//! around the *same* memory (`Device.newTextureFromIOSurface`). That way the
-//! guest's `transfer_to_host_2d` writes land directly in GPU-visible memory
-//! and the per-frame CPU->GPU upload (`MTLTexture.replaceRegion`) disappears.
-//!
-//! Being device-independent is the whole point: the display `MTLDevice` comes
-//! from the Swift app on another thread (and is absent in CLI mode), so the
-//! shared buffer cannot be an `MTLBuffer` created at resource-creation time —
-//! it has to be something any device can later wrap. That is exactly IOSurface.
+//! The vCPU writes guest transfers into device-independent shared memory. The
+//! render thread can later wrap that memory in a texture, even though its Metal
+//! device is unavailable when the resource is created.
 
 const std = @import("std");
 
@@ -67,14 +59,8 @@ pub const IOSurface = struct {
     /// guest transfers tightly-packed rows and the rest of the pipeline assumes
     /// `stride == width*4`; a padded surface would misalign every row.
     pub fn createBGRA(width: u32, height: u32) ?IOSurface {
-        // Metal refuses to wrap a texture over an IOSurface whose bytesPerRow
-        // isn't 16-byte aligned ("IOSurface texture: bytesPerRow (N) must be
-        // aligned to 16 bytes" — a hard assertion that ABORTS the process, so
-        // this must be caught here rather than at texture creation). IOSurface
-        // itself happily hands out a tight odd stride, so check before asking:
-        // a tight BGRA stride is width*4, which is 16-aligned iff width % 4 == 0.
-        // Callers fall back to a heap buffer (upload path) when this returns
-        // null. Real-world trigger: a compositor sizing a surface 431px wide.
+        // Metal aborts when wrapping an IOSurface whose row stride is not
+        // 16-byte aligned. A tight BGRA stride is aligned iff width % 4 == 0.
         if (width % 4 != 0) return null;
 
         const w: i32 = @intCast(width);

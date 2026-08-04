@@ -1,14 +1,3 @@
-// Minimal bobrvm display app.
-//
-// Scaffolding for verifying the guest scanout pipeline end-to-end while
-// the full SwiftUI app comes together: one window, one CAMetalLayer,
-// frames drawn by the Zig renderer thread (Swift owns the window and
-// Metal context only).
-//
-// Build: ./macos/MinimalApp/build.sh
-// Run:   BobrvmDisplay --kernel Image --initrd initrd [--disk d.img] \
-//            [--cmdline '...'] [--memory-mb 2048] [--net] [--cpus 1]
-
 import AppKit
 import Metal
 import QuartzCore
@@ -19,12 +8,8 @@ final class MetalView: NSView {
     var surface: bobrvm_surface_t?
     var lastFlags = NSEvent.ModifierFlags()
 
-    // Click-to-capture mouse grab (VMware/Parallels-style): while captured,
-    // the host cursor is hidden and unassociated from the display so raw
-    // hardware deltas keep flowing past the screen edges — otherwise the
-    // host cursor simply can't move further once it hits the edge of the
-    // physical display, capping how far the guest pointer could ever travel.
-    // Release with Control+Option (VMware Fusion's default host-key combo).
+    // Disassociating the cursor preserves raw deltas beyond screen edges.
+    // Control+Option releases the capture.
     var mouseCaptured = false
     var virtualX: CGFloat = 0
     var virtualY: CGFloat = 0
@@ -47,8 +32,7 @@ final class MetalView: NSView {
         mouseCaptured = false
         CGAssociateMouseAndMouseCursorPosition(1)
         NSCursor.unhide()
-        // Warp the host cursor back to the window's center so it reappears
-        // somewhere sane instead of wherever it silently drifted while hidden.
+        // The hidden cursor may have drifted outside the window while captured.
         if let window, let screen = window.screen ?? NSScreen.screens.first {
             let centerInWindow = NSPoint(x: bounds.midX, y: bounds.midY)
             let centerOnScreen = window.convertPoint(toScreen: convert(centerInWindow, to: nil))
@@ -62,9 +46,7 @@ final class MetalView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer = metalLayer
-        // Letterbox (not distort) the stale framebuffer while the window and
-        // the guest resolution disagree — i.e. between a live resize and the
-        // guest's modeset in response to the display hotplug.
+        // Guest modesets lag host resizes, so preserve the old frame's aspect ratio.
         metalLayer.contentsGravity = .resizeAspect
     }
 
@@ -88,10 +70,7 @@ final class MetalView: NSView {
     override func keyDown(with event: NSEvent) { sendKey(event, pressed: true) }
     override func keyUp(with event: NSEvent) { sendKey(event, pressed: false) }
 
-    // ⌘-modified keys never reach keyDown — AppKit routes them to the
-    // key-equivalent/menu chain, so without this override every ⌘-combo is
-    // silently swallowed. Forward them to the guest as a press+release
-    // pulse (the matching keyUp is also suppressed while ⌘ is held).
+    // AppKit routes Command shortcuts through the menu chain and suppresses keyUp.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown, event.modifierFlags.contains(.command) else { return false }
         sendKey(event, pressed: true)
@@ -100,11 +79,7 @@ final class MetalView: NSView {
     }
 
     override func flagsChanged(with event: NSEvent) {
-        // Modifier keys: derive press/release from the DEVICE-dependent
-        // flag bits (NX_DEVICE*KEYMASK) so left and right variants track
-        // independently — the generic flags (.shift & co) stay set while
-        // the *other* side is still held, which turned "release left
-        // shift" into a re-press and left the guest with a stuck modifier.
+        // Generic flags cannot distinguish release of one side while the other is held.
         let deviceBitFor: [UInt16: UInt] = [
             0x37: 0x0008, // Command -> NX_DEVICELCMDKEYMASK
             0x36: 0x0010, // Right Command -> NX_DEVICERCMDKEYMASK
@@ -116,10 +91,7 @@ final class MetalView: NSView {
             0x3E: 0x2000, // Right Control -> NX_DEVICERCTLKEYMASK
         ]
         if event.keyCode == 0x39 {
-            // CapsLock is a toggle on the Mac side but a momentary key to
-            // the guest, which toggles its own caps state on PRESS edges.
-            // Pulse press+release on every host flip; press-only/release-
-            // only left the guest's caps lock stuck on.
+            // macOS exposes Caps Lock as a toggle; the guest expects a key pulse.
             sendKey(event, pressed: true)
             sendKey(event, pressed: false)
         } else if let bit = deviceBitFor[event.keyCode] {
@@ -131,11 +103,7 @@ final class MetalView: NSView {
         lastFlags = event.modifierFlags
     }
 
-    /// Release every modifier in the guest. Called when the app/window
-    /// loses key status: a release that happens while unfocused (⌘Tab is
-    /// the classic case — the ⌘ press reaches us, the release goes to the
-    /// app switcher) otherwise leaves the guest with a modifier held
-    /// forever, making every later keystroke look modified.
+    // Releases may go to another app after focus changes, leaving guest keys stuck.
     func releaseAllModifiers() {
         for code: UInt16 in [0x37, 0x36, 0x38, 0x3C, 0x3A, 0x3D, 0x3B, 0x3E] {
             sendKeyCode(code, pressed: false)
@@ -167,10 +135,7 @@ final class MetalView: NSView {
     private func sendMousePos(_ event: NSEvent) {
         guard let surface else { return }
         if mouseCaptured {
-            // event.deltaX/deltaY are raw hardware deltas (positive deltaY
-            // = moved down), which already matches the guest's top-left,
-            // y-down convention — no flip needed here, unlike the absolute
-            // path below.
+            // Raw deltas already use the guest's y-down convention.
             virtualX += event.deltaX
             virtualY += event.deltaY
             bobrvm_surface_mouse_pos(surface, virtualX, virtualY)
@@ -203,14 +168,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var device: MTLDevice!
     var queue: MTLCommandQueue!
 
-    /// Guest resolution follows backing pixels (Retina-native) instead of
-    /// logical points. Off by default: points give Fusion-like sane DPI.
+    // Off by default because logical points provide a conventional guest DPI.
     var hidpi = false
     var resizeDebounce: DispatchWorkItem?
 
-    /// Guest resolution for the current view size: points by default,
-    /// backing pixels with --hidpi. Width rounded down to even so the
-    /// guest's scanout resource keeps a tight (IOSurface-friendly) stride.
+    // Even widths keep the guest scanout stride IOSurface-friendly.
     private func guestSize() -> (UInt32, UInt32) {
         let scale = hidpi ? (window.backingScaleFactor) : 1.0
         let s = view.bounds.size
@@ -219,9 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return (w, h)
     }
 
-    /// Push the current window size to the guest (display hotplug) and the
-    /// host drawable. The guest modesets asynchronously; until then the old
-    /// framebuffer letterboxes.
+    // Update both guest display information and the host drawable.
     func requestGuestResize() {
         guard let surface else { return }
         let (w, h) = guestSize()
@@ -265,10 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Open at the screen's working-area size. The guest framebuffer is
-        // allocated ONCE at boot and can re-modeset smaller but never grow
-        // (fbdev), so starting the display large is what makes resize-to-fit
-        // work in both directions afterwards.
+        // fbdev allocates once at boot and can only modeset smaller afterward.
         let work = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1280, height: 800)
         let width = work.width
         let height = work.height
@@ -282,7 +239,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "bobrvm"
         window.center()
         window.delegate = self
-        // Native fullscreen (green button / ⌃⌘F).
         window.collectionBehavior.insert(.fullScreenPrimary)
 
         view = MetalView(frame: NSRect(x: 0, y: 0, width: width, height: height))
@@ -298,7 +254,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         queue = cq
         view.metalLayer.device = device
         view.metalLayer.pixelFormat = .bgra8Unorm
-        // The Zig renderer blits into the drawable texture.
         view.metalLayer.framebufferOnly = false
 
         bobrvm_init()
@@ -326,7 +281,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bobrApp = bobrvm_app_new(&runtimeCfg)
         guard bobrApp != nil else { fatalError("bobrvm_app_new failed") }
 
-        // Parse CLI arguments into the VM config.
         var kernel: String? = nil
         var initrd: String? = nil
         var disk: String? = nil
@@ -347,8 +301,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case "--disk2": disk2 = args.next()
             case "--disk2-readonly": disk2ReadOnly = true
             case "--disk2-writable": disk2ReadOnly = false
-            // 3D (virgl/venus) on the guest's virtio-gpu. Needs a libbobrvm
-            // built with -Dgpu-venus and the host venus stack for GL.
             case "--gpu3d": gpu3d = true
             case "--cmdline": cmdline = args.next() ?? cmdline
             case "--memory-mb": memoryMB = UInt64(args.next() ?? "") ?? memoryMB
@@ -382,19 +334,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         cfg.disk_read_only = diskC != nil && (disk?.hasSuffix(".iso") ?? false)
                         cfg.cmdline = cmdlineC
                         cfg.disk2_path = disk2C
-                        // Default read-only for ISOs, writable otherwise;
-                        // an explicit flag always wins.
+                        // Explicit disk access overrides the ISO default.
                         cfg.disk2_read_only = disk2ReadOnly ?? (disk2?.hasSuffix(".iso") ?? true)
                         cfg.enable_net = enableNet
                         cfg.enable_gpu3d = gpu3d
-                        // Boot the display with headroom for the LARGEST
-                        // attached screen: the guest fbdev framebuffer is
-                        // allocated once at this size and can re-modeset
-                        // smaller but never grow, so this is what lets
-                        // resize-to-fit work at any window size on any
-                        // monitor. The window-fit resize request that
-                        // follows the first windowDidResize shrinks the
-                        // mode to the actual window.
+                        // Reserve enough fbdev storage for every attached screen at boot.
                         let scale = hidpi ? (NSScreen.main?.backingScaleFactor ?? 1.0) : 1.0
                         let maxScreen = NSScreen.screens.reduce(NSSize(width: 1280, height: 800)) {
                             NSSize(width: max($0.width, $1.frame.width * scale),
@@ -425,14 +369,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bobrvm_surface_set_content_scale(surface, scale, scale)
         bobrvm_surface_set_size(surface, gw, gh)
 
-        // Route input events from the view to the guest.
         view.surface = surface
         window.makeFirstResponder(view)
         window.acceptsMouseMovedEvents = true
 
-        // Safety net: don't leave the host cursor hidden/ungrabbed — or
-        // guest modifiers stuck down — if the user switches away from the
-        // app some other way than ⌃⌥ (⌘Tab being the classic case).
+        // App switching can bypass the release events handled by MetalView.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
             object: nil, queue: .main
@@ -441,10 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.view.releaseAllModifiers()
         }
 
-        // Drive frames at 60 Hz. (CVDisplayLink integration comes with
-        // the full app; a timer is enough to verify the pipeline.)
-        // Piggyback a ~0.5s host-clipboard poll: on changeCount
-        // transitions, announce a vdagent GRAB so the guest can paste.
+        // Poll pasteboard changes alongside this minimal app's render timer.
         var tick = 0
         var lastChangeCount = NSPasteboard.general.changeCount
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -459,17 +397,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
         }
-        // .common (not scheduledTimer's .default): the run loop switches to
-        // the event-tracking mode during live window resizes and menu
-        // tracking, where .default timers don't fire — the display froze
-        // for the whole drag.
+        // Default-mode timers pause while AppKit tracks window and menu events.
         RunLoop.main.add(t, forMode: .common)
         timer = t
 
-        // One-shot fit: the display boots at largest-screen size (for fbdev
-        // headroom); once the guest's display stack is up, shrink the mode
-        // to the actual window. Harmless no-op if window restoration
-        // already fired a resize.
+        // Shrink the boot-sized fbdev mode after the guest display stack starts.
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             self?.guestResizeNow()
         }

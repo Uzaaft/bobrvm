@@ -1,19 +1,13 @@
-//! Venus host-backend smoke test (Zig). Proves the Zig↔virglrenderer FFI:
-//! initializes the Venus path and confirms the Venus capset is present.
+//! Smoke test for the Zig↔virglrenderer Venus bindings.
 //!
-//! Build+sign: `zig build venus-smoke`. Run needs the brew GPU stack on
-//! DYLD_LIBRARY_PATH + VK_ICD_FILENAMES (the build step sets these). NOTE: in a
-//! sandboxed shell the process may be SIGKILLed before main by the sandbox when
-//! virglrenderer's initializers run; run it under lldb there
-//! (`lldb -b -o run -o quit zig-out/bin/venus_smoke`). On a normal (codesigned)
-//! macOS session it runs directly.
+//! `zig build venus-smoke` configures the required renderer and Vulkan paths.
+//! Sandboxed shells may need LLDB because the sandbox can kill virglrenderer's
+//! initializer before `main`.
 
 const std = @import("std");
 const venus = @import("venus");
 
 pub fn main() !void {
-    // ensureHost() self-configures RENDER_SERVER_EXEC_PATH + VK_ICD_FILENAMES
-    // from the build's virgl prefix (the same path gpu.zig uses).
     const host = venus.ensureHost() orelse {
         std.debug.print("venus init FAILED (host unavailable)\n", .{});
         std.process.exit(1);
@@ -33,8 +27,7 @@ pub fn main() !void {
         std.process.exit(2);
     }
 
-    // Exercise the bridge API surface: fill the Venus caps blob and create a
-    // Venus-capset context (the two operations a guest does first).
+    // These are the first two operations issued by a guest.
     var caps: [4096]u8 = undefined;
     host.fillCaps(venus.CAPSET_VENUS, v.max_ver, caps[0..v.max_size]);
     std.debug.print("  fill_caps(VENUS, ver={d}) wrote {d} bytes; head={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ v.max_ver, v.max_size, caps[0], caps[1], caps[2], caps[3] });

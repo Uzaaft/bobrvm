@@ -628,10 +628,6 @@ pub const Block = struct {
     }
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 test "Block init" {
     const blk = try Block.init(std.testing.allocator);
     defer blk.deinit();

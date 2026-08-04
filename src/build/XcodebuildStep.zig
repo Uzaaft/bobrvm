@@ -1,6 +1,4 @@
-//! Xcodebuild invocation step.
-//!
-//! Builds the macOS app using xcodebuild after the XCFramework is ready.
+//! Builds the macOS app after its XCFramework is ready.
 
 const XcodebuildStep = @This();
 
@@ -56,7 +54,6 @@ fn make(step: *Step, opts: Step.MakeOptions) !void {
     const xcodeproj_path = b.pathFromRoot("macos/Bobrvm.xcodeproj");
     const derived_data_path = b.pathFromRoot("zig-out/xcode-derived-data");
 
-    // Run xcodebuild
     var exit_code: u8 = 0;
     _ = b.runAllowFail(&.{
         "xcodebuild",

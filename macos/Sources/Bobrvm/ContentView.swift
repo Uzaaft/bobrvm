@@ -1,10 +1,3 @@
-//
-//  ContentView.swift
-//  Bobrvm
-//
-//  Main content view with VM list and display area.
-//
-
 import AppKit
 import Combine
 import SwiftUI
@@ -160,7 +153,6 @@ struct VMContextMenu: View {
 
     var body: some View {
         Group {
-            // Power controls
             Section {
                 switch vmInstance.state {
                 case .stopped:
@@ -214,7 +206,6 @@ struct VMContextMenu: View {
 
             Divider()
 
-            // VM management
             Section {
                 Button {
                     onEdit()
@@ -233,7 +224,6 @@ struct VMContextMenu: View {
 
             Divider()
 
-            // File operations
             Section {
                 if let diskPath = vmInstance.config.diskPath {
                     Button {
@@ -252,7 +242,6 @@ struct VMContextMenu: View {
 
             Divider()
 
-            // Danger zone
             Section {
                 Button(role: .destructive) {
                     onDelete()

@@ -1,9 +1,7 @@
 //! Built-in NAT responder (slirp-style addressing, no root required).
 //!
-//! Answers the guest's ARP, DHCP, and ICMP-echo traffic and forwards
-//! UDP/TCP to real hosts through host sockets — so `ip addr` shows a
-//! lease, `ping 10.0.2.2` works, DNS resolves, and `curl` reaches the
-//! internet, all without root. The vmnet.framework backend comes later.
+//! Answers ARP, DHCP, and ICMP echo locally, and forwards UDP/TCP through
+//! unprivileged host sockets.
 //!
 //!   guest:   10.0.2.15
 //!   gateway: 10.0.2.2 (this responder)

@@ -31,7 +31,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Build options
     const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
     const emit_macos_app = b.option(bool, "emit-macos-app", "Build macOS app via xcodebuild") orelse false;
 
@@ -63,7 +62,6 @@ pub fn build(b: *std.Build) void {
         }
     }.apply;
 
-    // Create the root module
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main_c.zig"),
         .target = target,
@@ -71,10 +69,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Link system frameworks on macOS
     if (target.result.os.tag == .macos) {
         root_module.addImport("objc", objc_dependency.module("objc"));
-        // Add framework search path from SDKROOT if available
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -95,7 +91,6 @@ pub fn build(b: *std.Build) void {
         root_module.linkFramework("Virtualization", .{});
         root_module.linkSystemLibrary("objc", .{});
 
-        // Add C source for os_log wrapper
         root_module.addCSourceFile(.{
             .file = b.path("src/os/log.c"),
             .flags = &.{"-std=c11"},
@@ -104,7 +99,6 @@ pub fn build(b: *std.Build) void {
 
     wireVenus(root_module, build_options, gpu_venus, virgl_lib);
 
-    // Create the main library
     const lib = b.addLibrary(.{
         .name = "bobrvm",
         .root_module = root_module,
@@ -113,14 +107,12 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
 
-    // Install headers
     b.installDirectory(.{
         .source_dir = b.path("include"),
         .install_dir = .header,
         .install_subdir = "",
     });
 
-    // CLI executable module
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -128,7 +120,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Link system frameworks for CLI on macOS
     if (target.result.os.tag == .macos) {
         cli_module.addImport("objc", objc_dependency.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
@@ -158,7 +149,6 @@ pub fn build(b: *std.Build) void {
 
     wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
 
-    // CLI executable
     const cli_exe = b.addExecutable(.{
         .name = "bobrvm",
         .root_module = cli_module,
@@ -186,7 +176,6 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&codesign.step);
     }
 
-    // CLI run step
     const cli_run = b.addRunArtifact(cli_exe);
     cli_run.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

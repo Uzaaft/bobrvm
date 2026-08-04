@@ -1,10 +1,3 @@
-//
-//  VMManager.swift
-//  Bobrvm
-//
-//  Manages VM instances and coordinates with UI.
-//
-
 import Combine
 import Foundation
 import OSLog
@@ -176,7 +169,6 @@ public final class VMManager: ObservableObject {
             isoReadOnly: true
         )
 
-        // Find and update the instance in our list
         guard let index = vms.firstIndex(where: { $0.id == instance.id }) else {
             throw BobrvmError.invalidArgument
         }

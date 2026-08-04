@@ -1,11 +1,3 @@
-//
-//  VMSurfaceView.swift
-//  Bobrvm
-//
-//  NSView subclass with CAMetalLayer for VM display.
-//  Routes input events to Zig core and coordinates with CVDisplayLink.
-//
-
 import AppKit
 import Combine
 import Metal

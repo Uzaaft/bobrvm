@@ -86,10 +86,6 @@ pub const Vdagent = struct {
         self.msg_buf.deinit(self.alloc);
     }
 
-    // =========================================================================
-    // Outbound
-    // =========================================================================
-
     /// Frame and send one VDAgentMessage, split into <=2048-byte chunks.
     fn sendMsg(self: *Vdagent, msg_type: MsgType, payload: []const u8) void {
         self.sendMsgParts(msg_type, &.{payload});
@@ -165,10 +161,6 @@ pub const Vdagent = struct {
         std.mem.writeInt(u32, &data_type, CLIP_UTF8_TEXT, .little);
         self.sendMsgParts(.clipboard, &.{ &data_type, text });
     }
-
-    // =========================================================================
-    // Inbound
-    // =========================================================================
 
     /// Feed guest→host port bytes (vCPU thread).
     pub fn feed(self: *Vdagent, data: []const u8) void {
@@ -268,10 +260,6 @@ pub const Vdagent = struct {
         }
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 const testing = std.testing;
 

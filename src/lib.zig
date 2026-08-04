@@ -1,16 +1,4 @@
-//! bobrvm - Linux virtualization for macOS
-//!
-//! Core library providing:
-//! - Apple Hypervisor.framework bindings
-//! - virtio device emulation
-//! - OpenGL 4.3 / Vulkan → Metal translation
-//! - High-performance renderer thread
-//! - Dual logging (stderr + macOS unified logging)
-//!
-//! The engineering principles behind this library were strongly influenced by
-//! Mitchell Hashimoto and the Ghostty maintainers. Their work demonstrated how
-//! to combine explicit ownership, native platform integration, and a small,
-//! performance-oriented core without compromising maintainability.
+//! Linux virtualization for macOS.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,7 +22,6 @@ pub const version: [:0]const u8 = "0.1.0";
 test {
     _ = @import("std").testing.refAllDecls(@This());
 
-    // Test all submodules
     _ = agent;
     _ = apprt;
     _ = config;

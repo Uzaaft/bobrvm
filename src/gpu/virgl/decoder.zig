@@ -1,7 +1,4 @@
-//! Virgl Command Stream Decoder.
-//!
-//! Parses the command stream from guest Mesa driver and dispatches
-//! to the appropriate handlers.
+//! Decodes command streams produced by the guest's Mesa virgl driver.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -195,10 +192,6 @@ pub const Decoder = struct {
         return @bitCast(bits);
     }
 
-    // =========================================================================
-    // Command Decoders
-    // =========================================================================
-
     /// Decode DRAW_VBO command.
     pub fn decodeDrawVbo(self: *Decoder, length: u16) DecodeError!DrawCommand {
         if (length < proto.CommandSize.DRAW_VBO) {
@@ -324,10 +317,6 @@ pub const Decoder = struct {
         return self.readU32();
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "Decoder init and header parse" {
     // Create a simple command: NOP with length 0
