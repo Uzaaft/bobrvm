@@ -27,6 +27,7 @@ pub const os = @import("os/main.zig");
 pub const virtio = @import("virtio/main.zig");
 pub const gpu = @import("gpu/main.zig");
 pub const renderer = @import("renderer/main.zig");
+pub const runtime = @import("runtime/main.zig");
 
 pub const version: [:0]const u8 = "0.1.0";
 
@@ -46,5 +47,6 @@ test {
     _ = virtio;
     _ = gpu;
     _ = renderer;
+    _ = runtime;
     _ = @import("cli/Config.zig");
 }

@@ -26,6 +26,10 @@ pub fn build(b: *std.Build) void {
     // Swift/Xcode integration never runs under nix, which builds only the Zig
     // core. The terminal dependency also needs the real Darwin SDK.
     const in_nix = is_nix_build or in_nix_shell;
+    const objc_dependency = b.dependency("zig_objc", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Build options
     const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
@@ -69,6 +73,7 @@ pub fn build(b: *std.Build) void {
 
     // Link system frameworks on macOS
     if (target.result.os.tag == .macos) {
+        root_module.addImport("objc", objc_dependency.module("objc"));
         // Add framework search path from SDKROOT if available
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
@@ -85,6 +90,9 @@ pub fn build(b: *std.Build) void {
         root_module.linkFramework("QuartzCore", .{});
         root_module.linkFramework("IOSurface", .{});
         root_module.linkFramework("CoreFoundation", .{});
+        root_module.linkFramework("Foundation", .{});
+        root_module.linkFramework("AppKit", .{});
+        root_module.linkFramework("Virtualization", .{});
         root_module.linkSystemLibrary("objc", .{});
 
         // Add C source for os_log wrapper
@@ -122,6 +130,7 @@ pub fn build(b: *std.Build) void {
 
     // Link system frameworks for CLI on macOS
     if (target.result.os.tag == .macos) {
+        cli_module.addImport("objc", objc_dependency.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -136,6 +145,9 @@ pub fn build(b: *std.Build) void {
         cli_module.linkFramework("QuartzCore", .{});
         cli_module.linkFramework("IOSurface", .{});
         cli_module.linkFramework("CoreFoundation", .{});
+        cli_module.linkFramework("Foundation", .{});
+        cli_module.linkFramework("AppKit", .{});
+        cli_module.linkFramework("Virtualization", .{});
         cli_module.linkSystemLibrary("objc", .{});
 
         cli_module.addCSourceFile(.{
