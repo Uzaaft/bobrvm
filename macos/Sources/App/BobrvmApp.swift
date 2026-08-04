@@ -28,6 +28,7 @@ struct BobrvmApp: SwiftUI.App {
                     .environmentObject(appDelegate.ghosttyRuntime)
             }
         }
+        .windowToolbarStyle(.unifiedCompact)
         .defaultSize(width: 1_280, height: 800)
 
         WindowGroup("Console", id: "vm-console", for: UUID.self) { $vmID in
