@@ -29,6 +29,11 @@ stdenv.mkDerivation (finalAttrs: {
       ]);
   };
 
+  zigDeps = zig.fetchDeps {
+    inherit (finalAttrs) pname version src;
+    hash = "sha256-5XIXOxHmrPDtsdEN0jDViGJcbnvHjtb1kfYicTw9WgM=";
+  };
+
   nativeBuildInputs = [
     pkg-config
     zig
@@ -41,7 +46,9 @@ stdenv.mkDerivation (finalAttrs: {
   buildPhase = ''
     runHook preBuild
     export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-    zig build -Dcpu=baseline -Doptimize=${finalAttrs.optimize}
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
+    zig build -Dcpu=baseline -Doptimize=${optimize}
     runHook postBuild
   '';
 
