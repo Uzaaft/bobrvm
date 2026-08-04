@@ -26,6 +26,14 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Build Zig library with Nix
+        run: nix build --print-build-logs
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -34,8 +42,34 @@ jobs:
       - name: Prepare Zig caches
         run: mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
 
-      - name: Build Bobrvm
-        run: zig build -Demit-macos-app=true -Doptimize=ReleaseFast
+      - name: Build Ghostty framework
+        run: zig build ghostty-lib -Doptimize=ReleaseFast
+
+      - name: Create Bobrvm framework
+        run: |
+          tools/repack-static-library.sh \
+              "$PWD/result/lib/libbobrvm.a" \
+              "$PWD/zig-out/lib/libbobrvm-xcode.a"
+          rm -rf macos/BobrvmKit.xcframework
+          xcodebuild -create-xcframework \
+              -library zig-out/lib/libbobrvm-xcode.a \
+              -headers result/include \
+              -output macos/BobrvmKit.xcframework
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build SwiftUI app
+        run: |
+          xcodebuild \
+              -project macos/Bobrvm.xcodeproj \
+              -scheme Bobrvm \
+              -configuration Release \
+              -derivedDataPath zig-out/xcode-derived-data \
+              CODE_SIGNING_ALLOWED=YES \
+              ONLY_ACTIVE_ARCH=YES \
+              -quiet \
+              build
 
       - name: Package app
         run: |
