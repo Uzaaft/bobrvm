@@ -109,12 +109,14 @@ struct EditVMView: View {
                         }
                     }
 
-                    FilePickerField(
-                        label: "CD/DVD Image",
-                        path: $isoPath,
-                        types: [.iso]
-                    )
-                    .onChange(of: isoPath) { _ in hasChanges = true }
+                    if vmInstance.guestSystem == .linux {
+                        FilePickerField(
+                            label: "CD/DVD Image",
+                            path: $isoPath,
+                            types: [.iso]
+                        )
+                        .onChange(of: isoPath) { _ in hasChanges = true }
+                    }
                 } header: {
                     Text("Storage")
                 } footer: {
@@ -187,11 +189,19 @@ struct EditVMView: View {
                 // GPU - show read-only when running
                 if isRunning {
                     Section {
-                        ReadOnlyConfigRow(
-                            label: "Shared Graphics Memory",
-                            value: "\(Int(vramMB)) MB",
-                            icon: "gpu"
-                        )
+                        if vmInstance.guestSystem == .macOS {
+                            ReadOnlyConfigRow(
+                                label: "Graphics",
+                                value: "Apple accelerated graphics",
+                                icon: "gpu"
+                            )
+                        } else {
+                            ReadOnlyConfigRow(
+                                label: "Shared Graphics Memory",
+                                value: "\(Int(vramMB)) MB",
+                                icon: "gpu"
+                            )
+                        }
                         ReadOnlyConfigRow(
                             label: "Maximum Resolution",
                             value: resolution.label,
@@ -206,15 +216,22 @@ struct EditVMView: View {
                     }
                 } else {
                     Section {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Shared Graphics Memory")
-                                Spacer()
-                                Text("\(Int(vramMB)) MB")
+                        if vmInstance.guestSystem == .macOS {
+                            LabeledContent("Graphics") {
+                                Text("Apple accelerated graphics")
                                     .foregroundColor(.secondary)
                             }
-                            Slider(value: $vramMB, in: 64...2048, step: 64)
-                                .onChange(of: vramMB) { _ in hasChanges = true }
+                        } else {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text("Shared Graphics Memory")
+                                    Spacer()
+                                    Text("\(Int(vramMB)) MB")
+                                        .foregroundColor(.secondary)
+                                }
+                                Slider(value: $vramMB, in: 64...2048, step: 64)
+                                    .onChange(of: vramMB) { _ in hasChanges = true }
+                            }
                         }
 
                         Picker("Maximum Guest Resolution", selection: $resolution) {

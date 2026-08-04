@@ -1,8 +1,10 @@
 # bobrvm
 
-Native Linux virtualization for macOS. The entire VM core — hypervisor,
-virtio devices, interrupt controller, GPU translation, networking — is
-Zig; only the window/Metal-context host is Swift (the ghostty split).
+Native Linux and macOS virtualization for Apple Silicon Macs. Linux guests use
+the Zig VM core — hypervisor, virtio devices, interrupt controller, GPU
+translation, and networking. macOS guests use Apple's Virtualization framework
+with persisted Apple hardware identity and native graphics, input, networking,
+and audio devices.
 
 Boots NixOS to a shell in two modes: a **GUI** window (VMware-Fusion
 style) and a **headless** drop-into-a-shell console.
@@ -13,6 +15,7 @@ Working and verified against a NixOS 25.05 aarch64 guest:
 
 | Area | State |
 |------|-------|
+| macOS guests (Virtualization.framework) | IPSW installation, persisted identity, native display/input/network/audio |
 | Boot (Apple Hypervisor.framework, arm64) |  NixOS to login, ~15s (1 vCPU) |
 | Serial console (virtio-console + PL011) |  interactive shell |
 | SMP (PSCI CPU_ON) |  4 vCPUs online |
@@ -120,7 +123,12 @@ zig build run
 
 ## Usage
 
-Two ways to run a guest, sharing the same Zig VM core.
+The macOS app can create Linux guests from an ISO or existing raw disk, and
+macOS guests from either Apple's latest supported restore image or a local IPSW.
+macOS installation downloads can be large and the app must remain open until
+installation finishes.
+
+Linux guests can also be run headlessly with the Zig VM core.
 
 ### Headless (drop into a shell)
 

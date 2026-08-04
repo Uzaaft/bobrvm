@@ -223,12 +223,12 @@ struct VMContextMenu: View {
                 }
                 .keyboardShortcut(",", modifiers: .command)
 
-                Button {
-                    duplicateVM()
+            Button {
+                duplicateVM()
                 } label: {
                     Label("Duplicate", systemImage: "plus.square.on.square")
                 }
-                .disabled(vmInstance.state == .running)
+                .disabled(vmInstance.state == .running || vmInstance.guestSystem == .macOS)
             }
 
             Divider()
@@ -265,6 +265,7 @@ struct VMContextMenu: View {
     }
 
     private func duplicateVM() {
+        guard vmInstance.guestSystem == .linux else { return }
         let newName = "\(vmInstance.name) (Copy)"
         try? vmManager.createVM(
             name: newName,
@@ -326,8 +327,15 @@ struct VMDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             if vmInstance.state == .running || vmInstance.state == .paused {
-                VMSurfaceRepresentable(vmInstance: vmInstance)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if vmInstance.guestSystem == .macOS,
+                    let machine = vmInstance.runtimeMacVM
+                {
+                    MacVirtualMachineView(machine: machine)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VMSurfaceRepresentable(vmInstance: vmInstance)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             } else {
                 VStack(spacing: 16) {
                     Image(systemName: "desktopcomputer")

@@ -128,7 +128,7 @@ private struct VMLibraryCard: View {
                     Text(vmInstance.name)
                         .font(.headline)
                         .lineLimit(1)
-                    Text("Virtual machine")
+                    Text("\(vmInstance.guestSystem.displayName) virtual machine")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -224,6 +224,7 @@ private struct VMLibraryCard: View {
     }
 
     private var opticalDriveText: String {
+        if vmInstance.guestSystem == .macOS { return "Apple Virtualization" }
         guard let path = vmInstance.isoPath else { return "CD/DVD: Empty" }
         return "CD/DVD: \(URL(fileURLWithPath: path).lastPathComponent)"
     }

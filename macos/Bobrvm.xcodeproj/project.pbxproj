@@ -23,6 +23,8 @@
 		C3F4A6D4B1CC4E2893A3E0A6 /* GhosttyRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */; };
 		C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */; };
 		1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */; };
+		A6B7C8D9E0F1122334455601 /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455602 /* Virtualization.framework */; };
+		A6B7C8D9E0F1122334455603 /* MacVirtualMachine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */; };
 		UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000002 /* QEMU_EFI.fd */; };
 		UEFI00000000000000000004 /* QEMU_VARS.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000005 /* QEMU_VARS.fd */; };
 		B0B000000000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000002 /* Assets.xcassets */; };
@@ -48,6 +50,8 @@
 		56F95697E6344228A7F9BA1B /* Bobrvm.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Bobrvm.entitlements; sourceTree = "<group>"; };
 		8260A68E8A704D57966124E6 /* Bobrvm-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Bobrvm-Bridging-Header.h"; sourceTree = "<group>"; };
 		0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
+		A6B7C8D9E0F1122334455602 /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
+		A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacVirtualMachine.swift; sourceTree = "<group>"; };
 		UEFI00000000000000000002 /* QEMU_EFI.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_EFI.fd; sourceTree = "<group>"; };
 		UEFI00000000000000000005 /* QEMU_VARS.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_VARS.fd; sourceTree = "<group>"; };
 		B0B000000000000000000002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -64,6 +68,7 @@
 				08FEA81F40114C27A1A9251A /* BobrvmKit.xcframework in Frameworks */,
 				A1B2C3D4E5F60718293A4B5C /* GhosttyKit.xcframework in Frameworks */,
 				1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */,
+				A6B7C8D9E0F1122334455601 /* Virtualization.framework in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -95,6 +100,7 @@
 				C3F4A6D1B1CC4E2893A3E0A3 /* GhosttyInput.swift */,
 				C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */,
 				C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */,
+				A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */,
 				B4B19DFF60E047A291BD2726 /* SettingsView.swift */,
 				B2E99685B82E41398008A70C /* VMManager.swift */,
 				B0B000000000000000000006 /* VMLibraryView.swift */,
@@ -118,6 +124,7 @@
 				27F916698DB04C12B429214A /* BobrvmKit.xcframework */,
 				A1B2C3D4E5F60718293A4B5D /* GhosttyKit.xcframework */,
 				0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */,
+				A6B7C8D9E0F1122334455602 /* Virtualization.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -230,6 +237,7 @@
 				E7DE4622B79F487381A5E9D7 /* VMManager.swift in Sources */,
 				B0B000000000000000000005 /* VMLibraryView.swift in Sources */,
 				E59A61D5A7ED4A43B2965238 /* VMSurfaceView.swift in Sources */,
+				A6B7C8D9E0F1122334455603 /* MacVirtualMachine.swift in Sources */,
 				763CCC85691B452497100414 /* BobrvmKit.swift in Sources */,
 			);
 		};

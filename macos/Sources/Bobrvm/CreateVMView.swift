@@ -17,6 +17,8 @@ struct CreateVMView: View {
     @State private var source = VMSource.installFromISO
     @State private var name = "Linux"
     @State private var isoPath = ""
+    @State private var ipswPath = ""
+    @State private var macOSRestoreSource = MacOSRestoreSource.latest
     @State private var existingDiskPath = ""
     @State private var memoryGB = 4.0
     @State private var vcpuCount = 2.0
@@ -25,6 +27,7 @@ struct CreateVMView: View {
     @State private var retinaEnabled = true
     @State private var diskSizeGB = 64.0
     @State private var isCreating = false
+    @State private var installationProgress = 0.0
     @State private var errorMessage: String?
 
     private let systemInfo = SystemInfo()
@@ -43,6 +46,13 @@ struct CreateVMView: View {
         }
         .frame(width: 720, height: 540)
         .disabled(isCreating)
+        .onChange(of: source) { selected in
+            guard selected == .installMacOS else { return }
+            if name == "Linux" { name = "macOS" }
+            memoryGB = max(memoryGB, 8)
+            vcpuCount = max(vcpuCount, 4)
+            diskSizeGB = max(diskSizeGB, 80)
+        }
         .alert(
             "Couldn’t Create Virtual Machine",
             isPresented: Binding(
@@ -63,6 +73,8 @@ struct CreateVMView: View {
             InstallationStepView(
                 source: $source,
                 isoPath: $isoPath,
+                ipswPath: $ipswPath,
+                macOSRestoreSource: $macOSRestoreSource,
                 existingDiskPath: $existingDiskPath
             )
         case .hardware:
@@ -72,6 +84,7 @@ struct CreateVMView: View {
                 vramMB: $vramMB,
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
+                guestSystem: source.guestSystem,
                 systemInfo: systemInfo
             )
         case .storage:
@@ -85,6 +98,8 @@ struct CreateVMView: View {
                 name: $name,
                 source: source,
                 isoPath: isoPath,
+                ipswPath: ipswPath,
+                macOSRestoreSource: macOSRestoreSource,
                 existingDiskPath: existingDiskPath,
                 memoryGB: Int(memoryGB),
                 vcpuCount: Int(vcpuCount),
@@ -105,7 +120,15 @@ struct CreateVMView: View {
                 Button("Back") { step = step.previous }
             }
             if isCreating {
-                ProgressView().controlSize(.small)
+                if source == .installMacOS {
+                    ProgressView(value: installationProgress)
+                        .frame(width: 160)
+                    Text("\(Int(installationProgress * 100))%")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
             }
             Button(step == .summary ? "Create" : "Continue") {
                 if step == .summary {
@@ -124,7 +147,12 @@ struct CreateVMView: View {
         if isCreating { return false }
         switch step {
         case .installation:
-            return source == .installFromISO ? !isoPath.isEmpty : !existingDiskPath.isEmpty
+            switch source {
+            case .installFromISO: return !isoPath.isEmpty
+            case .existingDisk: return !existingDiskPath.isEmpty
+            case .installMacOS:
+                return macOSRestoreSource == .latest || !ipswPath.isEmpty
+            }
         case .hardware, .storage:
             return true
         case .summary:
@@ -134,6 +162,31 @@ struct CreateVMView: View {
 
     private func createVM() {
         isCreating = true
+        installationProgress = 0
+
+        if source == .installMacOS {
+            Task { @MainActor in
+                do {
+                    try await vmManager.createMacOSVM(
+                        name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                        ipswPath: macOSRestoreSource == .local ? ipswPath : nil,
+                        memoryBytes: UInt64(memoryGB * 1024 * 1024 * 1024),
+                        vcpuCount: UInt8(vcpuCount),
+                        displayWidth: resolution.width,
+                        displayHeight: resolution.height,
+                        diskSizeGB: Int(diskSizeGB),
+                        retinaEnabled: retinaEnabled,
+                        progress: { installationProgress = $0 }
+                    )
+                    dismiss()
+                } catch {
+                    errorMessage = error.localizedDescription
+                    isCreating = false
+                }
+            }
+            return
+        }
+
         var createdDiskPath: String?
         do {
             let diskPath: String
@@ -222,6 +275,18 @@ private enum CreationStep: Int, CaseIterable {
 private enum VMSource: String, CaseIterable, Identifiable {
     case installFromISO
     case existingDisk
+    case installMacOS
+
+    var id: Self { self }
+
+    var guestSystem: GuestSystem {
+        self == .installMacOS ? .macOS : .linux
+    }
+}
+
+private enum MacOSRestoreSource: String, CaseIterable, Identifiable {
+    case latest
+    case local
 
     var id: Self { self }
 }
@@ -275,12 +340,14 @@ private struct CreationStepSidebar: View {
 private struct InstallationStepView: View {
     @Binding var source: VMSource
     @Binding var isoPath: String
+    @Binding var ipswPath: String
+    @Binding var macOSRestoreSource: MacOSRestoreSource
     @Binding var existingDiskPath: String
 
     var body: some View {
         WizardPage(
             title: "Choose an installation method",
-            subtitle: "Install Linux from an ISO image or use an existing virtual disk."
+            subtitle: "Install Linux or macOS, or use an existing Linux virtual disk."
         ) {
             SourceCard(
                 title: "Install from ISO image",
@@ -306,6 +373,38 @@ private struct InstallationStepView: View {
                 )
                 .padding(.leading, 44)
             }
+            SourceCard(
+                title: "Install macOS from Apple IPSW",
+                detail: "Create a native Apple silicon virtual Mac.",
+                icon: "apple.logo",
+                selected: source == .installMacOS
+            ) { source = .installMacOS }
+            if source == .installMacOS {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("macOS Version", selection: $macOSRestoreSource) {
+                        Text("Download latest supported macOS").tag(MacOSRestoreSource.latest)
+                        Text("Use a local IPSW").tag(MacOSRestoreSource.local)
+                    }
+                    if macOSRestoreSource == .local {
+                        FilePickerField(
+                            label: "Restore Image",
+                            path: $ipswPath,
+                            types: [.ipsw]
+                        )
+                    }
+                    Text(
+                        macOSRestoreSource == .latest
+                            ? "Apple’s restore image is roughly 15–25 GB and is cached after download."
+                            : "Select an Apple restore image compatible with this Mac."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Text("Installation can take an hour and the VM must remain open.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.leading, 44)
+            }
         }
     }
 }
@@ -316,6 +415,7 @@ private struct HardwareStepView: View {
     @Binding var vramMB: Double
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
+    let guestSystem: GuestSystem
     let systemInfo: SystemInfo
 
     var body: some View {
@@ -339,14 +439,19 @@ private struct HardwareStepView: View {
                 step: 1,
                 footer: "\(systemInfo.totalMemoryGB) GB installed on this Mac"
             )
-            SettingSlider(
-                title: "Shared graphics memory",
-                valueText: "\(Int(vramMB)) MB",
-                value: $vramMB,
-                range: 128...2048,
-                step: 128,
-                footer: "Reserved from host memory for the virtual GPU"
-            )
+            if guestSystem == .linux {
+                SettingSlider(
+                    title: "Shared graphics memory",
+                    valueText: "\(Int(vramMB)) MB",
+                    value: $vramMB,
+                    range: 128...2048,
+                    step: 128,
+                    footer: "Reserved from host memory for the virtual GPU"
+                )
+            } else {
+                Label("Apple accelerated graphics", systemImage: "gpu")
+                    .foregroundStyle(.secondary)
+            }
             Divider()
             HStack {
                 Text("Maximum guest resolution")
@@ -382,11 +487,11 @@ private struct StorageStepView: View {
     var body: some View {
         WizardPage(
             title: "Configure storage",
-            subtitle: source == .installFromISO
+            subtitle: source != .existingDisk
                 ? "The disk is sparse and consumes space only as data is written."
                 : "Bobrvm will attach the selected disk without changing its contents."
         ) {
-            if source == .installFromISO {
+            if source != .existingDisk {
                 SettingSlider(
                     title: "Maximum disk size",
                     valueText: "\(Int(diskSizeGB)) GB",
@@ -418,6 +523,8 @@ private struct SummaryStepView: View {
     @Binding var name: String
     let source: VMSource
     let isoPath: String
+    let ipswPath: String
+    let macOSRestoreSource: MacOSRestoreSource
     let existingDiskPath: String
     let memoryGB: Int
     let vcpuCount: Int
@@ -438,20 +545,36 @@ private struct SummaryStepView: View {
             }
             Divider()
             SummaryRow(label: "Processors & Memory", value: "\(vcpuCount) cores, \(memoryGB) GB")
-            SummaryRow(label: "Graphics", value: "\(vramMB) MB, \(resolution.label)")
+            SummaryRow(
+                label: "Graphics",
+                value: source == .installMacOS
+                    ? "Apple accelerated, \(resolution.label)"
+                    : "\(vramMB) MB, \(resolution.label)"
+            )
             SummaryRow(label: "Retina", value: retinaEnabled ? "Full resolution" : "Standard scale")
             SummaryRow(
                 label: "Disk",
-                value: source == .installFromISO
+                value: source != .existingDisk
                     ? "\(diskSizeGB) GB sparse disk"
                     : URL(fileURLWithPath: existingDiskPath).lastPathComponent
             )
             SummaryRow(
-                label: "CD/DVD",
-                value: source == .installFromISO
-                    ? URL(fileURLWithPath: isoPath).lastPathComponent
-                    : "Empty"
+                label: source == .installMacOS ? "Restore Image" : "CD/DVD",
+                value: installationMediaName
             )
+        }
+    }
+
+    private var installationMediaName: String {
+        switch source {
+        case .installFromISO:
+            return URL(fileURLWithPath: isoPath).lastPathComponent
+        case .installMacOS:
+            return macOSRestoreSource == .latest
+                ? "Latest supported macOS"
+                : URL(fileURLWithPath: ipswPath).lastPathComponent
+        case .existingDisk:
+            return "Empty"
         }
     }
 }
@@ -575,6 +698,43 @@ enum DiskManager {
         return path
     }
 
+    static func macOSBundleURL(id: UUID) -> URL {
+        appSupportDir
+            .appendingPathComponent("Mac", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    static func createMacOSAssets(
+        id: UUID,
+        diskSizeGB: Int
+    ) throws -> (disk: URL, auxiliaryStorage: URL) {
+        let fileManager = FileManager.default
+        let bundle = macOSBundleURL(id: id)
+        do {
+            try fileManager.createDirectory(at: bundle, withIntermediateDirectories: true)
+        } catch {
+            throw DiskError.directoryCreationFailed
+        }
+
+        let disk = bundle.appendingPathComponent("disk.img")
+        guard fileManager.createFile(atPath: disk.path, contents: nil) else {
+            throw BobrvmError.ioError
+        }
+        let handle = try FileHandle(forWritingTo: disk)
+        do {
+            try handle.truncate(atOffset: bytes(forGB: diskSizeGB))
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+
+        return (
+            disk: disk,
+            auxiliaryStorage: bundle.appendingPathComponent("auxiliary-storage")
+        )
+    }
+
     static func growRawDisk(path: String, sizeGB: Int) throws {
         try VirtualDisk.growRaw(path: path, sizeBytes: bytes(forGB: sizeGB))
     }
@@ -653,6 +813,7 @@ struct FilePickerField: View {
 
 extension UTType {
     static var iso: UTType { UTType(filenameExtension: "iso") ?? .diskImage }
+    static var ipsw: UTType { UTType(filenameExtension: "ipsw") ?? .data }
     static var rawDisk: UTType { UTType(filenameExtension: "raw") ?? .data }
     static var qcow2: UTType { UTType(filenameExtension: "qcow2") ?? .data }
 }

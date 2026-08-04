@@ -44,7 +44,9 @@ public final class VMManager: ObservableObject {
                 config: stored.vmConfig,
                 app: app,
                 isoPath: stored.isoPath,
-                retinaEnabled: stored.retinaEnabled ?? true
+                retinaEnabled: stored.retinaEnabled ?? true,
+                guestSystem: stored.guestSystem ?? .linux,
+                macOSPlatform: stored.macOSPlatform
             )
             vms.append(instance)
             Self.logger.info("Loaded VM: \(stored.name)")
@@ -76,6 +78,55 @@ public final class VMManager: ObservableObject {
             Self.logger.info("Saved VM configuration: \(name)")
         } catch {
             vm.destroy()
+            throw error
+        }
+    }
+
+    public func createMacOSVM(
+        name: String,
+        ipswPath: String?,
+        memoryBytes: UInt64,
+        vcpuCount: UInt8,
+        displayWidth: UInt32,
+        displayHeight: UInt32,
+        diskSizeGB: Int,
+        retinaEnabled: Bool,
+        progress: @escaping @MainActor (Double) -> Void
+    ) async throws {
+        guard let app else { throw BobrvmError.invalidArgument }
+
+        let id = UUID()
+        let bundleURL = DiskManager.macOSBundleURL(id: id)
+        do {
+            let assets = try DiskManager.createMacOSAssets(
+                id: id,
+                diskSizeGB: diskSizeGB
+            )
+            let result = try await MacOSRestoreService.install(
+                ipswURL: ipswPath.map(URL.init(fileURLWithPath:)),
+                diskURL: assets.disk,
+                auxiliaryStorageURL: assets.auxiliaryStorage,
+                memoryBytes: memoryBytes,
+                vcpuCount: vcpuCount,
+                displayWidth: displayWidth,
+                displayHeight: displayHeight,
+                retinaEnabled: retinaEnabled,
+                progress: progress
+            )
+            let instance = VMInstance(
+                id: id,
+                name: name,
+                config: result.config,
+                app: app,
+                retinaEnabled: retinaEnabled,
+                guestSystem: .macOS,
+                macOSPlatform: result.metadata
+            )
+            try VMStorage.saveVM(instance)
+            vms.append(instance)
+            Self.logger.info("Installed macOS virtual machine: \(name)")
+        } catch {
+            try? FileManager.default.removeItem(at: bundleURL)
             throw error
         }
     }
@@ -130,12 +181,10 @@ public final class VMManager: ObservableObject {
             throw BobrvmError.invalidArgument
         }
 
-        // Create new VM with updated config
-        guard let app = app else {
-            throw BobrvmError.invalidArgument
-        }
-
-        let newVM = try app.createVM(config: newConfig)
+        guard let app else { throw BobrvmError.invalidArgument }
+        let newVM = instance.guestSystem == .linux
+            ? try app.createVM(config: newConfig)
+            : nil
         let updatedInstance = VMInstance(
             id: instance.id,
             name: name,
@@ -143,13 +192,15 @@ public final class VMManager: ObservableObject {
             app: app,
             vm: newVM,
             isoPath: isoPath,
-            retinaEnabled: retinaEnabled
+            retinaEnabled: retinaEnabled,
+            guestSystem: instance.guestSystem,
+            macOSPlatform: instance.macOSPlatform
         )
 
         do {
             try VMStorage.saveVM(updatedInstance)
         } catch {
-            newVM.destroy()
+            newVM?.destroy()
             throw error
         }
 
@@ -189,10 +240,14 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     private var vm: VM?
     public let isoPath: String?
     public let retinaEnabled: Bool
+    public let guestSystem: GuestSystem
+    let macOSPlatform: MacOSPlatformMetadata?
 
     @Published public var surface: Surface?
 
     private var vmStateCancellable: AnyCancellable?
+    private var macVM: MacVirtualMachine?
+    private var macVMStateCancellable: AnyCancellable?
 
     public init(
         id: UUID = UUID(),
@@ -201,7 +256,9 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         app: App,
         vm: VM? = nil,
         isoPath: String? = nil,
-        retinaEnabled: Bool = true
+        retinaEnabled: Bool = true,
+        guestSystem: GuestSystem = .linux,
+        macOSPlatform: MacOSPlatformMetadata? = nil
     ) {
         self.id = id
         self.name = name
@@ -210,12 +267,17 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         self.vm = vm
         self.isoPath = isoPath
         self.retinaEnabled = retinaEnabled
+        self.guestSystem = guestSystem
+        self.macOSPlatform = macOSPlatform
 
         observeVM()
     }
 
     public var state: VMState {
-        vm?.state ?? .stopped
+        switch guestSystem {
+        case .linux: return vm?.state ?? .stopped
+        case .macOS: return macVM?.state ?? .stopped
+        }
     }
 
     public var vramMB: Int {
@@ -226,7 +288,27 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         vm
     }
 
+    var runtimeMacVM: MacVirtualMachine? {
+        macVM
+    }
+
     public func start() throws {
+        if guestSystem == .macOS {
+            guard let macOSPlatform else {
+                throw MacVirtualMachineError.missingPlatformMetadata
+            }
+            let machine = macVM
+                ?? MacVirtualMachine(
+                    config: config,
+                    metadata: macOSPlatform,
+                    retinaEnabled: retinaEnabled
+                )
+            macVM = machine
+            observeMacVM()
+            try machine.start()
+            return
+        }
+
         let vm: VM
         if let existing = self.vm {
             vm = existing
@@ -239,15 +321,27 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
 
     public func stop() {
-        vm?.stop()
+        if guestSystem == .macOS {
+            macVM?.stop()
+        } else {
+            vm?.stop()
+        }
     }
 
     public func pause() {
-        vm?.pause()
+        if guestSystem == .macOS {
+            macVM?.pause()
+        } else {
+            vm?.pause()
+        }
     }
 
     public func resume() {
-        vm?.resume()
+        if guestSystem == .macOS {
+            macVM?.resume()
+        } else {
+            vm?.resume()
+        }
     }
 
     public func requireVM() throws -> VM {
@@ -259,11 +353,20 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         vm?.stop()
         vm?.destroy()
         vm = nil
+        macVM?.destroy()
+        macVM = nil
         vmStateCancellable = nil
+        macVMStateCancellable = nil
     }
 
     private func observeVM() {
         vmStateCancellable = vm?.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
+
+    private func observeMacVM() {
+        macVMStateCancellable = macVM?.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
     }
@@ -294,6 +397,8 @@ enum VMStorage {
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
         let networkEnabled: Bool?
+        let guestSystem: GuestSystem?
+        let macOSPlatform: MacOSPlatformMetadata?
 
         var vmConfig: VMConfig {
             let storedFirmware: String? = firmwarePath.flatMap { path -> String? in
@@ -306,16 +411,19 @@ enum VMStorage {
 
             // A configured kernel selects direct Linux boot; firmware and
             // direct boot are mutually exclusive in the core configuration.
-            let effectiveFirmwarePath = kernelPath == nil ? storedFirmware ?? bundledFirmware : nil
+            let effectiveFirmwarePath = guestSystem == .macOS
+                ? nil
+                : kernelPath == nil ? storedFirmware ?? bundledFirmware : nil
 
-            let effectiveVarsPath: String? =
-                varsPath
-                ?? {
+            let effectiveVarsPath: String? = guestSystem == .macOS
+                ? nil
+                : varsPath
+                    ?? {
                     let safeName = DiskManager.safeFilename(name)
                     return DiskManager.appSupportDir
                         .appendingPathComponent("\(safeName)_vars.fd")
                         .path
-                }()
+                    }()
 
             return VMConfig(
                 memoryBytes: memoryBytes,
@@ -355,6 +463,8 @@ enum VMStorage {
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled
             self.networkEnabled = instance.config.networkEnabled
+            self.guestSystem = instance.guestSystem
+            self.macOSPlatform = instance.macOSPlatform
         }
     }
 
