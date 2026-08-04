@@ -134,6 +134,8 @@ struct CreateVMView: View {
             }
             if isCreating {
                 if source == .installMacOS {
+                    Text(installationProgress < 0.70 ? "Downloading macOS" : "Installing macOS")
+                        .foregroundStyle(.secondary)
                     ProgressView(value: installationProgress)
                         .frame(width: 160)
                     Text("\(Int(installationProgress * 100))%")

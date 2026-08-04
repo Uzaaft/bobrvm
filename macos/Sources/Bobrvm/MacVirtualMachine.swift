@@ -345,7 +345,7 @@ enum MacOSRestoreService {
       )
       let observation = installer.progress.observe(\.fractionCompleted) { observed, _ in
         Task { @MainActor in
-          progress(0.25 + observed.fractionCompleted * 0.75)
+          progress(0.70 + observed.fractionCompleted * 0.30)
         }
       }
       defer { observation.invalidate() }
@@ -364,7 +364,7 @@ enum MacOSRestoreService {
       progress: @escaping @MainActor (Double) -> Void
     ) async throws -> URL {
       if let selectedURL {
-        progress(0.25)
+        progress(0.70)
         return selectedURL.resolvingSymlinksInPath()
       }
 
@@ -381,14 +381,15 @@ enum MacOSRestoreService {
       try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
       let destination = cache.appendingPathComponent(latest.url.lastPathComponent)
       if FileManager.default.fileExists(atPath: destination.path) {
-        progress(0.25)
+        progress(0.70)
         return destination
       }
 
-      let (temporary, _) = try await URLSession.shared.download(from: latest.url)
-      try FileManager.default.moveItem(at: temporary, to: destination)
-      progress(0.25)
-      return destination
+      return try await RestoreImageDownloader.download(
+        from: latest.url,
+        to: destination,
+        progress: progress
+      )
     }
 
     private static func loadRestoreImage(from url: URL) async throws -> VZMacOSRestoreImage {
@@ -399,6 +400,97 @@ enum MacOSRestoreService {
       }
     }
   #endif
+}
+
+private final class RestoreImageDownloader: NSObject, URLSessionDownloadDelegate {
+  private let destination: URL
+  private let progress: @MainActor (Double) -> Void
+  private var continuation: CheckedContinuation<URL, Error>?
+  private var session: URLSession?
+  private var finished = false
+
+  private init(destination: URL, progress: @escaping @MainActor (Double) -> Void) {
+    self.destination = destination
+    self.progress = progress
+  }
+
+  static func download(
+    from source: URL,
+    to destination: URL,
+    progress: @escaping @MainActor (Double) -> Void
+  ) async throws -> URL {
+    let downloader = RestoreImageDownloader(destination: destination, progress: progress)
+    return try await downloader.start(source: source)
+  }
+
+  private func start(source: URL) async throws -> URL {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        self.continuation = continuation
+
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForResource = 24 * 60 * 60
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let session = URLSession(
+          configuration: configuration,
+          delegate: self,
+          delegateQueue: queue
+        )
+        self.session = session
+        session.downloadTask(with: source).resume()
+      }
+    } onCancel: {
+      self.session?.invalidateAndCancel()
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didWriteData bytesWritten: Int64,
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64
+  ) {
+    guard totalBytesExpectedToWrite > 0 else { return }
+    let fraction = min(1, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    Task { @MainActor in
+      progress(0.03 + fraction * 0.67)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didFinishDownloadingTo location: URL
+  ) {
+    do {
+      try FileManager.default.moveItem(at: location, to: destination)
+      finish(.success(destination))
+    } catch {
+      finish(.failure(error))
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didCompleteWithError error: Error?
+  ) {
+    if let error {
+      finish(.failure(error))
+    }
+  }
+
+  private func finish(_ result: Result<URL, Error>) {
+    guard !finished else { return }
+    finished = true
+    session?.finishTasksAndInvalidate()
+    session = nil
+    continuation?.resume(with: result)
+    continuation = nil
+  }
 }
 
 struct MacVirtualMachineView: NSViewRepresentable {
