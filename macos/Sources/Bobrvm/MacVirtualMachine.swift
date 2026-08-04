@@ -408,6 +408,9 @@ private final class RestoreImageDownloader: NSObject, URLSessionDownloadDelegate
   private var continuation: CheckedContinuation<URL, Error>?
   private var session: URLSession?
   private var finished = false
+  private var progressTimeNsLast: UInt64 = 0
+
+  private static let progressIntervalNs: UInt64 = 100_000_000
 
   private init(destination: URL, progress: @escaping @MainActor (Double) -> Void) {
     self.destination = destination
@@ -455,6 +458,11 @@ private final class RestoreImageDownloader: NSObject, URLSessionDownloadDelegate
   ) {
     guard totalBytesExpectedToWrite > 0 else { return }
     let fraction = min(1, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    let timeNs = DispatchTime.now().uptimeNanoseconds
+    let intervalElapsed = timeNs &- progressTimeNsLast >= Self.progressIntervalNs
+    guard fraction >= 1 || intervalElapsed else { return }
+
+    progressTimeNsLast = timeNs
     Task { @MainActor in
       progress(0.03 + fraction * 0.67)
     }
