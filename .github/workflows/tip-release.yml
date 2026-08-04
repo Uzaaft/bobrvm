@@ -18,6 +18,9 @@ jobs:
     name: Build and publish
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
 
     steps:
       - name: Check out source
@@ -27,6 +30,9 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      - name: Prepare Zig caches
+        run: mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
 
       - name: Build Bobrvm
         run: zig build -Demit-macos-app=true -Doptimize=ReleaseFast
