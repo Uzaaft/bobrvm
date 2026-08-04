@@ -13,7 +13,8 @@ struct CreateVMView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Environment(\.dismiss) private var dismiss
 
-    @State private var step = CreationStep.installation
+    @State private var step = CreationStep.operatingSystem
+    @State private var operatingSystem: CreationOperatingSystem?
     @State private var source = VMSource.installFromISO
     @State private var name = "Linux"
     @State private var isoPath = ""
@@ -46,12 +47,21 @@ struct CreateVMView: View {
         }
         .frame(width: 720, height: 540)
         .disabled(isCreating)
-        .onChange(of: source) { selected in
-            guard selected == .installMacOS else { return }
-            if name == "Linux" { name = "macOS" }
-            memoryGB = max(memoryGB, 8)
-            vcpuCount = max(vcpuCount, 4)
-            diskSizeGB = max(diskSizeGB, 80)
+        .onChange(of: operatingSystem) { selected in
+            guard let selected else { return }
+            switch selected {
+            case .linux:
+                source = .installFromISO
+                if name == "macOS" { name = "Linux" }
+            case .macOS:
+                source = .installMacOS
+                if name == "Linux" { name = "macOS" }
+                memoryGB = max(memoryGB, 8)
+                vcpuCount = max(vcpuCount, 4)
+                diskSizeGB = max(diskSizeGB, 80)
+            case .windows:
+                break
+            }
         }
         .alert(
             "Couldn’t Create Virtual Machine",
@@ -69,8 +79,11 @@ struct CreateVMView: View {
     @ViewBuilder
     private var stepContent: some View {
         switch step {
+        case .operatingSystem:
+            OperatingSystemStepView(selection: $operatingSystem)
         case .installation:
             InstallationStepView(
+                operatingSystem: operatingSystem ?? .linux,
                 source: $source,
                 isoPath: $isoPath,
                 ipswPath: $ipswPath,
@@ -116,7 +129,7 @@ struct CreateVMView: View {
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
             Spacer()
-            if step != .installation {
+            if step != .operatingSystem {
                 Button("Back") { step = step.previous }
             }
             if isCreating {
@@ -146,6 +159,8 @@ struct CreateVMView: View {
     private var canContinue: Bool {
         if isCreating { return false }
         switch step {
+        case .operatingSystem:
+            return operatingSystem?.isAvailable == true
         case .installation:
             switch source {
             case .installFromISO: return !isoPath.isEmpty
@@ -240,6 +255,7 @@ struct CreateVMView: View {
 }
 
 private enum CreationStep: Int, CaseIterable {
+    case operatingSystem
     case installation
     case hardware
     case storage
@@ -247,6 +263,7 @@ private enum CreationStep: Int, CaseIterable {
 
     var title: String {
         switch self {
+        case .operatingSystem: return "Operating System"
         case .installation: return "Installation"
         case .hardware: return "Hardware"
         case .storage: return "Storage"
@@ -256,6 +273,7 @@ private enum CreationStep: Int, CaseIterable {
 
     var icon: String {
         switch self {
+        case .operatingSystem: return "desktopcomputer"
         case .installation: return "opticaldisc"
         case .hardware: return "cpu"
         case .storage: return "internaldrive"
@@ -269,6 +287,39 @@ private enum CreationStep: Int, CaseIterable {
 
     var next: CreationStep {
         CreationStep(rawValue: min(Self.allCases.count - 1, rawValue + 1)) ?? self
+    }
+}
+
+private enum CreationOperatingSystem: String, CaseIterable, Identifiable {
+    case macOS
+    case linux
+    case windows
+
+    var id: Self { self }
+    var isAvailable: Bool { self != .windows }
+
+    var title: String {
+        switch self {
+        case .macOS: return "macOS"
+        case .linux: return "Linux"
+        case .windows: return "Windows"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .macOS: return "Create a native Apple silicon virtual Mac."
+        case .linux: return "Install Linux or attach an existing virtual disk."
+        case .windows: return "Windows virtualization is coming soon."
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .macOS: return "apple.logo"
+        case .linux: return "terminal"
+        case .windows: return "rectangle.split.2x2"
+        }
     }
 }
 
@@ -337,7 +388,32 @@ private struct CreationStepSidebar: View {
     }
 }
 
+private struct OperatingSystemStepView: View {
+    @Binding var selection: CreationOperatingSystem?
+
+    var body: some View {
+        WizardPage(
+            title: "Choose an operating system",
+            subtitle: "Select the operating system for this virtual machine."
+        ) {
+            ForEach(CreationOperatingSystem.allCases) { operatingSystem in
+                SourceCard(
+                    title: operatingSystem.title,
+                    detail: operatingSystem.detail,
+                    icon: operatingSystem.icon,
+                    selected: selection == operatingSystem,
+                    badge: operatingSystem.isAvailable ? nil : "Coming soon",
+                    enabled: operatingSystem.isAvailable
+                ) {
+                    selection = operatingSystem
+                }
+            }
+        }
+    }
+}
+
 private struct InstallationStepView: View {
+    let operatingSystem: CreationOperatingSystem
     @Binding var source: VMSource
     @Binding var isoPath: String
     @Binding var ipswPath: String
@@ -347,39 +423,11 @@ private struct InstallationStepView: View {
     var body: some View {
         WizardPage(
             title: "Choose an installation method",
-            subtitle: "Install Linux or macOS, or use an existing Linux virtual disk."
+            subtitle: operatingSystem == .macOS
+                ? "Choose where Bobrvm should obtain the macOS restore image."
+                : "Install Linux from an ISO or use an existing virtual disk."
         ) {
-            SourceCard(
-                title: "Install from ISO image",
-                detail: "Create a new disk and boot from installation media.",
-                icon: "opticaldisc",
-                selected: source == .installFromISO
-            ) { source = .installFromISO }
-            if source == .installFromISO {
-                FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
-                    .padding(.leading, 44)
-            }
-            SourceCard(
-                title: "Use an existing virtual disk",
-                detail: "Boot a raw or QCOW2 disk that already contains an operating system.",
-                icon: "externaldrive",
-                selected: source == .existingDisk
-            ) { source = .existingDisk }
-            if source == .existingDisk {
-                FilePickerField(
-                    label: "Virtual Disk",
-                    path: $existingDiskPath,
-                    types: [.rawDisk, .qcow2, .diskImage]
-                )
-                .padding(.leading, 44)
-            }
-            SourceCard(
-                title: "Install macOS from Apple IPSW",
-                detail: "Create a native Apple silicon virtual Mac.",
-                icon: "apple.logo",
-                selected: source == .installMacOS
-            ) { source = .installMacOS }
-            if source == .installMacOS {
+            if operatingSystem == .macOS {
                 VStack(alignment: .leading, spacing: 10) {
                     Picker("macOS Version", selection: $macOSRestoreSource) {
                         Text("Download latest supported macOS").tag(MacOSRestoreSource.latest)
@@ -403,7 +451,31 @@ private struct InstallationStepView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                .padding(.leading, 44)
+            } else {
+                SourceCard(
+                    title: "Install from ISO image",
+                    detail: "Create a new disk and boot from installation media.",
+                    icon: "opticaldisc",
+                    selected: source == .installFromISO
+                ) { source = .installFromISO }
+                if source == .installFromISO {
+                    FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
+                        .padding(.leading, 44)
+                }
+                SourceCard(
+                    title: "Use an existing virtual disk",
+                    detail: "Boot a raw or QCOW2 disk that already contains Linux.",
+                    icon: "externaldrive",
+                    selected: source == .existingDisk
+                ) { source = .existingDisk }
+                if source == .existingDisk {
+                    FilePickerField(
+                        label: "Virtual Disk",
+                        path: $existingDiskPath,
+                        types: [.rawDisk, .qcow2, .diskImage]
+                    )
+                    .padding(.leading, 44)
+                }
             }
         }
     }
@@ -603,6 +675,8 @@ private struct SourceCard: View {
     let detail: String
     let icon: String
     let selected: Bool
+    var badge: String? = nil
+    var enabled = true
     let action: () -> Void
 
     var body: some View {
@@ -614,8 +688,17 @@ private struct SourceCard: View {
                     Text(detail).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                if let badge {
+                    Text(badge)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(.quaternary, in: Capsule())
+                } else {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(selected ? Color.accentColor : .secondary)
+                }
             }
             .contentShape(Rectangle())
             .padding(12)
@@ -626,6 +709,8 @@ private struct SourceCard: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.62)
     }
 }
 
