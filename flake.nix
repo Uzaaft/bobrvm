@@ -45,7 +45,6 @@
       default = bobrvm;
 
       test = pkgs.callPackage ./nix/test.nix {inherit zig;};
-      xcframework = pkgs.callPackage ./nix/xcframework.nix {inherit zig;};
     });
 
     devShells = forAllPlatforms (pkgs: {

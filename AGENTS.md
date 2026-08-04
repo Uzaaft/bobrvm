@@ -8,8 +8,8 @@ bobrvm is Linux virtualization software for macOS with OpenGL 4.3 and Vulkan sup
 # Zig/Nix
 nix build
 nix build .#debug
-nix build .#xcframework
 nix build .#test
+nix develop -c zig build -Demit-xcframework=true -Demit-macos-app=false
 zig build test -Dtest-filter=<name>
 
 # Swift/Xcode (not managed by Nix)
