@@ -1,0 +1,62 @@
+name: Tip release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tip-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build Bobrvm
+        run: zig build -Demit-macos-app=true -Doptimize=ReleaseFast
+
+      - name: Package app
+        run: |
+          app="zig-out/xcode-derived-data/Build/Products/Release/Bobrvm.app"
+          test -d "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" Bobrvm-tip-arm64.zip
+
+      - name: Publish tip release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view tip >/dev/null 2>&1; then
+              gh api \
+                  --method PATCH \
+                  "repos/$GITHUB_REPOSITORY/git/refs/tags/tip" \
+                  -f sha="$GITHUB_SHA" \
+                  -F force=true
+              gh release edit tip \
+                  --title "Tip" \
+                  --notes "Automated Apple Silicon build of commit \`$GITHUB_SHA\`." \
+                  --prerelease
+              gh release upload tip Bobrvm-tip-arm64.zip --clobber
+          else
+              gh release create tip \
+                  Bobrvm-tip-arm64.zip \
+                  --target "$GITHUB_SHA" \
+                  --title "Tip" \
+                  --notes "Automated Apple Silicon build of commit \`$GITHUB_SHA\`." \
+                  --prerelease
+          fi
