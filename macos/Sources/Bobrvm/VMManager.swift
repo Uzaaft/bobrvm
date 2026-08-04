@@ -141,6 +141,7 @@ public final class VMManager: ObservableObject {
         displayWidth: Int,
         displayHeight: Int,
         retinaEnabled: Bool,
+        networkEnabled: Bool,
         diskSizeGB: Int?
     ) throws {
         guard instance.state == .stopped else {
@@ -157,7 +158,7 @@ public final class VMManager: ObservableObject {
             displayWidth: UInt32(displayWidth),
             displayHeight: UInt32(displayHeight),
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
-            networkEnabled: instance.config.networkEnabled,
+            networkEnabled: networkEnabled,
             firmwarePath: instance.config.firmwarePath,
             varsPath: instance.config.varsPath,
             kernelPath: instance.config.kernelPath,

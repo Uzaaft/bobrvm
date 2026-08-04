@@ -14,6 +14,7 @@ struct EditVMView: View {
     @State private var vramMB: Double
     @State private var resolution: DisplayResolution
     @State private var retinaEnabled: Bool
+    @State private var networkEnabled: Bool
     @State private var diskSizeGB: Double
     @State private var showingError = false
     @State private var errorMessage = ""
@@ -40,6 +41,7 @@ struct EditVMView: View {
                 height: vmInstance.config.displayHeight
             ))
         _retinaEnabled = State(initialValue: vmInstance.retinaEnabled)
+        _networkEnabled = State(initialValue: vmInstance.config.networkEnabled)
         _diskSizeGB = State(
             initialValue: Double(
                 vmInstance.config.diskPath.flatMap(DiskManager.sizeGB(path:)) ?? 8
@@ -238,6 +240,32 @@ struct EditVMView: View {
                     }
                 }
 
+                Section {
+                    Toggle("Connect Network Adapter", isOn: $networkEnabled)
+                        .disabled(isRunning)
+                        .onChange(of: networkEnabled) { _ in hasChanges = true }
+
+                    LabeledContent("Network") {
+                        Text("Share with my Mac")
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    HStack {
+                        Text("Network Adapter")
+                        if isRunning {
+                            Spacer()
+                            LockedBadge()
+                        }
+                    }
+                } footer: {
+                    Text(
+                        isRunning
+                            ? "Stop the VM to connect or disconnect its network adapter."
+                            : "Uses Bobrvm’s built-in NAT to share the Mac’s "
+                                + "internet connection."
+                    )
+                }
+
                 Section("Information") {
                     LabeledContent("VM ID") {
                         Text(vmInstance.id.uuidString)
@@ -337,6 +365,7 @@ struct EditVMView: View {
                 displayWidth: Int(resolution.width),
                 displayHeight: Int(resolution.height),
                 retinaEnabled: retinaEnabled,
+                networkEnabled: networkEnabled,
                 diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil
             )
             dismiss()

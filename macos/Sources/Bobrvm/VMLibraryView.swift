@@ -4,6 +4,7 @@ struct VMLibraryHomeView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Environment(\.openWindow) private var openWindow
     @State private var startError: String?
+    @State private var vmToEdit: VMInstance?
 
     private let columns = [
         GridItem(.adaptive(minimum: 260, maximum: 340), spacing: 16)
@@ -30,6 +31,9 @@ struct VMLibraryHomeView: View {
             Button("OK") { startError = nil }
         } message: {
             Text(startError ?? "An unknown error occurred.")
+        }
+        .sheet(item: $vmToEdit) { vm in
+            EditVMView(vmInstance: vm)
         }
     }
 
@@ -64,7 +68,8 @@ struct VMLibraryHomeView: View {
                         start: { start(vm) },
                         pause: { vm.pause() },
                         resume: { vm.resume() },
-                        stop: { vm.stop() }
+                        stop: { vm.stop() },
+                        edit: { vmToEdit = vm }
                     )
                 }
             }
@@ -107,6 +112,7 @@ private struct VMLibraryCard: View {
     let pause: () -> Void
     let resume: () -> Void
     let stop: () -> Void
+    let edit: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -154,6 +160,7 @@ private struct VMLibraryCard: View {
                 value: opticalDriveText
             )
             HStack {
+                ControlButton(title: "Settings", icon: "gearshape", action: edit)
                 Spacer()
                 controls
             }
@@ -196,6 +203,9 @@ private struct VMLibraryCard: View {
             Button("Pause", systemImage: "pause.fill", action: pause)
             Button("Stop", systemImage: "stop.fill", role: .destructive, action: stop)
         }
+
+        Divider()
+        Button("Settings…", systemImage: "gearshape", action: edit)
     }
 
     private var memoryText: String {
