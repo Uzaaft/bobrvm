@@ -320,6 +320,7 @@ pub fn build(b: *std.Build) void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
+        test_module.addImport("objc", objc_dependency.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -333,6 +334,9 @@ pub fn build(b: *std.Build) void {
         test_module.linkFramework("QuartzCore", .{});
         test_module.linkFramework("IOSurface", .{});
         test_module.linkFramework("CoreFoundation", .{});
+        test_module.linkFramework("Foundation", .{});
+        test_module.linkFramework("AppKit", .{});
+        test_module.linkFramework("Virtualization", .{});
         test_module.linkSystemLibrary("objc", .{});
     }
 
