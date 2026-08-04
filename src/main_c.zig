@@ -13,6 +13,7 @@ const os = @import("os/main.zig");
 const apprt = lib.apprt;
 const config = lib.config;
 const disk = lib.disk;
+const macos_runtime = lib.runtime.macos;
 
 const log = std.log.scoped(.main);
 
@@ -281,6 +282,67 @@ pub export fn bobrvm_vm_kick_vcpu(vm: ?*apprt.VM, vcpu_id: u32) void {
 pub export fn bobrvm_vm_force_exit_all(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.forceExitAll();
+}
+
+pub const VMState = enum(c_int) {
+    stopped = 0,
+    starting = 1,
+    running = 2,
+    pausing = 3,
+    paused = 4,
+    stopping = 5,
+    failed = 6,
+};
+
+pub export fn bobrvm_macos_vm_new(
+    cfg: ?*const macos_runtime.MacOSConfig,
+) ?*macos_runtime.MacRuntime {
+    if (builtin.os.tag != .macos) return null;
+    const config_value = cfg orelse return null;
+    const handle = std.heap.c_allocator.create(macos_runtime.MacRuntime) catch return null;
+    handle.* = macos_runtime.MacRuntime.init(config_value) catch {
+        std.heap.c_allocator.destroy(handle);
+        return null;
+    };
+    return handle;
+}
+
+pub export fn bobrvm_macos_vm_destroy(vm: ?*macos_runtime.MacRuntime) void {
+    const handle = vm orelse return;
+    handle.backend.deinit();
+    std.heap.c_allocator.destroy(handle);
+}
+
+pub export fn bobrvm_macos_vm_start(vm: ?*macos_runtime.MacRuntime) c_int {
+    const handle = vm orelse return 1;
+    handle.start() catch return 3;
+    return 0;
+}
+
+pub export fn bobrvm_macos_vm_stop(vm: ?*macos_runtime.MacRuntime) void {
+    const handle = vm orelse return;
+    handle.requestStop();
+}
+
+pub export fn bobrvm_macos_vm_pause(vm: ?*macos_runtime.MacRuntime) void {
+    const handle = vm orelse return;
+    handle.pause();
+}
+
+pub export fn bobrvm_macos_vm_resume(vm: ?*macos_runtime.MacRuntime) void {
+    const handle = vm orelse return;
+    handle.resumeVM();
+}
+
+pub export fn bobrvm_macos_vm_state(vm: ?*macos_runtime.MacRuntime) VMState {
+    const handle = vm orelse return .failed;
+    handle.tick();
+    return @enumFromInt(@intFromEnum(handle.state));
+}
+
+pub export fn bobrvm_macos_vm_display_view(vm: ?*macos_runtime.MacRuntime) ?*anyopaque {
+    const handle = vm orelse return null;
+    return handle.displayView();
 }
 
 // --------------------------------------------------------------------------

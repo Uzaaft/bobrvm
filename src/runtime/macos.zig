@@ -30,7 +30,6 @@ pub const MacOSConfig = extern struct {
 pub const Backend = struct {
     vm: Object,
     view: Object,
-    pending_state: ?runtime.State = null,
 
     pub const Config = MacOSConfig;
     pub const InitError = error{
@@ -41,10 +40,7 @@ pub const Backend = struct {
     };
     pub const StartError = error{ InvalidState, StartFailed };
 
-    const CompletionBlock = objc.Block(struct {
-        backend: *Backend,
-        success_state: runtime.State,
-    }, .{id}, void);
+    const CompletionBlock = objc.Block(struct {}, .{id}, void);
 
     pub fn init(config: *const Config) InitError!Backend {
         if (comptime builtin.cpu.arch != .aarch64) return error.UnsupportedHost;
@@ -65,9 +61,9 @@ pub const Backend = struct {
             return error.FrameworkObjectCreationFailed;
         }
         view.msgSend(void, "setVirtualMachine:", .{vm.value});
-        view.msgSend(void, "setCapturesSystemKeys:", .{objc.c.boolParam(true)});
+        view.msgSend(void, "setCapturesSystemKeys:", .{boolParam(true)});
         if (view.getClass().?.respondsToSelector(objc.sel("setAutomaticallyReconfiguresDisplay:"))) {
-            view.msgSend(void, "setAutomaticallyReconfiguresDisplay:", .{objc.c.boolParam(true)});
+            view.msgSend(void, "setAutomaticallyReconfiguresDisplay:", .{boolParam(true)});
         }
 
         return .{ .vm = vm, .view = view };
@@ -83,32 +79,28 @@ pub const Backend = struct {
     }
 
     pub fn start(self: *Backend) StartError!void {
-        if (!self.vm.msgSend(bool, "canStart", .{})) return error.InvalidState;
+        if (!boolResult(self.vm.msgSend(BOOL, "canStart", .{}))) return error.InvalidState;
         self.perform("startWithCompletionHandler:", .running);
     }
 
     pub fn requestStop(self: *Backend) void {
-        if (!self.vm.msgSend(bool, "canStop", .{})) return;
+        if (!boolResult(self.vm.msgSend(BOOL, "canStop", .{}))) return;
         self.perform("stopWithCompletionHandler:", .stopped);
     }
 
     pub fn pause(self: *Backend) void {
-        if (!self.vm.msgSend(bool, "canPause", .{})) return;
+        if (!boolResult(self.vm.msgSend(BOOL, "canPause", .{}))) return;
         self.perform("pauseWithCompletionHandler:", .paused);
     }
 
     pub fn resumeVM(self: *Backend) void {
-        if (!self.vm.msgSend(bool, "canResume", .{})) return;
+        if (!boolResult(self.vm.msgSend(BOOL, "canResume", .{}))) return;
         self.perform("resumeWithCompletionHandler:", .running);
     }
 
     pub fn tick(_: *Backend) void {}
 
     pub fn state(self: *Backend) ?runtime.State {
-        if (self.pending_state) |value| {
-            self.pending_state = null;
-            return value;
-        }
         return mapState(self.vm.msgSend(NSInteger, "state", .{}));
     }
 
@@ -116,17 +108,12 @@ pub const Backend = struct {
         return @ptrCast(self.view.value);
     }
 
-    fn perform(self: *Backend, comptime selector: [:0]const u8, success: runtime.State) void {
-        var block = CompletionBlock.init(.{
-            .backend = self,
-            .success_state = success,
-        }, completion);
+    fn perform(self: *Backend, comptime selector: [:0]const u8, _: runtime.State) void {
+        var block = CompletionBlock.init(.{}, completion);
         self.vm.msgSend(void, selector, .{&block});
     }
 
-    fn completion(block: *const CompletionBlock.Context, error_object: id) callconv(.c) void {
-        block.backend.pending_state = if (error_object == null) block.success_state else .failed;
-    }
+    fn completion(_: *const CompletionBlock.Context, _: id) callconv(.c) void {}
 };
 
 pub const MacRuntime = runtime.Runtime(Backend);
@@ -184,7 +171,7 @@ fn createConfiguration(config: *const MacOSConfig) Backend.InitError!Object {
     configuration.msgSend(void, "setEntropyDevices:", .{array(&.{try newObject("VZVirtioEntropyDeviceConfiguration")}).value});
 
     var error_object: id = null;
-    if (!configuration.msgSend(bool, "validateWithError:", .{&error_object})) {
+    if (!boolResult(configuration.msgSend(BOOL, "validateWithError:", .{&error_object}))) {
         return error.ConfigurationValidationFailed;
     }
     return configuration.retain();
@@ -195,7 +182,7 @@ fn createDiskAttachment(path: [*:0]const u8) Backend.InitError!Object {
     const result = (try allocObject("VZDiskImageStorageDeviceAttachment")).msgSend(
         Object,
         "initWithURL:readOnly:error:",
-        .{ (try fileURL(path)).value, objc.c.boolParam(false), &error_object },
+        .{ (try fileURL(path)).value, boolParam(false), &error_object },
     );
     if (result.value == null) return error.FrameworkObjectCreationFailed;
     return result;
@@ -264,8 +251,24 @@ fn mapState(value: NSInteger) runtime.State {
     };
 }
 
+fn boolParam(value: bool) BOOL {
+    return switch (BOOL) {
+        bool => value,
+        i8 => @intFromBool(value),
+        else => @compileError("unexpected Objective-C BOOL type"),
+    };
+}
+
+fn boolResult(value: BOOL) bool {
+    return switch (BOOL) {
+        bool => value,
+        i8 => value == 1,
+        else => @compileError("unexpected Objective-C BOOL type"),
+    };
+}
+
 test "Virtualization framework reports host support" {
     if (comptime builtin.cpu.arch != .aarch64) return error.SkipZigTest;
     const class = objc.getClass("VZVirtualMachine") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(class.msgSend(bool, "isSupported", .{}));
+    try std.testing.expect(boolResult(class.msgSend(BOOL, "isSupported", .{})));
 }

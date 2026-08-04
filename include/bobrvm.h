@@ -24,6 +24,7 @@ typedef void* bobrvm_app_t;
 typedef void* bobrvm_vm_t;
 typedef void* bobrvm_surface_t;
 typedef void* bobrvm_config_t;
+typedef void* bobrvm_macos_vm_t;
 
 /* -------------------------------------------------------------------------- */
 /* Build Mode                                                                 */
@@ -55,6 +56,16 @@ typedef enum {
     BOBRVM_ERROR_CANNOT_SHRINK = 11,
     BOBRVM_ERROR_UNSUPPORTED_FORMAT = 12,
 } bobrvm_error_e;
+
+typedef enum {
+    BOBRVM_VM_STATE_STOPPED = 0,
+    BOBRVM_VM_STATE_STARTING = 1,
+    BOBRVM_VM_STATE_RUNNING = 2,
+    BOBRVM_VM_STATE_PAUSING = 3,
+    BOBRVM_VM_STATE_PAUSED = 4,
+    BOBRVM_VM_STATE_STOPPING = 5,
+    BOBRVM_VM_STATE_FAILED = 6,
+} bobrvm_vm_state_e;
 
 /* -------------------------------------------------------------------------- */
 /* Input Events                                                               */
@@ -113,6 +124,19 @@ typedef struct {
      */
     bool enable_gpu3d;
 } bobrvm_vm_config_s;
+
+typedef struct {
+    uint64_t memory_bytes;
+    uint8_t vcpu_count;
+    uint32_t display_width;
+    uint32_t display_height;
+    bool retina;
+    const char* disk_path;
+    const char* auxiliary_storage_path;
+    const char* hardware_model_base64;
+    const char* machine_identifier_base64;
+    const char* mac_address;
+} bobrvm_macos_vm_config_s;
 
 /** Return the shared VM configuration defaults used by every frontend. */
 bobrvm_vm_config_s bobrvm_vm_config_defaults(void);
@@ -280,6 +304,19 @@ void bobrvm_vm_kick_vcpu(bobrvm_vm_t vm, uint32_t vcpu_id);
  * Useful for debugging stuck VMs.
  */
 void bobrvm_vm_force_exit_all(bobrvm_vm_t vm);
+
+/* -------------------------------------------------------------------------- */
+/* macOS Guest Runtime                                                        */
+/* -------------------------------------------------------------------------- */
+
+bobrvm_macos_vm_t bobrvm_macos_vm_new(const bobrvm_macos_vm_config_s* cfg);
+void bobrvm_macos_vm_destroy(bobrvm_macos_vm_t vm);
+bobrvm_error_e bobrvm_macos_vm_start(bobrvm_macos_vm_t vm);
+void bobrvm_macos_vm_stop(bobrvm_macos_vm_t vm);
+void bobrvm_macos_vm_pause(bobrvm_macos_vm_t vm);
+void bobrvm_macos_vm_resume(bobrvm_macos_vm_t vm);
+bobrvm_vm_state_e bobrvm_macos_vm_state(bobrvm_macos_vm_t vm);
+void* bobrvm_macos_vm_display_view(bobrvm_macos_vm_t vm);
 
 /* -------------------------------------------------------------------------- */
 /* Surface (Display)                                                          */
