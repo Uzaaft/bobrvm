@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const XCFrameworkStep = @import("src/build/XCFrameworkStep.zig");
 const XcodebuildStep = @import("src/build/XcodebuildStep.zig");
 
@@ -15,17 +16,38 @@ fn environmentVariable(b: *std.Build, key: []const u8) ?[]const u8 {
     return b.graph.env_map.get(key);
 }
 
+fn macosCFlags(b: *std.Build) []const []const u8 {
+    const sdk = environmentVariable(b, "SDKROOT") orelse std.mem.trim(
+        u8,
+        b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }),
+        &std.ascii.whitespace,
+    );
+    return b.dupeStrings(&.{
+        "-std=c11",
+        b.fmt("-isysroot{s}", .{sdk}),
+        b.fmt("-I{s}/usr/include", .{sdk}),
+    });
+}
+
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    var target = b.standardTargetOptions(.{});
+    if (target.result.os.tag == .macos and builtin.target.os.tag.isDarwin()) {
+        target = b.resolveTargetQuery(.{
+            .cpu_arch = target.query.cpu_arch orelse builtin.target.cpu.arch,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{
+                .major = 13,
+                .minor = 0,
+                .patch = 0,
+            } },
+        });
+    }
     const optimize = b.standardOptimizeOption(.{});
     // A sandboxed `nix build` sets NIX_BUILD_TOP but not IN_NIX_SHELL;
-    // `nix develop` sets both. Codesigning must run in the dev shell (the
-    // CLI needs the hypervisor entitlement) but can't run in the sandbox.
+    // `nix develop` sets both. The sandbox cannot use Apple's Xcode tools,
+    // while the development shell can build frameworks for the native app.
     const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
     const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
-    // Swift/Xcode integration never runs under nix, which builds only the Zig
-    // core. The terminal dependency also needs the real Darwin SDK.
-    const in_nix = is_nix_build or in_nix_shell;
     const objc_dependency = b.dependency("zig_objc", .{
         .target = target,
         .optimize = optimize,
@@ -93,7 +115,7 @@ pub fn build(b: *std.Build) void {
 
         root_module.addCSourceFile(.{
             .file = b.path("src/os/log.c"),
-            .flags = &.{"-std=c11"},
+            .flags = macosCFlags(b),
         });
     }
 
@@ -143,7 +165,7 @@ pub fn build(b: *std.Build) void {
 
         cli_module.addCSourceFile(.{
             .file = b.path("src/os/log.c"),
-            .flags = &.{"-std=c11"},
+            .flags = macosCFlags(b),
         });
     }
 
@@ -374,20 +396,21 @@ pub fn build(b: *std.Build) void {
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // XCFramework + app steps (macOS only, never under nix). All Zig
-    // dependencies are pinned to compatible compiler versions.
-    if (target.result.os.tag == .macos and !in_nix) {
+    // Framework generation uses Xcode and is opt-in so sandboxed Nix package
+    // builds only initialize the portable Zig artifacts.
+    if (target.result.os.tag == .macos and (emit_xcframework or emit_macos_app)) {
         const xcframework = XCFrameworkStep.create(b, lib);
         const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
         xcframework_step.dependOn(&xcframework.step);
 
-        if (emit_xcframework) {
-            b.default_step.dependOn(&xcframework.step);
-        }
-
         const ghostty_steps = addGhosttySteps(b, optimize);
         const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
         ghostty_step.dependOn(ghostty_steps.install_root_step);
+
+        if (emit_xcframework) {
+            b.default_step.dependOn(&xcframework.step);
+            b.default_step.dependOn(ghostty_steps.install_root_step);
+        }
 
         // macOS app step
         if (emit_macos_app) {
@@ -440,6 +463,12 @@ fn addGhosttySteps(
         b.fmt("-Dxcframework-target={s}", .{ghostty_target_arg}),
     });
     ghostty_cmd.setCwd(ghostty_dep.path("."));
+    // This is a nested Zig build. Sharing the parent's local cache can reuse
+    // successful step metadata without materializing Ghostty's output.
+    ghostty_cmd.setEnvironmentVariable(
+        "ZIG_LOCAL_CACHE_DIR",
+        b.pathFromRoot(".zig-cache/ghostty"),
+    );
     ghostty_cmd.expectExitCode(0);
     ghostty_cmd.addFileInput(ghostty_dep.path("build.zig"));
     ghostty_cmd.addFileInput(ghostty_dep.path("build.zig.zon"));
