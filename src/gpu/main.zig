@@ -640,7 +640,7 @@ pub const GpuDevice = struct {
                 },
 
                 .set_viewport_state => {
-                    const viewport = try dec.decodeViewport(header.length);
+                    const viewport = try virgl.decoder.Viewport.decode(&dec, header.length);
                     ctx.setViewport(0, .{
                         .scale = viewport.scale,
                         .translate = viewport.translate,
@@ -648,12 +648,12 @@ pub const GpuDevice = struct {
                 },
 
                 .set_framebuffer_state => {
-                    const fb = try dec.decodeFramebuffer(header.length);
+                    const fb = try virgl.decoder.Framebuffer.decode(&dec, header.length);
                     ctx.setFramebuffer(fb);
                 },
 
                 .clear => {
-                    const clear_cmd = try dec.decodeClear(header.length);
+                    const clear_cmd = try virgl.decoder.Clear.decode(&dec, header.length);
                     ctx.clear(clear_cmd);
                     // Execute the clear against the bound framebuffer's first
                     // color target: framebuffer cbuf[0] → surface → resource →
@@ -780,7 +780,7 @@ pub const GpuDevice = struct {
                 },
 
                 .draw_vbo => {
-                    const draw_cmd = try dec.decodeDrawVbo(header.length);
+                    const draw_cmd = try virgl.decoder.DrawVbo.decode(&dec, header.length);
                     ctx.draw(draw_cmd);
                     // Route the draw: rasterize the bound vertex buffer into the
                     // bound framebuffer color target. Shading is the passthrough

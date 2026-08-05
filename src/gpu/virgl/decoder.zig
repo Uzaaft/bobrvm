@@ -64,6 +64,46 @@ pub const DecodeError = error{
     InvalidLength,
 };
 
+pub const PayloadLength = union(enum) {
+    exact: u16,
+    minimum: u16,
+
+    fn accepts(self: PayloadLength, actual: u16) bool {
+        return switch (self) {
+            .exact => |expected| actual == expected,
+            .minimum => |minimum| actual >= minimum,
+        };
+    }
+};
+
+/// Statically pairs a command's decoded value, payload-length policy, and
+/// decoder. Decoding is bounded to the declared payload even when more commands
+/// follow it in the same guest buffer.
+pub fn CommandSpec(
+    comptime DecodedType: type,
+    comptime payload_length: PayloadLength,
+    comptime decode_fn: fn (*Decoder, u16) DecodeError!DecodedType,
+) type {
+    return struct {
+        pub const Decoded = DecodedType;
+
+        pub fn decode(dec: *Decoder, length: u16) DecodeError!Decoded {
+            if (!payload_length.accepts(length)) return DecodeError.InvalidLength;
+
+            const payload_end = dec.pos + length;
+            if (payload_end > dec.word_len) return DecodeError.UnexpectedEnd;
+
+            const command_end = dec.word_len;
+            dec.word_len = payload_end;
+            defer {
+                dec.word_len = command_end;
+                dec.pos = payload_end;
+            }
+            return decode_fn(dec, length);
+        }
+    };
+}
+
 /// Command decoder state machine.
 /// Largest payload a single virgl command can describe: the header's length
 /// field is a u16, in words.
@@ -318,6 +358,27 @@ pub const Decoder = struct {
     }
 };
 
+pub const DrawVbo = CommandSpec(
+    DrawCommand,
+    .{ .minimum = proto.CommandSize.DRAW_VBO },
+    Decoder.decodeDrawVbo,
+);
+pub const Clear = CommandSpec(
+    ClearCommand,
+    .{ .exact = proto.CommandSize.CLEAR },
+    Decoder.decodeClear,
+);
+pub const Viewport = CommandSpec(
+    ViewportState,
+    .{ .minimum = proto.CommandSize.SET_VIEWPORT_STATE },
+    Decoder.decodeViewport,
+);
+pub const Framebuffer = CommandSpec(
+    FramebufferState,
+    .{ .minimum = proto.CommandSize.FRAMEBUFFER_STATE_HDR },
+    Decoder.decodeFramebuffer,
+);
+
 test "Decoder init and header parse" {
     // Create a simple command: NOP with length 0
     const header = proto.CommandHeader{
@@ -362,10 +423,52 @@ test "Decoder clear command" {
     const header = try dec.nextHeader();
     try std.testing.expectEqual(proto.Command.clear, header.opcode);
 
-    const clear = try dec.decodeClear(header.length);
+    const clear = try Clear.decode(&dec, header.length);
     try std.testing.expect(clear.flags.color0);
     try std.testing.expect(clear.flags.depth);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), clear.color[0], 0.001);
+}
+
+test "command specs reject undersized fixed payloads" {
+    const commands = [_]u32{
+        (proto.CommandHeader{
+            .opcode = .clear,
+            .object_type = .null,
+            .length = 0,
+        }).encode(),
+    };
+    var dec = Decoder.init(std.mem.sliceAsBytes(&commands));
+    const header = try dec.nextHeader();
+
+    try std.testing.expectError(DecodeError.InvalidLength, Clear.decode(&dec, header.length));
+}
+
+test "command specs cannot consume the following command" {
+    const commands = [_]u32{
+        (proto.CommandHeader{
+            .opcode = .set_viewport_state,
+            .object_type = .null,
+            .length = proto.CommandSize.SET_VIEWPORT_STATE,
+        }).encode(),
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        (proto.CommandHeader{
+            .opcode = .nop,
+            .object_type = .null,
+            .length = 0,
+        }).encode(),
+    };
+    var dec = Decoder.init(std.mem.sliceAsBytes(&commands));
+    const viewport_header = try dec.nextHeader();
+    _ = try Viewport.decode(&dec, viewport_header.length);
+
+    const next = try dec.nextHeader();
+    try std.testing.expectEqual(proto.Command.nop, next.opcode);
 }
 
 test "Decoder tolerates an unaligned guest buffer" {
