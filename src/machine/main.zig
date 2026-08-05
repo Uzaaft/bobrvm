@@ -242,6 +242,41 @@ const VirtioMmioDevice = union(enum) {
     }
 };
 
+fn SnapshotSection(
+    comptime section_name: []const u8,
+    comptime field_name: []const u8,
+    comptime Codec: type,
+) type {
+    return struct {
+        fn capture(machine: anytype, alloc: Allocator, builder: *snapshot.Builder) !void {
+            const device: *const Codec.Device = @field(machine, field_name) orelse return;
+            try Codec.append(builder, alloc, section_name, device);
+        }
+
+        fn restore(machine: anytype, alloc: Allocator, reader: *const snapshot.Reader) !void {
+            const data = reader.section(section_name) orelse return;
+            const device: *Codec.Device = @field(machine, field_name) orelse return;
+            try Codec.decode(alloc, device, data);
+        }
+    };
+}
+
+/// The single source of truth for machine components persisted in snapshots.
+/// Balloon and sound state intentionally reset on restore and therefore have no
+/// descriptor here.
+const snapshot_sections = .{
+    SnapshotSection("gic", "gic_device", snapshot.GicCodec),
+    SnapshotSection("console", "console", snapshot.ConsoleCodec),
+    SnapshotSection("blk1", "block", snapshot.BlockCodec),
+    SnapshotSection("blk2", "block2", snapshot.BlockCodec),
+    SnapshotSection("rng", "rng", snapshot.RngCodec),
+    SnapshotSection("net", "net", snapshot.NetCodec),
+    SnapshotSection("kbd", "keyboard", snapshot.InputCodec),
+    SnapshotSection("mouse", "mouse", snapshot.InputCodec),
+    SnapshotSection("p9", "p9", snapshot.P9Codec),
+    SnapshotSection("gpu", "gpu", snapshot.GpuCodec),
+};
+
 /// Console multiport ids for the agent ports (order matches the names
 /// passed to Console.init in initVirtioDevices).
 const SPICE_PORT: u32 = 1; // com.redhat.spice.0
@@ -901,35 +936,8 @@ pub const Machine = struct {
             try builder.section(name, std.mem.asBytes(&vstate));
         }
 
-        if (self.gic_device) |gic_dev| {
-            try snapshot.appendGicSection(&builder, alloc, gic_dev);
-        }
-        if (self.console) |con| {
-            try snapshot.appendConsoleSection(&builder, alloc, con);
-        }
-        if (self.block) |blk| {
-            try snapshot.appendBlockSection(&builder, alloc, "blk1", blk);
-        }
-        if (self.block2) |blk| {
-            try snapshot.appendBlockSection(&builder, alloc, "blk2", blk);
-        }
-        if (self.rng) |rng_dev| {
-            try snapshot.appendRngSection(&builder, alloc, rng_dev);
-        }
-        if (self.net) |net| {
-            try snapshot.appendNetSection(&builder, alloc, net);
-        }
-        if (self.keyboard) |kbd| {
-            try snapshot.appendInputSection(&builder, alloc, "kbd", kbd);
-        }
-        if (self.mouse) |mouse| {
-            try snapshot.appendInputSection(&builder, alloc, "mouse", mouse);
-        }
-        if (self.p9) |p9_dev| {
-            try snapshot.appendP9Section(&builder, alloc, p9_dev);
-        }
-        if (self.gpu) |gpu_dev| {
-            try snapshot.appendGpuSection(&builder, gpu_dev);
+        inline for (snapshot_sections) |Section| {
+            try Section.capture(self, alloc, &builder);
         }
 
         return try builder.finish();
@@ -954,35 +962,8 @@ pub const Machine = struct {
             try self.runVcpuSnapOp(@intCast(i), &req);
         }
 
-        if (reader.section("gic")) |data| {
-            if (self.gic_device) |gic_dev| try snapshot.deserializeGic(gic_dev, data);
-        }
-        if (reader.section("console")) |data| {
-            if (self.console) |con| try snapshot.deserializeConsole(self.alloc, con, data);
-        }
-        if (reader.section("blk1")) |data| {
-            if (self.block) |blk| try snapshot.deserializeBlock(blk, data);
-        }
-        if (reader.section("blk2")) |data| {
-            if (self.block2) |blk| try snapshot.deserializeBlock(blk, data);
-        }
-        if (reader.section("rng")) |data| {
-            if (self.rng) |rng_dev| try snapshot.deserializeRng(rng_dev, data);
-        }
-        if (reader.section("net")) |data| {
-            if (self.net) |net| try snapshot.deserializeNet(net, data);
-        }
-        if (reader.section("kbd")) |data| {
-            if (self.keyboard) |kbd| try snapshot.deserializeInput(kbd, data);
-        }
-        if (reader.section("mouse")) |data| {
-            if (self.mouse) |mouse| try snapshot.deserializeInput(mouse, data);
-        }
-        if (reader.section("p9")) |data| {
-            if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
-        }
-        if (reader.section("gpu")) |data| {
-            if (self.gpu) |gpu_dev| try snapshot.deserializeGpu(gpu_dev, data);
+        inline for (snapshot_sections) |Section| {
+            try Section.restore(self, self.alloc, &reader);
         }
         _ = alloc;
     }
@@ -1152,35 +1133,8 @@ pub const Machine = struct {
         // Devices + GIC.
         const reader = try snapshot.Reader.init(state);
         if (reader.section("vcpu1")) |_| return error.SmpRestoreUnsupported;
-        if (reader.section("gic")) |data| {
-            if (self.gic_device) |gic_dev| try snapshot.deserializeGic(gic_dev, data);
-        }
-        if (reader.section("console")) |data| {
-            if (self.console) |con| try snapshot.deserializeConsole(self.alloc, con, data);
-        }
-        if (reader.section("blk1")) |data| {
-            if (self.block) |blk| try snapshot.deserializeBlock(blk, data);
-        }
-        if (reader.section("blk2")) |data| {
-            if (self.block2) |blk| try snapshot.deserializeBlock(blk, data);
-        }
-        if (reader.section("rng")) |data| {
-            if (self.rng) |rng_dev| try snapshot.deserializeRng(rng_dev, data);
-        }
-        if (reader.section("net")) |data| {
-            if (self.net) |net| try snapshot.deserializeNet(net, data);
-        }
-        if (reader.section("kbd")) |data| {
-            if (self.keyboard) |kbd| try snapshot.deserializeInput(kbd, data);
-        }
-        if (reader.section("mouse")) |data| {
-            if (self.mouse) |mouse| try snapshot.deserializeInput(mouse, data);
-        }
-        if (reader.section("p9")) |data| {
-            if (self.p9) |p9_dev| try snapshot.deserializeP9(self.alloc, p9_dev, data);
-        }
-        if (reader.section("gpu")) |data| {
-            if (self.gpu) |gpu_dev| try snapshot.deserializeGpu(gpu_dev, data);
+        inline for (snapshot_sections) |Section| {
+            try Section.restore(self, self.alloc, &reader);
         }
 
         // vCPU 0 registers — we are its owning thread.

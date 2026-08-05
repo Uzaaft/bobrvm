@@ -284,6 +284,7 @@ pub fn serializeGic(alloc: Allocator, gic: *const gic_mod.Gic) ![]u8 {
 pub fn appendGicSection(
     builder: *Builder,
     fallback_alloc: Allocator,
+    name: []const u8,
     gic: *const gic_mod.Gic,
 ) !void {
     assert(gic.num_cpus > 0);
@@ -292,10 +293,10 @@ pub fn appendGicSection(
     const scratch_alloc = stack_allocator.get();
     const data = try serializeGic(scratch_alloc, gic);
     defer scratch_alloc.free(data);
-    try builder.section("gic", data);
+    try builder.section(name, data);
 }
 
-pub fn deserializeGic(gic: *gic_mod.Gic, data: []const u8) !void {
+pub fn deserializeGic(_: Allocator, gic: *gic_mod.Gic, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     gic.ctlr = try cur.int(u32);
     const nspis = try cur.int(u32);
@@ -394,6 +395,7 @@ pub fn serializeConsole(alloc: Allocator, con: *const virtio.Console) ![]u8 {
 pub fn appendConsoleSection(
     builder: *Builder,
     fallback_alloc: Allocator,
+    name: []const u8,
     con: *const virtio.Console,
 ) !void {
     assert(con.ports.len <= std.math.maxInt(u8));
@@ -402,7 +404,7 @@ pub fn appendConsoleSection(
     const scratch_alloc = stack_allocator.get();
     const data = try serializeConsole(scratch_alloc, con);
     defer scratch_alloc.free(data);
-    try builder.section("console", data);
+    try builder.section(name, data);
 }
 
 pub fn deserializeConsole(_: Allocator, con: *virtio.Console, data: []const u8) !void {
@@ -451,7 +453,7 @@ pub fn appendBlockSection(
     try builder.section(name, data);
 }
 
-pub fn deserializeBlock(blk: *virtio.Block, data: []const u8) !void {
+pub fn deserializeBlock(_: Allocator, blk: *virtio.Block, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &blk.transport);
     blk.request_last_avail = try cur.int(u16);
@@ -474,6 +476,7 @@ pub fn serializeRng(alloc: Allocator, rng: *const virtio.Rng) ![]u8 {
 pub fn appendRngSection(
     builder: *Builder,
     fallback_alloc: Allocator,
+    name: []const u8,
     rng: *const virtio.Rng,
 ) !void {
     assert(rng.transport.queues.len > 0);
@@ -482,10 +485,10 @@ pub fn appendRngSection(
     const scratch_alloc = stack_allocator.get();
     const data = try serializeRng(scratch_alloc, rng);
     defer scratch_alloc.free(data);
-    try builder.section("rng", data);
+    try builder.section(name, data);
 }
 
-pub fn deserializeRng(rng: *virtio.Rng, data: []const u8) !void {
+pub fn deserializeRng(_: Allocator, rng: *virtio.Rng, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &rng.transport);
     rng.last_avail = try cur.int(u16);
@@ -509,6 +512,7 @@ pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
 pub fn appendNetSection(
     builder: *Builder,
     fallback_alloc: Allocator,
+    name: []const u8,
     net: *const virtio.Net,
 ) !void {
     assert(net.transport.queues.len > 0);
@@ -517,10 +521,10 @@ pub fn appendNetSection(
     const scratch_alloc = stack_allocator.get();
     const data = try serializeNet(scratch_alloc, net);
     defer scratch_alloc.free(data);
-    try builder.section("net", data);
+    try builder.section(name, data);
 }
 
-pub fn deserializeNet(net: *virtio.Net, data: []const u8) !void {
+pub fn deserializeNet(_: Allocator, net: *virtio.Net, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &net.transport);
     net.rx_last_avail = try cur.int(u16);
@@ -557,7 +561,7 @@ pub fn appendInputSection(
     try builder.section(name, data);
 }
 
-pub fn deserializeInput(input: *virtio.Input, data: []const u8) !void {
+pub fn deserializeInput(_: Allocator, input: *virtio.Input, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &input.transport);
     input.event_last_avail = try cur.int(u16);
@@ -594,6 +598,7 @@ pub fn serializeP9(alloc: Allocator, dev: *const virtio.P9) ![]u8 {
 pub fn appendP9Section(
     builder: *Builder,
     fallback_alloc: Allocator,
+    name: []const u8,
     dev: *const virtio.P9,
 ) !void {
     assert(dev.server.fids.count() <= std.math.maxInt(u32));
@@ -602,7 +607,7 @@ pub fn appendP9Section(
     const scratch_alloc = stack_allocator.get();
     const data = try serializeP9(scratch_alloc, dev);
     defer scratch_alloc.free(data);
-    try builder.section("p9", data);
+    try builder.section(name, data);
 }
 
 pub fn deserializeP9(alloc: Allocator, dev: *virtio.P9, data: []const u8) !void {
@@ -691,11 +696,16 @@ pub fn serializeGpu(alloc: Allocator, g: *const virtio.Gpu) ![]u8 {
     return result;
 }
 
-pub fn appendGpuSection(builder: *Builder, g: *const virtio.Gpu) !void {
+pub fn appendGpuSection(
+    builder: *Builder,
+    _: Allocator,
+    name: []const u8,
+    g: *const virtio.Gpu,
+) !void {
     assert(g.resources.count() <= std.math.maxInt(u32));
     assert(g.transport.queues.len <= mmio.Transport.MAX_QUEUES);
     const serialized_bytes = try gpuSerializedBytes(g);
-    try builder.prepareSection("gpu", serialized_bytes);
+    try builder.prepareSection(name, serialized_bytes);
     var out = Out{ .alloc = builder.alloc, .buf = builder.buf };
     builder.buf = .empty;
     defer {
@@ -706,7 +716,7 @@ pub fn appendGpuSection(builder: *Builder, g: *const virtio.Gpu) !void {
     try writeGpu(&out, g, serialized_bytes);
 }
 
-pub fn deserializeGpu(g: *virtio.Gpu, data: []const u8) !void {
+pub fn deserializeGpu(_: Allocator, g: *virtio.Gpu, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, g.transport);
     g.ctrl_last_avail = try cur.int(u16);
@@ -728,6 +738,45 @@ pub fn deserializeGpu(g: *virtio.Gpu, data: []const u8) !void {
     g.scanout_resource_id = scanout_id;
     g.frame_generation +%= 1; // force the renderer to re-present
 }
+
+/// Builds a statically-typed snapshot codec from normalized append/decode
+/// functions. The calls in these wrappers are analyzed at comptime for every
+/// section descriptor that uses the codec.
+pub fn DeviceCodec(
+    comptime DeviceType: type,
+    comptime append_fn: anytype,
+    comptime decode_fn: anytype,
+) type {
+    return struct {
+        pub const Device = DeviceType;
+
+        pub fn append(
+            builder: *Builder,
+            alloc: Allocator,
+            name: []const u8,
+            device: *const Device,
+        ) !void {
+            try append_fn(builder, alloc, name, device);
+        }
+
+        pub fn decode(
+            alloc: Allocator,
+            device: *Device,
+            data: []const u8,
+        ) !void {
+            try decode_fn(alloc, device, data);
+        }
+    };
+}
+
+pub const GicCodec = DeviceCodec(gic_mod.Gic, appendGicSection, deserializeGic);
+pub const ConsoleCodec = DeviceCodec(virtio.Console, appendConsoleSection, deserializeConsole);
+pub const BlockCodec = DeviceCodec(virtio.Block, appendBlockSection, deserializeBlock);
+pub const RngCodec = DeviceCodec(virtio.Rng, appendRngSection, deserializeRng);
+pub const NetCodec = DeviceCodec(virtio.Net, appendNetSection, deserializeNet);
+pub const InputCodec = DeviceCodec(virtio.Input, appendInputSection, deserializeInput);
+pub const P9Codec = DeviceCodec(virtio.P9, appendP9Section, deserializeP9);
+pub const GpuCodec = DeviceCodec(virtio.Gpu, appendGpuSection, deserializeGpu);
 
 // =============================================================================
 // Tests
@@ -771,7 +820,7 @@ test "snapshot: gic state roundtrip" {
 
     const gic2 = try gic_mod.Gic.init(testing.allocator, 2);
     defer gic2.deinit();
-    try deserializeGic(gic2, data);
+    try deserializeGic(testing.allocator, gic2, data);
     try testing.expectEqual(@as(u32, 0x33), gic2.ctlr);
     try testing.expect(gic2.spis[10].enabled and gic2.spis[10].pending);
     try testing.expectEqual(@as(u8, 0x40), gic2.spis[10].priority);
@@ -788,7 +837,7 @@ test "snapshot: GIC section assembly allocation profile" {
     const alloc = counted.allocator();
     var builder = try Builder.init(alloc);
     defer builder.deinit();
-    try appendGicSection(&builder, alloc, gic);
+    try appendGicSection(&builder, alloc, "gic", gic);
     const bytes = try builder.finish();
     defer alloc.free(bytes);
 
@@ -843,7 +892,7 @@ test "snapshot: console section assembly allocation profile" {
     const alloc = counted.allocator();
     var builder = try Builder.init(alloc);
     defer builder.deinit();
-    try appendConsoleSection(&builder, alloc, con);
+    try appendConsoleSection(&builder, alloc, "console", con);
     const bytes = try builder.finish();
     defer alloc.free(bytes);
 
@@ -872,7 +921,7 @@ test "snapshot: block device roundtrip" {
 
     const blk2 = try virtio.Block.init(testing.allocator);
     defer blk2.deinit();
-    try deserializeBlock(blk2, data);
+    try deserializeBlock(testing.allocator, blk2, data);
     try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(blk2.transport.status)));
     try testing.expectEqual(@as(u64, 0xfeed_face), blk2.transport.driver_features);
     try testing.expect(blk2.transport.queues[0].ready);
@@ -916,7 +965,7 @@ test "snapshot: RNG device roundtrip" {
 
     const rng2 = try virtio.Rng.init(testing.allocator);
     defer rng2.deinit();
-    try deserializeRng(rng2, data);
+    try deserializeRng(testing.allocator, rng2, data);
     try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(rng2.transport.status)));
     try testing.expect(rng2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x6000_0000), rng2.transport.queues[0].driver_addr);
@@ -931,7 +980,7 @@ test "snapshot: RNG section assembly allocation profile" {
     const alloc = counted.allocator();
     var builder = try Builder.init(alloc);
     defer builder.deinit();
-    try appendRngSection(&builder, alloc, rng);
+    try appendRngSection(&builder, alloc, "rng", rng);
     const bytes = try builder.finish();
     defer alloc.free(bytes);
 
@@ -961,7 +1010,7 @@ test "snapshot: network device roundtrip" {
 
     const net2 = try virtio.Net.init(testing.allocator);
     defer net2.deinit();
-    try deserializeNet(net2, data);
+    try deserializeNet(testing.allocator, net2, data);
     try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(net2.transport.status)));
     try testing.expect(net2.transport.queues[0].ready);
     try testing.expect(net2.transport.queues[1].ready);
@@ -978,7 +1027,7 @@ test "snapshot: network section assembly allocation profile" {
     const alloc = counted.allocator();
     var builder = try Builder.init(alloc);
     defer builder.deinit();
-    try appendNetSection(&builder, alloc, net);
+    try appendNetSection(&builder, alloc, "net", net);
     const bytes = try builder.finish();
     defer alloc.free(bytes);
 
@@ -1008,7 +1057,7 @@ test "snapshot: input device roundtrip" {
 
     const input2 = try virtio.Input.init(testing.allocator, .keyboard);
     defer input2.deinit();
-    try deserializeInput(input2, data);
+    try deserializeInput(testing.allocator, input2, data);
     try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(input2.transport.status)));
     try testing.expect(input2.transport.queues[0].ready);
     try testing.expect(input2.transport.queues[1].ready);
@@ -1075,7 +1124,7 @@ test "snapshot: P9 section assembly allocation profile" {
     const alloc = counted.allocator();
     var builder = try Builder.init(alloc);
     defer builder.deinit();
-    try appendP9Section(&builder, alloc, dev);
+    try appendP9Section(&builder, alloc, "p9", dev);
     const bytes = try builder.finish();
     defer alloc.free(bytes);
 
@@ -1108,7 +1157,7 @@ test "snapshot: gpu 2D framebuffer survives roundtrip" {
 
     const gpu2 = try virtio.Gpu.init(testing.allocator, false);
     defer gpu2.deinit();
-    try deserializeGpu(gpu2, data);
+    try deserializeGpu(testing.allocator, gpu2, data);
 
     try testing.expectEqual(@as(u32, 7), gpu2.scanout_resource_id);
     try testing.expectEqual(@as(u32, 4), gpu2.display_width);
@@ -1135,7 +1184,7 @@ test "snapshot: GPU section assembly allocation profile" {
     const alloc = counted.allocator();
     var builder = try Builder.init(alloc);
     defer builder.deinit();
-    try appendGpuSection(&builder, gpu);
+    try appendGpuSection(&builder, alloc, "gpu", gpu);
     const bytes = try builder.finish();
     defer alloc.free(bytes);
 
@@ -1148,7 +1197,7 @@ test "snapshot: GPU section assembly allocation profile" {
 
     const restored = try virtio.Gpu.init(testing.allocator, false);
     defer restored.deinit();
-    try deserializeGpu(restored, section);
+    try deserializeGpu(testing.allocator, restored, section);
     const restored_resource = restored.resources.getPtr(7).?;
     try testing.expectEqualSlices(u8, &pattern, restored_resource.host_data);
 }
