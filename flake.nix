@@ -10,6 +10,11 @@
     };
 
     ziglint.url = "github:uzaaft/ziglint-nix";
+
+    zon2nix = {
+      url = "github:jcollie/zon2nix?ref=main";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -17,6 +22,7 @@
     nixpkgs,
     zig-overlay,
     ziglint,
+    zon2nix,
   }: let
     inherit (nixpkgs) lib;
 
@@ -33,6 +39,10 @@
   in {
     packages = forAllPlatforms (pkgs: let
       zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
+      zigDeps = pkgs.callPackage ./build.zig.zon.nix {
+        name = "bobrvm-zig-deps";
+        zig_0_16 = zig;
+      };
       package = optimize:
         pkgs.callPackage ./nix/package.nix {
           inherit optimize zig;
@@ -44,12 +54,16 @@
       debug = bobrvm-debug;
       default = bobrvm;
 
+      deps = zigDeps;
+      framework-deps = bobrvm.zigDeps;
+
       test = pkgs.callPackage ./nix/test.nix {inherit zig;};
     });
 
     devShells = forAllPlatforms (pkgs: {
       default = pkgs.callPackage ./nix/devShell.nix {
         zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
+        inherit zon2nix;
       };
     });
 

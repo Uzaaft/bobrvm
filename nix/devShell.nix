@@ -4,9 +4,11 @@
   stdenv,
   alejandra,
   jujutsu,
+  pandoc,
   pkg-config,
   zig,
   ziglint,
+  zon2nix,
 }:
 mkShell {
   name = "bobrvm";
@@ -14,9 +16,11 @@ mkShell {
   packages = [
     alejandra
     jujutsu
+    pandoc
     pkg-config
     zig
     ziglint
+    zon2nix.packages.${stdenv.hostPlatform.system}.zon2nix
   ];
 
   shellHook = lib.optionalString stdenv.hostPlatform.isDarwin ''
