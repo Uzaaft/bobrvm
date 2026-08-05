@@ -462,6 +462,9 @@ fn addGhosttySteps(
         b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         b.fmt("-Dxcframework-target={s}", .{ghostty_target_arg}),
     });
+    if (environmentVariable(b, "BOBRVM_ZIG_SYSTEM_PACKAGE_DIR")) |dir| {
+        ghostty_cmd.addArgs(&.{ "--system", dir });
+    }
     ghostty_cmd.setCwd(ghostty_dep.path("."));
     // This is a nested Zig build. Sharing the parent's local cache can reuse
     // successful step metadata without materializing Ghostty's output.

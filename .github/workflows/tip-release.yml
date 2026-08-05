@@ -34,13 +34,31 @@ jobs:
       - name: Build Zig library with Nix
         run: nix build --print-build-logs
 
+      - name: Build Zig dependency directory
+        id: deps
+        run: |
+          nix build --print-build-logs .#deps
+          echo "path=$(readlink result)" >> "$GITHUB_OUTPUT"
+
+      - name: Build direct Zig dependency cache
+        id: direct-deps
+        run: |
+          nix build --print-build-logs .#framework-deps
+          echo "path=$(readlink result)" >> "$GITHUB_OUTPUT"
+
       - name: Prepare Zig caches
-        run: mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
+        env:
+          BOBRVM_ZIG_DIRECT_DEPS: ${{ steps.direct-deps.outputs.path }}
+        run: |
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
+          ln -s "$BOBRVM_ZIG_DIRECT_DEPS" "$ZIG_GLOBAL_CACHE_DIR/p"
 
       - name: Show Xcode version
         run: xcodebuild -version
 
       - name: Build app frameworks
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
         run: |
           nix develop --command zig build \
               -Doptimize=ReleaseFast \
