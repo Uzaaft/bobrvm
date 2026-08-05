@@ -110,7 +110,7 @@ pub const P9 = struct {
             .req_buf = req_buf,
             .resp_buf = resp_buf,
         };
-        transport.setNotifyCallback(handleNotify, dev);
+        transport.setNotifyCallback(mmio.bindNotify(P9, dev, handleNotify));
 
         assert(dev.transport.device_id == 9);
         return dev;
@@ -133,12 +133,8 @@ pub const P9 = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *P9,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *P9, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Handle MMIO read.
@@ -170,8 +166,7 @@ pub const P9 = struct {
         return std.mem.readInt(u32, &out, .little);
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *P9 = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *P9, queue_idx: u32) void {
         if (queue_idx == 0) self.processQueue();
     }
 

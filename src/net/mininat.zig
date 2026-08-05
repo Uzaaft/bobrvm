@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const net_compat = @import("../compat/net.zig");
 const global = @import("../global.zig");
 
@@ -42,20 +43,17 @@ const ETH_HDR = 14;
 const ETHERTYPE_IP: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
 
-/// Reply sink: frames the responder wants delivered to the guest.
-pub const ReplyFn = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
-
 /// Exclusive frame storage borrowed from a reply sink until commit.
 pub const ReplyLease = struct {
     frame: []u8,
     token: usize,
 };
 
-pub const ReplyReserveFn = *const fn (
-    frame_len: usize,
-    userdata: ?*anyopaque,
-) ?ReplyLease;
-pub const ReplyCommitFn = *const fn (lease: ReplyLease, userdata: ?*anyopaque) void;
+/// Reply sink: frames the responder wants delivered to the guest.
+pub const Reply = callback_binding.Binding1([]const u8, void);
+pub const ReplyReserve = callback_binding.Binding1(usize, ?ReplyLease);
+pub const ReplyCommit = callback_binding.Binding1(ReplyLease, void);
+pub const RxReady = callback_binding.Binding0(bool);
 
 const UdpKey = struct {
     guest_port: u16,
@@ -235,10 +233,9 @@ const TcpFlow = struct {
 };
 
 pub const MiniNat = struct {
-    reply: ReplyFn,
-    reply_userdata: ?*anyopaque,
-    reply_reserve: ?ReplyReserveFn = null,
-    reply_commit: ?ReplyCommitFn = null,
+    reply: Reply,
+    reply_reserve: ?ReplyReserve = null,
+    reply_commit: ?ReplyCommit = null,
 
     alloc: std.mem.Allocator,
     udp_flows: std.AutoHashMap(UdpKey, UdpFlow),
@@ -254,8 +251,7 @@ pub const MiniNat = struct {
     /// (which, with no retransmit, would stall the connection). Data
     /// waits in the host socket buffer; the host kernel's TCP window then
     /// throttles the real sender.
-    rx_ready: ?*const fn (?*anyopaque) bool = null,
-    rx_ready_userdata: ?*anyopaque = null,
+    rx_ready: ?RxReady = null,
 
     /// Host→guest port-forward listeners. Populated by addForward()
     /// BEFORE start(); immutable afterwards (pollLoop reads unlocked).
@@ -277,10 +273,9 @@ pub const MiniNat = struct {
     /// Our advertised window / max relayed segment payload.
     pub const TCP_MSS: usize = 1400;
 
-    pub fn init(alloc: std.mem.Allocator, reply: ReplyFn, userdata: ?*anyopaque) MiniNat {
+    pub fn init(alloc: std.mem.Allocator, reply: Reply) MiniNat {
         return .{
             .reply = reply,
-            .reply_userdata = userdata,
             .alloc = alloc,
             .udp_flows = std.AutoHashMap(UdpKey, UdpFlow).init(alloc),
             .tcp_flows = std.AutoHashMap(TcpKey, TcpFlow).init(alloc),
@@ -288,7 +283,11 @@ pub const MiniNat = struct {
         };
     }
 
-    pub fn setReplyLease(self: *MiniNat, reserve: ReplyReserveFn, commit: ReplyCommitFn) void {
+    pub fn setReplyLease(
+        self: *MiniNat,
+        reserve: ReplyReserve,
+        commit: ReplyCommit,
+    ) void {
         assert(self.reply_reserve == null);
         assert(self.reply_commit == null);
         self.reply_reserve = reserve;
@@ -304,7 +303,7 @@ pub const MiniNat = struct {
         assert(frame_len > 0);
         assert(fallback.len >= frame_len);
         if (self.reply_reserve) |reserve| {
-            const lease = reserve(frame_len, self.reply_userdata) orelse return null;
+            const lease = reserve.call(frame_len) orelse return null;
             assert(lease.frame.len == frame_len);
             return .{ .frame = lease.frame, .token = lease.token };
         }
@@ -316,10 +315,10 @@ pub const MiniNat = struct {
         assert(buffer.frame.len > 0);
         assert((buffer.token == null) == (self.reply_commit == null));
         if (buffer.token) |token| {
-            self.reply_commit.?(.{ .frame = buffer.frame, .token = token }, self.reply_userdata);
+            self.reply_commit.?.call(.{ .frame = buffer.frame, .token = token });
             return;
         }
-        self.reply(buffer.frame, self.reply_userdata);
+        self.reply.call(buffer.frame);
     }
 
     fn initTcpSendPool(self: *MiniNat) std.mem.Allocator.Error!void {
@@ -384,9 +383,8 @@ pub const MiniNat = struct {
     }
 
     /// Set the RX back-pressure predicate (see rx_ready).
-    pub fn setRxReady(self: *MiniNat, cb: *const fn (?*anyopaque) bool, userdata: ?*anyopaque) void {
-        self.rx_ready = cb;
-        self.rx_ready_userdata = userdata;
+    pub fn setRxReady(self: *MiniNat, rx_ready: RxReady) void {
+        self.rx_ready = rx_ready;
     }
 
     /// Add a host→guest port forward: connections accepted on the host's
@@ -727,7 +725,7 @@ pub const MiniNat = struct {
         // Back-pressure: if the guest RX queue is backed up, don't pull
         // more host data this pass (connect completion and close still
         // proceed). Leaves data in the host socket → real sender throttles.
-        const rx_ok = if (self.rx_ready) |rr| rr(self.rx_ready_userdata) else true;
+        const rx_ok = if (self.rx_ready) |rx_ready| rx_ready.call() else true;
 
         var iter = self.tcp_flows.iterator();
         while (iter.next()) |entry| {
@@ -1516,8 +1514,8 @@ fn clearReplies() void {
 test "mininat: ARP request for gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     test_reply_lease_len = 0;
     test_reply_lease_committed = false;
     defer {
@@ -1553,8 +1551,8 @@ test "mininat: ARP request for gateway gets a reply" {
 test "mininat: UDP reply is built directly in leased RX storage" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     test_reply_lease_len = 0;
     test_reply_lease_committed = false;
     defer {
@@ -1582,8 +1580,8 @@ test "mininat: UDP reply is built directly in leased RX storage" {
 test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     test_reply_lease_len = 0;
     test_reply_lease_committed = false;
     defer {
@@ -1626,8 +1624,8 @@ test "mininat: DHCP DISCOVER gets an OFFER with our lease" {
 test "mininat: ICMP echo to gateway gets a reply" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     test_reply_lease_len = 0;
     test_reply_lease_committed = false;
     defer {
@@ -1671,8 +1669,8 @@ test "mininat: ICMP echo to a remote host is reframed for the guest" {
     // reply" type==0 check).
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     test_reply_lease_len = 0;
     test_reply_lease_committed = false;
     defer {
@@ -1789,7 +1787,7 @@ fn buildGuestTcpFrame(
 test "mininat: port forward — accept, handshake, and guest->host relay" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
     defer {
         var titer = nat.tcp_flows.valueIterator();
         while (titer.next()) |flow| {
@@ -1866,8 +1864,8 @@ test "mininat: port forward — accept, handshake, and guest->host relay" {
 test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmits" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -1935,8 +1933,8 @@ test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmit
 test "TcpSendBuffer sends wrapped retransmit without scratch copy" {
     test_alloc = testing.allocator;
     defer clearReplies();
-    var nat = MiniNat.init(testing.allocator, testReply, null);
-    nat.setReplyLease(testReplyReserve, testReplyCommit);
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    nat.setReplyLease(ReplyReserve.initRaw(testReplyReserve, null), ReplyCommit.initRaw(testReplyCommit, null));
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -2001,7 +1999,7 @@ test "TcpSendBuffer allocation profile" {
 
 test "MiniNat TCP send slab checks out and recycles without allocation" {
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
-    var nat = MiniNat.init(counted.allocator(), testReply, null);
+    var nat = MiniNat.init(counted.allocator(), Reply.initRaw(testReply, null));
     defer {
         nat.deinitTcpSendPool();
         nat.udp_flows.deinit();
@@ -2036,7 +2034,7 @@ test "MiniNat TCP send slab checks out and recycles without allocation" {
 
 test "MiniNat first flow-table inserts allocation profile" {
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
-    var nat = MiniNat.init(counted.allocator(), testReply, null);
+    var nat = MiniNat.init(counted.allocator(), Reply.initRaw(testReply, null));
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();
@@ -2065,7 +2063,7 @@ test "MiniNat first flow-table inserts allocation profile" {
 
 test "MiniNat reserved flow tables fill without allocation" {
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
-    var nat = MiniNat.init(counted.allocator(), testReply, null);
+    var nat = MiniNat.init(counted.allocator(), Reply.initRaw(testReply, null));
     defer {
         nat.udp_flows.deinit();
         nat.tcp_flows.deinit();

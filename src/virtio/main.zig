@@ -7,6 +7,7 @@ pub const Queue = @import("queue.zig");
 pub const mmio = @import("mmio.zig");
 
 pub const Console = @import("console.zig").Console;
+pub const console = @import("console.zig");
 pub const Block = @import("blk.zig").Block;
 pub const blk = @import("blk.zig");
 pub const Input = @import("input.zig").Input;

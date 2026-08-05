@@ -11,6 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
@@ -18,6 +19,8 @@ const ring = @import("ring.zig");
 const virgl = @import("../gpu/virgl/main.zig");
 const gpu_module = @import("../gpu/main.zig");
 const iosurface = @import("../gpu/iosurface.zig");
+
+pub const FrameReady = callback_binding.Binding0(void);
 
 /// Venus (KosmicKrisp) GPU backend, opt-in via `-Dgpu-venus`. When disabled the
 /// import resolves to a stub so nothing links virglrenderer and the default
@@ -609,8 +612,7 @@ pub const Gpu = struct {
     guest_memory: ?ring.GetMemFn,
 
     /// Frame ready callback (scanout resource was flushed).
-    frame_callback: ?*const fn (userdata: ?*anyopaque) void,
-    frame_userdata: ?*anyopaque,
+    frame_ready: ?FrameReady,
 
     /// 3D (virgl) support: guest contexts + resources + command decode.
     virgl_enabled: bool,
@@ -734,8 +736,7 @@ pub const Gpu = struct {
             .display_width = 1280,
             .display_height = 800,
             .guest_memory = null,
-            .frame_callback = null,
-            .frame_userdata = null,
+            .frame_ready = null,
             .virgl_enabled = enable_virgl,
             .gpu_device = gpu_module.GpuDevice.init(alloc),
             .backing3d = std.AutoHashMap(u32, BackingEntries).init(alloc),
@@ -751,7 +752,7 @@ pub const Gpu = struct {
             .venus_mappings = std.AutoHashMap(u32, MapRecord).init(alloc),
         };
 
-        transport.setNotifyCallback(handleNotify, gpu);
+        transport.setNotifyCallback(mmio.bindNotify(Gpu, gpu, handleNotify));
 
         assert(gpu.transport.device_id == 16);
 
@@ -894,12 +895,8 @@ pub const Gpu = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Gpu,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Gpu, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Wire the host-visible memory window (Venus). `map`/`unmap` bridge host
@@ -923,13 +920,8 @@ pub const Gpu = struct {
     }
 
     /// Set frame ready callback.
-    pub fn setFrameCallback(
-        self: *Gpu,
-        callback: *const fn (?*anyopaque) void,
-        userdata: ?*anyopaque,
-    ) void {
-        self.frame_callback = callback;
-        self.frame_userdata = userdata;
+    pub fn setFrameCallback(self: *Gpu, frame_ready: FrameReady) void {
+        self.frame_ready = frame_ready;
     }
 
     pub fn presentationGeneration(self: *const Gpu) u64 {
@@ -1091,8 +1083,7 @@ pub const Gpu = struct {
         }
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Gpu = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Gpu, queue_idx: u32) void {
         switch (queue_idx) {
             0 => self.processControlQueue(),
             1 => self.processCursorQueue(),
@@ -1471,7 +1462,7 @@ pub const Gpu = struct {
         // SET_SCANOUT and never call RESOURCE_FLUSH, so without this the
         // frame callback only ever fired for the boot console.
         if (cmd.resource_id != 0) {
-            if (self.frame_callback) |cb| cb(self.frame_userdata);
+            if (self.frame_ready) |frame_ready| frame_ready.call();
         }
         return .resp_ok_nodata;
     }
@@ -1533,8 +1524,8 @@ pub const Gpu = struct {
             self.refresh3dScanout();
             self.frame_generation +%= 1; // content changed: renderer should present
             _ = self.presentation_generation.fetchAdd(1, .release);
-            if (self.frame_callback) |cb| {
-                cb(self.frame_userdata);
+            if (self.frame_ready) |frame_ready| {
+                frame_ready.call();
             }
         }
         return .resp_ok_nodata;
@@ -2983,7 +2974,7 @@ test "resizeDisplay flags the display event and raises config-change" {
         }
     };
     Line.level = false;
-    gpu.transport.setIrqCallback(Line.cb, null);
+    gpu.transport.setIrqCallback(mmio.Irq.initRaw(Line.cb, null));
 
     // Boot size = fbdev framebuffer allocation = the resize ceiling.
     gpu.setDisplaySize(2560, 1440);

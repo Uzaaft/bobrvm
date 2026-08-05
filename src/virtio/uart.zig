@@ -6,9 +6,13 @@
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const global = @import("../global.zig");
 
 const log = std.log.scoped(.uart);
+
+pub const Output = callback_binding.Binding1([]const u8, void);
+pub const Irq = callback_binding.Binding1(bool, void);
 
 /// PL011 register offsets.
 pub const Reg = struct {
@@ -54,12 +58,10 @@ pub const INT = struct {
 
 /// Simple UART state.
 pub const Uart = struct {
-    output_callback: ?*const fn (data: []const u8, userdata: ?*anyopaque) void = null,
-    output_userdata: ?*anyopaque = null,
+    output: ?Output = null,
 
     /// IRQ line callback (level-triggered).
-    irq_callback: ?*const fn (level: bool, userdata: ?*anyopaque) void = null,
-    irq_userdata: ?*anyopaque = null,
+    irq: ?Irq = null,
 
     // Registers
     cr: u32 = 0x0300, // Control: TX/RX enabled
@@ -85,22 +87,12 @@ pub const Uart = struct {
         return .{};
     }
 
-    pub fn setOutputCallback(
-        self: *Uart,
-        callback: *const fn (data: []const u8, userdata: ?*anyopaque) void,
-        userdata: ?*anyopaque,
-    ) void {
-        self.output_callback = callback;
-        self.output_userdata = userdata;
+    pub fn setOutputCallback(self: *Uart, output: Output) void {
+        self.output = output;
     }
 
-    pub fn setIrqCallback(
-        self: *Uart,
-        callback: *const fn (level: bool, userdata: ?*anyopaque) void,
-        userdata: ?*anyopaque,
-    ) void {
-        self.irq_callback = callback;
-        self.irq_userdata = userdata;
+    pub fn setIrqCallback(self: *Uart, irq: Irq) void {
+        self.irq = irq;
     }
 
     /// Queue host input for the guest. Drops bytes if the FIFO is full.
@@ -144,8 +136,8 @@ pub const Uart = struct {
         const level = (self.ris() & self.imsc) != 0;
         if (level == self.irq_level) return;
         self.irq_level = level;
-        if (self.irq_callback) |cb| {
-            cb(level, self.irq_userdata);
+        if (self.irq) |irq| {
+            irq.call(level);
         }
     }
 
@@ -188,8 +180,8 @@ pub const Uart = struct {
             Reg.UARTDR => {
                 // TX data - output the character
                 const char: u8 = @truncate(value);
-                if (self.output_callback) |cb| {
-                    cb(&[_]u8{char}, self.output_userdata);
+                if (self.output) |output| {
+                    output.call(&[_]u8{char});
                 }
             },
             Reg.UARTRSR => {}, // Clear errors (ignore)
@@ -254,7 +246,7 @@ test "Uart IRQ line follows mask" {
             level = l;
         }
     };
-    uart.setIrqCallback(Ctx.cb, null);
+    uart.setIrqCallback(Irq.initRaw(Ctx.cb, null));
 
     // Input with RX masked: no IRQ
     uart.queueInput("x");

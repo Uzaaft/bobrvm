@@ -228,7 +228,7 @@ pub const Snd = struct {
             .guest_memory = null,
         };
 
-        transport.setNotifyCallback(handleNotify, snd);
+        transport.setNotifyCallback(mmio.bindNotify(Snd, snd, handleNotify));
 
         assert(snd.transport.device_id == 25);
         return snd;
@@ -244,12 +244,8 @@ pub const Snd = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Snd,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Snd, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Set the playback backend (defaults to a silent sink).
@@ -284,8 +280,7 @@ pub const Snd = struct {
         return 0;
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Snd = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Snd, queue_idx: u32) void {
         switch (queue_idx) {
             CONTROLQ => self.processControlQueue(),
             TXQ => self.processTxQueue(),

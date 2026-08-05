@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
@@ -46,7 +47,7 @@ pub const Config = extern struct {
 /// Frame sink for guest → host traffic. The frame is borrowed only for the
 /// callback duration. The callback may run on the vCPU thread; backends queue
 /// replies via queueRxFrame.
-pub const TxCallback = *const fn (frame: []const u8, userdata: ?*anyopaque) void;
+pub const Tx = callback_binding.Binding1([]const u8, void);
 
 const RxFrame = packed struct(u32) {
     storage_index: u10,
@@ -100,8 +101,7 @@ pub const Net = struct {
     guest_memory: ?ring.GetMemFn,
 
     /// Guest → host frame sink.
-    tx_callback: ?TxCallback,
-    tx_userdata: ?*anyopaque,
+    tx: ?Tx,
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
@@ -139,8 +139,7 @@ pub const Net = struct {
             .rx_free_head = 0,
             .rx_mutex = .init,
             .guest_memory = null,
-            .tx_callback = null,
-            .tx_userdata = null,
+            .tx = null,
         };
         for (&net.rx_storage, 0..) |*storage, index| {
             storage.* = .{
@@ -155,7 +154,7 @@ pub const Net = struct {
         }
 
         net.transport.initEmbedded(1, features, &net.transport_queues); // 1 = net device ID
-        net.transport.setNotifyCallback(handleNotify, net);
+        net.transport.setNotifyCallback(mmio.bindNotify(Net, net, handleNotify));
 
         assert(net.transport.device_id == 1);
         assert(@sizeOf(RxFrame) == 4);
@@ -177,17 +176,12 @@ pub const Net = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Net,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Net, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
-    pub fn setTxCallback(self: *Net, callback: TxCallback, userdata: ?*anyopaque) void {
-        self.tx_callback = callback;
-        self.tx_userdata = userdata;
+    pub fn setTxCallback(self: *Net, tx: Tx) void {
+        self.tx = tx;
     }
 
     /// Queue a frame for delivery to the guest. Thread-safe; the frame
@@ -294,8 +288,7 @@ pub const Net = struct {
         return 0;
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Net = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Net, queue_idx: u32) void {
         switch (queue_idx) {
             0 => self.processRx(),
             1 => self.processTx(),
@@ -343,7 +336,7 @@ pub const Net = struct {
                 const frame = mem[@sizeOf(NetHeader)..];
                 assert(frame.len > 0);
                 assert(frame.len <= MAX_FRAME);
-                if (self.tx_callback) |cb| cb(frame, self.tx_userdata);
+                if (self.tx) |tx| tx.call(frame);
                 return;
             }
         }
@@ -358,7 +351,7 @@ pub const Net = struct {
                 const frame = get_mem(frame_desc.addr, frame_desc.len) orelse return;
                 assert(frame.len > 0);
                 assert(frame.len <= MAX_FRAME);
-                if (self.tx_callback) |cb| cb(frame, self.tx_userdata);
+                if (self.tx) |tx| tx.call(frame);
                 return;
             }
         }
@@ -391,8 +384,8 @@ pub const Net = struct {
         }
 
         if (frame_len == 0) return;
-        if (self.tx_callback) |cb| {
-            cb(frame_buf[0..frame_len], self.tx_userdata);
+        if (self.tx) |tx| {
+            tx.call(frame_buf[0..frame_len]);
         }
     }
 
@@ -710,7 +703,7 @@ fn testTxSplitCallback(frame: []const u8, _: ?*anyopaque) void {
 test "Net sends a contiguous TX payload without copying" {
     const net = try Net.init(testing.allocator);
     defer net.deinit();
-    net.setTxCallback(testTxCallback, null);
+    net.setTxCallback(Tx.initRaw(testTxCallback, null));
 
     var chain: ring.Chain = .{};
     chain.descs[0] = .{ .addr = 0x1000, .len = test_tx_memory.len, .flags = 0, .next = 0 };
@@ -726,7 +719,7 @@ test "Net sends a contiguous TX payload without copying" {
 test "Net borrows a split-header TX payload without copying" {
     const net = try Net.init(testing.allocator);
     defer net.deinit();
-    net.setTxCallback(testTxSplitCallback, null);
+    net.setTxCallback(Tx.initRaw(testTxSplitCallback, null));
 
     var chain: ring.Chain = .{};
     chain.descs[0] = .{ .addr = 0x1000, .len = test_tx_split_header.len, .flags = 0, .next = 1 };

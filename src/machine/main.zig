@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
 const thread_compat = @import("../compat/thread.zig");
@@ -219,13 +220,9 @@ const VirtioMmioDevice = union(enum) {
         }
     }
 
-    fn setIrqCallback(
-        self: VirtioMmioDevice,
-        callback: virtio.mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
+    fn setIrqCallback(self: VirtioMmioDevice, irq: virtio.mmio.Irq) void {
         switch (self) {
-            inline else => |device| device.setIrqCallback(callback, userdata),
+            inline else => |device| device.setIrqCallback(irq),
         }
     }
 
@@ -646,15 +643,13 @@ pub const Machine = struct {
         self.kickCpu(0);
     }
 
-    fn vdagentSendCallback(data: []const u8, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn vdagentSend(self: *Machine, data: []const u8) void {
         const console = self.console orelse return;
         console.queuePortInput(SPICE_PORT, data) catch {};
         self.kickCpu(0);
     }
 
-    fn vdagentFeedCallback(data: []const u8, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn vdagentFeed(self: *Machine, data: []const u8) void {
         if (self.vdagent) |*v| v.feed(data);
     }
 
@@ -669,10 +664,10 @@ pub const Machine = struct {
         userdata: ?*anyopaque,
     ) void {
         if (self.vdagent) |*v| {
-            v.on_guest_clipboard = on_guest_clipboard;
-            v.on_guest_clipboard_userdata = userdata;
-            v.request_host_clipboard = request_host_clipboard;
-            v.request_host_clipboard_userdata = userdata;
+            v.setClipboardHandlers(
+                agent.vdagent.GuestClipboard.initRaw(on_guest_clipboard, userdata),
+                agent.vdagent.HostClipboardRequest.initRaw(request_host_clipboard, userdata),
+            );
         }
     }
 
@@ -687,16 +682,14 @@ pub const Machine = struct {
     }
 
     /// Send bytes to the guest agent port (host→guest). Thread-safe.
-    fn qgaSendCallback(data: []const u8, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn qgaSend(self: *Machine, data: []const u8) void {
         const console = self.console orelse return;
         console.queuePortInput(QGA_PORT, data) catch {};
         self.kickCpu(0);
     }
 
     /// Guest agent port output (guest→host); runs on the vCPU thread.
-    fn qgaFeedCallback(data: []const u8, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn qgaFeed(self: *Machine, data: []const u8) void {
         if (self.qga) |*q| q.feed(data);
     }
 
@@ -2033,9 +2026,13 @@ pub const Machine = struct {
         // Initialize UART (PL011 for earlycon)
         self.uart = virtio.Uart.init();
         if (self.console_output) |cb| {
-            self.uart.setOutputCallback(cb, self.console_userdata);
+            self.uart.setOutputCallback(
+                virtio.uart.Output.initRaw(cb, self.console_userdata),
+            );
         }
-        self.uart.setIrqCallback(uartIrqCallback, self);
+        self.uart.setIrqCallback(
+            callback_binding.Handler1(Machine, bool, void, uartIrqCallback).bind(self),
+        );
         log.debug("initialized UART at 0x{x}", .{MemoryLayout.UART_BASE});
 
         self.rtc = virtio.Rtc.init();
@@ -2050,7 +2047,9 @@ pub const Machine = struct {
             "org.qemu.guest_agent.0",
         });
         if (self.console_output) |cb| {
-            self.console.?.setOutputCallback(cb, self.console_userdata);
+            self.console.?.setOutputCallback(
+                virtio.console.Output.initRaw(cb, self.console_userdata),
+            );
         }
         // Set up IRQ callback - virtio console is SPI 32 (intid 32)
         self.registerVirtioMmioDevice(
@@ -2061,12 +2060,24 @@ pub const Machine = struct {
         log.debug("initialized virtio-console at 0x{x}", .{MemoryLayout.virtioBase(0)});
 
         // qemu-guest-agent channel on the second named port.
-        self.qga = agent.Qga.init(self.alloc, qgaSendCallback, self);
-        self.console.?.setPortOutput(QGA_PORT, qgaFeedCallback, self);
+        self.qga = agent.Qga.init(
+            self.alloc,
+            callback_binding.Handler1(Machine, []const u8, void, qgaSend).bind(self),
+        );
+        self.console.?.setPortOutput(
+            QGA_PORT,
+            callback_binding.Handler1(Machine, []const u8, void, qgaFeed).bind(self),
+        );
 
         // spice-vdagent clipboard channel on the first named port.
-        self.vdagent = agent.Vdagent.init(self.alloc, vdagentSendCallback, self);
-        self.console.?.setPortOutput(SPICE_PORT, vdagentFeedCallback, self);
+        self.vdagent = agent.Vdagent.init(
+            self.alloc,
+            callback_binding.Handler1(Machine, []const u8, void, vdagentSend).bind(self),
+        );
+        self.console.?.setPortOutput(
+            SPICE_PORT,
+            callback_binding.Handler1(Machine, []const u8, void, vdagentFeed).bind(self),
+        );
 
         // Initialize primary block device (slot 1) if disk_path is set
         if (self.config.disk_path) |disk_path| {
@@ -2130,7 +2141,9 @@ pub const Machine = struct {
                 gpuIrqCallback,
             );
             if (self.frame_callback) |cb| {
-                self.gpu.?.setFrameCallback(cb, self.frame_userdata);
+                self.gpu.?.setFrameCallback(
+                    virtio.gpu.FrameReady.initRaw(cb, self.frame_userdata),
+                );
             }
             log.debug("initialized virtio-gpu at 0x{x} (slot {}, {}x{})", .{
                 MemoryLayout.virtioBase(self.gpu_slot),
@@ -2172,9 +2185,32 @@ pub const Machine = struct {
                 .{ .net = self.net.? },
                 netIrqCallback,
             );
-            self.nat = mininat.MiniNat.init(self.alloc, natReplyCallback, self);
-            self.nat.setReplyLease(natReplyReserveCallback, natReplyCommitCallback);
-            self.nat.setRxReady(natRxReadyCallback, self);
+            self.nat = mininat.MiniNat.init(
+                self.alloc,
+                callback_binding.Handler1(
+                    Machine,
+                    []const u8,
+                    void,
+                    natReplyCallback,
+                ).bind(self),
+            );
+            self.nat.setReplyLease(
+                callback_binding.Handler1(
+                    Machine,
+                    usize,
+                    ?mininat.ReplyLease,
+                    natReplyReserveCallback,
+                ).bind(self),
+                callback_binding.Handler1(
+                    Machine,
+                    mininat.ReplyLease,
+                    void,
+                    natReplyCommitCallback,
+                ).bind(self),
+            );
+            self.nat.setRxReady(
+                callback_binding.Handler0(Machine, bool, natRxReadyCallback).bind(self),
+            );
             for (self.config.forwards) |fwd| {
                 self.nat.addForward(fwd) catch |err| {
                     log.err("port forward {}->{} failed: {} (port in use?)", .{
@@ -2183,7 +2219,9 @@ pub const Machine = struct {
                 };
             }
             try self.nat.start();
-            self.net.?.setTxCallback(netTxCallback, self);
+            self.net.?.setTxCallback(
+                callback_binding.Handler1(Machine, []const u8, void, netTxCallback).bind(self),
+            );
             log.debug("initialized virtio-net at slot {} (built-in NAT)", .{self.net_slot});
         }
 
@@ -2244,12 +2282,14 @@ pub const Machine = struct {
         self: *Machine,
         slot: u8,
         device: VirtioMmioDevice,
-        irq_callback: virtio.mmio.IrqFn,
+        comptime irq_handler: fn (*Machine, bool) void,
     ) void {
         assert(slot < self.mmio_devices.len);
         assert(self.mmio_devices[slot] == null);
         device.setGuestMemory(getGuestMemoryWrapper);
-        device.setIrqCallback(irq_callback, self);
+        device.setIrqCallback(
+            callback_binding.Handler1(Machine, bool, void, irq_handler).bind(self),
+        );
         self.mmio_devices[slot] = device;
     }
 
@@ -2309,7 +2349,7 @@ pub const Machine = struct {
         device.bar0_addr = bar0_addr;
         device.transport.setDeviceConfig(std.mem.asBytes(&blk.config));
         device.transport.setNotifyCallback(notify, self);
-        blk.transport.setIrqCallback(irq, self);
+        blk.transport.setIrqCallback(virtio.mmio.Irq.initRaw(irq, self));
 
         const ecam_device = pci.PciDevice{ .config = device.config, .present = true };
         try self.ecam_host.?.addDevice(slot, 0, ecam_device);
@@ -2335,7 +2375,9 @@ pub const Machine = struct {
         self.pci_gpu.?.bar0_addr = bar0_addr;
         self.pci_gpu.?.transport.setDeviceConfig(std.mem.asBytes(&gpu_dev.config));
         self.pci_gpu.?.transport.setNotifyCallback(pciGpuNotify, self);
-        gpu_dev.transport.setIrqCallback(pciGpuBackendIrq, self);
+        gpu_dev.transport.setIrqCallback(
+            virtio.mmio.Irq.initRaw(pciGpuBackendIrq, self),
+        );
 
         const ecam_dev = pci.PciDevice{ .config = self.pci_gpu.?.config, .present = true };
         try self.ecam_host.?.addDevice(2, 0, ecam_dev);
@@ -2855,32 +2897,28 @@ pub const Machine = struct {
         return ram[ram_offset..][0..len];
     }
 
-    fn consoleIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn consoleIrqCallback(self: *Machine, level: bool) void {
         // DTB declares virtio slot 0 as GIC_SPI 32 → intid 32 + 32 = 64.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64, level);
         }
     }
 
-    fn blk1IrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn blk1IrqCallback(self: *Machine, level: bool) void {
         // DTB declares virtio slot 1 as GIC_SPI 33 → intid 32 + 33 = 65.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(65, level);
         }
     }
 
-    fn blk2IrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn blk2IrqCallback(self: *Machine, level: bool) void {
         // DTB declares virtio slot 2 as GIC_SPI 34 → intid 32 + 34 = 66.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(66, level);
         }
     }
 
-    fn gpuIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn gpuIrqCallback(self: *Machine, level: bool) void {
         // Virtio slot N is GIC_SPI 32+N → intid 64 + N.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.gpu_slot), level);
@@ -2909,50 +2947,43 @@ pub const Machine = struct {
         vm.unmap(guest_pa, size) catch {};
     }
 
-    fn rngIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn rngIrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.rng_slot), level);
         }
     }
 
-    fn p9IrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn p9IrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.p9_slot), level);
         }
     }
 
-    fn balloonIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn balloonIrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.balloon_slot), level);
         }
     }
 
-    fn sndIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn sndIrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.snd_slot), level);
         }
     }
 
-    fn keyboardIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn keyboardIrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.keyboard_slot), level);
         }
     }
 
-    fn mouseIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn mouseIrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.mouse_slot), level);
         }
     }
 
-    fn netIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn netIrqCallback(self: *Machine, level: bool) void {
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(64 + @as(u32, self.net_slot), level);
         }
@@ -2960,24 +2991,18 @@ pub const Machine = struct {
 
     /// Guest → host frame: hand to the NAT responder (vCPU thread,
     /// machine lock held).
-    fn netTxCallback(frame: []const u8, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn netTxCallback(self: *Machine, frame: []const u8) void {
         self.nat.handleFrame(frame);
     }
 
     /// NAT responder → guest frame.
-    fn natReplyCallback(frame: []const u8, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn natReplyCallback(self: *Machine, frame: []const u8) void {
         if (self.net) |net| net.queueRxFrame(frame);
     }
 
-    fn natReplyReserveCallback(
-        frame_len: usize,
-        userdata: ?*anyopaque,
-    ) ?mininat.ReplyLease {
+    fn natReplyReserveCallback(self: *Machine, frame_len: usize) ?mininat.ReplyLease {
         assert(frame_len > 0);
         assert(frame_len <= virtio.Net.MAX_FRAME);
-        const self: *Machine = @ptrCast(@alignCast(userdata));
         const net = self.net orelse return null;
         const reservation = net.reserveRxFrame(frame_len) orelse return null;
         return .{
@@ -2986,10 +3011,9 @@ pub const Machine = struct {
         };
     }
 
-    fn natReplyCommitCallback(lease: mininat.ReplyLease, userdata: ?*anyopaque) void {
+    fn natReplyCommitCallback(self: *Machine, lease: mininat.ReplyLease) void {
         assert(lease.frame.len > 0);
         assert(lease.token <= std.math.maxInt(u16));
-        const self: *Machine = @ptrCast(@alignCast(userdata));
         const net = self.net orelse unreachable;
         net.commitRxFrame(.{
             .bytes = lease.frame,
@@ -2998,14 +3022,12 @@ pub const Machine = struct {
     }
 
     /// NAT back-pressure: true while the guest RX queue has headroom.
-    fn natRxReadyCallback(userdata: ?*anyopaque) bool {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn natRxReadyCallback(self: *Machine) bool {
         if (self.net) |net| return net.rxReady();
         return true;
     }
 
-    fn uartIrqCallback(level: bool, userdata: ?*anyopaque) void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
+    fn uartIrqCallback(self: *Machine, level: bool) void {
         // DTB declares the PL011 as GIC_SPI 1 → intid 32 + 1 = 33.
         if (self.gic_device) |gic_dev| {
             gic_dev.setSpiPending(33, level);
@@ -3122,7 +3144,7 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    try testing.expect(@sizeOf(Machine) <= 6152);
+    try testing.expect(@sizeOf(Machine) <= 6224);
 }
 
 test "stop before synchronous thread entry cancels startup" {

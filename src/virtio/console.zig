@@ -9,11 +9,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const global = @import("../global.zig");
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
 const log = std.log.scoped(.virtio_console);
+
+pub const Output = callback_binding.Binding1([]const u8, void);
 
 /// Console feature bits.
 pub const Features = struct {
@@ -137,8 +140,7 @@ const Port = struct {
     /// shows up in the guest at /sys/class/virtio-ports/vportXpY/name.
     name: []const u8,
     /// Guest→host data sink; unset means data is dropped.
-    output_callback: ?*const fn ([]const u8, ?*anyopaque) void = null,
-    output_userdata: ?*anyopaque = null,
+    output: ?Output = null,
     /// Host→guest bytes awaiting rx buffers. Guarded by the console's
     /// input_mutex (same append-on-host-thread/drain-on-vCPU pattern).
     input_buffer: InputBuffer = .{},
@@ -165,8 +167,7 @@ pub const Console = struct {
     input_mutex: std.Io.Mutex,
 
     /// Callback for output data.
-    output_callback: ?*const fn (data: []const u8, userdata: ?*anyopaque) void,
-    output_userdata: ?*anyopaque,
+    output: ?Output,
 
     /// Guest memory accessor.
     guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
@@ -252,8 +253,7 @@ pub const Console = struct {
             .output_buffer = .empty,
             .input_buffer = .{},
             .input_mutex = .init,
-            .output_callback = null,
-            .output_userdata = null,
+            .output = null,
             .guest_memory = null,
             .ports = ports,
         };
@@ -263,7 +263,7 @@ pub const Console = struct {
 
         // Set up notification callback
         console.transport.initEmbedded(3, features, queues);
-        console.transport.setNotifyCallback(handleNotify, console);
+        console.transport.setNotifyCallback(mmio.bindNotify(Console, console, handleNotify));
 
         // Post-condition
         assert(console.transport.device_id == 3); // console device ID
@@ -285,12 +285,10 @@ pub const Console = struct {
     pub fn setPortOutput(
         self: *Console,
         id: u32,
-        callback: *const fn ([]const u8, ?*anyopaque) void,
-        userdata: ?*anyopaque,
+        output: Output,
     ) void {
         assert(id >= 1 and id <= self.ports.len);
-        self.ports[id - 1].output_callback = callback;
-        self.ports[id - 1].output_userdata = userdata;
+        self.ports[id - 1].output = output;
     }
 
     /// Queue host→guest data for multiport port `id` (1-based). Same
@@ -310,13 +308,8 @@ pub const Console = struct {
     }
 
     /// Set output callback (called when guest writes to console).
-    pub fn setOutputCallback(
-        self: *Console,
-        callback: *const fn ([]const u8, ?*anyopaque) void,
-        userdata: ?*anyopaque,
-    ) void {
-        self.output_callback = callback;
-        self.output_userdata = userdata;
+    pub fn setOutputCallback(self: *Console, output: Output) void {
+        self.output = output;
     }
 
     /// Set guest memory accessor.
@@ -327,12 +320,8 @@ pub const Console = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Console,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Console, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Queue input data to send to guest. Called from the host input
@@ -375,14 +364,13 @@ pub const Console = struct {
         // Emergency write (single character output)
         if (offset == @offsetOf(Config, "emerg_wr")) {
             const char: u8 = @truncate(value);
-            if (self.output_callback) |cb| {
-                cb(&[_]u8{char}, self.output_userdata);
+            if (self.output) |output| {
+                output.call(&[_]u8{char});
             }
         }
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Console = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Console, queue_idx: u32) void {
         switch (queue_idx) {
             0 => {
                 self.processReceiveQueue();
@@ -530,7 +518,7 @@ pub const Console = struct {
             for (chain.slice()) |desc| {
                 if (desc.isWrite()) continue;
                 const data = get_mem(desc.addr, desc.len) orelse continue;
-                if (port.output_callback) |cb| cb(data, port.output_userdata);
+                if (port.output) |output| output.call(data);
             }
             ring.pushUsed(qc, head, 0, get_mem);
             self.mp_last_avail[qidx] +%= 1;
@@ -763,8 +751,8 @@ pub const Console = struct {
 
             // Read data buffer from guest memory
             if (get_mem(buf_addr, buf_len)) |data| {
-                if (self.output_callback) |cb| {
-                    cb(data, self.output_userdata);
+                if (self.output) |output| {
+                    output.call(data);
                 }
                 total_len += buf_len;
             }
@@ -973,7 +961,10 @@ test "Console multiport: handshake announces and names ports" {
 
     // Guest→host: port-1 tx (idx 5) reaches the port sink.
     defer test_port_out.deinit(std.testing.allocator);
-    console.setPortOutput(1, testPortSink, null);
+    console.setPortOutput(
+        1,
+        Output.initRaw(testPortSink, null),
+    );
     const P1_TX: u64 = 0xB000;
     setupTestQueue(console, 5, P1_TX);
     @memcpy(TestMem.get(0xC000, 4).?, "pong");

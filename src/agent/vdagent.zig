@@ -19,10 +19,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const callback = @import("../callback.zig");
 
 const log = std.log.scoped(.vdagent);
 
-pub const SendFn = *const fn (data: []const u8, userdata: ?*anyopaque) void;
+pub const Send = callback.Binding1([]const u8, void);
+pub const GuestClipboard = callback.Binding1([]const u8, void);
+pub const HostClipboardRequest = callback.Binding0(void);
 
 /// VDIChunkHeader routing port (client-originated traffic).
 const VDP_CLIENT_PORT: u32 = 1;
@@ -55,8 +58,7 @@ const PROTOCOL: u32 = 1;
 
 pub const Vdagent = struct {
     alloc: Allocator,
-    send_fn: SendFn,
-    send_userdata: ?*anyopaque,
+    send: Send,
 
     /// Raw inbound byte stream (chunk headers + payloads, reassembled).
     in_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -69,21 +71,28 @@ pub const Vdagent = struct {
     guest_owns_clipboard: bool = false,
 
     /// Guest copied text; host should set its pasteboard.
-    on_guest_clipboard: ?*const fn (text: []const u8, userdata: ?*anyopaque) void = null,
-    on_guest_clipboard_userdata: ?*anyopaque = null,
+    on_guest_clipboard: ?GuestClipboard = null,
     /// Guest wants the host clipboard; owner responds with sendClipboard().
-    request_host_clipboard: ?*const fn (userdata: ?*anyopaque) void = null,
-    request_host_clipboard_userdata: ?*anyopaque = null,
+    request_host_clipboard: ?HostClipboardRequest = null,
 
     pub const BUF_MAX: usize = 4 * 1024 * 1024;
 
-    pub fn init(alloc: Allocator, send_fn: SendFn, userdata: ?*anyopaque) Vdagent {
-        return .{ .alloc = alloc, .send_fn = send_fn, .send_userdata = userdata };
+    pub fn init(alloc: Allocator, send: Send) Vdagent {
+        return .{ .alloc = alloc, .send = send };
     }
 
     pub fn deinit(self: *Vdagent) void {
         self.in_buf.deinit(self.alloc);
         self.msg_buf.deinit(self.alloc);
+    }
+
+    pub fn setClipboardHandlers(
+        self: *Vdagent,
+        on_guest_clipboard: GuestClipboard,
+        request_host_clipboard: HostClipboardRequest,
+    ) void {
+        self.on_guest_clipboard = on_guest_clipboard;
+        self.request_host_clipboard = request_host_clipboard;
     }
 
     /// Frame and send one VDAgentMessage, split into <=2048-byte chunks.
@@ -134,7 +143,7 @@ pub const Vdagent = struct {
                 }
             }
             std.debug.assert(copied == chunk_len);
-            self.send_fn(chunk[0 .. 8 + chunk_len], self.send_userdata);
+            self.send.call(chunk[0 .. 8 + chunk_len]);
             remaining -= chunk_len;
         }
     }
@@ -243,16 +252,16 @@ pub const Vdagent = struct {
                 const kind = std.mem.readInt(u32, payload[0..4], .little);
                 if (kind != CLIP_UTF8_TEXT) return;
                 log.info("guest clipboard: {} bytes", .{payload.len - 4});
-                if (self.on_guest_clipboard) |cb| {
-                    cb(payload[4..], self.on_guest_clipboard_userdata);
+                if (self.on_guest_clipboard) |binding| {
+                    binding.call(payload[4..]);
                 }
             },
             .clipboard_request => {
                 if (payload.len < 4) return;
                 const kind = std.mem.readInt(u32, payload[0..4], .little);
                 if (kind != CLIP_UTF8_TEXT) return;
-                if (self.request_host_clipboard) |cb| {
-                    cb(self.request_host_clipboard_userdata);
+                if (self.request_host_clipboard) |binding| {
+                    binding.call();
                 }
             },
             .clipboard_release => self.guest_owns_clipboard = false,
@@ -312,7 +321,7 @@ fn testHostReq(_: ?*anyopaque) void {
 test "vdagent: caps handshake replies with by-demand clipboard" {
     defer clearSent();
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
-    var vd = Vdagent.init(counted.allocator(), testSend, null);
+    var vd = Vdagent.init(counted.allocator(), Send.initRaw(testSend, null));
     defer vd.deinit();
 
     var caps_payload: [8]u8 = undefined;
@@ -340,9 +349,9 @@ test "vdagent: guest grab triggers request; clipboard data reaches callback" {
         test_guest_clip.deinit(testing.allocator);
         test_guest_clip = .empty;
     }
-    var vd = Vdagent.init(testing.allocator, testSend, null);
+    var vd = Vdagent.init(testing.allocator, Send.initRaw(testSend, null));
     defer vd.deinit();
-    vd.on_guest_clipboard = testGuestClip;
+    vd.on_guest_clipboard = GuestClipboard.initRaw(testGuestClip, null);
 
     // GRAB offering [png, utf8] → we must REQUEST utf8.
     var grab: [8]u8 = undefined;
@@ -371,9 +380,9 @@ test "vdagent: guest grab triggers request; clipboard data reaches callback" {
 
 test "vdagent: host grab + guest request + data delivery" {
     defer clearSent();
-    var vd = Vdagent.init(testing.allocator, testSend, null);
+    var vd = Vdagent.init(testing.allocator, Send.initRaw(testSend, null));
     defer vd.deinit();
-    vd.request_host_clipboard = testHostReq;
+    vd.request_host_clipboard = HostClipboardRequest.initRaw(testHostReq, null);
     test_host_requested = false;
 
     // Channel not live yet: grab is a no-op.
@@ -404,7 +413,7 @@ test "vdagent: host grab + guest request + data delivery" {
 test "vdagent: large message splits into 2048-byte chunks" {
     defer clearSent();
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
-    var vd = Vdagent.init(counted.allocator(), testSend, null);
+    var vd = Vdagent.init(counted.allocator(), Send.initRaw(testSend, null));
     defer vd.deinit();
 
     const big = try testing.allocator.alloc(u8, 5000);

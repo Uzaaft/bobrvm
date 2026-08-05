@@ -13,15 +13,15 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const callback = @import("../callback.zig");
 
 const log = std.log.scoped(.qga);
 
-pub const SendFn = *const fn (data: []const u8, userdata: ?*anyopaque) void;
+pub const Send = callback.Binding1([]const u8, void);
 
 pub const Qga = struct {
     alloc: Allocator,
-    send_fn: SendFn,
-    send_userdata: ?*anyopaque,
+    sender: Send,
 
     /// Partial-line assembly for guest→host responses.
     line_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -35,8 +35,8 @@ pub const Qga = struct {
     pub const LINE_MAX: usize = 64 * 1024;
     const parse_scratch_bytes = 8 * 1024;
 
-    pub fn init(alloc: Allocator, send_fn: SendFn, userdata: ?*anyopaque) Qga {
-        return .{ .alloc = alloc, .send_fn = send_fn, .send_userdata = userdata };
+    pub fn init(alloc: Allocator, sender: Send) Qga {
+        return .{ .alloc = alloc, .sender = sender };
     }
 
     pub fn deinit(self: *Qga) void {
@@ -45,7 +45,7 @@ pub const Qga = struct {
     }
 
     fn send(self: *Qga, json: []const u8) void {
-        self.send_fn(json, self.send_userdata);
+        self.sender.call(json);
     }
 
     /// guest-sync: flushes the guest's parser state; the response echoes
@@ -217,7 +217,7 @@ test "qga: commands serialize as newline-delimited JSON" {
         test_sent = .empty;
         test_send_calls = 0;
     }
-    var qga = Qga.init(testing.allocator, testSend, null);
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
     defer qga.deinit();
 
     qga.sync(42);
@@ -233,7 +233,7 @@ test "qga: commands serialize as newline-delimited JSON" {
 }
 
 test "qga: feed parses split responses and sync ids" {
-    var qga = Qga.init(testing.allocator, testSend, null);
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
     defer qga.deinit();
 
     // Response arrives split across feeds, plus a trailing partial line.
@@ -252,7 +252,7 @@ test "qga: feed parses split responses and sync ids" {
 
 test "qga: partial line assembly allocation profile" {
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
-    var qga = Qga.init(counted.allocator(), testSend, null);
+    var qga = Qga.init(counted.allocator(), Send.initRaw(testSend, null));
     defer qga.deinit();
     var input: [1024]u8 = @splat('x');
 
@@ -264,7 +264,7 @@ test "qga: partial line assembly allocation profile" {
 }
 
 test "qga: sync response JSON parse allocation profile" {
-    var qga = Qga.init(testing.allocator, testSend, null);
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
     defer qga.deinit();
     try qga.line_buf.ensureTotalCapacity(testing.allocator, 64);
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
@@ -279,7 +279,7 @@ test "qga: sync response JSON parse allocation profile" {
 }
 
 test "qga: guest-network-get-interfaces parses ipv4 addresses" {
-    var qga = Qga.init(testing.allocator, testSend, null);
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
     defer qga.deinit();
 
     qga.feed("{\"return\": [" ++

@@ -65,7 +65,7 @@ pub const Balloon = struct {
         };
 
         balloon.transport.initEmbedded(5, virtio_version_1, &balloon.transport_queues);
-        balloon.transport.setNotifyCallback(handleNotify, balloon);
+        balloon.transport.setNotifyCallback(mmio.bindNotify(Balloon, balloon, handleNotify));
 
         assert(balloon.transport.device_id == 5);
         return balloon;
@@ -80,12 +80,8 @@ pub const Balloon = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Balloon,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Balloon, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Set the target balloon size (in 4 KiB pages) and notify the guest via
@@ -123,8 +119,7 @@ pub const Balloon = struct {
         return 0;
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Balloon = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Balloon, queue_idx: u32) void {
         switch (queue_idx) {
             0 => self.processQueue(0, true), // inflateq
             1 => self.processQueue(1, false), // deflateq

@@ -253,7 +253,7 @@ pub const Input = struct {
         };
 
         input.transport.initEmbedded(18, virtio_version_1, &input.transport_queues);
-        input.transport.setNotifyCallback(handleNotify, input);
+        input.transport.setNotifyCallback(mmio.bindNotify(Input, input, handleNotify));
 
         assert(input.transport.device_id == 18);
 
@@ -272,12 +272,8 @@ pub const Input = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Input,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Input, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Set interrupt callback.
@@ -542,8 +538,7 @@ pub const Input = struct {
     // Event Delivery
     // =========================================================================
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Input = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Input, queue_idx: u32) void {
         switch (queue_idx) {
             0 => self.deliverEvents(),
             1 => self.processStatusQueue(),

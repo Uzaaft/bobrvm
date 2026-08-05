@@ -3,6 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 
 pub const REGION_SIZE: usize = 0x200;
 
@@ -10,7 +11,16 @@ pub const MAGIC: u32 = 0x74726976;
 
 pub const VERSION: u32 = 2;
 
-pub const IrqFn = *const fn (level: bool, userdata: ?*anyopaque) void;
+pub const Irq = callback_binding.Binding1(bool, void);
+pub const Notify = callback_binding.Binding1(u32, void);
+
+pub fn bindNotify(
+    comptime Context: type,
+    context: *Context,
+    comptime handler: fn (*Context, u32) void,
+) Notify {
+    return callback_binding.Handler1(Context, u32, void, handler).bind(context);
+}
 
 /// MMIO register offsets.
 pub const Reg = enum(u12) {
@@ -90,13 +100,11 @@ pub const Transport = struct {
     config_generation: u32,
 
     /// Callback for queue notifications.
-    notify_callback: ?*const fn (queue_idx: u32, userdata: ?*anyopaque) void,
-    notify_userdata: ?*anyopaque,
+    notify: ?Notify,
 
     /// Callback for the interrupt line (level-triggered): true while
     /// InterruptStatus is non-zero, false once the driver ACKs it all.
-    irq_callback: ?IrqFn,
-    irq_userdata: ?*anyopaque,
+    irq: ?Irq,
 
     /// Shared-memory region (VIRTIO_MMIO_SHM_*), selected by shm_sel. Only
     /// region 0 is used (virtio-gpu host-visible window for Venus blobs). A
@@ -188,10 +196,8 @@ pub const Transport = struct {
             .queues = queues,
             .interrupt_status = .{},
             .config_generation = 0,
-            .notify_callback = null,
-            .notify_userdata = null,
-            .irq_callback = null,
-            .irq_userdata = null,
+            .notify = null,
+            .irq = null,
         };
     }
 
@@ -205,23 +211,13 @@ pub const Transport = struct {
     }
 
     /// Set notification callback.
-    pub fn setNotifyCallback(
-        self: *Transport,
-        callback: *const fn (u32, ?*anyopaque) void,
-        userdata: ?*anyopaque,
-    ) void {
-        self.notify_callback = callback;
-        self.notify_userdata = userdata;
+    pub fn setNotifyCallback(self: *Transport, notify: Notify) void {
+        self.notify = notify;
     }
 
     /// Set IRQ line callback (for injecting interrupts to guest).
-    pub fn setIrqCallback(
-        self: *Transport,
-        callback: IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.irq_callback = callback;
-        self.irq_userdata = userdata;
+    pub fn setIrqCallback(self: *Transport, irq: Irq) void {
+        self.irq = irq;
     }
 
     /// Handle MMIO read.
@@ -278,8 +274,8 @@ pub const Transport = struct {
                 self.interrupt_status = @bitCast(@as(u32, @bitCast(self.interrupt_status)) & ~value);
                 // Deassert the (level) interrupt line once fully ACKed
                 if (@as(u32, @bitCast(self.interrupt_status)) == 0) {
-                    if (self.irq_callback) |cb| {
-                        cb(false, self.irq_userdata);
+                    if (self.irq) |irq| {
+                        irq.call(false);
                     }
                 }
             },
@@ -356,8 +352,8 @@ pub const Transport = struct {
     }
 
     fn handleNotify(self: *Transport, queue_idx: u32) void {
-        if (self.notify_callback) |cb| {
-            cb(queue_idx, self.notify_userdata);
+        if (self.notify) |notify| {
+            notify.call(queue_idx);
         }
     }
 
@@ -379,8 +375,8 @@ pub const Transport = struct {
     pub fn signalUsedBuffer(self: *Transport) void {
         self.interrupt_status.used_buffer = true;
         // Assert the (level) interrupt line
-        if (self.irq_callback) |cb| {
-            cb(true, self.irq_userdata);
+        if (self.irq) |irq| {
+            irq.call(true);
         }
     }
 
@@ -389,8 +385,8 @@ pub const Transport = struct {
         self.interrupt_status.config_change = true;
         self.config_generation +%= 1;
         // Assert the (level) interrupt line
-        if (self.irq_callback) |cb| {
-            cb(true, self.irq_userdata);
+        if (self.irq) |irq| {
+            irq.call(true);
         }
     }
 
@@ -447,7 +443,7 @@ test "Transport config change raises and ack clears the interrupt line" {
         }
     };
     var line = Line{};
-    transport.setIrqCallback(Line.cb, &line);
+    transport.setIrqCallback(Irq.initRaw(Line.cb, &line));
 
     const gen_before = transport.config_generation;
     transport.signalConfigChange();

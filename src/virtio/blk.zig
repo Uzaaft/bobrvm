@@ -200,7 +200,7 @@ pub const Block = struct {
 
         // Set up notification callback
         blk.transport.initEmbedded(2, features, &blk.transport_queues);
-        blk.transport.setNotifyCallback(handleNotify, blk);
+        blk.transport.setNotifyCallback(mmio.bindNotify(Block, blk, handleNotify));
 
         // Post-condition
         assert(blk.transport.device_id == 2); // block device ID
@@ -248,12 +248,8 @@ pub const Block = struct {
         self.guest_memory = accessor;
     }
 
-    pub fn setIrqCallback(
-        self: *Block,
-        callback: mmio.IrqFn,
-        userdata: ?*anyopaque,
-    ) void {
-        self.transport.setIrqCallback(callback, userdata);
+    pub fn setIrqCallback(self: *Block, irq: mmio.Irq) void {
+        self.transport.setIrqCallback(irq);
     }
 
     /// Set interrupt callback.
@@ -295,8 +291,7 @@ pub const Block = struct {
         // Config is read-only for block device
     }
 
-    fn handleNotify(queue_idx: u32, userdata: ?*anyopaque) void {
-        const self: *Block = @ptrCast(@alignCast(userdata));
+    fn handleNotify(self: *Block, queue_idx: u32) void {
         if (queue_idx == 0) {
             self.processRequestQueue();
         }
