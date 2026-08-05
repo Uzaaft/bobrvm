@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
+const comptime_contract = @import("../comptime.zig");
 
 pub const State = enum(u8) {
     stopped,
@@ -78,25 +79,22 @@ pub fn Runtime(comptime Backend: type) type {
 }
 
 fn validateBackend(comptime Backend: type) void {
-    const declarations = [_][]const u8{
-        "Config",
-        "InitError",
-        "StartError",
+    comptime_contract.requireDecl(Backend, "Config");
+    comptime_contract.requireDecl(Backend, "InitError");
+    comptime_contract.requireDecl(Backend, "StartError");
+    comptime_contract.requireFn(
+        Backend,
         "init",
-        "deinit",
-        "start",
-        "requestStop",
-        "pause",
-        "resumeVM",
-        "tick",
-        "state",
-        "displayView",
-    };
-    inline for (declarations) |name| {
-        if (!@hasDecl(Backend, name)) {
-            @compileError("guest runtime backend is missing declaration: " ++ name);
-        }
-    }
+        fn (*const Backend.Config) Backend.InitError!Backend,
+    );
+    comptime_contract.requireFn(Backend, "deinit", fn (*Backend) void);
+    comptime_contract.requireFn(Backend, "start", fn (*Backend) Backend.StartError!void);
+    comptime_contract.requireFn(Backend, "requestStop", fn (*Backend) void);
+    comptime_contract.requireFn(Backend, "pause", fn (*Backend) void);
+    comptime_contract.requireFn(Backend, "resumeVM", fn (*Backend) void);
+    comptime_contract.requireFn(Backend, "tick", fn (*Backend) void);
+    comptime_contract.requireFn(Backend, "state", fn (*Backend) ?State);
+    comptime_contract.requireFn(Backend, "displayView", fn (*Backend) ?*anyopaque);
 }
 
 test "runtime specializes lifecycle without a vtable" {
@@ -104,34 +102,34 @@ test "runtime specializes lifecycle without a vtable" {
         starts: u8 = 0,
         current: ?State = null,
 
-        const Config = struct {};
-        const InitError = error{};
-        const StartError = error{ InvalidState, StartFailed };
+        pub const Config = struct {};
+        pub const InitError = error{};
+        pub const StartError = error{ InvalidState, StartFailed };
 
-        fn init(_: *const Config) InitError!@This() {
+        pub fn init(_: *const Config) InitError!@This() {
             return .{};
         }
-        fn deinit(_: *@This()) void {}
-        fn start(self: *@This()) StartError!void {
+        pub fn deinit(_: *@This()) void {}
+        pub fn start(self: *@This()) StartError!void {
             self.starts += 1;
             self.current = .running;
         }
-        fn requestStop(self: *@This()) void {
+        pub fn requestStop(self: *@This()) void {
             self.current = .stopped;
         }
-        fn pause(self: *@This()) void {
+        pub fn pause(self: *@This()) void {
             self.current = .paused;
         }
-        fn resumeVM(self: *@This()) void {
+        pub fn resumeVM(self: *@This()) void {
             self.current = .running;
         }
-        fn tick(_: *@This()) void {}
-        fn state(self: *@This()) ?State {
+        pub fn tick(_: *@This()) void {}
+        pub fn state(self: *@This()) ?State {
             const result = self.current;
             self.current = null;
             return result;
         }
-        fn displayView(_: *@This()) ?*anyopaque {
+        pub fn displayView(_: *@This()) ?*anyopaque {
             return null;
         }
     };
