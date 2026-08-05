@@ -10,6 +10,8 @@ pub const MAGIC: u32 = 0x74726976;
 
 pub const VERSION: u32 = 2;
 
+pub const IrqFn = *const fn (level: bool, userdata: ?*anyopaque) void;
+
 /// MMIO register offsets.
 pub const Reg = enum(u12) {
     magic = 0x000,
@@ -93,7 +95,7 @@ pub const Transport = struct {
 
     /// Callback for the interrupt line (level-triggered): true while
     /// InterruptStatus is non-zero, false once the driver ACKs it all.
-    irq_callback: ?*const fn (level: bool, userdata: ?*anyopaque) void,
+    irq_callback: ?IrqFn,
     irq_userdata: ?*anyopaque,
 
     /// Shared-memory region (VIRTIO_MMIO_SHM_*), selected by shm_sel. Only
@@ -215,7 +217,7 @@ pub const Transport = struct {
     /// Set IRQ line callback (for injecting interrupts to guest).
     pub fn setIrqCallback(
         self: *Transport,
-        callback: *const fn (bool, ?*anyopaque) void,
+        callback: IrqFn,
         userdata: ?*anyopaque,
     ) void {
         self.irq_callback = callback;

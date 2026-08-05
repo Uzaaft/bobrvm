@@ -177,6 +177,14 @@ pub const Net = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Net,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     pub fn setTxCallback(self: *Net, callback: TxCallback, userdata: ?*anyopaque) void {
         self.tx_callback = callback;
         self.tx_userdata = userdata;

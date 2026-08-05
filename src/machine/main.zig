@@ -199,6 +199,49 @@ pub const MachineConfig = struct {
 // than 8, so the dispatch bound must cover the full reservation.
 const VIRTIO_SLOT_COUNT: u64 = 16;
 
+/// Closed set of devices routable through the virtio-mmio aperture. The
+/// `inline else` calls are monomorphized and make the shared device contract a
+/// compile-time requirement without introducing a vtable.
+const VirtioMmioDevice = union(enum) {
+    console: *virtio.Console,
+    block: *virtio.Block,
+    gpu: *virtio.Gpu,
+    input: *virtio.Input,
+    net: *virtio.Net,
+    rng: *virtio.Rng,
+    balloon: *virtio.Balloon,
+    snd: *virtio.Snd,
+    p9: *virtio.P9,
+
+    fn setGuestMemory(self: VirtioMmioDevice, accessor: *const fn (u64, usize) ?[]u8) void {
+        switch (self) {
+            inline else => |device| device.setGuestMemory(accessor),
+        }
+    }
+
+    fn setIrqCallback(
+        self: VirtioMmioDevice,
+        callback: virtio.mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        switch (self) {
+            inline else => |device| device.setIrqCallback(callback, userdata),
+        }
+    }
+
+    fn read(self: VirtioMmioDevice, offset: u12) u32 {
+        return switch (self) {
+            inline else => |device| device.read(offset),
+        };
+    }
+
+    fn write(self: VirtioMmioDevice, offset: u12, value: u32) void {
+        switch (self) {
+            inline else => |device| device.write(offset, value),
+        }
+    }
+};
+
 /// Console multiport ids for the agent ports (order matches the names
 /// passed to Console.init in initVirtioDevices).
 const SPICE_PORT: u32 = 1; // com.redhat.spice.0
@@ -255,6 +298,10 @@ pub const Machine = struct {
 
     /// Virtio console device.
     console: ?*virtio.Console = null,
+
+    /// Typed bus registration for every active virtio-mmio slot.
+    mmio_devices: [VIRTIO_SLOT_COUNT]?VirtioMmioDevice =
+        .{null} ** VIRTIO_SLOT_COUNT,
 
     /// Virtio block device (primary, slot 1).
     block: ?*virtio.Block = null,
@@ -408,6 +455,7 @@ pub const Machine = struct {
 
     pub fn deinit(self: *Machine) void {
         self.stop();
+        self.mmio_devices = .{null} ** VIRTIO_SLOT_COUNT;
 
         if (self.console) |console| {
             console.deinit();
@@ -1517,39 +1565,8 @@ pub const Machine = struct {
                 0;
             var result: u32 = 0;
 
-            if (self.gpu != null and slot == self.gpu_slot) {
-                const gpu_dev = self.gpu.?;
-                if (is_write) gpu_dev.write(offset, value) else result = gpu_dev.read(offset);
-            } else if (self.keyboard != null and slot == self.keyboard_slot) {
-                const kbd = self.keyboard.?;
-                if (is_write) kbd.write(offset, value) else result = kbd.read(offset);
-            } else if (self.mouse != null and slot == self.mouse_slot) {
-                const mouse = self.mouse.?;
-                if (is_write) mouse.write(offset, value) else result = mouse.read(offset);
-            } else if (self.net != null and slot == self.net_slot) {
-                const net = self.net.?;
-                if (is_write) net.write(offset, value) else result = net.read(offset);
-            } else if (self.rng != null and slot == self.rng_slot) {
-                const rng_dev = self.rng.?;
-                if (is_write) rng_dev.write(offset, value) else result = rng_dev.read(offset);
-            } else if (self.p9 != null and slot == self.p9_slot) {
-                const p9_dev = self.p9.?;
-                if (is_write) p9_dev.write(offset, value) else result = p9_dev.read(offset);
-            } else if (self.snd != null and slot == self.snd_slot) {
-                const snd_dev = self.snd.?;
-                if (is_write) snd_dev.write(offset, value) else result = snd_dev.read(offset);
-            } else if (self.balloon != null and slot == self.balloon_slot) {
-                const balloon_dev = self.balloon.?;
-                if (is_write) balloon_dev.write(offset, value) else result = balloon_dev.read(offset);
-            } else if (slot == 0 and self.console != null) {
-                const console = self.console.?;
-                if (is_write) console.write(offset, value) else result = console.read(offset);
-            } else if (slot == 1 and self.block != null) {
-                const blk = self.block.?;
-                if (is_write) blk.write(offset, value) else result = blk.read(offset);
-            } else if (slot == 2 and self.block2 != null) {
-                const blk = self.block2.?;
-                if (is_write) blk.write(offset, value) else result = blk.read(offset);
+            if (self.mmio_devices[slot]) |device| {
+                if (is_write) device.write(offset, value) else result = device.read(offset);
             }
 
             if (!is_write and srt != 31) {
@@ -2081,9 +2098,12 @@ pub const Machine = struct {
         if (self.console_output) |cb| {
             self.console.?.setOutputCallback(cb, self.console_userdata);
         }
-        self.console.?.setGuestMemory(getGuestMemoryWrapper);
         // Set up IRQ callback - virtio console is SPI 32 (intid 32)
-        self.console.?.transport.setIrqCallback(consoleIrqCallback, self);
+        self.registerVirtioMmioDevice(
+            0,
+            .{ .console = self.console.? },
+            consoleIrqCallback,
+        );
         log.debug("initialized virtio-console at 0x{x}", .{MemoryLayout.virtioBase(0)});
 
         // qemu-guest-agent channel on the second named port.
@@ -2098,8 +2118,7 @@ pub const Machine = struct {
         if (self.config.disk_path) |disk_path| {
             self.block = try virtio.Block.init(self.alloc);
             try self.block.?.attachDisk(disk_path, self.config.disk_read_only);
-            self.block.?.setGuestMemory(getGuestMemoryWrapper);
-            self.block.?.transport.setIrqCallback(blk1IrqCallback, self);
+            self.registerVirtioMmioDevice(1, .{ .block = self.block.? }, blk1IrqCallback);
             log.debug("initialized virtio-blk at 0x{x} with disk: {s}", .{
                 MemoryLayout.virtioBase(1),
                 disk_path,
@@ -2114,8 +2133,7 @@ pub const Machine = struct {
                 log.err("failed to attach disk2 '{s}': {}", .{ disk2_path, err });
                 return err;
             };
-            self.block2.?.setGuestMemory(getGuestMemoryWrapper);
-            self.block2.?.transport.setIrqCallback(blk2IrqCallback, self);
+            self.registerVirtioMmioDevice(2, .{ .block = self.block2.? }, blk2IrqCallback);
             log.debug("initialized virtio-blk2 at 0x{x} with disk: {s} (read-only: {})", .{
                 MemoryLayout.virtioBase(2),
                 disk2_path,
@@ -2131,7 +2149,6 @@ pub const Machine = struct {
                 self.config.enable_virgl,
                 self.config.gpu_memory_bytes,
             );
-            self.gpu.?.setGuestMemory(getGuestMemoryWrapper);
             // Venus host-visible memory window: a guest-PA range above RAM that
             // host blob memory is hv_vm_map'd into on RESOURCE_MAP_BLOB. Its
             // presence makes the guest kernel set VIRTGPU_PARAM_HOST_VISIBLE.
@@ -2153,7 +2170,11 @@ pub const Machine = struct {
                 }
             }
             self.gpu.?.setDisplaySize(self.config.display_width, self.config.display_height);
-            self.gpu.?.transport.setIrqCallback(gpuIrqCallback, self);
+            self.registerVirtioMmioDevice(
+                self.gpu_slot,
+                .{ .gpu = self.gpu.? },
+                gpuIrqCallback,
+            );
             if (self.frame_callback) |cb| {
                 self.gpu.?.setFrameCallback(cb, self.frame_userdata);
             }
@@ -2167,13 +2188,19 @@ pub const Machine = struct {
             // Input devices accompany the display.
             self.keyboard_slot = self.gpu_slot + 1;
             self.keyboard = try virtio.Input.init(self.alloc, .keyboard);
-            self.keyboard.?.setGuestMemory(getGuestMemoryWrapper);
-            self.keyboard.?.transport.setIrqCallback(keyboardIrqCallback, self);
+            self.registerVirtioMmioDevice(
+                self.keyboard_slot,
+                .{ .input = self.keyboard.? },
+                keyboardIrqCallback,
+            );
 
             self.mouse_slot = self.gpu_slot + 2;
             self.mouse = try virtio.Input.init(self.alloc, .tablet);
-            self.mouse.?.setGuestMemory(getGuestMemoryWrapper);
-            self.mouse.?.transport.setIrqCallback(mouseIrqCallback, self);
+            self.registerVirtioMmioDevice(
+                self.mouse_slot,
+                .{ .input = self.mouse.? },
+                mouseIrqCallback,
+            );
 
             log.debug("initialized virtio-input at slots {} (kbd), {} (mouse)", .{
                 self.keyboard_slot,
@@ -2186,8 +2213,11 @@ pub const Machine = struct {
             self.net_slot = 1 + self.config.blockDeviceCount() +
                 (if (self.config.enable_gpu) @as(u8, 3) else 0);
             self.net = try virtio.Net.init(self.alloc);
-            self.net.?.setGuestMemory(getGuestMemoryWrapper);
-            self.net.?.transport.setIrqCallback(netIrqCallback, self);
+            self.registerVirtioMmioDevice(
+                self.net_slot,
+                .{ .net = self.net.? },
+                netIrqCallback,
+            );
             self.nat = mininat.MiniNat.init(self.alloc, natReplyCallback, self);
             self.nat.setReplyLease(natReplyReserveCallback, natReplyCommitCallback);
             self.nat.setRxReady(natRxReadyCallback, self);
@@ -2208,16 +2238,22 @@ pub const Machine = struct {
             (if (self.config.enable_gpu) @as(u8, 3) else 0) +
             @intFromBool(self.config.enable_net);
         self.rng = try virtio.Rng.init(self.alloc);
-        self.rng.?.setGuestMemory(getGuestMemoryWrapper);
-        self.rng.?.transport.setIrqCallback(rngIrqCallback, self);
+        self.registerVirtioMmioDevice(
+            self.rng_slot,
+            .{ .rng = self.rng.? },
+            rngIrqCallback,
+        );
         log.debug("initialized virtio-rng at slot {}", .{self.rng_slot});
 
         // 9p shared folder (slot after the rng) if configured.
         if (self.config.shared_dir) |dir| {
             self.p9_slot = self.rng_slot + 1;
             self.p9 = try virtio.P9.init(self.alloc, "host", dir);
-            self.p9.?.setGuestMemory(getGuestMemoryWrapper);
-            self.p9.?.transport.setIrqCallback(p9IrqCallback, self);
+            self.registerVirtioMmioDevice(
+                self.p9_slot,
+                .{ .p9 = self.p9.? },
+                p9IrqCallback,
+            );
             log.debug("initialized virtio-9p at slot {} sharing {s}", .{ self.p9_slot, dir });
         }
 
@@ -2225,16 +2261,22 @@ pub const Machine = struct {
         // after the 9p device when a shared folder is configured).
         self.balloon_slot = self.rng_slot + 1 + @intFromBool(self.config.shared_dir != null);
         self.balloon = try virtio.Balloon.init(self.alloc);
-        self.balloon.?.setGuestMemory(getGuestMemoryWrapper);
-        self.balloon.?.transport.setIrqCallback(balloonIrqCallback, self);
+        self.registerVirtioMmioDevice(
+            self.balloon_slot,
+            .{ .balloon = self.balloon.? },
+            balloonIrqCallback,
+        );
         log.debug("initialized virtio-balloon at slot {}", .{self.balloon_slot});
 
         // Sound device (opt-in), in the slot after the balloon.
         if (self.config.enable_snd) {
             self.snd_slot = self.balloon_slot + 1;
             self.snd = try virtio.Snd.init(self.alloc);
-            self.snd.?.setGuestMemory(getGuestMemoryWrapper);
-            self.snd.?.transport.setIrqCallback(sndIrqCallback, self);
+            self.registerVirtioMmioDevice(
+                self.snd_slot,
+                .{ .snd = self.snd.? },
+                sndIrqCallback,
+            );
             log.debug("initialized virtio-snd at slot {}", .{self.snd_slot});
         }
 
@@ -2242,6 +2284,19 @@ pub const Machine = struct {
         if (self.config.isFirmwareBoot()) {
             try self.initEcam();
         }
+    }
+
+    fn registerVirtioMmioDevice(
+        self: *Machine,
+        slot: u8,
+        device: VirtioMmioDevice,
+        irq_callback: virtio.mmio.IrqFn,
+    ) void {
+        assert(slot < self.mmio_devices.len);
+        assert(self.mmio_devices[slot] == null);
+        device.setGuestMemory(getGuestMemoryWrapper);
+        device.setIrqCallback(irq_callback, self);
+        self.mmio_devices[slot] = device;
     }
 
     fn initEcam(self: *Machine) !void {
@@ -3113,7 +3168,7 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    try testing.expect(@sizeOf(Machine) <= 5768);
+    try testing.expect(@sizeOf(Machine) <= 6152);
 }
 
 test "stop before synchronous thread entry cancels startup" {

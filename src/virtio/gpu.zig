@@ -894,6 +894,14 @@ pub const Gpu = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Gpu,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     /// Wire the host-visible memory window (Venus). `map`/`unmap` bridge host
     /// blob memory into the guest window via HVF; this also advertises the
     /// virtio shm region so the guest kernel sets VIRTGPU_PARAM_HOST_VISIBLE.

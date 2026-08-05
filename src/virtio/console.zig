@@ -327,6 +327,14 @@ pub const Console = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Console,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     /// Queue input data to send to guest. Called from the host input
     /// thread; delivery happens on the vCPU thread via pollReceive.
     pub fn queueInput(self: *Console, data: []const u8) Error!void {

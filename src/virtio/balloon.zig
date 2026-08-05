@@ -80,6 +80,14 @@ pub const Balloon = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Balloon,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     /// Set the target balloon size (in 4 KiB pages) and notify the guest via
     /// a config-change interrupt. The guest driver reacts by inflating or
     /// deflating until config.actual reaches config.num_pages.

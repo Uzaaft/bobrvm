@@ -73,6 +73,14 @@ pub const Rng = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Rng,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     /// Handle MMIO read.
     pub fn read(self: *Rng, offset: u12) u32 {
         // No config space.

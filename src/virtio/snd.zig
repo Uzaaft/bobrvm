@@ -244,6 +244,14 @@ pub const Snd = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Snd,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     /// Set the playback backend (defaults to a silent sink).
     pub fn setSink(self: *Snd, sink: PlaybackSink) void {
         self.sink = sink;

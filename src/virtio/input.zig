@@ -272,6 +272,14 @@ pub const Input = struct {
         self.guest_memory = accessor;
     }
 
+    pub fn setIrqCallback(
+        self: *Input,
+        callback: mmio.IrqFn,
+        userdata: ?*anyopaque,
+    ) void {
+        self.transport.setIrqCallback(callback, userdata);
+    }
+
     /// Set interrupt callback.
     pub fn setInterruptCallback(
         self: *Input,
