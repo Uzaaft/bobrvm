@@ -3289,6 +3289,7 @@ const MachineError = error{
 
 test {
     _ = MemoryLayout;
+    _ = gic;
     _ = icc;
 }
 

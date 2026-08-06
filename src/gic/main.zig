@@ -698,8 +698,9 @@ pub const Gic = struct {
         _ = size;
 
         // Determine which CPU's redistributor
-        const cpu_id: u8 = @intCast(offset / GICR_FRAME_SIZE);
-        if (cpu_id >= self.num_cpus) return 0;
+        const cpu_index = offset / GICR_FRAME_SIZE;
+        if (cpu_index >= self.num_cpus) return 0;
+        const cpu_id: u8 = @intCast(cpu_index);
 
         const frame_offset: u32 = @intCast(offset % GICR_FRAME_SIZE);
         const is_sgi_frame = frame_offset >= GICR.SGI_OFFSET;
@@ -736,8 +737,9 @@ pub const Gic = struct {
     pub fn redistWrite(self: *Gic, offset: u64, size: u8, value: u64) void {
         _ = size;
 
-        const cpu_id: u8 = @intCast(offset / GICR_FRAME_SIZE);
-        if (cpu_id >= self.num_cpus) return;
+        const cpu_index = offset / GICR_FRAME_SIZE;
+        if (cpu_index >= self.num_cpus) return;
+        const cpu_id: u8 = @intCast(cpu_index);
 
         const frame_offset: u32 = @intCast(offset % GICR_FRAME_SIZE);
         const is_sgi_frame = frame_offset >= GICR.SGI_OFFSET;
@@ -946,4 +948,20 @@ test "Gic SPI pending" {
     const intid = gic.ackInterrupt(0);
     try std.testing.expectEqual(@as(u32, 33), intid);
     try std.testing.expect(gic.spis[1].active);
+}
+
+test "Gic redistributor rejects offsets outside the configured CPUs" {
+    const gic = try Gic.init(std.testing.allocator, 2);
+    defer gic.deinit();
+
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        gic.redistRead(std.math.maxInt(u64), 4),
+    );
+    gic.redistWrite(std.math.maxInt(u64), 4, std.math.maxInt(u64));
+
+    try std.testing.expectEqual(
+        @as(u64, GICR.WAKER_CHILDREN_ASLEEP),
+        gic.redistRead(GICR.WAKER, 4),
+    );
 }
