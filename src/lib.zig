@@ -39,4 +39,5 @@ test {
     _ = runtime;
     _ = @import("cli/Config.zig");
     _ = @import("compat/file.zig");
+    _ = @import("compat/thread.zig");
 }

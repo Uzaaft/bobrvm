@@ -73,3 +73,43 @@ pub fn waitTimeout(
         }
     }
 }
+
+test "condition timeout returns with the caller mutex relocked" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var cond: std.Io.Condition = .init;
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(io);
+
+    try std.testing.expectError(error.Timeout, waitTimeout(&cond, io, &mutex, .{
+        .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+    }));
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock(io);
+}
+
+const SignalContext = struct {
+    cond: *std.Io.Condition,
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+
+    fn signal(self: *SignalContext) void {
+        self.mutex.lockUncancelable(self.io);
+        self.cond.signal(self.io);
+        self.mutex.unlock(self.io);
+    }
+};
+
+test "condition signal wins before a long timeout" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var cond: std.Io.Condition = .init;
+    var mutex: std.Io.Mutex = .init;
+    var context: SignalContext = .{ .cond = &cond, .mutex = &mutex, .io = io };
+
+    mutex.lockUncancelable(io);
+    const thread = try std.Thread.spawn(.{}, SignalContext.signal, .{&context});
+    defer thread.join();
+    try waitTimeout(&cond, io, &mutex, .{
+        .duration = .{ .raw = .fromSeconds(1), .clock = .awake },
+    });
+    mutex.unlock(io);
+}
