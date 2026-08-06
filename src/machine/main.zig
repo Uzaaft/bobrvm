@@ -29,6 +29,8 @@ const agent = @import("../agent/main.zig");
 pub const snapshot = @import("snapshot.zig");
 
 const log = std.log.scoped(.machine);
+const ID_AA64PFR0_GIC_SHIFT: u6 = 24;
+const ID_AA64PFR0_GIC_MASK: u64 = 0xF << ID_AA64PFR0_GIC_SHIFT;
 
 // Darwin copy-on-write file clone (instant on APFS; snapshot substrate).
 extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: u32) c_int;
@@ -39,6 +41,10 @@ const enable_debug_logs = builtin.mode == .Debug;
 // Single VM per process (a Hypervisor.framework restriction), shared by
 // all vCPU threads for guest memory access.
 var current_machine: ?*Machine = null;
+
+fn withGicSystemRegisters(pfr0: u64) u64 {
+    return (pfr0 & ~ID_AA64PFR0_GIC_MASK) | (@as(u64, 1) << ID_AA64PFR0_GIC_SHIFT);
+}
 
 /// Memory layout for ARM64 Linux VM.
 /// Based on QEMU virt machine layout for UEFI compatibility.
@@ -1422,7 +1428,6 @@ pub const Machine = struct {
                         gic_dev.setPpiPending(cpu_id, 27, true);
                     }
                     self.machine_lock.unlock(global.io());
-                    try vcpu.setPendingInterrupt(.irq, true);
                 },
                 .unknown => {
                     log.warn("unknown exit reason", .{});
@@ -1999,6 +2004,9 @@ pub const Machine = struct {
             .rtc_base = MemoryLayout.RTC_BASE,
             .gic_dist_base = MemoryLayout.GIC_DIST_BASE,
             .gic_redist_base = MemoryLayout.GIC_REDIST_BASE,
+            .flash_enabled = self.config.isFirmwareBoot(),
+            .flash_base = MemoryLayout.PFLASH_CODE_BASE,
+            .flash_bank_size = MemoryLayout.PFLASH_CODE_SIZE,
             .pcie_enabled = self.config.isFirmwareBoot(),
             .pcie_ecam_base = MemoryLayout.ECAM_BASE,
             .pcie_ecam_size = MemoryLayout.ECAM_SIZE,
@@ -2006,7 +2014,7 @@ pub const Machine = struct {
             .pcie_mmio_size = MemoryLayout.PCI_MMIO_SIZE,
         };
 
-        const dtb_addr = MemoryLayout.dtbBase(self.config.ram_size);
+        const dtb_addr = self.dtbGuestAddress();
         const ram_offset = dtb_addr - MemoryLayout.RAM_BASE;
         const ram = self.ram.?;
 
@@ -2023,6 +2031,16 @@ pub const Machine = struct {
             else => return err,
         };
         log.info("loaded DTB: {} bytes at 0x{x}", .{ dtb_data.len, dtb_addr });
+    }
+
+    fn dtbGuestAddress(self: *const Machine) u64 {
+        // ArmVirtQemu firmware has PcdDeviceTreeInitialBaseAddress fixed at
+        // the first byte of RAM. Direct Linux boot keeps the DTB near the top
+        // of the low-memory window to avoid the kernel and initrd.
+        return if (self.config.isFirmwareBoot())
+            MemoryLayout.RAM_BASE
+        else
+            MemoryLayout.dtbBase(self.config.ram_size);
     }
 
     fn initGic(self: *Machine) !void {
@@ -2816,6 +2834,11 @@ pub const Machine = struct {
         // Enable FP/SIMD for all vCPUs (CPACR_EL1.FPEN = 0b11)
         try vcpu.setSysReg(.cpacr_el1, 3 << 20);
 
+        // Apple CPUs do not have a host GIC, so HVF omits the GIC feature
+        // field. The guest still has bobrvm's emulated GICv3 CPU interface.
+        const pfr0 = try vcpu.getSysReg(.id_aa64pfr0_el1);
+        try vcpu.setSysReg(.id_aa64pfr0_el1, withGicSystemRegisters(pfr0));
+
         // Set up SP_EL0 and SP_EL1 to valid addresses (per-vCPU)
         const stack_base = MemoryLayout.RAM_BASE + 0x10000 + @as(u64, id) * 0x20000;
         try vcpu.setSysReg(.sp_el0, stack_base);
@@ -2840,7 +2863,7 @@ pub const Machine = struct {
             try vcpu.setPC(boot_pc);
 
             // x0 = DTB address (used by both firmware and kernel)
-            try vcpu.setReg(.x0, MemoryLayout.dtbBase(self.config.ram_size));
+            try vcpu.setReg(.x0, self.dtbGuestAddress());
 
             // x1, x2, x3 = 0 (reserved)
             try vcpu.setReg(.x1, 0);
@@ -3109,6 +3132,14 @@ test "MemoryLayout constants" {
     try testing.expectEqual(@as(u64, 0x7fe0_0000), MemoryLayout.dtbBase(16 * 1024 * 1024 * 1024));
     try testing.expectEqual(@as(u64, 0x0A00_0000), MemoryLayout.virtioBase(0));
     try testing.expectEqual(@as(u64, 0x0A00_0200), MemoryLayout.virtioBase(1));
+}
+
+test "withGicSystemRegisters advertises GICv3 without changing other features" {
+    const pfr0: u64 = 0xA501_0000_5F00_1234;
+    const updated = withGicSystemRegisters(pfr0);
+
+    try std.testing.expectEqual(@as(u64, 1), (updated & ID_AA64PFR0_GIC_MASK) >> 24);
+    try std.testing.expectEqual(pfr0 & ~ID_AA64PFR0_GIC_MASK, updated & ~ID_AA64PFR0_GIC_MASK);
 }
 
 test "MachineConfig.isFirmwareBoot" {

@@ -66,6 +66,12 @@ pub const DtbConfig = struct {
     gic_dist_base: u64 = 0x0800_0000,
     /// GIC redistributor base.
     gic_redist_base: u64 = 0x080A_0000,
+    /// Advertise the two QEMU virt CFI flash banks.
+    flash_enabled: bool = false,
+    /// First flash bank base address.
+    flash_base: u64 = 0,
+    /// Size of each flash bank.
+    flash_bank_size: u64 = 64 * 1024 * 1024,
     /// Enable PCIe host bridge (for UEFI boot).
     pcie_enabled: bool = false,
     /// PCIe ECAM base address.
@@ -160,6 +166,19 @@ pub const DtbBuilder = struct {
         try self.prop_u32("#size-cells", 2);
         try self.prop_string("compatible", "linux,dummy-virt");
         try self.prop_u32("interrupt-parent", 0x8001); // phandle for GIC
+
+        if (config.flash_enabled) {
+            try self.beginNode("flash@0");
+            try self.prop_string("compatible", "cfi-flash");
+            try self.prop_u64_array("reg", &.{
+                config.flash_base,
+                config.flash_bank_size,
+                config.flash_base + config.flash_bank_size,
+                config.flash_bank_size,
+            });
+            try self.prop_u32("bank-width", 4);
+            try self.endNode();
+        }
 
         // Chosen node (boot parameters)
         try self.beginNode("chosen");
@@ -332,27 +351,27 @@ pub const DtbBuilder = struct {
         try self.prop_u32_array("interrupt-map-mask", &interrupt_map_mask);
 
         // Interrupt map: route each device's INTA# to a distinct GIC SPI.
-        // Format: child_unit child_irq parent_phandle parent_irq...
+        // Format: child unit, child IRQ, parent phandle, parent unit, parent IRQ.
         // GIC SPI 48-50 correspond to interrupt IDs 80-82.
         const interrupt_map = [_]u32{
             // Device 0, INTA# -> SPI 48
-            0x0000, 0, 0, 1, 0x8001, 0, 48, 4,
+            0x0000, 0, 0, 1, 0x8001, 0, 0, 0, 48, 4,
             // Device 0, INTB# -> SPI 49
-            0x0000, 0, 0, 2, 0x8001, 0, 49, 4,
+            0x0000, 0, 0, 2, 0x8001, 0, 0, 0, 49, 4,
             // Device 0, INTC# -> SPI 50
-            0x0000, 0, 0, 3, 0x8001, 0, 50, 4,
+            0x0000, 0, 0, 3, 0x8001, 0, 0, 0, 50, 4,
             // Device 0, INTD# -> SPI 51
-            0x0000, 0, 0, 4, 0x8001, 0, 51, 4,
+            0x0000, 0, 0, 4, 0x8001, 0, 0, 0, 51, 4,
             // Device 1, INTA# -> SPI 49
-            0x0800, 0, 0, 1, 0x8001, 0, 49, 4,
+            0x0800, 0, 0, 1, 0x8001, 0, 0, 0, 49, 4,
             // Device 1, INTB# -> SPI 50
-            0x0800, 0, 0, 2, 0x8001, 0, 50, 4,
+            0x0800, 0, 0, 2, 0x8001, 0, 0, 0, 50, 4,
             // Device 1, INTC# -> SPI 51
-            0x0800, 0, 0, 3, 0x8001, 0, 51, 4,
+            0x0800, 0, 0, 3, 0x8001, 0, 0, 0, 51, 4,
             // Device 1, INTD# -> SPI 48
-            0x0800, 0, 0, 4, 0x8001, 0, 48, 4,
+            0x0800, 0, 0, 4, 0x8001, 0, 0, 0, 48, 4,
             // Device 2, INTA# -> SPI 50
-            0x1000, 0, 0, 1, 0x8001, 0, 50, 4,
+            0x1000, 0, 0, 1, 0x8001, 0, 0, 0, 50, 4,
         };
         try self.prop_u32_array("interrupt-map", &interrupt_map);
 
@@ -518,6 +537,26 @@ test "DtbConfig defaults" {
 
     try std.testing.expectEqual(@as(u64, 0x0A00_0000), config.virtio_base);
     try std.testing.expectEqual(@as(u8, 1), config.virtio_count);
+}
+
+test "DtbBuilder advertises firmware flash and PCIe" {
+    var stack_allocator = std.heap.stackFallback(DtbBuilder.scratch_bytes, std.testing.allocator);
+    var builder = DtbBuilder.init(stack_allocator.get());
+    defer builder.deinit();
+
+    const config = DtbConfig{
+        .ram_base = 0x40000000,
+        .ram_size = 512 * 1024 * 1024,
+        .vcpu_count = 2,
+        .cmdline = "",
+        .flash_enabled = true,
+        .pcie_enabled = true,
+    };
+    var output: [4096]u8 align(@alignOf(FdtHeader)) = undefined;
+    const blob = try builder.generateInto(config, &output);
+
+    try std.testing.expect(std.mem.indexOf(u8, blob, "cfi-flash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "pci-host-ecam-generic") != null);
 }
 
 test "DtbBuilder stack scratch falls back for large configurations" {
