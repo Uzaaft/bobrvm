@@ -124,6 +124,8 @@ pub const Builder = struct {
     }
 
     pub fn section(self: *Builder, name: []const u8, data: []const u8) !void {
+        if (name.len > std.math.maxInt(u8)) return error.NameTooLong;
+
         try self.buf.append(self.alloc, @intCast(name.len));
         try self.buf.appendSlice(self.alloc, name);
         try self.appendInt(u64, data.len);
@@ -164,17 +166,19 @@ pub const Reader = struct {
     /// Find a section by name.
     pub fn section(self: Reader, name: []const u8) ?[]const u8 {
         var off: usize = MAGIC.len + 4;
-        while (off + 1 <= self.bytes.len) {
+        while (off < self.bytes.len) {
             const name_len = self.bytes[off];
             off += 1;
-            if (off + name_len + 8 > self.bytes.len) return null;
+            if (name_len > self.bytes.len - off) return null;
             const sec_name = self.bytes[off..][0..name_len];
             off += name_len;
+            if (@sizeOf(u64) > self.bytes.len - off) return null;
             const size = std.mem.readInt(u64, self.bytes[off..][0..8], .little);
             off += 8;
-            if (off + size > self.bytes.len) return null;
-            if (std.mem.eql(u8, sec_name, name)) return self.bytes[off..][0..size];
-            off += @intCast(size);
+            if (size > self.bytes.len - off) return null;
+            const size_usize: usize = @intCast(size);
+            if (std.mem.eql(u8, sec_name, name)) return self.bytes[off..][0..size_usize];
+            off += size_usize;
         }
         return null;
     }
@@ -189,12 +193,12 @@ const Cursor = struct {
     off: usize = 0,
 
     fn int(self: *Cursor, comptime T: type) !T {
-        if (self.off + @sizeOf(T) > self.buf.len) return error.Truncated;
+        if (@sizeOf(T) > self.buf.len - self.off) return error.Truncated;
         defer self.off += @sizeOf(T);
         return std.mem.readInt(T, self.buf[self.off..][0..@sizeOf(T)], .little);
     }
     fn bytes(self: *Cursor, len: usize) ![]const u8 {
-        if (self.off + len > self.buf.len) return error.Truncated;
+        if (len > self.buf.len - self.off) return error.Truncated;
         defer self.off += len;
         return self.buf[self.off..][0..len];
     }
@@ -798,6 +802,25 @@ test "snapshot: container roundtrip and unknown sections" {
     try testing.expect(r.section("gamma") == null);
 
     try testing.expectError(error.BadMagic, Reader.init("XXXXXXXX\x01\x00\x00\x00"));
+}
+
+test "snapshot: malformed section size does not overflow" {
+    var bytes: [MAGIC.len + 4 + 1 + 1 + 8]u8 = undefined;
+    @memcpy(bytes[0..MAGIC.len], MAGIC);
+    std.mem.writeInt(u32, bytes[MAGIC.len..][0..4], VERSION, .little);
+    bytes[MAGIC.len + 4] = 1;
+    bytes[MAGIC.len + 5] = 'x';
+    std.mem.writeInt(u64, bytes[bytes.len - 8 ..][0..8], std.math.maxInt(u64), .little);
+
+    const reader = try Reader.init(&bytes);
+    try testing.expect(reader.section("x") == null);
+}
+
+test "snapshot: builder rejects section names above the wire limit" {
+    var builder = try Builder.init(testing.allocator);
+    defer builder.deinit();
+    var name: [std.math.maxInt(u8) + 1]u8 = @splat('x');
+    try testing.expectError(error.NameTooLong, builder.section(&name, "data"));
 }
 
 test "snapshot: gic state roundtrip" {
