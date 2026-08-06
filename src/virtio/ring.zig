@@ -10,6 +10,25 @@ const mmio = @import("mmio.zig");
 
 pub const GetMemFn = *const fn (addr: u64, len: usize) ?[]u8;
 
+fn guestAddress(base: u64, offset: u64, len: usize) ?u64 {
+    const addr = std.math.add(u64, base, offset) catch return null;
+    const len_u64 = std.math.cast(u64, len) orelse return null;
+    _ = std.math.add(u64, addr, len_u64) catch return null;
+    return addr;
+}
+
+fn indexedGuestAddress(
+    base: u64,
+    header_size: u64,
+    index: u16,
+    entry_size: u64,
+    len: usize,
+) ?u64 {
+    const entry_offset = std.math.mul(u64, index, entry_size) catch return null;
+    const offset = std.math.add(u64, header_size, entry_offset) catch return null;
+    return guestAddress(base, offset, len);
+}
+
 /// A descriptor read out of guest memory.
 pub const Desc = struct {
     addr: u64,
@@ -31,7 +50,9 @@ pub const Desc = struct {
 
 /// Read one descriptor from the descriptor table.
 pub fn readDesc(qc: mmio.QueueConfig, idx: u16, get_mem: GetMemFn) ?Desc {
-    const mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
+    if (idx >= qc.num) return null;
+    const addr = indexedGuestAddress(qc.desc_addr, 0, idx, 16, 16) orelse return null;
+    const mem = get_mem(addr, 16) orelse return null;
     return .{
         .addr = std.mem.readInt(u64, mem[0..8], .little),
         .len = std.mem.readInt(u32, mem[8..12], .little),
@@ -42,23 +63,30 @@ pub fn readDesc(qc: mmio.QueueConfig, idx: u16, get_mem: GetMemFn) ?Desc {
 
 /// Read the avail ring index.
 pub fn availIdx(qc: mmio.QueueConfig, get_mem: GetMemFn) ?u16 {
-    const mem = get_mem(qc.driver_addr, 6) orelse return null;
+    if (qc.num == 0) return null;
+    const addr = guestAddress(qc.driver_addr, 0, 6) orelse return null;
+    const mem = get_mem(addr, 6) orelse return null;
     return std.mem.readInt(u16, mem[2..4], .little);
 }
 
 /// Read the descriptor index at an avail ring position.
 pub fn availEntry(qc: mmio.QueueConfig, pos: u16, get_mem: GetMemFn) ?u16 {
+    if (qc.num == 0) return null;
     const ring_idx = pos % qc.num;
-    const mem = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse return null;
+    const addr = indexedGuestAddress(qc.driver_addr, 4, ring_idx, 2, 2) orelse return null;
+    const mem = get_mem(addr, 2) orelse return null;
     return std.mem.readInt(u16, mem[0..2], .little);
 }
 
 /// Append an entry to the used ring and bump its index.
 pub fn pushUsed(qc: mmio.QueueConfig, desc_idx: u16, len: u32, get_mem: GetMemFn) void {
-    const used_ring = get_mem(qc.device_addr, 6) orelse return;
+    if (qc.num == 0 or desc_idx >= qc.num) return;
+    const ring_addr = guestAddress(qc.device_addr, 0, 6) orelse return;
+    const used_ring = get_mem(ring_addr, 6) orelse return;
     var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
     const pos = used_idx % qc.num;
-    const entry = get_mem(qc.device_addr + 4 + @as(u64, pos) * 8, 8) orelse return;
+    const entry_addr = indexedGuestAddress(qc.device_addr, 4, pos, 8, 8) orelse return;
+    const entry = get_mem(entry_addr, 8) orelse return;
     std.mem.writeInt(u32, entry[0..4], desc_idx, .little);
     std.mem.writeInt(u32, entry[4..8], len, .little);
     used_idx +%= 1;
@@ -76,7 +104,8 @@ pub const Chain = struct {
     pub fn collect(qc: mmio.QueueConfig, head: u16, get_mem: GetMemFn) Chain {
         var chain: Chain = .{};
         var idx = head;
-        while (chain.count < MAX_CHAIN) {
+        const limit = @min(@as(usize, qc.num), MAX_CHAIN);
+        while (chain.count < limit) {
             const desc = readDesc(qc, idx, get_mem) orelse break;
             chain.descs[chain.count] = desc;
             chain.count += 1;
@@ -93,7 +122,9 @@ pub const Chain = struct {
     /// First device-readable descriptor's guest memory (the request).
     pub fn request(self: *const Chain, get_mem: GetMemFn) ?[]u8 {
         for (self.slice()) |d| {
-            if (!d.isWrite()) return get_mem(d.addr, d.len);
+            if (!d.isWrite() and guestAddress(d.addr, 0, d.len) != null) {
+                if (get_mem(d.addr, d.len)) |mem| return mem;
+            }
         }
         return null;
     }
@@ -101,7 +132,9 @@ pub const Chain = struct {
     /// First device-writable descriptor's guest memory (the response).
     pub fn response(self: *const Chain, get_mem: GetMemFn) ?[]u8 {
         for (self.slice()) |d| {
-            if (d.isWrite()) return get_mem(d.addr, d.len);
+            if (d.isWrite() and guestAddress(d.addr, 0, d.len) != null) {
+                if (get_mem(d.addr, d.len)) |mem| return mem;
+            }
         }
         return null;
     }
@@ -118,8 +151,8 @@ var test_mem: [8192]u8 = undefined;
 
 fn testGetMem(addr: u64, len: usize) ?[]u8 {
     if (addr < 0x1000) return null;
-    const off = addr - 0x1000;
-    if (off + len > test_mem.len) return null;
+    const off = std.math.cast(usize, addr - 0x1000) orelse return null;
+    if (off > test_mem.len or len > test_mem.len - off) return null;
     return test_mem[off..][0..len];
 }
 

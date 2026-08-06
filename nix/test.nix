@@ -24,6 +24,7 @@ stdenv.mkDerivation {
     ln -s ${zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
     zig build test
     zig build bare-metal-test
+    zig build test-fuzz-virtqueue --fuzz=100K
     runHook postBuild
   '';
 
