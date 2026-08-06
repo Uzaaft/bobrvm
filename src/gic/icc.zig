@@ -294,3 +294,59 @@ test "ICC binary point registers discard reserved bits" {
     try std.testing.expectEqual(@as(u64, 7), handler.read(0, Reg.BPR0));
     try std.testing.expectEqual(@as(u64, 2), handler.read(0, Reg.BPR1));
 }
+
+test "ICC trap decoding matches known MRS and MSR encodings" {
+    const mrs_sre = IccHandler.decodeIss(0x003A_30B9);
+    try std.testing.expectEqual(Reg.SRE, mrs_sre.reg);
+    try std.testing.expectEqual(@as(u5, 5), mrs_sre.rt);
+    try std.testing.expect(mrs_sre.is_read);
+
+    const msr_sgi1r = IccHandler.decodeIss(0x003A_3196);
+    try std.testing.expectEqual(Reg.SGI1R, msr_sgi1r.reg);
+    try std.testing.expectEqual(@as(u5, 12), msr_sgi1r.rt);
+    try std.testing.expect(!msr_sgi1r.is_read);
+}
+
+test "ICC register state is isolated per CPU" {
+    const gic = try Gic.init(std.testing.allocator, 2);
+    defer gic.deinit();
+    const handler = try IccHandler.init(std.testing.allocator, gic, 2);
+    defer handler.deinit(std.testing.allocator);
+
+    handler.write(1, Reg.PMR, 0xA5);
+    handler.write(1, Reg.BPR1, 6);
+    handler.write(1, Reg.IGRPEN1, 1);
+    handler.write(1, Reg.SRE, 0);
+
+    try std.testing.expectEqual(@as(u64, 0xFF), handler.read(0, Reg.PMR));
+    try std.testing.expectEqual(@as(u64, 0), handler.read(0, Reg.IGRPEN1));
+    try std.testing.expectEqual(@as(u64, 0xA5), handler.read(1, Reg.PMR));
+    try std.testing.expectEqual(@as(u64, 6), handler.read(1, Reg.BPR1));
+    try std.testing.expectEqual(@as(u64, 1), handler.read(1, Reg.IGRPEN1));
+    try std.testing.expectEqual(@as(u64, 7), handler.read(1, Reg.SRE));
+    try std.testing.expectEqual(@as(u64, 0), handler.read(2, Reg.PMR));
+}
+
+test "ICC SGI targets only CPUs selected by the affinity bitmap" {
+    const gic = try Gic.init(std.testing.allocator, 3);
+    defer gic.deinit();
+    const handler = try IccHandler.init(std.testing.allocator, gic, 3);
+    defer handler.deinit(std.testing.allocator);
+
+    gic.distWrite(gic_module.GICD.CTLR, 4, gic_module.GICD.CTLR_ENABLE_G1NS);
+    for (1..3) |cpu_id| {
+        const redist_base = cpu_id * gic_module.GICR_FRAME_SIZE;
+        const enable_addr = redist_base + gic_module.GICR.SGI_OFFSET +
+            gic_module.GICR.ISENABLER0;
+        gic.redistWrite(enable_addr, 4, 1 << 3);
+        handler.write(@intCast(cpu_id), Reg.IGRPEN1, 1);
+    }
+
+    handler.write(0, Reg.SGI1R, (@as(u64, 3) << 24) | (1 << 1) | (1 << 2));
+
+    try std.testing.expect(!gic.hasDeliverableIrq(0));
+    try std.testing.expect(gic.hasDeliverableIrq(1));
+    try std.testing.expect(gic.hasDeliverableIrq(2));
+    try std.testing.expectEqual(@as(u64, 3), handler.read(1, Reg.IAR1));
+    try std.testing.expectEqual(@as(u64, 3), handler.read(2, Reg.IAR1));
+}
