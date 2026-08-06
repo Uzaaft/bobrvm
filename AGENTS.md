@@ -9,8 +9,11 @@ bobrvm is Linux virtualization software for macOS with OpenGL 4.3 and Vulkan sup
 nix build
 nix build .#debug
 nix build .#test
-nix develop -c zig build -Demit-xcframework=true -Demit-macos-app=false
+nix develop -c zig build xcframework ghostty-lib
+zig build run
+zig build macos-app
 zig build test -Dtest-filter=<name>
+macos/build.nu
 
 # Swift/Xcode (not managed by Nix)
 xcodebuild -project macos/Bobrvm.xcodeproj -scheme Bobrvm
@@ -105,7 +108,8 @@ The guest-visible memory map follows QEMU `virt`:
 
 ## References
 
-- [TigerBeetle TIGER_STYLE](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
+- [TigerBeetle
+  TIGER_STYLE](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
 - [Ghostty](https://github.com/ghostty-org/ghostty)
 - [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor)
 - [Virtio 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)

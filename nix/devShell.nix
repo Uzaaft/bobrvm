@@ -4,6 +4,7 @@
   stdenv,
   alejandra,
   jujutsu,
+  nushell,
   pandoc,
   pkg-config,
   zig,
@@ -16,6 +17,7 @@ mkShell {
   packages = [
     alejandra
     jujutsu
+    nushell
     pandoc
     pkg-config
     zig

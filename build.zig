@@ -29,7 +29,7 @@ fn macosCFlags(b: *std.Build) []const []const u8 {
     });
 }
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     var target = b.standardTargetOptions(.{});
     if (target.result.os.tag == .macos and builtin.target.os.tag.isDarwin()) {
         target = b.resolveTargetQuery(.{
@@ -53,16 +53,44 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const emit_xcframework = b.option(bool, "emit-xcframework", "Build XCFramework") orelse false;
-    const emit_macos_app = b.option(bool, "emit-macos-app", "Build macOS app via xcodebuild") orelse false;
+    const emit_xcframework = b.option(
+        bool,
+        "emit-xcframework",
+        "Build XCFramework",
+    ) orelse false;
+    const emit_macos_app = b.option(
+        bool,
+        "emit-macos-app",
+        "Build macOS app via xcodebuild",
+    ) orelse false;
+    const test_filters = b.option(
+        [][]const u8,
+        "test-filter",
+        "Filter Zig tests by name",
+    ) orelse &[0][]const u8{};
+
+    // Keep the primary workflows visible in `zig build --help` regardless of
+    // which artifacts the default install emits.
+    const run_step = b.step("run", "Build and run the macOS app");
+    const macos_app_step = b.step("macos-app", "Build the macOS app");
+    const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
+    const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
 
     // Venus (KosmicKrisp) GPU backend — opt-in. When set, the GPU device routes
     // 3D contexts to virglrenderer(venus); the default build never links it.
     // Needs the macOS-patched virglrenderer (tools/build-virglrenderer-macos.sh).
-    const gpu_venus = b.option(bool, "gpu-venus", "Enable the Venus/KosmicKrisp GPU backend") orelse false;
+    const gpu_venus = b.option(
+        bool,
+        "gpu-venus",
+        "Enable the Venus/KosmicKrisp GPU backend",
+    ) orelse false;
     const home = environmentVariable(b, "HOME") orelse "/tmp";
     const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-upstream", .{home});
-    const virgl_prefix = b.option([]const u8, "virgl-prefix", "virglrenderer(venus) install prefix") orelse default_virgl_prefix;
+    const virgl_prefix = b.option(
+        []const u8,
+        "virgl-prefix",
+        "virglrenderer(venus) install prefix",
+    ) orelse default_virgl_prefix;
     const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
 
     const build_options = b.addOptions();
@@ -74,7 +102,12 @@ pub fn build(b: *std.Build) void {
     // Applies the build_options import and, when venus is enabled, the
     // virglrenderer link, to a module that compiles the GPU device.
     const wireVenus = struct {
-        fn apply(m: *std.Build.Module, opts: *std.Build.Step.Options, enabled: bool, libdir: []const u8) void {
+        fn apply(
+            m: *std.Build.Module,
+            opts: *std.Build.Step.Options,
+            enabled: bool,
+            libdir: []const u8,
+        ) void {
             m.addOptions("build_options", opts);
             if (enabled) {
                 m.addLibraryPath(.{ .cwd_relative = libdir });
@@ -207,46 +240,6 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("cli", "Run the headless CLI");
     cli_step.dependOn(&cli_run.step);
 
-    // GUI run step - build and run the minimal Swift display app. This avoids
-    // the full Xcode integration, so it also works inside a nix dev shell.
-    if (target.result.os.tag == .macos) {
-        // swiftc must use the real system Xcode/SDK, not the nix-provided
-        // SDKROOT/DEVELOPER_DIR (a mismatched Swift toolchain + SDK pair
-        // fails to compile the Swift standard library module).
-        const gui_build = b.addSystemCommand(&.{"macos/MinimalApp/build.sh"});
-        gui_build.step.dependOn(b.getInstallStep());
-        gui_build.removeEnvironmentVariable("SDKROOT");
-        gui_build.removeEnvironmentVariable("DEVELOPER_DIR");
-        // nix's xcrun/xcodebuild shims sit ahead of /usr/bin on PATH and
-        // resolve the SDK to a mismatched nix-provided one; put the real
-        // system toolchain first so swiftc finds Xcode's actual SDK.
-        if (environmentVariable(b, "PATH")) |path| {
-            gui_build.setEnvironmentVariable("PATH", b.fmt("/usr/bin:/bin:{s}", .{path}));
-        }
-        if (gpu_venus) {
-            // libbobrvm.a references virgl_renderer_*; build.sh links the
-            // upstream virglrenderer dylib + venus entitlements when set.
-            gui_build.setEnvironmentVariable("BOBRVM_GUI_VENUS", "1");
-            gui_build.setEnvironmentVariable("VIRGL_PREFIX", virgl_prefix);
-        }
-
-        const gui_run = b.addSystemCommand(&.{"zig-out/bin/BobrvmDisplay"});
-        if (gpu_venus) {
-            // virglrenderer dlopens the Vulkan loader by name at runtime.
-            gui_run.setEnvironmentVariable(
-                "DYLD_LIBRARY_PATH",
-                b.fmt("{s}/lib:/opt/homebrew/opt/vulkan-loader/lib:/opt/homebrew/opt/spirv-tools/lib:/opt/homebrew/lib", .{virgl_prefix}),
-            );
-        }
-        gui_run.step.dependOn(&gui_build.step);
-        if (b.args) |args| {
-            gui_run.addArgs(args);
-        }
-
-        const gui_step = b.step("gui", "Build and run the minimal Swift GUI display app");
-        gui_step.dependOn(&gui_run.step);
-    }
-
     // ==========================================================================
     // Venus GPU backend smoke test (macOS): prove the Zig↔virglrenderer(venus)
     // FFI creates a Venus context through the render server. Opt-in via
@@ -311,11 +304,17 @@ pub fn build(b: *std.Build) void {
         );
         run_venus_smoke.step.dependOn(&sign_venus_smoke.step);
 
-        const venus_smoke_step = b.step("venus-smoke", "Build+run the Venus host backend smoke test");
+        const venus_smoke_step = b.step(
+            "venus-smoke",
+            "Build+run the Venus host backend smoke test",
+        );
         venus_smoke_step.dependOn(&run_venus_smoke.step);
 
         // Build-and-sign only (no run) — useful where the sandbox blocks the run.
-        const venus_smoke_build_step = b.step("venus-smoke-build", "Build+sign the Venus smoke test (no run)");
+        const venus_smoke_build_step = b.step(
+            "venus-smoke-build",
+            "Build+sign the Venus smoke test (no run)",
+        );
         venus_smoke_build_step.dependOn(&sign_venus_smoke.step);
     }
 
@@ -356,6 +355,7 @@ pub fn build(b: *std.Build) void {
     // Test step
     const main_tests = b.addTest(.{
         .root_module = test_module,
+        .filters = test_filters,
     });
 
     const run_tests = b.addRunArtifact(main_tests);
@@ -391,20 +391,22 @@ pub fn build(b: *std.Build) void {
     });
 
     // Install the binary
-    const install_bare_metal = b.addInstallFile(bare_metal_bin.getOutput(), "test/bare_metal_test.bin");
+    const install_bare_metal = b.addInstallFile(
+        bare_metal_bin.getOutput(),
+        "test/bare_metal_test.bin",
+    );
 
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // Framework generation uses Xcode and is opt-in so sandboxed Nix package
-    // builds only initialize the portable Zig artifacts.
-    if (target.result.os.tag == .macos and (emit_xcframework or emit_macos_app)) {
+    // Framework and app steps are always available on macOS. The emit options
+    // only add them to the default install, which keeps sandboxed Nix builds
+    // limited to the portable Zig artifacts.
+    if (target.result.os.tag == .macos) {
         const xcframework = XCFrameworkStep.create(b, lib);
-        const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
         xcframework_step.dependOn(&xcframework.step);
 
         const ghostty_steps = addGhosttySteps(b, optimize);
-        const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
         ghostty_step.dependOn(ghostty_steps.install_root_step);
 
         if (emit_xcframework) {
@@ -412,29 +414,22 @@ pub fn build(b: *std.Build) void {
             b.default_step.dependOn(ghostty_steps.install_root_step);
         }
 
-        // macOS app step
-        if (emit_macos_app) {
-            const xcodebuild = XcodebuildStep.create(b, xcframework, optimize);
-            xcodebuild.step.dependOn(ghostty_steps.install_root_step);
-            b.default_step.dependOn(&xcodebuild.step);
-        }
-
-        // Run step - build and run app with logging to terminal
-        const run_step = b.step("run", "Build and run the macOS app (with terminal logging)");
-        const xcodebuild_for_run = XcodebuildStep.create(b, xcframework, optimize);
-        xcodebuild_for_run.step.dependOn(ghostty_steps.install_root_step);
-        run_step.dependOn(&xcodebuild_for_run.step);
+        const xcodebuild = XcodebuildStep.create(b, xcframework, optimize);
+        xcodebuild.build.step.dependOn(ghostty_steps.install_root_step);
+        macos_app_step.dependOn(&xcodebuild.build.step);
+        if (emit_macos_app) b.default_step.dependOn(macos_app_step);
 
         // Run the signed Xcode product directly so stderr remains visible.
-        const configuration = if (optimize == .Debug) "Debug" else "Release";
-        const app_executable = b.pathFromRoot(b.fmt(
-            "zig-out/xcode-derived-data/Build/Products/{s}/Bobrvm.app/Contents/MacOS/Bobrvm",
-            .{configuration},
-        ));
-        const run_cmd = b.addSystemCommand(&.{app_executable});
+        const run_cmd = b.addSystemCommand(&.{xcodebuild.app_executable});
         run_cmd.setEnvironmentVariable("BOBRVM_LOG", "true");
-        run_cmd.step.dependOn(&xcodebuild_for_run.step);
+        run_cmd.step.dependOn(&xcodebuild.build.step);
+        if (b.args) |args| run_cmd.addArgs(args);
         run_step.dependOn(&run_cmd.step);
+    } else {
+        try run_step.addError("the macOS app can only run on macOS", .{});
+        try macos_app_step.addError("the macOS app can only build on macOS", .{});
+        try xcframework_step.addError("BobrvmKit.xcframework requires macOS", .{});
+        try ghostty_step.addError("GhosttyKit.xcframework requires macOS", .{});
     }
 }
 

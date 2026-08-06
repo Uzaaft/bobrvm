@@ -32,8 +32,11 @@ nix build .#debug       # debug library
 nix build .#test        # Zig tests
 
 zig build              # library in the development shell
-zig build run          # build and run with terminal logging
-zig build -Demit-macos-app
+zig build run          # build and run the native app with terminal logging
+zig build macos-app    # build the native app without running it
+zig build cli -- help  # run the headless CLI
+zig build test         # run all Zig tests
+zig build test -Dtest-filter=<name>
 ```
 
 See [macos/README.md](macos/README.md) for Xcode and framework builds.
@@ -55,13 +58,11 @@ Use `--disk2 <image> --disk2-writable` for a persistent second disk. Add a
 display device with `--gpu` or `--virgl`; use `--display WxH` to set its size.
 The build signs the CLI with the Hypervisor.framework entitlement.
 
-For the lightweight Swift display app:
+For a headless Linux guest:
 
 ```sh
-nix develop -c zig build
-./macos/MinimalApp/build.sh
-./zig-out/bin/BobrvmDisplay --kernel Image --initrd initrd \
-  --cmdline 'console=tty0 console=hvc0 ...'
+zig build cli -- run --kernel Image --initrd initrd \
+  --cmdline 'console=hvc0 ...'
 ```
 
 ## Guest graphics

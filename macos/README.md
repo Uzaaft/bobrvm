@@ -5,22 +5,29 @@ The Zig libraries own virtualization and rendering.
 
 ## Build
 
-Generate the frameworks before opening the Xcode project:
+Build and run the native app from the repository root:
 
 ```sh
-zig build ghostty-lib xcframework
-open macos/Bobrvm.xcodeproj
+zig build run
 ```
 
-This requires Zig 0.16. `BobrvmKit.xcframework` is written to `macos/` and
-`GhosttyKit.xcframework` to `zig-out/`; these macOS-only steps are not part of
-the Nix development shell.
+Use `zig build macos-app` to build without launching. Both commands generate
+`BobrvmKit.xcframework` in `macos/`, generate `GhosttyKit.xcframework` in
+`zig-out/`, and build the signed app with Xcode. Pass application arguments
+after `--` when running.
 
-Build the frameworks and signed Debug app together with:
+For Swift-only iteration, generate the frameworks once and use the
+Ghostty-style clean-environment Xcode helper:
 
 ```sh
-zig build -Demit-macos-app=true
+zig build xcframework ghostty-lib
+macos/build.nu
+macos/build.nu --configuration Release
+macos/build.nu --action clean
 ```
+
+The helper avoids Nix compiler and linker overrides. It requires Nushell,
+which is included in `nix develop`. All build paths require Zig 0.16.
 
 Configure an Apple Development or Developer ID team in Xcode before
 distribution.

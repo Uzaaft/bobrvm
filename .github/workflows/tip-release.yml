@@ -61,21 +61,12 @@ jobs:
           BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
         run: |
           nix develop --command zig build \
-              -Doptimize=ReleaseFast \
-              -Demit-xcframework=true \
-              -Demit-macos-app=false
+              xcframework \
+              ghostty-lib \
+              -Doptimize=ReleaseFast
 
       - name: Build SwiftUI app
-        run: |
-          xcodebuild \
-              -project macos/Bobrvm.xcodeproj \
-              -scheme Bobrvm \
-              -configuration Release \
-              -derivedDataPath zig-out/xcode-derived-data \
-              CODE_SIGNING_ALLOWED=YES \
-              ONLY_ACTIVE_ARCH=YES \
-              -quiet \
-              build
+        run: nix develop --command macos/build.nu --configuration Release
 
       - name: Package app
         run: |
