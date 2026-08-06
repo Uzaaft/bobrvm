@@ -420,10 +420,11 @@ pub fn build(b: *std.Build) !void {
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
 
-    // Framework and app steps are always available on macOS. The emit options
-    // only add them to the default install, which keeps sandboxed Nix builds
-    // limited to the portable Zig artifacts.
-    if (target.result.os.tag == .macos) {
+    // Register native Apple workflows only when their SDK discovery and Xcode
+    // processes can run. The steps remain visible in sandboxed Nix builds, but
+    // their Ghostty dependency must not be instantiated while building the
+    // portable Zig artifacts.
+    if (target.result.os.tag == .macos and !is_nix_build) {
         const xcframework = XCFrameworkStep.create(b, lib);
         xcframework_step.dependOn(&xcframework.step);
 
@@ -446,6 +447,14 @@ pub fn build(b: *std.Build) !void {
         run_cmd.step.dependOn(&xcodebuild.build.step);
         if (b.args) |args| run_cmd.addArgs(args);
         run_step.dependOn(&run_cmd.step);
+    } else if (target.result.os.tag == .macos) {
+        const message = "native Apple workflows require nix develop or Xcode";
+        try run_step.addError(message, .{});
+        try macos_app_step.addError(message, .{});
+        try xcframework_step.addError(message, .{});
+        try ghostty_step.addError(message, .{});
+        if (emit_xcframework) b.default_step.dependOn(xcframework_step);
+        if (emit_macos_app) b.default_step.dependOn(macos_app_step);
     } else {
         try run_step.addError("the macOS app can only run on macOS", .{});
         try macos_app_step.addError("the macOS app can only build on macOS", .{});
