@@ -347,15 +347,37 @@ pub const Gic = struct {
 
     /// Get highest priority pending interrupt for a CPU (for IAR read).
     pub fn ackInterrupt(self: *Gic, cpu_id: u8) u32 {
+        return self.ackInterruptFiltered(cpu_id, null, 0xFF);
+    }
+
+    /// Get the highest-priority pending interrupt in one group below the priority mask.
+    pub fn ackInterruptForGroup(
+        self: *Gic,
+        cpu_id: u8,
+        group: u1,
+        priority_mask: u8,
+    ) u32 {
+        return self.ackInterruptFiltered(cpu_id, group, priority_mask);
+    }
+
+    fn ackInterruptFiltered(
+        self: *Gic,
+        cpu_id: u8,
+        group: ?u1,
+        priority_mask: u8,
+    ) u32 {
         if (cpu_id >= self.num_cpus) return 1023; // Spurious
 
         var best_intid: u32 = 1023;
-        var best_priority: u8 = 0xFF;
+        var best_priority = priority_mask;
 
         // Check SGIs/PPIs
         const redist = &self.redists[cpu_id];
         for (redist.sgi_ppi, 0..) |irq, i| {
-            if (irq.pending and irq.enabled and !irq.active and irq.priority < best_priority) {
+            const group_matches = group == null or irq.group == group.?;
+            if (group_matches and irq.pending and irq.enabled and
+                !irq.active and irq.priority < best_priority)
+            {
                 best_priority = irq.priority;
                 best_intid = @intCast(i);
             }
@@ -363,7 +385,10 @@ pub const Gic = struct {
 
         // Check SPIs
         for (self.spis, 0..) |spi, i| {
-            if (spi.pending and spi.enabled and !spi.active and spi.target_cpu == cpu_id and spi.priority < best_priority) {
+            const group_matches = group == null or spi.group == group.?;
+            if (group_matches and spi.pending and spi.enabled and !spi.active and
+                spi.target_cpu == cpu_id and spi.priority < best_priority)
+            {
                 best_priority = spi.priority;
                 best_intid = @as(u32, @intCast(i)) + 32;
             }
