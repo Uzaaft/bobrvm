@@ -161,8 +161,8 @@ pub const IccHandler = struct {
                     self.gic.endInterrupt(cpu_id, intid);
                 }
             },
-            Reg.BPR0 => state.bpr0 = @truncate(value),
-            Reg.BPR1 => state.bpr1 = @truncate(value),
+            Reg.BPR0 => state.bpr0 = @as(u8, @truncate(value)) & 0x7,
+            Reg.BPR1 => state.bpr1 = @as(u8, @truncate(value)) & 0x7,
             Reg.CTLR => state.ctlr = @truncate(value),
             Reg.IGRPEN0 => {
                 state.igrpen0 = (value & 1) != 0;
@@ -280,4 +280,17 @@ test "ICC split EOI mode keeps an interrupt active until DIR" {
     try std.testing.expectEqual(@as(usize, 1), eoi_record.count);
     try std.testing.expectEqual(@as(u8, 0), eoi_record.cpu_id);
     try std.testing.expectEqual(@as(u32, 5), eoi_record.intid);
+}
+
+test "ICC binary point registers discard reserved bits" {
+    const gic = try Gic.init(std.testing.allocator, 1);
+    defer gic.deinit();
+    const handler = try IccHandler.init(std.testing.allocator, gic, 1);
+    defer handler.deinit(std.testing.allocator);
+
+    handler.write(0, Reg.BPR0, std.math.maxInt(u64));
+    handler.write(0, Reg.BPR1, 0xFA);
+
+    try std.testing.expectEqual(@as(u64, 7), handler.read(0, Reg.BPR0));
+    try std.testing.expectEqual(@as(u64, 2), handler.read(0, Reg.BPR1));
 }
