@@ -1886,7 +1886,7 @@ pub const Machine = struct {
         context_id: u64,
     ) !void {
         _ = self;
-        try vcpu.setSysReg(.cpacr_el1, 3 << 20);
+        try setupVcpuFeatures(vcpu);
         try vcpu.setSysReg(.vbar_el1, MemoryLayout.RAM_BASE);
         try vcpu.setSysReg(.sctlr_el1, 0);
         // Best-effort: HVF may treat MPIDR as read-only (its default is
@@ -2997,13 +2997,7 @@ pub const Machine = struct {
     /// Set up initial state for a single vCPU.
     /// Only vCPU 0 gets the boot configuration; others wait for IPI.
     fn setupVcpuState(self: *Machine, vcpu: *hypervisor.Vcpu, id: u32) !void {
-        // Enable FP/SIMD for all vCPUs (CPACR_EL1.FPEN = 0b11)
-        try vcpu.setSysReg(.cpacr_el1, 3 << 20);
-
-        // Apple CPUs do not have a host GIC, so HVF omits the GIC feature
-        // field. The guest still has bobrvm's emulated GICv3 CPU interface.
-        const pfr0 = try vcpu.getSysReg(.id_aa64pfr0_el1);
-        try vcpu.setSysReg(.id_aa64pfr0_el1, withGicSystemRegisters(pfr0));
+        try setupVcpuFeatures(vcpu);
 
         // Set up SP_EL0 and SP_EL1 to valid addresses (per-vCPU)
         const stack_base = MemoryLayout.RAM_BASE + 0x10000 + @as(u64, id) * 0x20000;
@@ -3061,6 +3055,14 @@ pub const Machine = struct {
 
             log.debug("vCPU {}: secondary state at 0x{x} (waiting for PSCI CPU_ON)", .{ id, wfi_addr });
         }
+    }
+
+    fn setupVcpuFeatures(vcpu: *hypervisor.Vcpu) !void {
+        // Apple CPUs do not expose a host GIC, but every guest vCPU uses
+        // bobrvm's emulated GICv3 system-register interface.
+        const pfr0 = try vcpu.getSysReg(.id_aa64pfr0_el1);
+        try vcpu.setSysReg(.id_aa64pfr0_el1, withGicSystemRegisters(pfr0));
+        try vcpu.setSysReg(.cpacr_el1, 3 << 20);
     }
 
     // =========================================================================
