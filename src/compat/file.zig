@@ -30,3 +30,41 @@ pub fn readToEndAlloc(file: std.Io.File, alloc: std.mem.Allocator, max_bytes: us
 
     return result.toOwnedSlice(alloc);
 }
+
+test "bounded file read preserves binary data from the current position" {
+    const testing = std.testing;
+    const io = global.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const output = try tmp.dir.createFile(io, "binary", .{});
+    try output.writeStreamingAll(io, "skip\x00payload");
+    output.close(io);
+
+    const input = try tmp.dir.openFile(io, "binary", .{});
+    defer input.close(io);
+    var prefix: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), try input.readStreaming(io, &.{&prefix}));
+    try testing.expectEqualSlices(u8, "skip\x00", &prefix);
+
+    const result = try readToEndAlloc(input, testing.allocator, 7);
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "payload", result);
+}
+
+test "bounded file read rejects data beyond the limit across chunks" {
+    const testing = std.testing;
+    const io = global.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var data: [4097]u8 = undefined;
+    for (&data, 0..) |*byte, index| byte.* = @truncate(index);
+    const output = try tmp.dir.createFile(io, "oversized", .{});
+    try output.writeStreamingAll(io, &data);
+    output.close(io);
+
+    const input = try tmp.dir.openFile(io, "oversized", .{});
+    defer input.close(io);
+    try testing.expectError(error.FileTooBig, readToEndAlloc(input, testing.allocator, 4096));
+}

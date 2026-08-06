@@ -38,4 +38,5 @@ test {
     _ = renderer;
     _ = runtime;
     _ = @import("cli/Config.zig");
+    _ = @import("compat/file.zig");
 }
