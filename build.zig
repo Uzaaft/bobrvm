@@ -100,6 +100,10 @@ pub fn build(b: *std.Build) !void {
         "test-fuzz-agent-protocol",
         "Run guest agent protocol property tests",
     );
+    const snapshot_container_fuzz_step = b.step(
+        "test-fuzz-snapshot-container",
+        "Run snapshot container property tests",
+    );
 
     // Venus (KosmicKrisp) GPU backend — opt-in. When set, the GPU device routes
     // 3D contexts to virglrenderer(venus); the default build never links it.
@@ -430,6 +434,22 @@ pub fn build(b: *std.Build) !void {
     const run_agent_protocol_fuzz_tests = b.addRunArtifact(agent_protocol_fuzz_tests);
     test_step.dependOn(&run_agent_protocol_fuzz_tests.step);
     agent_protocol_fuzz_step.dependOn(&run_agent_protocol_fuzz_tests.step);
+
+    const snapshot_container_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/snapshot_container_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .error_tracing = false,
+    });
+    const snapshot_container_fuzz_tests = b.addTest(.{
+        .root_module = snapshot_container_fuzz_module,
+        .filters = test_filters,
+    });
+    const run_snapshot_container_fuzz_tests = b.addRunArtifact(
+        snapshot_container_fuzz_tests,
+    );
+    test_step.dependOn(&run_snapshot_container_fuzz_tests.step);
+    snapshot_container_fuzz_step.dependOn(&run_snapshot_container_fuzz_tests.step);
 
     const wayland_test_module = b.createModule(.{
         .root_source_file = b.path("src/guest_tools/wayland.zig"),

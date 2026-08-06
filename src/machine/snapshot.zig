@@ -22,11 +22,12 @@ const hypervisor = @import("../hypervisor/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
 const mmio = @import("../virtio/mmio.zig");
+const snapshot_container = @import("snapshot_container.zig");
 
 const log = std.log.scoped(.snapshot);
 
-pub const MAGIC = "BBRSNAP1";
-pub const VERSION: u32 = 1;
+pub const MAGIC = snapshot_container.MAGIC;
+pub const VERSION = snapshot_container.VERSION;
 const block_section_scratch_bytes = 128;
 const console_section_scratch_bytes = 512;
 const gic_section_scratch_bytes = 2 * 1024;
@@ -152,37 +153,7 @@ pub const Builder = struct {
     }
 };
 
-pub const Reader = struct {
-    bytes: []const u8,
-
-    pub fn init(bytes: []const u8) !Reader {
-        if (bytes.len < MAGIC.len + 4) return error.Truncated;
-        if (!std.mem.eql(u8, bytes[0..MAGIC.len], MAGIC)) return error.BadMagic;
-        const version = std.mem.readInt(u32, bytes[MAGIC.len..][0..4], .little);
-        if (version != VERSION) return error.BadVersion;
-        return .{ .bytes = bytes };
-    }
-
-    /// Find a section by name.
-    pub fn section(self: Reader, name: []const u8) ?[]const u8 {
-        var off: usize = MAGIC.len + 4;
-        while (off < self.bytes.len) {
-            const name_len = self.bytes[off];
-            off += 1;
-            if (name_len > self.bytes.len - off) return null;
-            const sec_name = self.bytes[off..][0..name_len];
-            off += name_len;
-            if (@sizeOf(u64) > self.bytes.len - off) return null;
-            const size = std.mem.readInt(u64, self.bytes[off..][0..8], .little);
-            off += 8;
-            if (size > self.bytes.len - off) return null;
-            const size_usize: usize = @intCast(size);
-            if (std.mem.eql(u8, sec_name, name)) return self.bytes[off..][0..size_usize];
-            off += size_usize;
-        }
-        return null;
-    }
-};
+pub const Reader = snapshot_container.Reader;
 
 // =============================================================================
 // Field-wise value serialization helpers
