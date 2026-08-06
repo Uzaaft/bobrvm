@@ -131,7 +131,8 @@ pub const IccHandler = struct {
                 self.gic.ackInterruptForGroup(cpu_id, 1, state.pmr)
             else
                 1023,
-            Reg.HPPIR0, Reg.HPPIR1 => 1023, // TODO: implement without ack
+            Reg.HPPIR0 => self.gic.peekInterruptForGroup(cpu_id, 0, state.pmr),
+            Reg.HPPIR1 => self.gic.peekInterruptForGroup(cpu_id, 1, state.pmr),
             Reg.BPR0 => state.bpr0,
             Reg.BPR1 => state.bpr1,
             Reg.CTLR => state.ctlr,
@@ -211,5 +212,21 @@ test "ICC IAR1 honors its group enable and priority mask" {
     try std.testing.expectEqual(@as(u64, 1023), handler.read(0, Reg.IAR1));
 
     handler.write(0, Reg.PMR, 0xB0);
+    try std.testing.expectEqual(@as(u64, 5), handler.read(0, Reg.IAR1));
+}
+
+test "ICC HPPIR1 reports the highest pending interrupt without acknowledging it" {
+    const gic = try Gic.init(std.testing.allocator, 1);
+    defer gic.deinit();
+    const handler = try IccHandler.init(std.testing.allocator, gic, 1);
+    defer handler.deinit(std.testing.allocator);
+
+    const sgi_frame = gic_module.GICR.SGI_OFFSET;
+    gic.redistWrite(sgi_frame + gic_module.GICR.ISENABLER0, 4, 1 << 5);
+    gic.setPpiPending(0, 5, true);
+    handler.write(0, Reg.IGRPEN1, 1);
+    handler.write(0, Reg.PMR, 0xB0);
+
+    try std.testing.expectEqual(@as(u64, 5), handler.read(0, Reg.HPPIR1));
     try std.testing.expectEqual(@as(u64, 5), handler.read(0, Reg.IAR1));
 }

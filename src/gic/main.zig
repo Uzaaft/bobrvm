@@ -360,13 +360,45 @@ pub const Gic = struct {
         return self.ackInterruptFiltered(cpu_id, group, priority_mask);
     }
 
+    /// Inspect the highest-priority pending interrupt without acknowledging it.
+    pub fn peekInterruptForGroup(
+        self: *const Gic,
+        cpu_id: u8,
+        group: u1,
+        priority_mask: u8,
+    ) u32 {
+        return self.highestPendingInterrupt(cpu_id, group, priority_mask);
+    }
+
     fn ackInterruptFiltered(
         self: *Gic,
         cpu_id: u8,
         group: ?u1,
         priority_mask: u8,
     ) u32 {
-        if (cpu_id >= self.num_cpus) return 1023; // Spurious
+        const best_intid = self.highestPendingInterrupt(cpu_id, group, priority_mask);
+
+        // Mark as active, clear pending (for edge-triggered)
+        if (best_intid < 32) {
+            const irq = &self.redists[cpu_id].sgi_ppi[best_intid];
+            irq.active = true;
+            if (irq.config == 1) irq.pending = false; // Edge-triggered
+        } else if (best_intid < MAX_INTID) {
+            const spi = &self.spis[best_intid - 32];
+            spi.active = true;
+            if (spi.config == 1) spi.pending = false; // Edge-triggered
+        }
+
+        return best_intid;
+    }
+
+    fn highestPendingInterrupt(
+        self: *const Gic,
+        cpu_id: u8,
+        group: ?u1,
+        priority_mask: u8,
+    ) u32 {
+        if (cpu_id >= self.num_cpus) return 1023;
 
         var best_intid: u32 = 1023;
         var best_priority = priority_mask;
@@ -393,18 +425,6 @@ pub const Gic = struct {
                 best_intid = @as(u32, @intCast(i)) + 32;
             }
         }
-
-        // Mark as active, clear pending (for edge-triggered)
-        if (best_intid < 32) {
-            const irq = &self.redists[cpu_id].sgi_ppi[best_intid];
-            irq.active = true;
-            if (irq.config == 1) irq.pending = false; // Edge-triggered
-        } else if (best_intid < MAX_INTID) {
-            const spi = &self.spis[best_intid - 32];
-            spi.active = true;
-            if (spi.config == 1) spi.pending = false; // Edge-triggered
-        }
-
         return best_intid;
     }
 
