@@ -49,6 +49,7 @@ pub const PortForward = struct {
 
 pub const ParseError = error{
     InvalidArgument,
+    InvalidName,
     HelpRequested,
     MissingName,
 };
@@ -241,6 +242,8 @@ pub fn ensureConfigDir(alloc: Allocator) ![]const u8 {
 }
 
 pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
+    try validateName(name);
+
     const dir = try getConfigDir(alloc);
     defer alloc.free(dir);
     const filename = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
@@ -249,7 +252,7 @@ pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
 }
 
 pub fn save(self: *const Config, alloc: Allocator) !void {
-    if (self.name.len == 0) return ParseError.MissingName;
+    try validateName(self.name);
 
     const dir_path = try ensureConfigDir(alloc);
     defer alloc.free(dir_path);
@@ -265,6 +268,14 @@ pub fn save(self: *const Config, alloc: Allocator) !void {
 
     try file.writePositionalAll(global.io(), json_bytes, 0);
     try file.writePositionalAll(global.io(), "\n", json_bytes.len);
+}
+
+fn validateName(name: []const u8) ParseError!void {
+    const suffix = ".json";
+
+    if (name.len == 0) return error.MissingName;
+    if (name.len > std.Io.Dir.max_name_bytes - suffix.len) return error.InvalidName;
+    if (std.mem.indexOfAny(u8, name, "/\x00") != null) return error.InvalidName;
 }
 
 pub const LoadedConfig = struct {
@@ -378,4 +389,43 @@ test "persisted config uses shared GPU memory validation" {
 
     const valid = Config{ .gpu_memory_mb = 2048 };
     try valid.validate();
+}
+
+test "config paths reject names outside the VM directory" {
+    const invalid_names = [_][]const u8{
+        "../escape",
+        "nested/vm",
+        "/absolute",
+    };
+
+    for (invalid_names) |name| {
+        const result = getConfigPath(std.testing.allocator, name);
+        if (result) |path| {
+            std.testing.allocator.free(path);
+            return error.TestExpectedError;
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidName, err);
+        }
+    }
+}
+
+test "config paths enforce filename boundaries" {
+    try std.testing.expectError(
+        error.MissingName,
+        getConfigPath(std.testing.allocator, ""),
+    );
+    try std.testing.expectError(
+        error.InvalidName,
+        getConfigPath(std.testing.allocator, "nul\x00name"),
+    );
+
+    const name_bytes_max = std.Io.Dir.max_name_bytes - ".json".len;
+    var name: [name_bytes_max + 1]u8 = @splat('a');
+    const path = try getConfigPath(std.testing.allocator, name[0..name_bytes_max]);
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".json"));
+    try std.testing.expectError(
+        error.InvalidName,
+        getConfigPath(std.testing.allocator, &name),
+    );
 }
