@@ -44,7 +44,8 @@ See [macos/README.md](macos/README.md) for Xcode and framework builds.
 ## Run a Linux guest
 
 `bobrvm run` starts a headless VM attached to the guest console. Press
-<kbd>Ctrl</kbd>+<kbd>]</kbd> to quit.
+<kbd>Ctrl</kbd>+<kbd>]</kbd> to quit. Press <kbd>Ctrl</kbd>+<kbd>B</kbd>, then
+<kbd>?</kbd>, for guest-tools status and lifecycle commands.
 
 ```sh
 ./zig-out/bin/bobrvm run \
@@ -65,15 +66,23 @@ zig build cli -- run --kernel Image --initrd initrd \
   --cmdline 'console=hvc0 ...'
 ```
 
-## Guest graphics
+## Guest tools
 
-The flake exports `nixosModules.guest`, which configures a NixOS guest for
-Zink and Venus:
+The flake exports `packages.aarch64-linux.bobrvm-tools` and
+`nixosModules.guest`. The module configures Venus/Zink graphics and can opt in
+to clipboard integration, guest lifecycle management, quiesced snapshots,
+file delivery, and a shared folder:
 
 ```nix
 {
   imports = [ bobrvm.nixosModules.guest ];
-  virtualisation.bobrvm.guest.enable = true;
+  virtualisation.bobrvm.guest = {
+    enable = true;
+    management.enable = true;
+    clipboard.enable = true;
+    fileTransfer.enable = true;
+    sharedFolder.enable = true;
+  };
 }
 ```
 
@@ -85,6 +94,9 @@ third_party/sync.sh
 third_party/build.sh
 zig build -Dgpu-venus
 ```
+
+See [docs/guest-tools.md](docs/guest-tools.md) for the feature matrix, security
+defaults, diagnostics, and complete NixOS configuration.
 
 See [third_party/README.md](third_party/README.md) for the pinned GPU forks and
 [docs/gpu-direction-decision.md](docs/gpu-direction-decision.md) for design

@@ -66,9 +66,11 @@ pub const Vdagent = struct {
     msg_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     /// Guest agent announced its capabilities (channel is live).
-    guest_caps_seen: bool = false,
+    guest_caps_seen: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Guest currently owns the clipboard (sent a GRAB with UTF8).
     guest_owns_clipboard: bool = false,
+    /// True only while the guest is waiting for host clipboard data.
+    host_clipboard_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Guest copied text; host should set its pasteboard.
     on_guest_clipboard: ?GuestClipboard = null,
@@ -93,6 +95,10 @@ pub const Vdagent = struct {
     ) void {
         self.on_guest_clipboard = on_guest_clipboard;
         self.request_host_clipboard = request_host_clipboard;
+    }
+
+    pub fn isConnected(self: *const Vdagent) bool {
+        return self.guest_caps_seen.load(.acquire);
     }
 
     /// Frame and send one VDAgentMessage, split into <=2048-byte chunks.
@@ -158,7 +164,7 @@ pub const Vdagent = struct {
     /// Announce that the HOST clipboard changed; the guest requests the
     /// data when it wants to paste.
     pub fn hostClipboardGrab(self: *Vdagent) void {
-        if (!self.guest_caps_seen) return;
+        if (!self.guest_caps_seen.load(.acquire)) return;
         var payload: [4]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], CLIP_UTF8_TEXT, .little);
         self.sendMsg(.clipboard_grab, &payload);
@@ -166,6 +172,7 @@ pub const Vdagent = struct {
 
     /// Deliver host clipboard text (answers the guest's REQUEST).
     pub fn sendClipboard(self: *Vdagent, text: []const u8) void {
+        if (!self.host_clipboard_requested.swap(false, .acq_rel)) return;
         var data_type: [4]u8 = undefined;
         std.mem.writeInt(u32, &data_type, CLIP_UTF8_TEXT, .little);
         self.sendMsgParts(.clipboard, &.{ &data_type, text });
@@ -230,9 +237,10 @@ pub const Vdagent = struct {
             .announce_capabilities => {
                 if (payload.len < 4) return;
                 const request = std.mem.readInt(u32, payload[0..4], .little);
-                self.guest_caps_seen = true;
+                self.guest_caps_seen.store(true, .release);
                 log.info("guest vdagent connected (caps request={})", .{request});
                 if (request != 0) self.sendCaps();
+                if (self.request_host_clipboard != null) self.hostClipboardGrab();
             },
             .clipboard_grab => {
                 // Guest copied something; request UTF8 if offered.
@@ -260,6 +268,7 @@ pub const Vdagent = struct {
                 if (payload.len < 4) return;
                 const kind = std.mem.readInt(u32, payload[0..4], .little);
                 if (kind != CLIP_UTF8_TEXT) return;
+                self.host_clipboard_requested.store(true, .release);
                 if (self.request_host_clipboard) |binding| {
                     binding.call();
                 }
@@ -336,7 +345,7 @@ test "vdagent: caps handshake replies with by-demand clipboard" {
     try testing.expectEqual(@as(usize, 0), counted.resize_index);
     try testing.expectEqual(@as(usize, 0), vd.in_buf.capacity);
     try testing.expectEqual(@as(usize, 0), vd.msg_buf.capacity);
-    try testing.expect(vd.guest_caps_seen);
+    try testing.expect(vd.isConnected());
     const reply = firstSentMsg();
     try testing.expectEqual(@intFromEnum(MsgType.announce_capabilities), reply.msg_type);
     const caps = std.mem.readInt(u32, reply.payload[4..8], .little);
@@ -389,13 +398,15 @@ test "vdagent: host grab + guest request + data delivery" {
     vd.hostClipboardGrab();
     try testing.expectEqual(@as(usize, 0), test_sent.items.len);
 
-    vd.guest_caps_seen = true;
+    vd.guest_caps_seen.store(true, .release);
     vd.hostClipboardGrab();
     const grab = firstSentMsg();
     try testing.expectEqual(@intFromEnum(MsgType.clipboard_grab), grab.msg_type);
+    clearSent();
+    vd.sendClipboard("unsolicited");
+    try testing.expectEqual(@as(usize, 0), test_sent.items.len);
 
     // Guest requests; owner responds with sendClipboard.
-    clearSent();
     var req: [4]u8 = undefined;
     std.mem.writeInt(u32, req[0..4], CLIP_UTF8_TEXT, .little);
     const req_msg = try guestMsg(testing.allocator, .clipboard_request, &req);
@@ -419,6 +430,7 @@ test "vdagent: large message splits into 2048-byte chunks" {
     const big = try testing.allocator.alloc(u8, 5000);
     defer testing.allocator.free(big);
     @memset(big, 'x');
+    vd.host_clipboard_requested.store(true, .release);
     vd.sendClipboard(big);
 
     // Walk the chunk stream: every chunk <= 2048, payload total = 20+4+5000.

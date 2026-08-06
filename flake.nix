@@ -26,52 +26,86 @@
   }: let
     inherit (nixpkgs) lib;
 
-    platforms = [
-      "aarch64-darwin"
-      "x86_64-darwin"
-    ];
-    forAllPlatforms = function:
+    hostPlatforms = ["aarch64-darwin"];
+    guestPlatforms = ["aarch64-linux"];
+    forPlatforms = platforms: function:
       lib.genAttrs platforms (system:
         function (import nixpkgs {
           inherit system;
           overlays = [ziglint.overlays.default];
         }));
   in {
-    packages = forAllPlatforms (pkgs: let
-      zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
-      zigDeps = pkgs.callPackage ./build.zig.zon.nix {
-        name = "bobrvm-zig-deps";
-        zig_0_16 = zig;
-      };
-      package = optimize:
-        pkgs.callPackage ./nix/package.nix {
-          inherit optimize zig;
+    packages =
+      (forPlatforms hostPlatforms (pkgs: let
+        zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
+        zigDeps = pkgs.callPackage ./build.zig.zon.nix {
+          name = "bobrvm-zig-deps";
+          zig_0_16 = zig;
         };
-    in rec {
-      bobrvm-debug = package "Debug";
-      bobrvm-releasefast = package "ReleaseFast";
-      bobrvm = bobrvm-releasefast;
-      debug = bobrvm-debug;
-      default = bobrvm;
+        package = optimize:
+          pkgs.callPackage ./nix/package.nix {
+            inherit optimize zig;
+          };
+      in rec {
+        bobrvm-debug = package "Debug";
+        bobrvm-releasefast = package "ReleaseFast";
+        bobrvm = bobrvm-releasefast;
+        debug = bobrvm-debug;
+        default = bobrvm;
 
-      deps = zigDeps;
-      framework-deps = bobrvm.zigDeps;
+        deps = zigDeps;
+        framework-deps = bobrvm.zigDeps;
 
-      test = pkgs.callPackage ./nix/test.nix {inherit zig;};
-    });
+        test = pkgs.callPackage ./nix/test.nix {inherit zig;};
+      }))
+      // (forPlatforms guestPlatforms (pkgs: {
+        bobrvm-tools = pkgs.callPackage ./nix/guest-tools.nix {};
+      }));
 
-    devShells = forAllPlatforms (pkgs: {
+    devShells = forPlatforms hostPlatforms (pkgs: {
       default = pkgs.callPackage ./nix/devShell.nix {
         zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
         inherit zon2nix;
       };
     });
 
-    formatter = forAllPlatforms (pkgs: pkgs.alejandra);
+    formatter = forPlatforms hostPlatforms (pkgs: pkgs.alejandra);
 
-    checks = forAllPlatforms (pkgs: {
-      inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) test;
-    });
+    checks =
+      (forPlatforms hostPlatforms (pkgs: {
+        inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) test;
+      }))
+      // (forPlatforms guestPlatforms (pkgs: let
+        guestSystem = nixpkgs.lib.nixosSystem {
+          system = pkgs.stdenv.hostPlatform.system;
+          modules = [
+            self.nixosModules.guest
+            {
+              virtualisation.bobrvm.guest = {
+                enable = true;
+                management.enable = true;
+                clipboard.enable = true;
+                fileTransfer.enable = true;
+                quiescedSnapshots.enable = true;
+                sharedFolder.enable = true;
+              };
+            }
+          ];
+        };
+        guestConfig = guestSystem.config;
+      in {
+        inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) bobrvm-tools;
+        guest-module = assert guestConfig.services.qemuGuest.enable;
+        assert guestConfig.services.spice-vdagentd.enable;
+        assert lib.hasSuffix "/bin/bobrvm-session-agent"
+        guestConfig.systemd.user.services.bobrvm-session-agent.serviceConfig.ExecStart;
+        assert guestConfig.fileSystems."/mnt/bobrvm".fsType == "9p";
+        assert lib.hasInfix "--inbox /var/lib/bobrvm/inbox"
+        guestConfig.systemd.services.bobrvm-agentd.serviceConfig.ExecStart;
+          pkgs.runCommand "bobrvm-guest-module-check" {} ''
+            touch "$out"
+          '';
+      }));
 
     nixosModules = rec {
       guest = import ./nix/guest-module.nix;

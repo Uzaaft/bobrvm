@@ -911,6 +911,7 @@ struct FilePickerField: View {
     let label: String
     @Binding var path: String
     let types: [UTType]
+    var selectDirectories = false
 
     var body: some View {
         LabeledContent(label) {
@@ -937,8 +938,11 @@ struct FilePickerField: View {
     private func selectFile() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = types
+        panel.canChooseDirectories = selectDirectories
+        panel.canChooseFiles = !selectDirectories
+        if !types.isEmpty {
+            panel.allowedContentTypes = types
+        }
         if panel.runModal() == .OK, let url = panel.url { path = url.path }
     }
 }
