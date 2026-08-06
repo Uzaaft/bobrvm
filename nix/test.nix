@@ -25,6 +25,7 @@ stdenv.mkDerivation {
     zig build test
     zig build bare-metal-test
     zig build test-fuzz-virtqueue --fuzz=100K
+    zig build test-fuzz-virgl-decoder --fuzz=100K
     runHook postBuild
   '';
 
