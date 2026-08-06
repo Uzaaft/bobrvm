@@ -43,6 +43,15 @@ pub fn build(b: *std.Build) void {
         });
     }
     const optimize = b.standardOptimizeOption(.{});
+    const emit_guest_tools = b.option(
+        bool,
+        "emit-guest-tools",
+        "Build Linux guest integration tools",
+    ) orelse false;
+    if (emit_guest_tools) {
+        addGuestTools(b, target, optimize);
+        return;
+    }
     // A sandboxed `nix build` sets NIX_BUILD_TOP but not IN_NIX_SHELL;
     // `nix develop` sets both. The sandbox cannot use Apple's Xcode tools,
     // while the development shell can build frameworks for the native app.
@@ -354,13 +363,27 @@ pub fn build(b: *std.Build) void {
     wireVenus(test_module, build_options, gpu_venus, virgl_lib);
 
     // Test step
+    const test_filter = b.option([]const u8, "test-filter", "Only run matching tests");
     const main_tests = b.addTest(.{
         .root_module = test_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
 
     const run_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    const wayland_test_module = b.createModule(.{
+        .root_source_file = b.path("src/guest_tools/wayland.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const wayland_tests = b.addTest(.{
+        .root_module = wayland_test_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+    });
+    const run_wayland_tests = b.addRunArtifact(wayland_tests);
+    test_step.dependOn(&run_wayland_tests.step);
 
     // ==========================================================================
     // Integration test: bare-metal ARM64 test binary (pure assembly)
@@ -435,6 +458,53 @@ pub fn build(b: *std.Build) void {
         run_cmd.setEnvironmentVariable("BOBRVM_LOG", "true");
         run_cmd.step.dependOn(&xcodebuild_for_run.step);
         run_step.dependOn(&run_cmd.step);
+    }
+}
+
+fn addGuestTools(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    if (target.result.os.tag != .linux) {
+        std.debug.panic("guest tools require a Linux target", .{});
+    }
+    const tools = .{
+        .{ "bobrvm-agentd", "src/guest_tools/agentd.zig" },
+        .{ "bobrvm-session-agent", "src/guest_tools/session_agent.zig" },
+        .{ "bobrvm-toolbox", "src/guest_tools/toolbox.zig" },
+    };
+    const protocol_module = b.createModule(.{
+        .root_source_file = b.path("src/agent/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wayland_module = b.createModule(.{
+        .root_source_file = b.path("src/guest_tools/wayland.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    inline for (tools) |tool| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(tool[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        if (std.mem.eql(u8, tool[0], "bobrvm-agentd") or
+            std.mem.eql(u8, tool[0], "bobrvm-session-agent"))
+        {
+            module.addImport("guest_protocol", protocol_module);
+        }
+        if (std.mem.eql(u8, tool[0], "bobrvm-session-agent")) {
+            module.addImport("wayland_client", wayland_module);
+        }
+        const executable = b.addExecutable(.{
+            .name = tool[0],
+            .root_module = module,
+        });
+        b.installArtifact(executable);
     }
 }
 

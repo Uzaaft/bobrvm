@@ -27,6 +27,11 @@ pub const Qga = struct {
     line_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Latest response outcomes (observability + tests).
     responses_seen: u64 = 0,
+    connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    next_request_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    watched_request_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    watched_response_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    watched_response_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     last_sync_id: ?i64 = null,
     /// Guest IPv4 addresses reported by guest-network-get-interfaces
     /// (comma-separated, lo excluded).
@@ -34,6 +39,9 @@ pub const Qga = struct {
 
     pub const LINE_MAX: usize = 64 * 1024;
     const parse_scratch_bytes = 8 * 1024;
+    pub const WatchedRequest = struct {
+        id: u64,
+    };
 
     pub fn init(alloc: Allocator, sender: Send) Qga {
         return .{ .alloc = alloc, .sender = sender };
@@ -63,6 +71,19 @@ pub const Qga = struct {
     /// guest-ping: liveness probe (empty return on success).
     pub fn ping(self: *Qga) void {
         self.send("{\"execute\":\"guest-ping\"}\n");
+    }
+
+    pub fn isConnected(self: *const Qga) bool {
+        return self.connected.load(.acquire);
+    }
+
+    pub fn watchedResponseReady(self: *const Qga, request: WatchedRequest) bool {
+        return self.watched_response_id.load(.acquire) == request.id;
+    }
+
+    pub fn watchedResponseFailed(self: *const Qga, request: WatchedRequest) bool {
+        if (!self.watchedResponseReady(request)) return false;
+        return self.watched_response_error.load(.acquire);
     }
 
     /// Graceful guest shutdown ("powerdown"), reboot ("reboot") or
@@ -95,6 +116,18 @@ pub const Qga = struct {
     /// guest_ips via feed().
     pub fn queryNetworkInterfaces(self: *Qga) void {
         self.send("{\"execute\":\"guest-network-get-interfaces\"}\n");
+    }
+
+    pub fn trimFilesystems(self: *Qga) void {
+        self.send("{\"execute\":\"guest-fstrim\"}\n");
+    }
+
+    pub fn freezeFilesystems(self: *Qga) WatchedRequest {
+        return self.sendWatched("guest-fsfreeze-freeze");
+    }
+
+    pub fn thawFilesystems(self: *Qga) WatchedRequest {
+        return self.sendWatched("guest-fsfreeze-thaw");
     }
 
     /// Feed guest→host bytes (console port output). Called on the vCPU
@@ -149,6 +182,8 @@ pub const Qga = struct {
 
         const root = parsed.value;
         if (root != .object) return;
+        self.connected.store(true, .release);
+        self.recordWatchedResponse(root, root.object.get("error") != null);
 
         if (root.object.get("error")) |err| {
             self.responses_seen += 1;
@@ -173,6 +208,28 @@ pub const Qga = struct {
             .array => |ifaces| self.parseInterfaces(ifaces),
             else => log.debug("guest agent response ok", .{}),
         }
+    }
+
+    fn sendWatched(self: *Qga, command: []const u8) WatchedRequest {
+        const request_id = self.next_request_id.fetchAdd(1, .monotonic);
+        self.watched_request_id.store(request_id, .release);
+        var buffer: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "{{\"execute\":\"{s}\",\"id\":{}}}\n",
+            .{ command, request_id },
+        ) catch unreachable;
+        self.send(message);
+        return .{ .id = request_id };
+    }
+
+    fn recordWatchedResponse(self: *Qga, root: std.json.Value, failed: bool) void {
+        const id_value = root.object.get("id") orelse return;
+        if (id_value != .integer or id_value.integer < 0) return;
+        const request_id: u64 = @intCast(id_value.integer);
+        if (self.watched_request_id.load(.acquire) != request_id) return;
+        self.watched_response_error.store(failed, .release);
+        self.watched_response_id.store(request_id, .release);
     }
 
     fn parseInterfaces(self: *Qga, ifaces: std.json.Array) void {
@@ -223,13 +280,37 @@ test "qga: commands serialize as newline-delimited JSON" {
     qga.sync(42);
     qga.shutdown("powerdown");
     qga.setTime(1_700_000_000_000_000_000);
+    qga.trimFilesystems();
+    _ = qga.freezeFilesystems();
+    _ = qga.thawFilesystems();
 
     const expected =
         "{\"execute\":\"guest-sync\",\"arguments\":{\"id\":42}}\n" ++
         "{\"execute\":\"guest-shutdown\",\"arguments\":{\"mode\":\"powerdown\"}}\n" ++
-        "{\"execute\":\"guest-set-time\",\"arguments\":{\"time\":1700000000000000000}}\n";
+        "{\"execute\":\"guest-set-time\",\"arguments\":{\"time\":1700000000000000000}}\n" ++
+        "{\"execute\":\"guest-fstrim\"}\n" ++
+        "{\"execute\":\"guest-fsfreeze-freeze\",\"id\":1}\n" ++
+        "{\"execute\":\"guest-fsfreeze-thaw\",\"id\":2}\n";
     try testing.expectEqualStrings(expected, test_sent.items);
-    try testing.expectEqual(@as(usize, 3), test_send_calls);
+    try testing.expectEqual(@as(usize, 6), test_send_calls);
+}
+
+test "qga: watched requests ignore unrelated responses" {
+    defer {
+        test_sent.deinit(testing.allocator);
+        test_sent = .empty;
+        test_send_calls = 0;
+    }
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
+    defer qga.deinit();
+    test_sent.clearRetainingCapacity();
+    const request = qga.freezeFilesystems();
+
+    qga.feed("{\"return\":{},\"id\":99}\n");
+    try testing.expect(!qga.watchedResponseReady(request));
+    qga.feed("{\"return\":{},\"id\":1}\n");
+    try testing.expect(qga.watchedResponseReady(request));
+    try testing.expect(!qga.watchedResponseFailed(request));
 }
 
 test "qga: feed parses split responses and sync ids" {
@@ -244,6 +325,7 @@ test "qga: feed parses split responses and sync ids" {
     qga.feed("urn\": 7}\n");
     try testing.expectEqual(@as(u64, 3), qga.responses_seen);
     try testing.expectEqual(@as(i64, 7), qga.last_sync_id.?);
+    try testing.expect(qga.isConnected());
 
     // Garbage lines don't count or crash.
     qga.feed("not json at all\n");

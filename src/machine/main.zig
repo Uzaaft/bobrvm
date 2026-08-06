@@ -26,6 +26,7 @@ const pci = @import("../pci/main.zig");
 const dtb = @import("dtb.zig");
 const agent = @import("../agent/main.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const GuestToolsStatus = agent.native.Status;
 
 const log = std.log.scoped(.machine);
 
@@ -278,6 +279,8 @@ const snapshot_sections = .{
 /// passed to Console.init in initVirtioDevices).
 const SPICE_PORT: u32 = 1; // com.redhat.spice.0
 const QGA_PORT: u32 = 2; // org.qemu.guest_agent.0
+const BOBRVM_AGENT_PORT: u32 = 3; // org.bobrvm.agent.0
+const BOBRVM_CLIPBOARD_PORT: u32 = 4; // org.bobrvm.clipboard.0
 
 /// A register capture/restore request executed ON the vCPU's owning
 /// thread (HVF rejects cross-thread register access). The requester
@@ -374,11 +377,17 @@ pub const Machine = struct {
 
     /// qemu-guest-agent channel on console port QGA_PORT
     /// ("org.qemu.guest_agent.0"). Talks to the stock distro agent.
-    qga: ?agent.Qga = null,
+    qga: ?*agent.Qga = null,
 
     /// spice-vdagent clipboard channel on console port SPICE_PORT
     /// ("com.redhat.spice.0"). Talks to the stock spice-vdagent daemon.
     vdagent: ?agent.Vdagent = null,
+
+    /// bobrvm-native desktop integration channel on BOBRVM_AGENT_PORT.
+    native_agent: ?*agent.Native = null,
+
+    /// Per-user Wayland clipboard integration on BOBRVM_CLIPBOARD_PORT.
+    wayland_agent: ?*agent.Native = null,
 
     /// UART device (PL011 for earlycon).
     uart: virtio.Uart = .{},
@@ -542,14 +551,27 @@ pub const Machine = struct {
             self.snd = null;
         }
 
-        if (self.qga) |*q| {
+        if (self.qga) |q| {
             q.deinit();
+            self.alloc.destroy(q);
             self.qga = null;
         }
 
         if (self.vdagent) |*v| {
             v.deinit();
             self.vdagent = null;
+        }
+
+        if (self.native_agent) |native| {
+            native.deinit();
+            self.alloc.destroy(native);
+            self.native_agent = null;
+        }
+
+        if (self.wayland_agent) |native| {
+            native.deinit();
+            self.alloc.destroy(native);
+            self.wayland_agent = null;
         }
 
         if (self.icc_handler) |handler| {
@@ -669,16 +691,24 @@ pub const Machine = struct {
                 agent.vdagent.HostClipboardRequest.initRaw(request_host_clipboard, userdata),
             );
         }
+        if (self.wayland_agent) |native| {
+            native.setClipboardHandlers(
+                agent.native.GuestClipboard.initRaw(on_guest_clipboard, userdata),
+                agent.native.HostClipboardRequest.initRaw(request_host_clipboard, userdata),
+            );
+        }
     }
 
     /// Announce a host clipboard change to the guest. Thread-safe.
     pub fn hostClipboardGrab(self: *Machine) void {
         if (self.vdagent) |*v| v.hostClipboardGrab();
+        if (self.wayland_agent) |native| native.hostClipboardGrab();
     }
 
     /// Deliver host clipboard text (answers the guest's request).
     pub fn sendHostClipboard(self: *Machine, text: []const u8) void {
         if (self.vdagent) |*v| v.sendClipboard(text);
+        if (self.wayland_agent) |native| native.sendClipboard(text);
     }
 
     /// Send bytes to the guest agent port (host→guest). Thread-safe.
@@ -690,14 +720,84 @@ pub const Machine = struct {
 
     /// Guest agent port output (guest→host); runs on the vCPU thread.
     fn qgaFeed(self: *Machine, data: []const u8) void {
-        if (self.qga) |*q| q.feed(data);
+        if (self.qga) |q| q.feed(data);
+    }
+
+    fn nativeAgentSend(self: *Machine, data: []const u8) void {
+        const console = self.console orelse return;
+        console.queuePortInput(BOBRVM_AGENT_PORT, data) catch {};
+        self.kickCpu(0);
+    }
+
+    fn nativeAgentFeed(self: *Machine, data: []const u8) void {
+        if (self.native_agent) |native| native.feed(data);
+    }
+
+    fn waylandAgentSend(self: *Machine, data: []const u8) void {
+        const console = self.console orelse return;
+        console.queuePortInput(BOBRVM_CLIPBOARD_PORT, data) catch {};
+        self.kickCpu(0);
+    }
+
+    fn waylandAgentFeed(self: *Machine, data: []const u8) void {
+        if (self.wayland_agent) |native| native.feed(data);
+    }
+
+    pub fn guestToolsStatus(self: *const Machine) agent.native.Status {
+        if (self.native_agent) |native| {
+            if (native.status() == .protocol_error) return .protocol_error;
+            if (native.status() == .ready) return .ready;
+        }
+        if (self.wayland_agent) |native| {
+            if (native.status() == .protocol_error) return .protocol_error;
+            if (native.status() == .ready) return .ready;
+        }
+        if (self.qga) |q| if (q.isConnected()) return .ready;
+        if (self.vdagent) |*v| if (v.isConnected()) return .ready;
+        if (self.native_agent) |native| return native.status();
+        if (self.wayland_agent) |native| return native.status();
+        return .disconnected;
+    }
+
+    pub fn guestToolsCapabilities(self: *const Machine) u64 {
+        var capabilities: u64 = 0;
+        if (self.native_agent) |native| capabilities |= native.capabilities();
+        if (self.wayland_agent) |native| capabilities |= native.capabilities();
+        if (self.qga) |q| {
+            if (q.isConnected()) capabilities |= agent.native.HostCapability.management;
+        }
+        if (self.vdagent) |*v| {
+            if (v.isConnected()) capabilities |= agent.native.HostCapability.clipboard;
+        }
+        return capabilities;
+    }
+
+    pub fn sendFileToGuest(self: *Machine, path: []const u8) !void {
+        const native = self.native_agent orelse return error.AgentUnavailable;
+        if (native.capabilities() & agent.native.HostCapability.file_transfer == 0) {
+            return error.AgentUnavailable;
+        }
+        try native.offerFile(path);
     }
 
     /// Ask the guest to shut down gracefully via qemu-guest-agent
     /// (requires the agent running in the guest). The guest then powers
     /// off through the normal PSCI SYSTEM_OFF path. Thread-safe.
     pub fn requestGuestShutdown(self: *Machine) void {
-        if (self.qga) |*q| q.shutdown("powerdown");
+        if (self.qga) |q| q.shutdown("powerdown");
+    }
+
+    pub fn requestGuestReboot(self: *Machine) void {
+        if (self.qga) |q| q.shutdown("reboot");
+    }
+
+    pub fn trimGuestFilesystems(self: *Machine) void {
+        if (self.qga) |q| q.trimFilesystems();
+    }
+
+    pub fn guestManagementReady(self: *const Machine) bool {
+        if (self.qga) |q| return q.isConnected();
+        return false;
     }
 
     /// Host wall clock in nanoseconds (zig 0.16 moved timestamps into Io).
@@ -707,7 +807,7 @@ pub const Machine = struct {
 
     /// Probe guest-agent liveness (response visible via qga state/logs).
     pub fn pingGuestAgent(self: *Machine) void {
-        if (self.qga) |*q| {
+        if (self.qga) |q| {
             q.sync(@divTrunc(hostRealNs(), std.time.ns_per_ms));
             q.ping();
         }
@@ -715,12 +815,12 @@ pub const Machine = struct {
 
     /// Set the guest wall clock to the host's (for restore-from-disk).
     pub fn syncGuestTime(self: *Machine) void {
-        if (self.qga) |*q| q.setTime(hostRealNs());
+        if (self.qga) |q| q.setTime(hostRealNs());
     }
 
     /// Ask the agent for guest interface IPs (lands in qga.guest_ips).
     pub fn queryGuestIps(self: *Machine) void {
-        if (self.qga) |*q| q.queryNetworkInterfaces();
+        if (self.qga) |q| q.queryNetworkInterfaces();
     }
 
     /// Request a live guest display resolution change (host window resized).
@@ -1013,6 +1113,43 @@ pub const Machine = struct {
         try meta_file.writePositionalAll(io, meta.items, 0);
 
         log.info("snapshot written to {s} ({} disk clones)", .{ dir, disk_idx });
+    }
+
+    /// Capture a filesystem-consistent snapshot using qemu-guest-agent.
+    /// Thaw is attempted after every capture outcome once vCPUs are running.
+    pub fn snapshotToQuiesced(self: *Machine, dir: []const u8) !void {
+        const qga = self.qga orelse return error.AgentUnavailable;
+        if (!qga.isConnected()) return error.AgentUnavailable;
+
+        const freeze_request = qga.freezeFilesystems();
+        defer self.thawAfterSnapshot(qga);
+        try self.waitForQgaResponse(qga, freeze_request);
+        try self.snapshotTo(dir);
+    }
+
+    fn thawAfterSnapshot(self: *Machine, qga: *agent.Qga) void {
+        const thaw_request = qga.thawFilesystems();
+        self.waitForQgaResponse(qga, thaw_request) catch |err| {
+            log.err("failed to thaw guest filesystems after snapshot: {}", .{err});
+        };
+    }
+
+    fn waitForQgaResponse(
+        self: *Machine,
+        qga: *agent.Qga,
+        request: agent.Qga.WatchedRequest,
+    ) !void {
+        var waited_ms: u32 = 0;
+        while (!qga.watchedResponseReady(request)) {
+            if (waited_ms >= 5000) return error.AgentTimeout;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 2 * std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+            waited_ms += 2;
+        }
+        _ = self;
+        if (qga.watchedResponseFailed(request)) return error.AgentRejected;
     }
 
     /// Copy-on-write file clone (instant on APFS); replaces dst.
@@ -2045,6 +2182,8 @@ pub const Machine = struct {
         self.console = try virtio.Console.init(self.alloc, &.{
             "com.redhat.spice.0",
             "org.qemu.guest_agent.0",
+            "org.bobrvm.agent.0",
+            "org.bobrvm.clipboard.0",
         });
         if (self.console_output) |cb| {
             self.console.?.setOutputCallback(
@@ -2060,7 +2199,8 @@ pub const Machine = struct {
         log.debug("initialized virtio-console at 0x{x}", .{MemoryLayout.virtioBase(0)});
 
         // qemu-guest-agent channel on the second named port.
-        self.qga = agent.Qga.init(
+        self.qga = try self.alloc.create(agent.Qga);
+        self.qga.?.* = agent.Qga.init(
             self.alloc,
             callback_binding.Handler1(Machine, []const u8, void, qgaSend).bind(self),
         );
@@ -2068,6 +2208,8 @@ pub const Machine = struct {
             QGA_PORT,
             callback_binding.Handler1(Machine, []const u8, void, qgaFeed).bind(self),
         );
+        self.qga.?.sync(@divTrunc(hostRealNs(), std.time.ns_per_ms));
+        self.qga.?.ping();
 
         // spice-vdagent clipboard channel on the first named port.
         self.vdagent = agent.Vdagent.init(
@@ -2078,6 +2220,30 @@ pub const Machine = struct {
             SPICE_PORT,
             callback_binding.Handler1(Machine, []const u8, void, vdagentFeed).bind(self),
         );
+
+        self.native_agent = try self.alloc.create(agent.Native);
+        self.native_agent.?.* = agent.Native.init(
+            self.alloc,
+            callback_binding.Handler1(Machine, []const u8, void, nativeAgentSend).bind(self),
+            .{ .capabilities = agent.native.Capability.file_transfer },
+        );
+        self.console.?.setPortOutput(
+            BOBRVM_AGENT_PORT,
+            callback_binding.Handler1(Machine, []const u8, void, nativeAgentFeed).bind(self),
+        );
+        self.native_agent.?.begin();
+
+        self.wayland_agent = try self.alloc.create(agent.Native);
+        self.wayland_agent.?.* = agent.Native.init(
+            self.alloc,
+            callback_binding.Handler1(Machine, []const u8, void, waylandAgentSend).bind(self),
+            .{ .capabilities = agent.native.Capability.clipboard },
+        );
+        self.console.?.setPortOutput(
+            BOBRVM_CLIPBOARD_PORT,
+            callback_binding.Handler1(Machine, []const u8, void, waylandAgentFeed).bind(self),
+        );
+        self.wayland_agent.?.begin();
 
         // Initialize primary block device (slot 1) if disk_path is set
         if (self.config.disk_path) |disk_path| {

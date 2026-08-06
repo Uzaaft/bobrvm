@@ -15,6 +15,7 @@ struct EditVMView: View {
     @State private var resolution: DisplayResolution
     @State private var retinaEnabled: Bool
     @State private var networkEnabled: Bool
+    @State private var sharedFolderPath: String
     @State private var diskSizeGB: Double
     @State private var showingError = false
     @State private var errorMessage = ""
@@ -42,6 +43,7 @@ struct EditVMView: View {
             ))
         _retinaEnabled = State(initialValue: vmInstance.retinaEnabled)
         _networkEnabled = State(initialValue: vmInstance.config.networkEnabled)
+        _sharedFolderPath = State(initialValue: vmInstance.config.sharedFolderPath ?? "")
         _diskSizeGB = State(
             initialValue: Double(
                 vmInstance.config.diskPath.flatMap(DiskManager.sizeGB(path:)) ?? 8
@@ -110,6 +112,15 @@ struct EditVMView: View {
                             types: [.iso]
                         )
                         .onChange(of: isoPath) { _ in hasChanges = true }
+
+                        FilePickerField(
+                            label: "Shared Folder",
+                            path: $sharedFolderPath,
+                            types: [],
+                            selectDirectories: true
+                        )
+                        .disabled(isRunning)
+                        .onChange(of: sharedFolderPath) { _ in hasChanges = true }
                     }
                 } header: {
                     Text("Storage")
@@ -366,6 +377,7 @@ struct EditVMView: View {
                 displayHeight: Int(resolution.height),
                 retinaEnabled: retinaEnabled,
                 networkEnabled: networkEnabled,
+                sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
                 diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil
             )
             dismiss()

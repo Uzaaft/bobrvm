@@ -103,6 +103,7 @@ public struct VMConfig {
     public var displayHeight: UInt32
     public var gpuMemoryBytes: UInt64
     public var networkEnabled: Bool
+    public var sharedFolderPath: String?
     /// UEFI firmware path (e.g., QEMU_EFI.fd). If set, boots via firmware.
     public var firmwarePath: String?
     /// UEFI variables file path. Created if doesn't exist.
@@ -124,6 +125,7 @@ public struct VMConfig {
         displayHeight: UInt32? = nil,
         gpuMemoryBytes: UInt64? = nil,
         networkEnabled: Bool? = nil,
+        sharedFolderPath: String? = nil,
         firmwarePath: String? = nil,
         varsPath: String? = nil,
         kernelPath: String? = nil,
@@ -141,6 +143,7 @@ public struct VMConfig {
         self.displayHeight = displayHeight ?? defaults.display_height
         self.gpuMemoryBytes = gpuMemoryBytes ?? defaults.gpu_memory_bytes
         self.networkEnabled = networkEnabled ?? defaults.enable_net
+        self.sharedFolderPath = sharedFolderPath
         self.firmwarePath = firmwarePath
         self.varsPath = varsPath
         self.kernelPath = kernelPath
@@ -188,7 +191,10 @@ public struct VMConfig {
                                 config.disk_path = diskPtr
                                 return try withOptionalCString(isoPath) { isoPtr in
                                     config.disk2_path = isoPtr
-                                    return try withUnsafePointer(to: &config) { try body($0) }
+                                    return try withOptionalCString(sharedFolderPath) { sharePtr in
+                                        config.shared_dir = sharePtr
+                                        return try withUnsafePointer(to: &config) { try body($0) }
+                                    }
                                 }
                             }
                         }
@@ -332,6 +338,13 @@ public final class App {
     public func tick() {
         guard let h = handle else { return }
         bobrvm_app_tick(h)
+        refreshGuestToolsStatus()
+    }
+
+    public func refreshGuestToolsStatus() {
+        for vm in vms {
+            vm.refreshGuestToolsStatus()
+        }
     }
 
     public func createVM(config: VMConfig) throws -> VM {
@@ -356,6 +369,14 @@ public final class App {
 
     func removeVM(_ vm: VM) {
         vms.removeAll { $0 === vm }
+    }
+
+    /// Announce a host pasteboard change to every running Linux VM. The
+    /// SPICE agent requests the contents lazily when the guest pastes.
+    public func notifyHostClipboardChanged() {
+        for vm in vms where vm.state == .running {
+            vm.hostClipboardChanged()
+        }
     }
 }
 
@@ -386,6 +407,7 @@ extension BobrvmAppDelegate {
 public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
     @Published public private(set) var isStopping = false
+    @Published public private(set) var guestToolsStatus = GuestToolsStatus.disconnected
     public private(set) var consoleOutput = ""
 
     private var handle: bobrvm_vm_t?
@@ -417,6 +439,17 @@ public final class VM: ObservableObject {
     public func clearConsoleOutput() {
         consoleOutput = ""
         consoleEventSubject.send(.clear)
+    }
+
+    func refreshGuestToolsStatus() {
+        guard let handle else {
+            guestToolsStatus = .disconnected
+            return
+        }
+        let status = GuestToolsStatus(bobrvm_vm_guest_tools_status(handle))
+        if status != guestToolsStatus {
+            guestToolsStatus = status
+        }
     }
 
     deinit {
@@ -466,6 +499,60 @@ public final class VM: ObservableObject {
         state = .running
     }
 
+    public func shutdownGracefully() {
+        guard let handle else { return }
+        bobrvm_vm_shutdown_graceful(handle)
+    }
+
+    public func rebootGuest() {
+        guard let handle else { return }
+        bobrvm_vm_guest_reboot(handle)
+    }
+
+    public func trimGuestFilesystems() {
+        guard let handle else { return }
+        bobrvm_vm_guest_trim(handle)
+    }
+
+    public func synchronizeGuestTime() {
+        guard let handle else { return }
+        bobrvm_vm_guest_sync_time(handle)
+    }
+
+    public func hostClipboardChanged() {
+        guard let handle else { return }
+        bobrvm_vm_host_clipboard_changed(handle)
+    }
+
+    public var isGuestManagementReady: Bool {
+        guard let handle else { return false }
+        return bobrvm_vm_guest_management_ready(handle)
+    }
+
+    public func snapshotQuiesced(to directory: URL) async throws {
+        guard let handle else { throw BobrvmError.invalidState }
+        let sendableHandle = SendableVMHandle(value: handle)
+        let path = directory.path
+        let code = await Task.detached(priority: .userInitiated) {
+            path.withCString { directoryPath in
+                bobrvm_vm_snapshot_quiesced(sendableHandle.value, directoryPath)
+            }
+        }.value
+        guard code.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+    }
+
+    public func sendFileToGuest(_ file: URL) throws {
+        guard let handle else { throw BobrvmError.invalidState }
+        let code = file.path.withCString { path in
+            bobrvm_vm_send_file(handle, path)
+        }
+        guard code.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+    }
+
     public func createSurface(
         device: MTLDevice,
         layer: CAMetalLayer,
@@ -506,6 +593,50 @@ public enum VMState: String, CaseIterable {
     case stopped
     case running
     case paused
+}
+
+public struct GuestToolsStatus: Equatable, Sendable {
+    public enum Connection: Equatable, Sendable {
+        case disconnected
+        case connecting
+        case ready
+        case protocolError
+    }
+
+    public let connection: Connection
+    public let capabilities: UInt64
+
+    public var supportsClipboard: Bool {
+        capabilities & UInt64(BOBRVM_GUEST_TOOLS_CLIPBOARD.rawValue) != 0
+    }
+
+    public var supportsFileTransfer: Bool {
+        capabilities & UInt64(BOBRVM_GUEST_TOOLS_FILE_TRANSFER.rawValue) != 0
+    }
+
+    public var supportsManagement: Bool {
+        capabilities & UInt64(BOBRVM_GUEST_TOOLS_MANAGEMENT.rawValue) != 0
+    }
+
+    public static let disconnected = GuestToolsStatus(
+        connection: .disconnected,
+        capabilities: 0
+    )
+
+    init(_ status: bobrvm_guest_tools_status_s) {
+        connection = switch status.connection.rawValue {
+        case BOBRVM_GUEST_TOOLS_CONNECTING.rawValue: .connecting
+        case BOBRVM_GUEST_TOOLS_READY.rawValue: .ready
+        case BOBRVM_GUEST_TOOLS_PROTOCOL_ERROR.rawValue: .protocolError
+        default: .disconnected
+        }
+        capabilities = status.capabilities
+    }
+
+    public init(connection: Connection, capabilities: UInt64) {
+        self.connection = connection
+        self.capabilities = capabilities
+    }
 }
 
 public struct MacVMConfig {

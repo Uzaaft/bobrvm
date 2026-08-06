@@ -239,6 +239,56 @@ pub export fn bobrvm_vm_shutdown_graceful(vm: ?*apprt.VM) void {
     v.requestGracefulShutdown();
 }
 
+pub const GuestToolsStatus = extern struct {
+    connection: c_int,
+    capabilities: u64,
+};
+
+pub export fn bobrvm_vm_guest_tools_status(vm: ?*apprt.VM) GuestToolsStatus {
+    const v = vm orelse return .{ .connection = 0, .capabilities = 0 };
+    return .{
+        .connection = @intFromEnum(v.guestToolsStatus()),
+        .capabilities = v.guestToolsCapabilities(),
+    };
+}
+
+pub export fn bobrvm_vm_guest_management_ready(vm: ?*apprt.VM) bool {
+    const v = vm orelse return false;
+    return v.guestManagementReady();
+}
+
+pub export fn bobrvm_vm_guest_reboot(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.requestGuestReboot();
+}
+
+pub export fn bobrvm_vm_guest_trim(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.trimGuestFilesystems();
+}
+
+pub export fn bobrvm_vm_guest_sync_time(vm: ?*apprt.VM) void {
+    const v = vm orelse return;
+    v.syncGuestTime();
+}
+
+pub export fn bobrvm_vm_snapshot_quiesced(
+    vm: ?*apprt.VM,
+    dir: ?[*:0]const u8,
+) c_int {
+    const v = vm orelse return 1;
+    const path = dir orelse return 1;
+    v.snapshotQuiesced(std.mem.span(path)) catch return 9;
+    return 0;
+}
+
+pub export fn bobrvm_vm_send_file(vm: ?*apprt.VM, path: ?[*:0]const u8) c_int {
+    const v = vm orelse return 1;
+    const file_path = path orelse return 1;
+    v.sendFileToGuest(std.mem.span(file_path)) catch return 9;
+    return 0;
+}
+
 pub export fn bobrvm_vm_host_clipboard_changed(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.hostClipboardChanged();

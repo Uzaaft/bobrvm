@@ -366,6 +366,39 @@ struct VMDetailView: View {
                     }
                     .help("Stop VM")
 
+                    Menu {
+                        Text(guestToolsDescription)
+                        Divider()
+                        Button("Shut Down Guest") {
+                            vmInstance.shutdownGracefully()
+                        }
+                        .disabled(!vmInstance.isGuestManagementReady)
+                        Button("Reboot Guest") {
+                            vmInstance.rebootGuest()
+                        }
+                        .disabled(!vmInstance.isGuestManagementReady)
+                        Divider()
+                        Button("Synchronize Time") {
+                            vmInstance.synchronizeGuestTime()
+                        }
+                        .disabled(!vmInstance.isGuestManagementReady)
+                        Button("Trim Filesystems") {
+                            vmInstance.trimGuestFilesystems()
+                        }
+                        .disabled(!vmInstance.isGuestManagementReady)
+                        Button("Create Quiesced Snapshot…") {
+                            createQuiescedSnapshot()
+                        }
+                        .disabled(!vmInstance.isGuestManagementReady)
+                        Divider()
+                        Button("Send File to Guest…") {
+                            sendFileToGuest()
+                        }
+                        .disabled(!vmInstance.guestToolsStatus.supportsFileTransfer)
+                    } label: {
+                        Label("Guest Tools", systemImage: "wrench.and.screwdriver")
+                    }
+
                 case .paused:
                     Button(action: { vmInstance.resume() }) {
                         Label("Resume", systemImage: "play.fill")
@@ -379,6 +412,46 @@ struct VMDetailView: View {
                 }
 
             }
+        }
+    }
+
+    private func sendFileToGuest() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let file = panel.url else { return }
+        do {
+            try vmInstance.sendFileToGuest(file)
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.messageText = "Could Not Send File"
+            alert.runModal()
+        }
+    }
+
+    private func createQuiescedSnapshot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        Task {
+            do {
+                try await vmInstance.snapshotQuiesced(to: directory)
+            } catch {
+                let alert = NSAlert(error: error)
+                alert.messageText = "Could Not Create Snapshot"
+                alert.runModal()
+            }
+        }
+    }
+
+    private var guestToolsDescription: String {
+        switch vmInstance.guestToolsStatus.connection {
+        case .disconnected: return "Guest Tools: Disconnected"
+        case .connecting: return "Guest Tools: Connecting"
+        case .ready: return "Guest Tools: Ready"
+        case .protocolError: return "Guest Tools: Protocol Error"
         }
     }
 }

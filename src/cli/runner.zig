@@ -198,7 +198,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     }
 
     // Interactive console: raw mode so keystrokes (including Ctrl-C) go to
-    // the guest. Ctrl-] detaches and shuts down, like telnet.
+    // the guest. Ctrl-] detaches; Ctrl-B prefixes host management commands.
     const stdin_fd = std.posix.STDIN_FILENO;
     const stdin_is_tty = std.c.isatty(stdin_fd) != 0;
     if (stdin_is_tty) {
@@ -212,7 +212,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
             raw.iflag.ICRNL = false;
             raw.iflag.IXON = false;
             std.posix.tcsetattr(stdin_fd, .NOW, raw) catch {};
-            log.info("console attached (Ctrl-] to quit)", .{});
+            log.info("console attached (Ctrl-] to quit, Ctrl-B ? for host commands)", .{});
         } else |_| {}
     }
     defer restoreTermios();
@@ -542,6 +542,7 @@ fn restoreTermios() void {
 /// the process exits (and reaps it) when the VM stops.
 fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
     var buf: [1024]u8 = undefined;
+    var host_command_pending = false;
     while (true) {
         const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch break;
         if (n == 0) {
@@ -558,18 +559,96 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
             break;
         }
 
-        if (is_tty) {
+        if (!is_tty) {
+            hw.injectConsoleInput(buf[0..n]);
+            continue;
+        }
+
+        var guest_start: usize = 0;
+        for (buf[0..n], 0..) |byte, i| {
+            if (host_command_pending) {
+                if (guest_start < i) hw.injectConsoleInput(buf[guest_start..i]);
+                host_command_pending = false;
+                if (classifyHostCommand(byte)) |command| {
+                    executeHostCommand(hw, command);
+                } else {
+                    log.warn("unknown host command 0x{x}; Ctrl-B ? lists commands", .{byte});
+                }
+                guest_start = i + 1;
+                continue;
+            }
+
+            if (byte == host_command_prefix) {
+                if (guest_start < i) hw.injectConsoleInput(buf[guest_start..i]);
+                host_command_pending = true;
+                guest_start = i + 1;
+                continue;
+            }
+
             // Ctrl-] detaches: forward everything before it, then shut down.
-            if (std.mem.indexOfScalar(u8, buf[0..n], 0x1d)) |esc| {
-                if (esc > 0) hw.injectConsoleInput(buf[0..esc]);
+            if (byte == 0x1d) {
+                if (guest_start < i) hw.injectConsoleInput(buf[guest_start..i]);
                 restoreTermios();
                 std.posix.raise(std.posix.SIG.TERM) catch {};
                 return;
             }
         }
-
-        hw.injectConsoleInput(buf[0..n]);
+        if (guest_start < n) hw.injectConsoleInput(buf[guest_start..n]);
     }
+}
+
+const host_command_prefix: u8 = 0x02;
+
+const HostCommand = enum {
+    literal_prefix,
+    help,
+    status,
+    shutdown,
+    reboot,
+    sync_time,
+    trim,
+};
+
+fn classifyHostCommand(byte: u8) ?HostCommand {
+    return switch (byte) {
+        host_command_prefix => .literal_prefix,
+        '?' => .help,
+        'p' => .status,
+        's' => .shutdown,
+        'r' => .reboot,
+        't' => .sync_time,
+        'f' => .trim,
+        else => null,
+    };
+}
+
+fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
+    switch (command) {
+        .literal_prefix => hw.injectConsoleInput(&.{host_command_prefix}),
+        .help => log.info(
+            "host commands: p=status s=shutdown r=reboot t=sync-time f=trim Ctrl-B=literal",
+            .{},
+        ),
+        .status => log.info("guest tools: {s}, capabilities=0x{x}", .{
+            @tagName(hw.guestToolsStatus()),
+            hw.guestToolsCapabilities(),
+        }),
+        .shutdown => hw.requestGuestShutdown(),
+        .reboot => hw.requestGuestReboot(),
+        .sync_time => hw.syncGuestTime(),
+        .trim => hw.trimGuestFilesystems(),
+    }
+}
+
+test "host console command decoder" {
+    try std.testing.expectEqual(HostCommand.help, classifyHostCommand('?').?);
+    try std.testing.expectEqual(HostCommand.status, classifyHostCommand('p').?);
+    try std.testing.expectEqual(HostCommand.shutdown, classifyHostCommand('s').?);
+    try std.testing.expectEqual(HostCommand.reboot, classifyHostCommand('r').?);
+    try std.testing.expectEqual(HostCommand.sync_time, classifyHostCommand('t').?);
+    try std.testing.expectEqual(HostCommand.trim, classifyHostCommand('f').?);
+    try std.testing.expectEqual(HostCommand.literal_prefix, classifyHostCommand(0x02).?);
+    try std.testing.expect(classifyHostCommand('x') == null);
 }
 
 fn consoleOutput(data: []const u8, _: ?*anyopaque) void {

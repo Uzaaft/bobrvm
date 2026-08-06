@@ -79,6 +79,8 @@ pub const VMConfig = extern struct {
     disk2_read_only: bool = true,
     /// Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP).
     enable_net: bool = false,
+    /// Host directory exported through virtio-9p with mount tag "host".
+    shared_dir: ?[*:0]const u8 = null,
     /// Initial guest display size in pixels (0 = machine default).
     display_width: u32 = config_policy.display_width_default,
     display_height: u32 = config_policy.display_height_default,
@@ -104,6 +106,9 @@ pub const VMConfig = extern struct {
             .disk2_path = optionalString(self.disk2_path),
             .disk2_read_only = self.disk2_read_only,
         }) catch return false;
+        if (optionalString(self.shared_dir)) |path| {
+            if (!std.fs.path.isAbsolute(path)) return false;
+        }
         return true;
     }
 
@@ -122,7 +127,7 @@ pub const VMConfig = extern struct {
         return self.copyOwned(storage);
     }
 
-    fn ownedStrings(self: VMConfig) [7]?[]const u8 {
+    fn ownedStrings(self: VMConfig) [8]?[]const u8 {
         assert(@sizeOf(@TypeOf(self.firmware_path)) == @sizeOf(?*const anyopaque));
         assert(@sizeOf(@TypeOf(self.disk2_path)) == @sizeOf(?*const anyopaque));
         return .{
@@ -133,6 +138,7 @@ pub const VMConfig = extern struct {
             optionalString(self.cmdline),
             optionalString(self.disk_path),
             optionalString(self.disk2_path),
+            optionalString(self.shared_dir),
         };
     }
 
@@ -160,7 +166,7 @@ pub const VMConfig = extern struct {
             }
         }
         assert(storage.len == expected);
-        assert(strings.len == 7);
+        assert(strings.len == 8);
 
         var owned_strings: [strings.len]?[]const u8 = @splat(null);
         var offset: usize = 0;
@@ -186,6 +192,7 @@ pub const VMConfig = extern struct {
             .disk2_path = owned_strings[6],
             .disk2_read_only = self.disk2_read_only,
             .enable_net = self.enable_net,
+            .shared_dir = owned_strings[7],
             .display_width = self.display_width,
             .display_height = self.display_height,
             .gpu_memory_bytes = self.gpu_memory_bytes,
@@ -209,6 +216,7 @@ pub const OwnedVMConfig = struct {
     disk2_path: ?[]const u8 = null,
     disk2_read_only: bool = true,
     enable_net: bool = false,
+    shared_dir: ?[]const u8 = null,
     display_width: u32 = 0,
     display_height: u32 = 0,
     gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
@@ -516,8 +524,15 @@ pub const VM = struct {
                 .enable_gpu = true,
                 .enable_virgl = self.config.enable_gpu3d,
                 .enable_net = self.config.enable_net,
-                .display_width = if (self.config.display_width != 0) self.config.display_width else 1280,
-                .display_height = if (self.config.display_height != 0) self.config.display_height else 800,
+                .shared_dir = self.config.shared_dir,
+                .display_width = if (self.config.display_width != 0)
+                    self.config.display_width
+                else
+                    1280,
+                .display_height = if (self.config.display_height != 0)
+                    self.config.display_height
+                else
+                    800,
                 .gpu_memory_bytes = if (self.config.gpu_memory_bytes != 0)
                     self.config.gpu_memory_bytes
                 else
@@ -532,7 +547,7 @@ pub const VM = struct {
             // Set console output callback
             self.hw_machine.?.setConsoleOutput(consoleOutputCallback, self);
 
-            // Bridge the vdagent clipboard channel to the app's system
+            // Bridge the X11 and Wayland guest channels to the app's system
             // clipboard callbacks (NSPasteboard on the Swift side).
             self.hw_machine.?.setClipboardHandlers(
                 guestClipboardCallback,
@@ -630,8 +645,45 @@ pub const VM = struct {
         if (self.hw_machine) |hw| hw.requestGuestShutdown();
     }
 
-    /// Host clipboard changed: announce to the guest (vdagent GRAB). The
-    /// guest pulls the data via read_clipboard when it wants to paste.
+    pub fn requestGuestReboot(self: *VM) void {
+        if (self.hw_machine) |hw| hw.requestGuestReboot();
+    }
+
+    pub fn trimGuestFilesystems(self: *VM) void {
+        if (self.hw_machine) |hw| hw.trimGuestFilesystems();
+    }
+
+    pub fn syncGuestTime(self: *VM) void {
+        if (self.hw_machine) |hw| hw.syncGuestTime();
+    }
+
+    pub fn guestManagementReady(self: *const VM) bool {
+        if (self.hw_machine) |hw| return hw.guestManagementReady();
+        return false;
+    }
+
+    pub fn snapshotQuiesced(self: *VM, dir: []const u8) !void {
+        const hw = self.hw_machine orelse return error.InvalidState;
+        try hw.snapshotToQuiesced(dir);
+    }
+
+    pub fn guestToolsStatus(self: *const VM) machine.GuestToolsStatus {
+        if (self.hw_machine) |hw| return hw.guestToolsStatus();
+        return .disconnected;
+    }
+
+    pub fn guestToolsCapabilities(self: *const VM) u64 {
+        if (self.hw_machine) |hw| return hw.guestToolsCapabilities();
+        return 0;
+    }
+
+    pub fn sendFileToGuest(self: *VM, path: []const u8) !void {
+        const hw = self.hw_machine orelse return error.InvalidState;
+        try hw.sendFileToGuest(path);
+    }
+
+    /// Host clipboard changed: announce to every connected guest backend.
+    /// The requesting backend then pulls data through read_clipboard.
     pub fn hostClipboardChanged(self: *VM) void {
         if (self.hw_machine) |hw| hw.hostClipboardGrab();
     }
@@ -1018,6 +1070,13 @@ test "VMConfig validation" {
 
     const invalid_cpu = VMConfig{ .memory_bytes = 1024, .vcpu_count = 0 };
     assert(!invalid_cpu.validate());
+
+    const invalid_share = VMConfig{
+        .memory_bytes = 1024,
+        .vcpu_count = 1,
+        .shared_dir = "relative/path",
+    };
+    assert(!invalid_share.validate());
 }
 
 test "guest clipboard callback forwards text" {
@@ -1072,6 +1131,7 @@ test "VMConfig owns strings in one allocation" {
         .cmdline = "console=hvc0",
         .disk_path = "disk.raw",
         .disk2_path = "install.iso",
+        .shared_dir = "/Users/example/Shared",
     };
 
     var owned = try cfg.dupe(alloc);
@@ -1081,6 +1141,7 @@ test "VMConfig owns strings in one allocation" {
     try std.testing.expectEqualStrings("firmware.fd", owned.firmware_path.?);
     try std.testing.expectEqualStrings("console=hvc0", owned.cmdline.?);
     try std.testing.expectEqualStrings("install.iso", owned.disk2_path.?);
+    try std.testing.expectEqualStrings("/Users/example/Shared", owned.shared_dir.?);
 }
 
 test "App VM registry does not allocate" {
@@ -1117,9 +1178,11 @@ test "VM object and configuration storage share one allocation" {
         .cmdline = "console=hvc0",
         .disk_path = "disk.raw",
         .disk2_path = "install.iso",
+        .shared_dir = "/Users/example/Shared",
     };
     const string_bytes = "firmware.fd".len + "vars.fd".len + "kernel".len +
-        "initrd".len + "console=hvc0".len + "disk.raw".len + "install.iso".len;
+        "initrd".len + "console=hvc0".len + "disk.raw".len + "install.iso".len +
+        "/Users/example/Shared".len;
     const vm = try app.createVM(&cfg);
 
     try std.testing.expectEqual(@as(usize, 1), counted.allocations);
@@ -1127,6 +1190,7 @@ test "VM object and configuration storage share one allocation" {
     try std.testing.expectEqualStrings("firmware.fd", vm.config.firmware_path.?);
     try std.testing.expectEqualStrings("console=hvc0", vm.config.cmdline.?);
     try std.testing.expectEqualStrings("install.iso", vm.config.disk2_path.?);
+    try std.testing.expectEqualStrings("/Users/example/Shared", vm.config.shared_dir.?);
     vm.destroy();
     app.alloc = base_alloc;
 }

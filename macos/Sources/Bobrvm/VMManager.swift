@@ -142,6 +142,7 @@ public final class VMManager: ObservableObject {
         displayHeight: Int,
         retinaEnabled: Bool,
         networkEnabled: Bool,
+        sharedFolderPath: String?,
         diskSizeGB: Int?
     ) throws {
         guard instance.state == .stopped else {
@@ -159,6 +160,7 @@ public final class VMManager: ObservableObject {
             displayHeight: UInt32(displayHeight),
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
             networkEnabled: networkEnabled,
+            sharedFolderPath: sharedFolderPath,
             firmwarePath: instance.config.firmwarePath,
             varsPath: instance.config.varsPath,
             kernelPath: instance.config.kernelPath,
@@ -277,6 +279,14 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         Int(config.gpuMemoryBytes / (1024 * 1024))
     }
 
+    public var guestToolsStatus: GuestToolsStatus {
+        vm?.guestToolsStatus ?? .disconnected
+    }
+
+    public var isGuestManagementReady: Bool {
+        vm?.isGuestManagementReady ?? false
+    }
+
     var runtimeVM: VM? {
         vm
     }
@@ -337,6 +347,32 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         }
     }
 
+    public func shutdownGracefully() {
+        vm?.shutdownGracefully()
+    }
+
+    public func rebootGuest() {
+        vm?.rebootGuest()
+    }
+
+    public func trimGuestFilesystems() {
+        vm?.trimGuestFilesystems()
+    }
+
+    public func synchronizeGuestTime() {
+        vm?.synchronizeGuestTime()
+    }
+
+    public func sendFileToGuest(_ file: URL) throws {
+        guard let vm else { throw BobrvmError.invalidState }
+        try vm.sendFileToGuest(file)
+    }
+
+    public func snapshotQuiesced(to directory: URL) async throws {
+        guard let vm else { throw BobrvmError.invalidState }
+        try await vm.snapshotQuiesced(to: directory)
+    }
+
     public func requireVM() throws -> VM {
         guard let vm else { throw BobrvmError.invalidState }
         return vm
@@ -390,6 +426,7 @@ enum VMStorage {
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
         let networkEnabled: Bool?
+        let sharedFolderPath: String?
         let guestSystem: GuestSystem?
         let macOSPlatform: MacOSPlatformMetadata?
 
@@ -425,6 +462,7 @@ enum VMStorage {
                 displayHeight: displayHeight ?? 800,
                 gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
                 networkEnabled: networkEnabled ?? true,
+                sharedFolderPath: sharedFolderPath,
                 firmwarePath: effectiveFirmwarePath,
                 varsPath: effectiveVarsPath,
                 kernelPath: kernelPath,
@@ -456,6 +494,7 @@ enum VMStorage {
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled
             self.networkEnabled = instance.config.networkEnabled
+            self.sharedFolderPath = instance.config.sharedFolderPath
             self.guestSystem = instance.guestSystem
             self.macOSPlatform = instance.macOSPlatform
         }

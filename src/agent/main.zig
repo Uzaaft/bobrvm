@@ -3,6 +3,8 @@
 
 pub const qga = @import("qga.zig");
 pub const Qga = qga.Qga;
+pub const native = @import("native.zig");
+pub const Native = native.Native;
 pub const vdagent = @import("vdagent.zig");
 pub const Vdagent = vdagent.Vdagent;
 

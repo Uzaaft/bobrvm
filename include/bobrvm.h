@@ -56,6 +56,24 @@ typedef enum {
     BOBRVM_VM_STATE_FAILED = 6,
 } bobrvm_vm_state_e;
 
+typedef enum {
+    BOBRVM_GUEST_TOOLS_DISCONNECTED = 0,
+    BOBRVM_GUEST_TOOLS_CONNECTING = 1,
+    BOBRVM_GUEST_TOOLS_READY = 2,
+    BOBRVM_GUEST_TOOLS_PROTOCOL_ERROR = 3,
+} bobrvm_guest_tools_connection_e;
+
+typedef struct {
+    bobrvm_guest_tools_connection_e connection;
+    uint64_t capabilities;
+} bobrvm_guest_tools_status_s;
+
+typedef enum {
+    BOBRVM_GUEST_TOOLS_CLIPBOARD = 1ULL << 0,
+    BOBRVM_GUEST_TOOLS_FILE_TRANSFER = 1ULL << 1,
+    BOBRVM_GUEST_TOOLS_MANAGEMENT = 1ULL << 8,
+} bobrvm_guest_tools_capability_e;
+
 /* Input. */
 
 typedef struct {
@@ -93,6 +111,8 @@ typedef struct {
     /** Defaults to read-only for ISO media. */
     bool disk2_read_only;
     bool enable_net;
+    /** Host directory exported through virtio-9p with mount tag "host". */
+    const char* shared_dir;
     /** Initial guest display width in pixels (0 = default 1280). */
     uint32_t display_width;
     /** Initial guest display height in pixels (0 = default 800). */
@@ -208,6 +228,17 @@ void bobrvm_vm_resume(bobrvm_vm_t vm);
  * guest-initiated poweroff path; keep bobrvm_vm_stop as force fallback.
  */
 void bobrvm_vm_shutdown_graceful(bobrvm_vm_t vm);
+
+/** Return the aggregate state of the negotiated guest integration channels. */
+bobrvm_guest_tools_status_s bobrvm_vm_guest_tools_status(bobrvm_vm_t vm);
+
+bool bobrvm_vm_guest_management_ready(bobrvm_vm_t vm);
+void bobrvm_vm_guest_reboot(bobrvm_vm_t vm);
+void bobrvm_vm_guest_trim(bobrvm_vm_t vm);
+void bobrvm_vm_guest_sync_time(bobrvm_vm_t vm);
+bobrvm_error_e bobrvm_vm_snapshot_quiesced(bobrvm_vm_t vm, const char* directory);
+/** Queue one regular file for delivery to the configured guest inbox. */
+bobrvm_error_e bobrvm_vm_send_file(bobrvm_vm_t vm, const char* path);
 
 /**
  * Notify the guest that the HOST clipboard changed (vdagent GRAB). The
