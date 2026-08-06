@@ -3070,4 +3070,5 @@ test "GpuDevice routes a guest clear command stream to Metal" {
 test {
     _ = virgl;
     _ = metal;
+    _ = @import("iosurface.zig");
 }

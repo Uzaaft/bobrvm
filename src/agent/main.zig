@@ -9,5 +9,7 @@ pub const vdagent = @import("vdagent.zig");
 pub const Vdagent = vdagent.Vdagent;
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = qga;
+    _ = native;
+    _ = vdagent;
 }

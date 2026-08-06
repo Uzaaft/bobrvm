@@ -22,4 +22,5 @@ pub const ContentScale = embedded.ContentScale;
 
 test {
     _ = embedded;
+    _ = @import("keymap.zig");
 }

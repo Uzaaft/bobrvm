@@ -3291,6 +3291,9 @@ test {
     _ = MemoryLayout;
     _ = gic;
     _ = icc;
+    _ = mininat;
+    _ = dtb;
+    _ = snapshot;
 }
 
 test "MemoryLayout constants" {

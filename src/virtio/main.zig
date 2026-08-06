@@ -72,9 +72,13 @@ test {
     _ = @import("input.zig");
     _ = @import("gpu.zig");
     _ = @import("net.zig");
+    _ = @import("uart.zig");
     _ = @import("balloon.zig");
     _ = @import("snd.zig");
     _ = @import("rtc.zig");
+    _ = @import("rng.zig");
+    _ = @import("p9.zig");
+    _ = @import("ring.zig");
 }
 
 test "DeviceId values" {
