@@ -6,6 +6,7 @@ const gic_module = @import("main.zig");
 const Gic = gic_module.Gic;
 
 const log = std.log.scoped(.icc);
+const CTLR_EOI_MODE: u32 = 1 << 1;
 
 /// ICC system-register encodings in `(Op0, Op1, CRn, CRm, Op2)` form.
 pub const Reg = struct {
@@ -155,8 +156,10 @@ pub const IccHandler = struct {
         switch (reg) {
             Reg.PMR => state.pmr = @truncate(value),
             Reg.EOIR0, Reg.EOIR1 => {
-                const intid: u32 = @truncate(value & 0xFFFFFF);
-                self.gic.endInterrupt(cpu_id, intid);
+                if (state.ctlr & CTLR_EOI_MODE == 0) {
+                    const intid: u32 = @truncate(value & 0xFFFFFF);
+                    self.gic.endInterrupt(cpu_id, intid);
+                }
             },
             Reg.BPR0 => state.bpr0 = @truncate(value),
             Reg.BPR1 => state.bpr1 = @truncate(value),
@@ -229,4 +232,52 @@ test "ICC HPPIR1 reports the highest pending interrupt without acknowledging it"
 
     try std.testing.expectEqual(@as(u64, 5), handler.read(0, Reg.HPPIR1));
     try std.testing.expectEqual(@as(u64, 5), handler.read(0, Reg.IAR1));
+}
+
+const EoiRecord = struct {
+    count: usize = 0,
+    cpu_id: u8 = 0,
+    intid: u32 = 0,
+
+    fn record(cpu_id: u8, intid: u32, userdata: ?*anyopaque) void {
+        const self: *EoiRecord = @ptrCast(@alignCast(userdata));
+        self.count += 1;
+        self.cpu_id = cpu_id;
+        self.intid = intid;
+    }
+};
+
+test "ICC split EOI mode keeps an interrupt active until DIR" {
+    const gic = try Gic.init(std.testing.allocator, 1);
+    defer gic.deinit();
+    const handler = try IccHandler.init(std.testing.allocator, gic, 1);
+    defer handler.deinit(std.testing.allocator);
+    var eoi_record: EoiRecord = .{};
+    gic.setEoiCallback(EoiRecord.record, &eoi_record);
+
+    const sgi_frame = gic_module.GICR.SGI_OFFSET;
+    gic.redistWrite(sgi_frame + gic_module.GICR.ISENABLER0, 4, 1 << 5);
+    gic.setPpiPending(0, 5, true);
+    handler.write(0, Reg.IGRPEN1, 1);
+    handler.write(0, Reg.PMR, 0xB0);
+    handler.write(0, Reg.CTLR, 1 << 1);
+
+    try std.testing.expectEqual(@as(u64, 5), handler.read(0, Reg.IAR1));
+    handler.write(0, Reg.EOIR1, 5);
+    const active_after_eoi = gic.redistRead(
+        sgi_frame + gic_module.GICR.ISACTIVER0,
+        4,
+    );
+    try std.testing.expect(active_after_eoi & (1 << 5) != 0);
+    try std.testing.expectEqual(@as(usize, 0), eoi_record.count);
+
+    handler.write(0, Reg.DIR, 5);
+    const active_after_dir = gic.redistRead(
+        sgi_frame + gic_module.GICR.ISACTIVER0,
+        4,
+    );
+    try std.testing.expectEqual(@as(u64, 0), active_after_dir & (1 << 5));
+    try std.testing.expectEqual(@as(usize, 1), eoi_record.count);
+    try std.testing.expectEqual(@as(u8, 0), eoi_record.cpu_id);
+    try std.testing.expectEqual(@as(u32, 5), eoi_record.intid);
 }
