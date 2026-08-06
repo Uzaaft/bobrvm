@@ -37,6 +37,7 @@ public enum BobrvmError: Error, LocalizedError {
         case 10: self = .alreadyExists
         case 11: self = .cannotShrink
         case 12: self = .unsupportedFormat
+        case 13: self = .invalidState
         default: self = .unknown(code)
         }
     }
@@ -90,7 +91,7 @@ public enum MouseButton: Int32 {
 }
 
 enum ConsoleEvent: Sendable {
-    case output(String)
+    case output(Data)
     case clear
 }
 
@@ -307,13 +308,11 @@ public final class App {
         runtimeConfig.console_output = { userdata, vmHandle, data, len in
             guard let userdata = userdata, let vmHandle, let data = data, len > 0 else { return }
             let app = Unmanaged<App>.fromOpaque(userdata).takeUnretainedValue()
-            let uint8Ptr = UnsafeRawPointer(data).bindMemory(to: UInt8.self, capacity: len)
-            let buffer = UnsafeBufferPointer(start: uint8Ptr, count: len)
-            let text = String(decoding: buffer, as: UTF8.self)
+            let output = Data(bytes: data, count: len)
             DispatchQueue.main.async {
                 guard let vm = app.vms.first(where: { $0.matches(vmHandle) }) else { return }
-                vm.appendConsoleOutput(text)
-                app.delegate?.app(app, vm: vm, didReceiveConsoleOutput: text)
+                vm.appendConsoleOutput(output)
+                app.delegate?.app(app, vm: vm, didReceiveConsoleOutput: output)
             }
         }
 
@@ -368,7 +367,7 @@ public protocol BobrvmAppDelegate: AnyObject {
     func appReadClipboard(_ app: App) -> String?
     func app(_ app: App, didRequestWriteClipboard text: String)
     func appGPUFrameReady(_ app: App)
-    func app(_ app: App, vm: VM, didReceiveConsoleOutput text: String)
+    func app(_ app: App, vm: VM, didReceiveConsoleOutput data: Data)
 }
 
 extension BobrvmAppDelegate {
@@ -377,7 +376,7 @@ extension BobrvmAppDelegate {
     public func appReadClipboard(_ app: App) -> String? { nil }
     public func app(_ app: App, didRequestWriteClipboard text: String) {}
     public func appGPUFrameReady(_ app: App) {}
-    public func app(_ app: App, vm: VM, didReceiveConsoleOutput text: String) {}
+    public func app(_ app: App, vm: VM, didReceiveConsoleOutput data: Data) {}
 }
 
 // MARK: - VM
@@ -386,7 +385,11 @@ extension BobrvmAppDelegate {
 public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
     @Published public private(set) var isStopping = false
-    public private(set) var consoleOutput = ""
+    private(set) var consoleOutputData = Data()
+
+    public var consoleOutput: String {
+        String(decoding: consoleOutputData, as: UTF8.self)
+    }
 
     private var handle: bobrvm_vm_t?
     private weak var app: App?
@@ -406,16 +409,16 @@ public final class VM: ObservableObject {
         handle == candidate
     }
 
-    func appendConsoleOutput(_ text: String) {
-        consoleOutput.append(text)
-        consoleEventSubject.send(.output(text))
+    func appendConsoleOutput(_ data: Data) {
+        consoleOutputData.append(data)
+        consoleEventSubject.send(.output(data))
 
-        guard consoleOutput.count > 125_000 else { return }
-        consoleOutput = String(consoleOutput.suffix(100_000))
+        guard consoleOutputData.count > 125_000 else { return }
+        consoleOutputData.removeFirst(consoleOutputData.count - 100_000)
     }
 
     public func clearConsoleOutput() {
-        consoleOutput = ""
+        consoleOutputData.removeAll(keepingCapacity: true)
         consoleEventSubject.send(.clear)
     }
 
@@ -464,6 +467,28 @@ public final class VM: ObservableObject {
         guard !isStopping, let h = handle else { return }
         bobrvm_vm_resume(h)
         state = .running
+    }
+
+    public func sendConsoleInput(_ data: Data) throws {
+        guard let h = handle else { throw BobrvmError.invalidState }
+        let result = data.withUnsafeBytes { buffer in
+            bobrvm_vm_console_write(
+                h,
+                buffer.bindMemory(to: UInt8.self).baseAddress,
+                buffer.count
+            )
+        }
+        guard result.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(result.rawValue))
+        }
+    }
+
+    public func resizeConsole(columns: UInt16, rows: UInt16) throws {
+        guard let h = handle else { throw BobrvmError.invalidState }
+        let result = bobrvm_vm_console_resize(h, columns, rows)
+        guard result.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(result.rawValue))
+        }
     }
 
     public func createSurface(

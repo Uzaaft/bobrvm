@@ -249,6 +249,29 @@ pub export fn bobrvm_vm_resume(vm: ?*apprt.VM) void {
     v.unpause();
 }
 
+pub export fn bobrvm_vm_console_write(
+    vm: ?*apprt.VM,
+    data: ?[*]const u8,
+    length: usize,
+) c_int {
+    const v = vm orelse return 1;
+    if (length == 0) return 0;
+    const bytes = data orelse return 1;
+    v.writeConsole(bytes[0..length]) catch return 13;
+    return 0;
+}
+
+pub export fn bobrvm_vm_console_resize(
+    vm: ?*apprt.VM,
+    columns: u16,
+    rows: u16,
+) c_int {
+    const v = vm orelse return 1;
+    const size = lib.console.Size.init(columns, rows) catch return 1;
+    v.resizeConsole(size);
+    return 0;
+}
+
 /// Force a vCPU to exit from hv_vcpu_run (for debugging stuck vCPUs).
 /// This injects an IRQ and forces an exit, useful when vCPU is stuck in WFI.
 pub export fn bobrvm_vm_kick_vcpu(vm: ?*apprt.VM, vcpu_id: u32) void {

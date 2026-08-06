@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
+const console_session = @import("../console/Session.zig");
 const global = @import("../global.zig");
 const thread_compat = @import("../compat/thread.zig");
 
@@ -113,6 +114,9 @@ pub const MachineConfig = struct {
 
     /// Number of vCPUs.
     vcpu_count: u8 = 1,
+
+    /// Initial guest-visible terminal dimensions in character cells.
+    console_size: console_session.Size = .{},
 
     /// Path to UEFI firmware (e.g., QEMU_EFI.fd). If set, boots via firmware.
     firmware_path: ?[]const u8 = null,
@@ -612,6 +616,18 @@ pub const Machine = struct {
         self.uart.queueInput(data);
         self.machine_lock.unlock(global.io());
         if (self.console) |console| console.queueInput(data) catch {};
+        self.kickCpu(0);
+    }
+
+    /// Update the guest-visible character-cell dimensions. PL011 has no size
+    /// protocol; virtio-console reports this through its configuration space.
+    pub fn resizeConsole(self: *Machine, size: console_session.Size) void {
+        assert(size.columns > 0);
+        assert(size.rows > 0);
+        self.machine_lock.lockUncancelable(global.io());
+        self.config.console_size = size;
+        if (self.console) |console| console.resize(size.columns, size.rows);
+        self.machine_lock.unlock(global.io());
         self.kickCpu(0);
     }
 
@@ -2046,6 +2062,10 @@ pub const Machine = struct {
             "com.redhat.spice.0",
             "org.qemu.guest_agent.0",
         });
+        self.console.?.setInitialSize(
+            self.config.console_size.columns,
+            self.config.console_size.rows,
+        );
         if (self.console_output) |cb| {
             self.console.?.setOutputCallback(
                 virtio.console.Output.initRaw(cb, self.console_userdata),
@@ -3144,7 +3164,7 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    try testing.expect(@sizeOf(Machine) <= 6224);
+    try testing.expect(@sizeOf(Machine) <= 6232);
 }
 
 test "stop before synchronous thread entry cancels startup" {

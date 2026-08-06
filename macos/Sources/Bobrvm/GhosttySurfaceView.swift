@@ -461,7 +461,7 @@ struct GhosttySurfaceViewRepresentable: NSViewRepresentable {
 
 struct GhosttyConsoleViewRepresentable: NSViewRepresentable {
     let app: ghostty_app_t
-    let initialOutput: String
+    let initialOutput: Data
     let events: AnyPublisher<ConsoleEvent, Never>
 
     func makeCoordinator() -> Coordinator {
@@ -489,7 +489,7 @@ struct GhosttyConsoleViewRepresentable: NSViewRepresentable {
         private let outputHandle: FileHandle
         private var cancellable: AnyCancellable?
 
-        init(initialOutput: String, events: AnyPublisher<ConsoleEvent, Never>) {
+        init(initialOutput: Data, events: AnyPublisher<ConsoleEvent, Never>) {
             let path = FileManager.default.temporaryDirectory
                 .appendingPathComponent("bobrvm-console-\(UUID().uuidString)")
             precondition(FileManager.default.createFile(atPath: path.path, contents: nil))
@@ -514,16 +514,16 @@ struct GhosttyConsoleViewRepresentable: NSViewRepresentable {
 
         private func update(_ event: ConsoleEvent) {
             switch event {
-            case .output(let text):
-                write(text)
+            case .output(let data):
+                write(data)
             case .clear:
-                write("\u{1B}[2J\u{1B}[H")
+                write(Data("\u{1B}[2J\u{1B}[H".utf8))
             }
         }
 
-        private func write(_ text: String) {
-            guard !text.isEmpty else { return }
-            outputHandle.write(Data(text.utf8))
+        private func write(_ data: Data) {
+            guard !data.isEmpty else { return }
+            outputHandle.write(data)
         }
     }
 }

@@ -9,7 +9,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
+const console = @import("../console/main.zig");
 const global = @import("../global.zig");
 const machine = @import("../machine/main.zig");
 const keymap = @import("keymap.zig");
@@ -401,6 +403,7 @@ pub const VM = struct {
     state: State,
     surfaces_head: ?*Surface,
     surface_count: usize,
+    console_session: console.Session,
 
     /// The actual machine (hypervisor + devices).
     hw_machine: ?*machine.Machine = null,
@@ -443,7 +446,14 @@ pub const VM = struct {
             .state = .stopped,
             .surfaces_head = null,
             .surface_count = 0,
+            .console_session = .init(),
         };
+        vm.console_session.setOutput(callback_binding.Handler1(
+            VM,
+            []const u8,
+            void,
+            forwardConsoleOutput,
+        ).bind(vm));
 
         // Post-condition: VM starts stopped with no surfaces
         assert(vm.state == .stopped);
@@ -529,8 +539,22 @@ pub const VM = struct {
                 return error.MachineCreationFailed;
             };
 
-            // Set console output callback
-            self.hw_machine.?.setConsoleOutput(consoleOutputCallback, self);
+            const hw = self.hw_machine.?;
+            hw.setConsoleOutput(consoleOutputCallback, self);
+            self.console_session.attach(.{
+                .write = callback_binding.Handler1(
+                    machine.Machine,
+                    []const u8,
+                    void,
+                    machine.Machine.injectConsoleInput,
+                ).bind(hw),
+                .resize = callback_binding.Handler1(
+                    machine.Machine,
+                    console.Size,
+                    void,
+                    machine.Machine.resizeConsole,
+                ).bind(hw),
+            });
 
             // Bridge the vdagent clipboard channel to the app's system
             // clipboard callbacks (NSPasteboard on the Swift side).
@@ -611,6 +635,7 @@ pub const VM = struct {
             self.vcpu_thread = null;
         }
         if (self.hw_machine) |hw| {
+            self.console_session.detach();
             // Must fully deinit to release hypervisor (only one VM per process).
             hw.deinit();
             self.hw_machine = null;
@@ -693,10 +718,21 @@ pub const VM = struct {
         }
     }
 
+    pub fn writeConsole(self: *VM, data: []const u8) console.Session.WriteError!void {
+        try self.console_session.write(data);
+    }
+
+    pub fn resizeConsole(self: *VM, size: console.Size) void {
+        self.console_session.resize(size);
+    }
+
     fn consoleOutputCallback(data: []const u8, userdata: ?*anyopaque) void {
         const vm: *VM = @ptrCast(@alignCast(userdata orelse return));
-        // Route to Swift via App callback
-        vm.app.sendConsoleOutput(vm, data);
+        vm.console_session.receive(data);
+    }
+
+    fn forwardConsoleOutput(self: *VM, data: []const u8) void {
+        self.app.sendConsoleOutput(self, data);
     }
 
     pub fn createSurface(

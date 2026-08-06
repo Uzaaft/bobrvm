@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 pub const agent = @import("agent/main.zig");
 pub const apprt = @import("apprt/main.zig");
 pub const config = @import("config.zig");
+pub const console = @import("console/main.zig");
 pub const disk = @import("disk.zig");
 pub const fs = @import("fs/main.zig");
 pub const global = @import("global.zig");
@@ -25,6 +26,7 @@ test {
     _ = agent;
     _ = apprt;
     _ = config;
+    _ = console;
     _ = disk;
     _ = fs;
     _ = global;

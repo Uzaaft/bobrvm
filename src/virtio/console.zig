@@ -324,6 +324,25 @@ pub const Console = struct {
         self.transport.setIrqCallback(irq);
     }
 
+    /// Set dimensions before the device is exposed to the guest.
+    pub fn setInitialSize(self: *Console, columns: u16, rows: u16) void {
+        assert(columns > 0);
+        assert(rows > 0);
+        self.config.cols = columns;
+        self.config.rows = rows;
+    }
+
+    /// Notify the guest that the character-cell dimensions changed.
+    /// The caller serializes this against guest MMIO and queue processing.
+    pub fn resize(self: *Console, columns: u16, rows: u16) void {
+        assert(columns > 0);
+        assert(rows > 0);
+        if (self.config.cols == columns and self.config.rows == rows) return;
+        self.config.cols = columns;
+        self.config.rows = rows;
+        self.transport.signalConfigChange();
+    }
+
     /// Queue input data to send to guest. Called from the host input
     /// thread; delivery happens on the vCPU thread via pollReceive.
     pub fn queueInput(self: *Console, data: []const u8) Error!void {
@@ -806,6 +825,25 @@ test "Console config read" {
     const cols = console.read(@intFromEnum(mmio.Reg.config));
     // cols=80, rows=25 → 0x00190050 in little-endian as u32
     try std.testing.expectEqual(@as(u32, 80 | (25 << 16)), cols);
+}
+
+test "Console resize updates dimensions and signals config change" {
+    const console = try Console.init(std.testing.allocator, &.{});
+    defer console.deinit();
+
+    console.setInitialSize(100, 30);
+    const config = console.read(@intFromEnum(mmio.Reg.config));
+    try std.testing.expectEqual(@as(u32, 100 | (30 << 16)), config);
+    try std.testing.expectEqual(@as(u32, 0), console.transport.config_generation);
+
+    console.resize(132, 43);
+    try std.testing.expect(console.transport.interrupt_status.config_change);
+    try std.testing.expectEqual(@as(u32, 1), console.transport.config_generation);
+    try std.testing.expectEqual(@as(u16, 132), console.config.cols);
+    try std.testing.expectEqual(@as(u16, 43), console.config.rows);
+
+    console.resize(132, 43);
+    try std.testing.expectEqual(@as(u32, 1), console.transport.config_generation);
 }
 
 test "Console queue input" {

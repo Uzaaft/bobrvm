@@ -466,7 +466,7 @@ struct ConsoleView: View {
             if let app = ghosttyRuntime.app {
                 GhosttyConsoleViewRepresentable(
                     app: app,
-                    initialOutput: vm.consoleOutput,
+                    initialOutput: vm.consoleOutputData,
                     events: vm.consoleEventPublisher
                 )
             } else {

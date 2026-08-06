@@ -44,6 +44,7 @@ typedef enum {
     BOBRVM_ERROR_ALREADY_EXISTS = 10,
     BOBRVM_ERROR_CANNOT_SHRINK = 11,
     BOBRVM_ERROR_UNSUPPORTED_FORMAT = 12,
+    BOBRVM_ERROR_INVALID_STATE = 13,
 } bobrvm_error_e;
 
 typedef enum {
@@ -164,7 +165,12 @@ typedef struct {
     void (*gpu_frame_ready)(void* userdata);
 
     /** Called on a vCPU thread. */
-    void (*console_output)(void* userdata, bobrvm_vm_t vm, const char* data, size_t len);
+    void (*console_output)(
+        void* userdata,
+        bobrvm_vm_t vm,
+        const uint8_t* data,
+        size_t len
+    );
 } bobrvm_runtime_config_s;
 
 /* Library lifecycle. */
@@ -201,6 +207,20 @@ void bobrvm_vm_finish_stop(bobrvm_vm_t vm);
 void bobrvm_vm_pause(bobrvm_vm_t vm);
 
 void bobrvm_vm_resume(bobrvm_vm_t vm);
+
+/** Send raw terminal bytes to the guest console. */
+bobrvm_error_e bobrvm_vm_console_write(
+    bobrvm_vm_t vm,
+    const uint8_t* data,
+    size_t length
+);
+
+/** Set guest-visible terminal dimensions in character cells. */
+bobrvm_error_e bobrvm_vm_console_resize(
+    bobrvm_vm_t vm,
+    uint16_t columns,
+    uint16_t rows
+);
 
 /**
  * Ask the guest to shut down cleanly via qemu-guest-agent (requires the
