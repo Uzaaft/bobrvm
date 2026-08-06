@@ -103,7 +103,7 @@ struct EditVMView: View {
                         }
                     }
 
-                    if vmInstance.guestSystem == .linux {
+                    if vmInstance.guestSystem != .macOS {
                         FilePickerField(
                             label: "CD/DVD Image",
                             path: $isoPath,

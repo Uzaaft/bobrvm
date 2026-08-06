@@ -50,9 +50,10 @@ public final class VMManager: ObservableObject {
         name: String,
         config: VMConfig,
         isoPath: String? = nil,
-        retinaEnabled: Bool = true
+        retinaEnabled: Bool = true,
+        guestSystem: GuestSystem = .linux
     ) throws {
-        guard let app else {
+        guard guestSystem != .macOS, let app else {
             throw BobrvmError.invalidArgument
         }
 
@@ -64,7 +65,8 @@ public final class VMManager: ObservableObject {
                 app: app,
                 vm: vm,
                 isoPath: isoPath,
-                retinaEnabled: retinaEnabled
+                retinaEnabled: retinaEnabled,
+                guestSystem: guestSystem
             )
             try VMStorage.saveVM(instance)
             vms.append(instance)
@@ -175,7 +177,7 @@ public final class VMManager: ObservableObject {
         }
 
         guard let app else { throw BobrvmError.invalidArgument }
-        let newVM = instance.guestSystem == .linux
+        let newVM = instance.guestSystem != .macOS
             ? try app.createVM(config: newConfig)
             : nil
         let updatedInstance = VMInstance(
@@ -268,7 +270,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
 
     public var state: VMState {
         switch guestSystem {
-        case .linux: return vm?.state ?? .stopped
+        case .linux, .windows: return vm?.state ?? .stopped
         case .macOS: return macVM?.state ?? .stopped
         }
     }

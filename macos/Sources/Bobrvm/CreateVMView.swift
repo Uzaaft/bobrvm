@@ -45,15 +45,19 @@ struct CreateVMView: View {
             switch selected {
             case .linux:
                 source = .installFromISO
-                if name == "macOS" { name = "Linux" }
+                updateDefaultName(to: selected)
             case .macOS:
                 source = .installMacOS
-                if name == "Linux" { name = "macOS" }
+                updateDefaultName(to: selected)
                 memoryGB = max(memoryGB, 8)
                 vcpuCount = max(vcpuCount, 4)
                 diskSizeGB = max(diskSizeGB, 80)
             case .windows:
-                break
+                source = .installFromISO
+                updateDefaultName(to: selected)
+                memoryGB = max(memoryGB, 4)
+                vcpuCount = max(vcpuCount, 2)
+                diskSizeGB = max(diskSizeGB, 64)
             }
         }
         .alert(
@@ -90,7 +94,7 @@ struct CreateVMView: View {
                 vramMB: $vramMB,
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
-                guestSystem: source.guestSystem,
+                guestSystem: (operatingSystem ?? .linux).guestSystem,
                 systemInfo: systemInfo
             )
         case .storage:
@@ -102,6 +106,7 @@ struct CreateVMView: View {
         case .summary:
             SummaryStepView(
                 name: $name,
+                operatingSystem: operatingSystem ?? .linux,
                 source: source,
                 isoPath: isoPath,
                 ipswPath: ipswPath,
@@ -155,7 +160,7 @@ struct CreateVMView: View {
         if isCreating { return false }
         switch step {
         case .operatingSystem:
-            return operatingSystem?.isAvailable == true
+            return operatingSystem != nil
         case .installation:
             switch source {
             case .installFromISO: return !isoPath.isEmpty
@@ -215,7 +220,8 @@ struct CreateVMView: View {
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                 config: config,
                 isoPath: source == .installFromISO ? isoPath : nil,
-                retinaEnabled: retinaEnabled
+                retinaEnabled: retinaEnabled,
+                guestSystem: (operatingSystem ?? .linux).guestSystem
             )
             dismiss()
         } catch {
@@ -246,6 +252,13 @@ struct CreateVMView: View {
             isoPath: source == .installFromISO ? isoPath : nil,
             isoReadOnly: true
         )
+    }
+
+    private func updateDefaultName(to operatingSystem: CreationOperatingSystem) {
+        let defaultNames = CreationOperatingSystem.allCases.map(\.title)
+        if defaultNames.contains(name) {
+            name = operatingSystem.title
+        }
     }
 }
 
@@ -291,7 +304,13 @@ private enum CreationOperatingSystem: String, CaseIterable, Identifiable {
     case windows
 
     var id: Self { self }
-    var isAvailable: Bool { self != .windows }
+    var guestSystem: GuestSystem {
+        switch self {
+        case .linux: return .linux
+        case .macOS: return .macOS
+        case .windows: return .windows
+        }
+    }
 
     var title: String {
         switch self {
@@ -305,7 +324,7 @@ private enum CreationOperatingSystem: String, CaseIterable, Identifiable {
         switch self {
         case .macOS: return "Create a native Apple silicon virtual Mac."
         case .linux: return "Install Linux or attach an existing virtual disk."
-        case .windows: return "Windows virtualization is coming soon."
+        case .windows: return "Install Windows for Arm or attach an existing virtual disk."
         }
     }
 
@@ -324,10 +343,6 @@ private enum VMSource: String, CaseIterable, Identifiable {
     case installMacOS
 
     var id: Self { self }
-
-    var guestSystem: GuestSystem {
-        self == .installMacOS ? .macOS : .linux
-    }
 }
 
 private enum MacOSRestoreSource: String, CaseIterable, Identifiable {
@@ -396,9 +411,7 @@ private struct OperatingSystemStepView: View {
                     title: operatingSystem.title,
                     detail: operatingSystem.detail,
                     icon: operatingSystem.icon,
-                    selected: selection == operatingSystem,
-                    badge: operatingSystem.isAvailable ? nil : "Coming soon",
-                    enabled: operatingSystem.isAvailable
+                    selected: selection == operatingSystem
                 ) {
                     selection = operatingSystem
                 }
@@ -414,13 +427,12 @@ private struct InstallationStepView: View {
     @Binding var ipswPath: String
     @Binding var macOSRestoreSource: MacOSRestoreSource
     @Binding var existingDiskPath: String
+    @State private var showingWindowsDownloader = false
 
     var body: some View {
         WizardPage(
             title: "Choose an installation method",
-            subtitle: operatingSystem == .macOS
-                ? "Choose where Bobrvm should obtain the macOS restore image."
-                : "Install Linux from an ISO or use an existing virtual disk."
+            subtitle: installationSubtitle
         ) {
             if operatingSystem == .macOS {
                 VStack(alignment: .leading, spacing: 10) {
@@ -437,7 +449,8 @@ private struct InstallationStepView: View {
                     }
                     Text(
                         macOSRestoreSource == .latest
-                            ? "Apple’s restore image is roughly 15–25 GB and is cached after download."
+                            ? "Apple’s restore image is roughly 15–25 GB and is cached after "
+                                + "download."
                             : "Select an Apple restore image compatible with this Mac."
                     )
                     .font(.caption)
@@ -454,12 +467,25 @@ private struct InstallationStepView: View {
                     selected: source == .installFromISO
                 ) { source = .installFromISO }
                 if source == .installFromISO {
-                    FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
-                        .padding(.leading, 44)
+                    VStack(alignment: .leading, spacing: 10) {
+                        FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
+                        if operatingSystem == .windows {
+                            Button {
+                                showingWindowsDownloader = true
+                            } label: {
+                                Label(
+                                    "Download Windows 11 from Microsoft…",
+                                    systemImage: "arrow.down.circle"
+                                )
+                            }
+                        }
+                    }
+                    .padding(.leading, 44)
                 }
                 SourceCard(
                     title: "Use an existing virtual disk",
-                    detail: "Boot a raw or QCOW2 disk that already contains Linux.",
+                    detail: "Boot a raw or QCOW2 disk that already contains "
+                        + "\(operatingSystem.title).",
                     icon: "externaldrive",
                     selected: source == .existingDisk
                 ) { source = .existingDisk }
@@ -471,7 +497,31 @@ private struct InstallationStepView: View {
                     )
                     .padding(.leading, 44)
                 }
+                if operatingSystem == .windows {
+                    Label(
+                        "Windows installation media must support Arm64.",
+                        systemImage: "info.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
             }
+        }
+        .sheet(isPresented: $showingWindowsDownloader) {
+            WindowsMediaDownloadView { url in
+                isoPath = url.path
+            }
+        }
+    }
+
+    private var installationSubtitle: String {
+        switch operatingSystem {
+        case .macOS:
+            return "Choose where Bobrvm should obtain the macOS restore image."
+        case .linux:
+            return "Install Linux from an ISO or use an existing virtual disk."
+        case .windows:
+            return "Install Windows for Arm from an ISO or use an existing virtual disk."
         }
     }
 }
@@ -506,7 +556,7 @@ private struct HardwareStepView: View {
                 step: 1,
                 footer: "\(systemInfo.totalMemoryGB) GB installed on this Mac"
             )
-            if guestSystem == .linux {
+            if guestSystem != .macOS {
                 SettingSlider(
                     title: "Shared graphics memory",
                     valueText: "\(Int(vramMB)) MB",
@@ -588,6 +638,7 @@ private struct StorageStepView: View {
 
 private struct SummaryStepView: View {
     @Binding var name: String
+    let operatingSystem: CreationOperatingSystem
     let source: VMSource
     let isoPath: String
     let ipswPath: String
@@ -611,6 +662,7 @@ private struct SummaryStepView: View {
                     .frame(width: 240)
             }
             Divider()
+            SummaryRow(label: "Operating System", value: operatingSystem.title)
             SummaryRow(label: "Processors & Memory", value: "\(vcpuCount) cores, \(memoryGB) GB")
             SummaryRow(
                 label: "Graphics",

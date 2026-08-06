@@ -25,6 +25,7 @@
 		1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */; };
 		A6B7C8D9E0F1122334455601 /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455602 /* Virtualization.framework */; };
 		A6B7C8D9E0F1122334455603 /* MacVirtualMachine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */; };
+		B0B000000000000000000007 /* WindowsMediaDownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000008 /* WindowsMediaDownloadView.swift */; };
 		UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000002 /* QEMU_EFI.fd */; };
 		UEFI00000000000000000004 /* QEMU_VARS.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000005 /* QEMU_VARS.fd */; };
 		B0B000000000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000002 /* Assets.xcassets */; };
@@ -52,6 +53,7 @@
 		0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
 		A6B7C8D9E0F1122334455602 /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
 		A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacVirtualMachine.swift; sourceTree = "<group>"; };
+		B0B000000000000000000008 /* WindowsMediaDownloadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowsMediaDownloadView.swift; sourceTree = "<group>"; };
 		UEFI00000000000000000002 /* QEMU_EFI.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_EFI.fd; sourceTree = "<group>"; };
 		UEFI00000000000000000005 /* QEMU_VARS.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_VARS.fd; sourceTree = "<group>"; };
 		B0B000000000000000000002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -105,6 +107,7 @@
 				B2E99685B82E41398008A70C /* VMManager.swift */,
 				B0B000000000000000000006 /* VMLibraryView.swift */,
 				016570CA1164450690E721F4 /* VMSurfaceView.swift */,
+				B0B000000000000000000008 /* WindowsMediaDownloadView.swift */,
 			);
 			path = Sources/Bobrvm;
 			sourceTree = "<group>";
@@ -238,6 +241,7 @@
 				B0B000000000000000000005 /* VMLibraryView.swift in Sources */,
 				E59A61D5A7ED4A43B2965238 /* VMSurfaceView.swift in Sources */,
 				A6B7C8D9E0F1122334455603 /* MacVirtualMachine.swift in Sources */,
+				B0B000000000000000000007 /* WindowsMediaDownloadView.swift in Sources */,
 				763CCC85691B452497100414 /* BobrvmKit.swift in Sources */,
 			);
 		};

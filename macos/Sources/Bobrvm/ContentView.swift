@@ -254,13 +254,14 @@ struct VMContextMenu: View {
     }
 
     private func duplicateVM() {
-        guard vmInstance.guestSystem == .linux else { return }
+        guard vmInstance.guestSystem != .macOS else { return }
         let newName = "\(vmInstance.name) (Copy)"
         try? vmManager.createVM(
             name: newName,
             config: vmInstance.config,
             isoPath: vmInstance.isoPath,
-            retinaEnabled: vmInstance.retinaEnabled
+            retinaEnabled: vmInstance.retinaEnabled,
+            guestSystem: vmInstance.guestSystem
         )
     }
 

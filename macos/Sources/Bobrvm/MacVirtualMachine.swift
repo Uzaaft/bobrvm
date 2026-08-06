@@ -6,11 +6,13 @@ import Virtualization
 public enum GuestSystem: String, Codable, CaseIterable {
   case linux
   case macOS
+  case windows
 
   public var displayName: String {
     switch self {
     case .linux: return "Linux"
     case .macOS: return "macOS"
+    case .windows: return "Windows"
     }
   }
 }
