@@ -56,7 +56,7 @@
         deps = zigDeps;
         framework-deps = bobrvm.zigDeps;
 
-        test = pkgs.callPackage ./nix/test.nix {inherit zig;};
+        test = pkgs.callPackage ./nix/test.nix {inherit zig zigDeps;};
       }))
       // (forPlatforms guestPlatforms (pkgs: {
         bobrvm-tools = pkgs.callPackage ./nix/guest-tools.nix {};

@@ -3,6 +3,7 @@
   stdenv,
   libiconv,
   zig,
+  zigDeps,
 }:
 stdenv.mkDerivation {
   pname = "bobrvm-test";
@@ -19,7 +20,10 @@ stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    ln -s ${zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
     zig build test
+    zig build bare-metal-test
     runHook postBuild
   '';
 

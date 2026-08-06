@@ -84,6 +84,10 @@ pub fn build(b: *std.Build) !void {
     const macos_app_step = b.step("macos-app", "Build the macOS app");
     const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
     const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
+    const bare_metal_integration_step = b.step(
+        "test-bare-metal",
+        "Run the bare-metal SMP integration test",
+    );
 
     // Venus (KosmicKrisp) GPU backend — opt-in. When set, the GPU device routes
     // 3D contexts to virglrenderer(venus); the default build never links it.
@@ -419,6 +423,27 @@ pub fn build(b: *std.Build) !void {
 
     const bare_metal_step = b.step("bare-metal-test", "Build bare-metal ARM64 test binary");
     bare_metal_step.dependOn(&install_bare_metal.step);
+
+    if (target.result.os.tag == .macos and !is_nix_build) {
+        const run_bare_metal = b.addSystemCommand(&.{
+            "bash",
+            "tests/integration/bare_metal/test.sh",
+        });
+        run_bare_metal.addFileInput(b.path("tests/integration/bare_metal/test.sh"));
+        run_bare_metal.step.dependOn(b.getInstallStep());
+        run_bare_metal.step.dependOn(&install_bare_metal.step);
+        bare_metal_integration_step.dependOn(&run_bare_metal.step);
+    } else if (target.result.os.tag == .macos) {
+        try bare_metal_integration_step.addError(
+            "bare-metal integration requires nix develop or native macOS",
+            .{},
+        );
+    } else {
+        try bare_metal_integration_step.addError(
+            "bare-metal integration requires macOS Hypervisor.framework",
+            .{},
+        );
+    }
 
     // Register native Apple workflows only when their SDK discovery and Xcode
     // processes can run. The steps remain visible in sandboxed Nix builds, but

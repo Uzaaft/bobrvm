@@ -1,23 +1,89 @@
-name: Tip release
+name: CI and tip release
 
 on:
   push:
     branches:
       - main
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: tip-release
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  test:
+    name: Build and unit test
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Run Zig tests and build integration guest
+        run: nix build --print-build-logs .#test
+
+  hypervisor:
+    name: Bare-metal SMP integration
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, bobrvm-hypervisor]
+    timeout-minutes: 30
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/bobrvm-zig-global
+      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/bobrvm-zig-local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Build Zig dependency directory
+        id: deps
+        run: |
+          nix build --print-build-logs .#deps
+          echo "path=$(readlink result)" >> "$GITHUB_OUTPUT"
+
+      - name: Build direct Zig dependency cache
+        id: direct-deps
+        run: |
+          nix build --print-build-logs .#framework-deps
+          echo "path=$(readlink result)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Zig caches
+        env:
+          BOBRVM_ZIG_DIRECT_DEPS: ${{ steps.direct-deps.outputs.path }}
+        run: |
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
+          ln -s "$BOBRVM_ZIG_DIRECT_DEPS" "$ZIG_GLOBAL_CACHE_DIR/p"
+
+      - name: Run two-vCPU Hypervisor.framework test
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
+        run: nix develop --command zig build test-bare-metal
+
   release:
     name: Build and publish
+    if: github.event_name != 'pull_request'
+    needs: [test, hypervisor]
     runs-on: macos-15
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
