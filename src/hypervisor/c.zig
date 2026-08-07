@@ -353,3 +353,24 @@ pub const Error = error{
     Denied,
     Unsupported,
 };
+
+test "Hypervisor return codes map to stable Zig errors" {
+    const cases = [_]struct {
+        code: hv_return_t,
+        expected: ?Error,
+    }{
+        .{ .code = HV_SUCCESS, .expected = null },
+        .{ .code = HV_ERROR, .expected = error.HypervisorError },
+        .{ .code = HV_BUSY, .expected = error.Busy },
+        .{ .code = HV_BAD_ARGUMENT, .expected = error.BadArgument },
+        .{ .code = HV_NO_RESOURCES, .expected = error.NoResources },
+        .{ .code = HV_NO_DEVICE, .expected = error.NoDevice },
+        .{ .code = HV_DENIED, .expected = error.Denied },
+        .{ .code = HV_UNSUPPORTED, .expected = error.Unsupported },
+        .{ .code = std.math.maxInt(hv_return_t), .expected = error.HypervisorError },
+    };
+
+    for (cases) |case| try std.testing.expectEqual(case.expected, toError(case.code));
+    try check(HV_SUCCESS);
+    try std.testing.expectError(error.BadArgument, check(HV_BAD_ARGUMENT));
+}
