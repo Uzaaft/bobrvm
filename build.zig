@@ -9,6 +9,11 @@ const GhosttySteps = struct {
     install_root_step: *std.Build.Step,
 };
 
+const dynamic_link_options: std.Build.Module.LinkSystemLibraryOptions = .{
+    .preferred_link_mode = .dynamic,
+    .search_strategy = .mode_first,
+};
+
 fn environmentVariable(b: *std.Build, key: []const u8) ?[]const u8 {
     if (@hasField(std.Build.Graph, "environ_map")) {
         return b.graph.environ_map.get(key);
@@ -83,7 +88,7 @@ pub fn build(b: *std.Build) !void {
 
     // Keep the primary workflows visible in `zig build --help` regardless of
     // which artifacts the default install emits.
-    const run_step = b.step("run", "Build and run the macOS app");
+    const run_step = b.step("run", "Build and run the native app");
     const macos_app_step = b.step("macos-app", "Build the macOS app");
     const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
     const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
@@ -237,13 +242,18 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .link_libc = true,
         });
-        gtk_module.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
+        gtk_module.linkSystemLibrary("gtk4", dynamic_link_options);
         const gtk_exe = b.addExecutable(.{
             .name = "bobrvm-gtk",
             .root_module = gtk_module,
         });
         const install_gtk = b.addInstallArtifact(gtk_exe, .{});
         b.getInstallStep().dependOn(&install_gtk.step);
+
+        const gtk_run = b.addRunArtifact(gtk_exe);
+        gtk_run.step.dependOn(&install_gtk.step);
+        if (b.args) |args| gtk_run.addArgs(args);
+        run_step.dependOn(&gtk_run.step);
     }
 
     // Code-sign the installed CLI with hypervisor entitlement (macOS only)
@@ -485,6 +495,10 @@ pub fn build(b: *std.Build) !void {
         try ghostty_step.addError(message, .{});
         if (emit_xcframework) b.default_step.dependOn(xcframework_step);
         if (emit_macos_app) b.default_step.dependOn(macos_app_step);
+    } else if (target.result.os.tag == .linux) {
+        try macos_app_step.addError("the macOS app can only build on macOS", .{});
+        try xcframework_step.addError("BobrvmKit.xcframework requires macOS", .{});
+        try ghostty_step.addError("GhosttyKit.xcframework requires macOS", .{});
     } else {
         try run_step.addError("the macOS app can only run on macOS", .{});
         try macos_app_step.addError("the macOS app can only build on macOS", .{});

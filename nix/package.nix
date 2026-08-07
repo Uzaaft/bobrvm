@@ -1,9 +1,13 @@
 {
   lib,
   stdenv,
+  glib,
+  gobject-introspection,
+  gsettings-desktop-schemas,
   libiconv,
   gtk4,
   pkg-config,
+  wrapGAppsHook4,
   zig,
   optimize ? "ReleaseFast",
 }:
@@ -39,13 +43,22 @@ stdenv.mkDerivation (finalAttrs: {
     inherit (finalAttrs) zigDeps;
   };
 
-  nativeBuildInputs = [
-    pkg-config
-    zig
-  ];
+  nativeBuildInputs =
+    [
+      pkg-config
+      zig
+    ]
+    ++ lib.optionals stdenv.hostPlatform.isLinux [
+      gobject-introspection
+      wrapGAppsHook4
+    ];
   buildInputs =
     lib.optional stdenv.hostPlatform.isDarwin libiconv
-    ++ lib.optional stdenv.hostPlatform.isLinux gtk4;
+    ++ lib.optionals stdenv.hostPlatform.isLinux [
+      glib
+      gsettings-desktop-schemas
+      gtk4
+    ];
 
   dontConfigure = true;
   dontUseZigBuild = true;

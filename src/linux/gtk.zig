@@ -89,7 +89,7 @@ const console_history_bytes: usize = 64 * 1024;
 
 const State = struct {
     allocator: std.mem.Allocator,
-    kernel_path: []const u8,
+    kernel_path: ?[]const u8,
     initrd_path: ?[]const u8,
     disk_path: ?[]const u8,
     vm: ?*VM = null,
@@ -106,9 +106,16 @@ const State = struct {
     closing: bool = false,
 
     fn start(self: *State) void {
+        const kernel_path = self.kernel_path orelse {
+            c.gtk_label_set_text(
+                self.status.?,
+                "No VM configured — pass a bzImage path to start a guest",
+            );
+            return;
+        };
         const vm = VM.create(self.allocator, .{
             .memory_bytes = memory_bytes,
-            .kernel_path = self.kernel_path,
+            .kernel_path = kernel_path,
             .initrd_path = self.initrd_path,
             .disk_path = self.disk_path,
             .network_enabled = true,
@@ -244,13 +251,9 @@ const State = struct {
 pub fn main(minimal: std.process.Init.Minimal) void {
     var args = minimal.args.iterate();
     _ = args.skip();
-    const kernel_path = args.next() orelse {
-        writeStderr("usage: bobrvm-gtk <bzImage> [initrd] [writable-disk]\n");
-        std.process.exit(2);
-    };
     var state = State{
         .allocator = std.heap.c_allocator,
-        .kernel_path = kernel_path,
+        .kernel_path = args.next(),
         .initrd_path = args.next(),
         .disk_path = args.next(),
     };
