@@ -35,6 +35,11 @@ fn checkResponse(server: *p9.P9Server, request: []u8, response: []u8) !void {
     @memcpy(request_copy[0..request.len], request);
 
     const response_len = server.handle(request, response);
+    if (response_len == 0) {
+        try testing.expect(response.len < 11);
+        try testing.expectEqualSlices(u8, request_copy[0..request.len], request);
+        return;
+    }
     try testing.expect(response_len >= 7);
     try testing.expect(response_len <= response.len);
     try testing.expectEqual(
@@ -55,7 +60,7 @@ fn checkServer(_: void, smith: *testing.Smith) !void {
     var root = [_]u8{'.'};
     var server = p9.P9Server.initEmbedded(testing.allocator, &root);
     defer server.deinitEmbedded();
-    var response: [p9.MSIZE_MAX]u8 = undefined;
+    var response: [request_bytes_max]u8 = undefined;
     var request: [request_bytes_max]u8 = undefined;
 
     const request_count = smith.valueRangeAtMost(u8, 1, requests_max);
@@ -71,7 +76,8 @@ fn checkServer(_: void, smith: *testing.Smith) !void {
             bytes[4] = safe_message_types[type_index];
         }
         setDeclaredSize(bytes, smith);
-        try checkResponse(&server, bytes, &response);
+        const response_len = smith.valueRangeAtMost(u16, 0, response.len);
+        try checkResponse(&server, bytes, response[0..response_len]);
     }
 }
 

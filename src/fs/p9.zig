@@ -200,35 +200,54 @@ pub const P9Server = struct {
 
     const Writer = struct {
         buf: []u8,
+        limit: usize,
         off: usize = 7, // header written by finish()
 
-        fn u8v(self: *Writer, v: u8) void {
+        fn ensureUnusedCapacity(self: *Writer, len: usize) Error!void {
+            if (self.off > self.limit or len > self.limit - self.off) return error.NoSpace;
+        }
+        fn setLimit(self: *Writer, limit: usize) void {
+            self.limit = @min(self.buf.len, limit);
+        }
+        fn u8v(self: *Writer, v: u8) Error!void {
+            try self.ensureUnusedCapacity(1);
             self.buf[self.off] = v;
             self.off += 1;
         }
-        fn u16v(self: *Writer, v: u16) void {
+        fn u16v(self: *Writer, v: u16) Error!void {
+            try self.ensureUnusedCapacity(2);
             std.mem.writeInt(u16, self.buf[self.off..][0..2], v, .little);
             self.off += 2;
         }
-        fn u32v(self: *Writer, v: u32) void {
+        fn u32v(self: *Writer, v: u32) Error!void {
+            try self.ensureUnusedCapacity(4);
             std.mem.writeInt(u32, self.buf[self.off..][0..4], v, .little);
             self.off += 4;
         }
-        fn u64v(self: *Writer, v: u64) void {
+        fn u64v(self: *Writer, v: u64) Error!void {
+            try self.ensureUnusedCapacity(8);
             std.mem.writeInt(u64, self.buf[self.off..][0..8], v, .little);
             self.off += 8;
         }
-        fn str(self: *Writer, s: []const u8) void {
-            self.u16v(@intCast(s.len));
+        fn str(self: *Writer, s: []const u8) Error!void {
+            if (s.len > std.math.maxInt(u16)) return error.NoSpace;
+            const encoded_len = std.math.add(usize, @sizeOf(u16), s.len) catch
+                return error.NoSpace;
+            try self.ensureUnusedCapacity(encoded_len);
+            try self.u16v(@intCast(s.len));
             @memcpy(self.buf[self.off..][0..s.len], s);
             self.off += s.len;
         }
-        fn qid(self: *Writer, q: Qid) void {
-            self.u8v(q.type);
-            self.u32v(q.version);
-            self.u64v(q.path);
+        fn qid(self: *Writer, q: Qid) Error!void {
+            try self.ensureUnusedCapacity(13);
+            try self.u8v(q.type);
+            try self.u32v(q.version);
+            try self.u64v(q.path);
         }
-        fn finish(self: *Writer, msg_type: u8, tag: u16) usize {
+        fn finish(self: *Writer, msg_type: u8, tag: u16) Error!usize {
+            if (self.off > self.limit or self.off > std.math.maxInt(u32)) {
+                return error.NoSpace;
+            }
             std.mem.writeInt(u32, self.buf[0..4], @intCast(self.off), .little);
             self.buf[4] = msg_type;
             std.mem.writeInt(u16, self.buf[5..7], tag, .little);
@@ -250,8 +269,8 @@ pub const P9Server = struct {
 
     fn lerror(w: *Writer, tag: u16, ecode: u32) usize {
         w.off = 7;
-        w.u32v(ecode);
-        return w.finish(Tlerror + 1, tag);
+        w.u32v(ecode) catch return 0;
+        return w.finish(Tlerror + 1, tag) catch return 0;
     }
 
     fn errnoToLinux() u32 {
@@ -361,7 +380,7 @@ pub const P9Server = struct {
     /// Handle one T-message; encodes the R-message into resp and returns
     /// its length. resp must hold at least msize bytes.
     pub fn handle(self: *P9Server, req: []const u8, resp: []u8) usize {
-        var w = Writer{ .buf = resp };
+        var w = Writer{ .buf = resp, .limit = @min(resp.len, self.msize) };
         if (req.len < 7) return lerror(&w, 0, L_EINVAL);
         const declared_size = std.mem.readInt(u32, req[0..4], .little);
         const tag = std.mem.readInt(u16, req[5..7], .little);
@@ -381,6 +400,7 @@ pub const P9Server = struct {
             error.Invalid => lerror(&w, tag, L_EINVAL),
             error.Access => lerror(&w, tag, L_EACCES),
             error.OutOfMemory => lerror(&w, tag, L_EIO),
+            error.NoSpace => lerror(&w, tag, L_EINVAL),
         };
     }
 
@@ -393,6 +413,7 @@ pub const P9Server = struct {
         Invalid,
         Access,
         OutOfMemory,
+        NoSpace,
     };
 
     fn getFid(self: *P9Server, id: u32) Error!*Fid {
@@ -404,18 +425,21 @@ pub const P9Server = struct {
             Tversion => {
                 const client_msize = try r.u32v();
                 const version = try r.str();
+                const response_version = if (std.mem.eql(u8, version, "9P2000.L"))
+                    "9P2000.L"
+                else
+                    "unknown";
+                const response_size = 7 + @sizeOf(u32) + @sizeOf(u16) + response_version.len;
+                if (client_msize < response_size) return error.Invalid;
                 self.msize = @min(client_msize, MSIZE_MAX);
+                w.setLimit(self.msize);
                 // Fresh session: drop all fids.
                 var iter = self.fids.valueIterator();
                 while (iter.next()) |fid| self.dropFid(fid);
                 self.fids.clearRetainingCapacity();
-                w.u32v(self.msize);
-                if (std.mem.eql(u8, version, "9P2000.L")) {
-                    w.str("9P2000.L");
-                } else {
-                    w.str("unknown");
-                }
-                return w.finish(Tversion + 1, tag);
+                try w.u32v(self.msize);
+                try w.str(response_version);
+                return try w.finish(Tversion + 1, tag);
             },
             Tattach => {
                 const fid = try r.u32v();
@@ -430,8 +454,8 @@ pub const P9Server = struct {
                     self.dropFid(&v);
                 }
                 try self.fids.put(fid, .{ .rel = rel });
-                w.qid(qidFromStat(st));
-                return w.finish(Tattach + 1, tag);
+                try w.qid(qidFromStat(st));
+                return try w.finish(Tattach + 1, tag);
             },
             Twalk => {
                 const fid = try r.u32v();
@@ -478,9 +502,9 @@ pub const P9Server = struct {
                     return lerror(w, tag, L_ENOENT);
                 }
 
-                w.u16v(@intCast(qids.items.len));
-                for (qids.items) |q| w.qid(q);
-                return w.finish(Twalk + 1, tag);
+                try w.u16v(@intCast(qids.items.len));
+                for (qids.items) |q| try w.qid(q);
+                return try w.finish(Twalk + 1, tag);
             },
             Tlopen => {
                 const fid_id = try r.u32v();
@@ -497,9 +521,9 @@ pub const P9Server = struct {
 
                 var st: std.c.Stat = undefined;
                 if (std.c.fstat(fd, &st) != 0) return error.Errno;
-                w.qid(qidFromStat(st));
-                w.u32v(0); // iounit: use msize-derived default
-                return w.finish(Tlopen + 1, tag);
+                try w.qid(qidFromStat(st));
+                try w.u32v(0); // iounit: use msize-derived default
+                return try w.finish(Tlopen + 1, tag);
             },
             Tlcreate => {
                 const fid_id = try r.u32v();
@@ -530,9 +554,9 @@ pub const P9Server = struct {
 
                 var st: std.c.Stat = undefined;
                 if (std.c.fstat(fd, &st) != 0) return error.Errno;
-                w.qid(qidFromStat(st));
-                w.u32v(0);
-                return w.finish(Tlcreate + 1, tag);
+                try w.qid(qidFromStat(st));
+                try w.u32v(0);
+                return try w.finish(Tlcreate + 1, tag);
             },
             Tgetattr => {
                 const fid_id = try r.u32v();
@@ -543,27 +567,27 @@ pub const P9Server = struct {
                 var st: std.c.Stat = undefined;
                 if (lstat(path.ptr, &st) != 0) return error.Stat;
 
-                w.u64v(0x000007ff); // valid: P9_GETATTR_BASIC
-                w.qid(qidFromStat(st));
-                w.u32v(st.mode);
-                w.u32v(st.uid);
-                w.u32v(st.gid);
-                w.u64v(st.nlink);
-                w.u64v(@bitCast(@as(i64, st.rdev)));
-                w.u64v(@bitCast(st.size));
-                w.u64v(4096); // blksize
-                w.u64v(@bitCast(st.blocks));
-                w.u64v(@bitCast(@as(i64, st.atimespec.sec)));
-                w.u64v(@bitCast(@as(i64, st.atimespec.nsec)));
-                w.u64v(@bitCast(@as(i64, st.mtimespec.sec)));
-                w.u64v(@bitCast(@as(i64, st.mtimespec.nsec)));
-                w.u64v(@bitCast(@as(i64, st.ctimespec.sec)));
-                w.u64v(@bitCast(@as(i64, st.ctimespec.nsec)));
-                w.u64v(0); // btime sec
-                w.u64v(0); // btime nsec
-                w.u64v(0); // gen
-                w.u64v(0); // data_version
-                return w.finish(Tgetattr + 1, tag);
+                try w.u64v(0x000007ff); // valid: P9_GETATTR_BASIC
+                try w.qid(qidFromStat(st));
+                try w.u32v(st.mode);
+                try w.u32v(st.uid);
+                try w.u32v(st.gid);
+                try w.u64v(st.nlink);
+                try w.u64v(@bitCast(@as(i64, st.rdev)));
+                try w.u64v(@bitCast(st.size));
+                try w.u64v(4096); // blksize
+                try w.u64v(@bitCast(st.blocks));
+                try w.u64v(@bitCast(@as(i64, st.atimespec.sec)));
+                try w.u64v(@bitCast(@as(i64, st.atimespec.nsec)));
+                try w.u64v(@bitCast(@as(i64, st.mtimespec.sec)));
+                try w.u64v(@bitCast(@as(i64, st.mtimespec.nsec)));
+                try w.u64v(@bitCast(@as(i64, st.ctimespec.sec)));
+                try w.u64v(@bitCast(@as(i64, st.ctimespec.nsec)));
+                try w.u64v(0); // btime sec
+                try w.u64v(0); // btime nsec
+                try w.u64v(0); // gen
+                try w.u64v(0); // data_version
+                return try w.finish(Tgetattr + 1, tag);
             },
             Tsetattr => {
                 const fid_id = try r.u32v();
@@ -589,7 +613,7 @@ pub const P9Server = struct {
                     if (std.c.chmod(path.ptr, @intCast(mode & 0o7777)) != 0) return error.Errno;
                 }
                 // Timestamps/ownership: accepted and ignored.
-                return w.finish(Tsetattr + 1, tag);
+                return try w.finish(Tsetattr + 1, tag);
             },
             Treaddir => {
                 const fid_id = try r.u32v();
@@ -603,7 +627,7 @@ pub const P9Server = struct {
                 defer _ = std.c.closedir(dir);
 
                 const max = @min(count, self.msize - 11 - 4);
-                w.u32v(0); // count patched below
+                try w.u32v(0); // count patched below
                 const data_start = w.off;
 
                 // offset = number of entries already delivered.
@@ -617,17 +641,17 @@ pub const P9Server = struct {
                     const entry_len = 13 + 8 + 1 + 2 + name.len;
                     if (w.off - data_start + entry_len > max) break;
                     index += 1;
-                    w.qid(.{
+                    try w.qid(.{
                         .type = if (ent.type == 4) 0x80 else if (ent.type == 10) 0x02 else 0x00,
                         .version = 0,
                         .path = ent.ino,
                     });
-                    w.u64v(index); // offset of NEXT entry
-                    w.u8v(ent.type);
-                    w.str(name);
+                    try w.u64v(index); // offset of NEXT entry
+                    try w.u8v(ent.type);
+                    try w.str(name);
                 }
                 std.mem.writeInt(u32, w.buf[data_start - 4 ..][0..4], @intCast(w.off - data_start), .little);
-                return w.finish(Treaddir + 1, tag);
+                return try w.finish(Treaddir + 1, tag);
             },
             Tread => {
                 const fid_id = try r.u32v();
@@ -637,13 +661,19 @@ pub const P9Server = struct {
                 const fd = fid.fd orelse return error.BadFid;
 
                 const max = @min(count, self.msize - 11 - 4);
-                w.u32v(0); // count patched below
+                try w.u32v(0); // count patched below
                 const data_start = w.off;
-                const n = std.c.pread(fd, w.buf[w.off..].ptr, max, @intCast(offset));
+                const capacity = w.limit - w.off;
+                const n = std.c.pread(
+                    fd,
+                    w.buf[w.off..w.limit].ptr,
+                    @min(max, capacity),
+                    @intCast(offset),
+                );
                 if (n < 0) return error.Errno;
                 w.off += @intCast(n);
                 std.mem.writeInt(u32, w.buf[data_start - 4 ..][0..4], @intCast(n), .little);
-                return w.finish(Tread + 1, tag);
+                return try w.finish(Tread + 1, tag);
             },
             Twrite => {
                 const fid_id = try r.u32v();
@@ -655,8 +685,8 @@ pub const P9Server = struct {
 
                 const n = std.c.pwrite(fd, data.ptr, data.len, @intCast(offset));
                 if (n < 0) return error.Errno;
-                w.u32v(@intCast(n));
-                return w.finish(Twrite + 1, tag);
+                try w.u32v(@intCast(n));
+                return try w.finish(Twrite + 1, tag);
             },
             Tmkdir => {
                 const fid_id = try r.u32v();
@@ -672,8 +702,8 @@ pub const P9Server = struct {
                 if (std.c.mkdir(path.ptr, @intCast(mode & 0o7777)) != 0) return error.Errno;
                 var st: std.c.Stat = undefined;
                 if (lstat(path.ptr, &st) != 0) return error.Stat;
-                w.qid(qidFromStat(st));
-                return w.finish(Tmkdir + 1, tag);
+                try w.qid(qidFromStat(st));
+                return try w.finish(Tmkdir + 1, tag);
             },
             Tunlinkat => {
                 const fid_id = try r.u32v();
@@ -690,7 +720,7 @@ pub const P9Server = struct {
                 const removedir = flags & 0x200 != 0;
                 const rc = if (removedir) std.c.rmdir(path.ptr) else std.c.unlink(path.ptr);
                 if (rc != 0) return error.Errno;
-                return w.finish(Tunlinkat + 1, tag);
+                return try w.finish(Tunlinkat + 1, tag);
             },
             Tremove => {
                 const fid_id = try r.u32v();
@@ -705,7 +735,7 @@ pub const P9Server = struct {
                     self.dropFid(&v);
                 }
                 if (rc != 0) return error.Errno;
-                return w.finish(Tremove + 1, tag);
+                return try w.finish(Tremove + 1, tag);
             },
             Treadlink => {
                 const fid_id = try r.u32v();
@@ -715,21 +745,21 @@ pub const P9Server = struct {
                 var target: [1024]u8 = undefined;
                 const n = std.c.readlink(path.ptr, &target, target.len);
                 if (n < 0) return error.Errno;
-                w.str(target[0..@intCast(n)]);
-                return w.finish(Treadlink + 1, tag);
+                try w.str(target[0..@intCast(n)]);
+                return try w.finish(Treadlink + 1, tag);
             },
             Tstatfs => {
                 _ = try r.u32v();
-                w.u32v(0x01021997); // V9FS_MAGIC
-                w.u32v(4096); // bsize
-                w.u64v(1 << 28); // blocks (fabricated ~1TB)
-                w.u64v(1 << 27); // bfree
-                w.u64v(1 << 27); // bavail
-                w.u64v(1 << 20); // files
-                w.u64v(1 << 19); // ffree
-                w.u64v(0); // fsid
-                w.u32v(255); // namelen
-                return w.finish(Tstatfs + 1, tag);
+                try w.u32v(0x01021997); // V9FS_MAGIC
+                try w.u32v(4096); // bsize
+                try w.u64v(1 << 28); // blocks (fabricated ~1TB)
+                try w.u64v(1 << 27); // bfree
+                try w.u64v(1 << 27); // bavail
+                try w.u64v(1 << 20); // files
+                try w.u64v(1 << 19); // ffree
+                try w.u64v(0); // fsid
+                try w.u32v(255); // namelen
+                return try w.finish(Tstatfs + 1, tag);
             },
             Tfsync => {
                 const fid_id = try r.u32v();
@@ -737,7 +767,7 @@ pub const P9Server = struct {
                 if (fid.fd) |fd| {
                     if (std.c.fsync(fd) != 0) return error.Errno;
                 }
-                return w.finish(Tfsync + 1, tag);
+                return try w.finish(Tfsync + 1, tag);
             },
             Tclunk => {
                 const fid_id = try r.u32v();
@@ -745,11 +775,11 @@ pub const P9Server = struct {
                     var v = old.value;
                     self.dropFid(&v);
                 } else return error.BadFid;
-                return w.finish(Tclunk + 1, tag);
+                return try w.finish(Tclunk + 1, tag);
             },
             Tflush => {
                 _ = try r.u16v(); // oldtag: we're synchronous, nothing in flight
-                return w.finish(Tflush + 1, tag);
+                return try w.finish(Tflush + 1, tag);
             },
             else => return error.NotSupported,
         }
@@ -1149,4 +1179,59 @@ test "p9: request parsing is bounded by the declared message size" {
     std.mem.writeInt(u32, request[0..4], @intCast(request.len + 1), .little);
     _ = server.handle(request, &response);
     try testing.expectEqual(L_EINVAL, std.mem.readInt(u32, response[7..11], .little));
+}
+
+test "p9: responses stay within the negotiated message size" {
+    var root = [_]u8{'.'};
+    var server = P9Server.initEmbedded(testing.allocator, &root);
+    defer server.deinitEmbedded();
+    var response: [64]u8 = undefined;
+
+    var version_payload = TestPayload{};
+    const version = try tmsg(
+        testing.allocator,
+        Tversion,
+        1,
+        version_payload.u32v(response.len).str("9P2000.L").slice(),
+    );
+    defer testing.allocator.free(version);
+    try testing.expectEqual(@as(usize, 21), server.handle(version, &response));
+
+    var attach_payload = TestPayload{};
+    const attach = try tmsg(testing.allocator, Tattach, 2, attach_payload.u32v(1).slice());
+    defer testing.allocator.free(attach);
+    _ = server.handle(attach, &response);
+
+    var getattr_payload = TestPayload{};
+    const getattr = try tmsg(
+        testing.allocator,
+        Tgetattr,
+        3,
+        getattr_payload.u32v(1).u64v(std.math.maxInt(u64)).slice(),
+    );
+    defer testing.allocator.free(getattr);
+    const response_len = server.handle(getattr, &response);
+    try testing.expectEqual(@as(usize, 11), response_len);
+    try testing.expectEqual(@as(u8, Tlerror + 1), response[4]);
+    try testing.expectEqual(L_EINVAL, std.mem.readInt(u32, response[7..11], .little));
+}
+
+test "p9: version rejects a message size too small for its response" {
+    var root = [_]u8{'.'};
+    var server = P9Server.initEmbedded(testing.allocator, &root);
+    defer server.deinitEmbedded();
+    var response: [MSIZE_MAX]u8 = undefined;
+
+    var payload = TestPayload{};
+    const request = try tmsg(
+        testing.allocator,
+        Tversion,
+        4,
+        payload.u32v(20).str("9P2000.L").slice(),
+    );
+    defer testing.allocator.free(request);
+    const response_len = server.handle(request, &response);
+    try testing.expectEqual(@as(usize, 11), response_len);
+    try testing.expectEqual(@as(u8, Tlerror + 1), response[4]);
+    try testing.expectEqual(MSIZE_MAX, server.msize);
 }
