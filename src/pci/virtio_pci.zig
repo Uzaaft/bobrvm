@@ -109,9 +109,9 @@ pub const DeviceStatus = packed struct(u8) {
     driver: bool = false,
     driver_ok: bool = false,
     features_ok: bool = false,
+    _padding: u2 = 0,
     device_needs_reset: bool = false,
     failed: bool = false,
-    _padding: u2 = 0,
 };
 
 /// Virtio PCI modern transport.
@@ -323,8 +323,8 @@ pub const VirtioPciTransport = struct {
                 (@as(u32, @intFromBool(self.status.driver)) << 1) |
                 (@as(u32, @intFromBool(self.status.driver_ok)) << 2) |
                 (@as(u32, @intFromBool(self.status.features_ok)) << 3) |
-                (@as(u32, @intFromBool(self.status.device_needs_reset)) << 4) |
-                (@as(u32, @intFromBool(self.status.failed)) << 5),
+                (@as(u32, @intFromBool(self.status.device_needs_reset)) << 6) |
+                (@as(u32, @intFromBool(self.status.failed)) << 7),
             .config_generation => self.config_generation,
             .queue_select => self.queue_select,
             .queue_size => if (self.currentQueue()) |q| q.size else MAX_QUEUE_SIZE,
@@ -848,6 +848,16 @@ test "VirtioPciTransport common config read" {
     transport.device_feature_select = 0;
     const features_lo = transport.readBar(BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.device_feature), 4);
     try std.testing.expectEqual(@as(u32, 0x100), features_lo);
+}
+
+test "VirtioPciTransport preserves standard high device status bits" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, 0, 1, 64);
+    defer transport.deinit();
+
+    const status_offset = @intFromEnum(CommonCfgReg.device_status);
+    transport.writeBar(status_offset, 1, 0xC3);
+
+    try std.testing.expectEqual(@as(u32, 0xC3), transport.readBar(status_offset, 1));
 }
 
 test "VirtioPciTransport ignores unnamed common configuration offsets" {
