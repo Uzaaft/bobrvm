@@ -514,7 +514,8 @@ pub const VirtioPciTransport = struct {
         self.isr_status = .{};
 
         for (self.queues) |*q| {
-            q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
+            const size_max = q.size_max;
+            q.* = QueueConfig{ .size = size_max, .size_max = size_max };
         }
     }
 
@@ -873,6 +874,19 @@ test "VirtioPciTransport supports bounded multiport console queues" {
     );
     try std.testing.expectEqual(@as(u16, 128), transport.queues[11].size);
     try std.testing.expectEqual(@as(u16, 128), transport.queues[11].size_max);
+}
+
+test "VirtioPciTransport reset preserves queue capacity" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 3, 0, 2, 8);
+    defer transport.deinit();
+    transport.setQueueSizeMax(0, 128);
+    transport.queues[0].enable = true;
+
+    transport.reset();
+
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[0].size);
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[0].size_max);
+    try std.testing.expect(!transport.queues[0].enable);
 }
 
 test "virtio GPU uses the modern device id and display class" {

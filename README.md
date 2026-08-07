@@ -48,7 +48,7 @@ The Linux package installs a dependency-light headless binary and a separate GTK
 application. Both use the same cancellable Zig VM lifecycle and KVM device model.
 The GTK application manages a persistent VM library, installer media, sparse raw
 disks, shared folders, port forwards, memory, CPUs, networking, pause/resume,
-guest management, clipboard sharing, and host-to-guest file delivery:
+guest management, clipboard sharing, host-to-guest file delivery, and quiesced snapshots:
 
 ```sh
 bobrvm run-kernel bzImage initrd writable-root.raw
@@ -56,7 +56,8 @@ bobrvm-gtk
 ```
 
 For automation, the GTK executable also accepts `--iso`, `--disk`, `--kernel`,
-`--initrd`, `--share`, repeatable `--forward host:guest`, `--memory`, and `--cpus`.
+`--initrd`, `--share`, `--restore`, repeatable `--forward host:guest`, `--memory`,
+`--cpus`, `--display WxH`, and `--gpu-memory MiB`.
 The Nix development shell and package provide OVMF automatically;
 `BOBRVM_OVMF_FD` and `BOBRVM_OVMF_VARS_FD` can override its images. Saving a VM
 creates a private writable variable store so UEFI boot entries survive restarts.
@@ -73,6 +74,9 @@ keyboard and absolute pointer events, and retains a bounded serial-console histo
 Stock qemu-guest-agent and spice-vdagent channels provide graceful lifecycle actions
 and text clipboard sharing when their guest services are installed. Closing the window
 requests an immediate vCPU exit and joins the VM before releasing resources.
+The Snapshot action freezes guest filesystems through qemu-guest-agent, captures KVM,
+device, RAM, firmware, and writable disk state, then resumes the guest. Select the
+snapshot directory in Restore Snapshot before starting an identically configured VM.
 
 Direct boot uses two KVM vCPUs by default and exposes their topology through an Intel
 MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable

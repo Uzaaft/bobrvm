@@ -56,6 +56,7 @@ pub const Config = struct {
     display_height: u32 = config_policy.display_height_default,
     gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
     shared_dir: ?[]const u8 = null,
+    restore_path: ?[]const u8 = null,
     command_line: []const u8,
     exits_max: u64,
 };
@@ -73,6 +74,7 @@ pub const CreateError = boot.ParseError || config_policy.ValidationError || x86.
     OpenVariablesFailed,
     ReadVariablesFailed,
     InvalidBootConfig,
+    RestoreFailed,
 };
 
 pub const StartError = std.Thread.SpawnError || error{InvalidState};
@@ -99,6 +101,19 @@ pub fn create(
     });
     if ((config.kernel_path == null) == (config.firmware_path == null)) {
         return error.InvalidBootConfig;
+    }
+    var restore_buffer: [1024]u8 = undefined;
+    var restore_file_path = config.restore_path;
+    var restore_directory: ?[]const u8 = null;
+    if (config.restore_path) |path| {
+        if (isDirectory(path)) {
+            restore_directory = path;
+            restore_file_path = std.fmt.bufPrint(
+                &restore_buffer,
+                "{s}/state.img",
+                .{path},
+            ) catch return error.RestoreFailed;
+        }
     }
     const kernel = if (config.kernel_path) |path|
         try readFile(allocator, path, kernel_bytes_max, .kernel)
@@ -128,6 +143,27 @@ pub fn create(
             return error.InvalidBootConfig;
         }
         @memcpy(firmware_bytes[0..bytes.len], bytes);
+    }
+    if (restore_file_path) |path| {
+        x86.Machine.validateSuspendImage(
+            path,
+            config.memory_bytes,
+            if (firmware) |bytes| bytes.len else 0,
+        ) catch |err| {
+            log.err("invalid snapshot {s}: {}", .{ path, err });
+            return error.RestoreFailed;
+        };
+    }
+    if (restore_directory) |path| {
+        x86.Machine.restoreSnapshotDisks(
+            allocator,
+            path,
+            config.disk_path,
+            config.disk2_path,
+        ) catch |err| {
+            log.err("failed to restore snapshot disks from {s}: {}", .{ path, err });
+            return error.RestoreFailed;
+        };
     }
 
     const boot_source: x86.Machine.BootSource = if (kernel) |bytes|
@@ -180,7 +216,19 @@ pub fn create(
     try self.machine.attachRng(allocator);
     try self.machine.attachGuestServices(allocator);
     if (config.network_enabled) try self.machine.attachNetwork(allocator, config.forwards);
+    if (restore_file_path) |path| {
+        self.machine.restoreFromDisk(path) catch |err| {
+            log.err("failed to restore snapshot {s}: {}", .{ path, err });
+            return error.RestoreFailed;
+        };
+    }
     return self;
+}
+
+fn isDirectory(path: []const u8) bool {
+    const directory = std.Io.Dir.cwd().openDir(global.io(), path, .{}) catch return false;
+    directory.close(global.io());
+    return true;
 }
 
 pub fn destroy(self: *VM) void {
@@ -326,6 +374,30 @@ pub fn sendHostClipboard(self: *VM, text: []const u8) void {
 
 pub fn sendFileToGuest(self: *VM, path: []const u8) !void {
     try self.machine.sendFileToGuest(path);
+}
+
+pub fn snapshotQuiesced(self: *VM, directory: []const u8) !void {
+    if (self.state_value.load(.acquire) != .running) return error.InvalidState;
+    try self.machine.snapshotToQuiesced(directory);
+}
+
+pub fn verifySnapshotRoundTrip(self: *VM, allocator: std.mem.Allocator) !void {
+    if (!self.requestPause()) return error.InvalidState;
+    var paused = true;
+    defer {
+        if (paused) _ = self.requestResume();
+    }
+    const snapshot_state = try self.machine.captureState(allocator);
+    defer allocator.free(snapshot_state);
+    try self.machine.applyState(allocator, snapshot_state);
+    if (!self.requestResume()) return error.InvalidState;
+    paused = false;
+}
+
+pub fn suspendToDisk(self: *VM, path: []const u8) !void {
+    if (!self.requestPause()) return error.InvalidState;
+    errdefer _ = self.requestResume();
+    try self.machine.suspendToDisk(path);
 }
 
 pub fn requestGuestShutdown(self: *VM) void {

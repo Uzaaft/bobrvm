@@ -19,6 +19,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const hypervisor = @import("../hypervisor/main.zig");
+const pci = @import("../pci/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
 const mmio = @import("../virtio/mmio.zig");
@@ -164,17 +165,19 @@ pub const Reader = struct {
     /// Find a section by name.
     pub fn section(self: Reader, name: []const u8) ?[]const u8 {
         var off: usize = MAGIC.len + 4;
-        while (off + 1 <= self.bytes.len) {
+        while (off < self.bytes.len) {
             const name_len = self.bytes[off];
             off += 1;
-            if (off + name_len + 8 > self.bytes.len) return null;
+            if (name_len > self.bytes.len - off) return null;
             const sec_name = self.bytes[off..][0..name_len];
             off += name_len;
+            if (@sizeOf(u64) > self.bytes.len - off) return null;
             const size = std.mem.readInt(u64, self.bytes[off..][0..8], .little);
             off += 8;
-            if (off + size > self.bytes.len) return null;
-            if (std.mem.eql(u8, sec_name, name)) return self.bytes[off..][0..size];
-            off += @intCast(size);
+            const section_len = std.math.cast(usize, size) orelse return null;
+            if (section_len > self.bytes.len - off) return null;
+            if (std.mem.eql(u8, sec_name, name)) return self.bytes[off..][0..section_len];
+            off += section_len;
         }
         return null;
     }
@@ -189,12 +192,12 @@ const Cursor = struct {
     off: usize = 0,
 
     fn int(self: *Cursor, comptime T: type) !T {
-        if (self.off + @sizeOf(T) > self.buf.len) return error.Truncated;
+        if (@sizeOf(T) > self.buf.len - self.off) return error.Truncated;
         defer self.off += @sizeOf(T);
         return std.mem.readInt(T, self.buf[self.off..][0..@sizeOf(T)], .little);
     }
     fn bytes(self: *Cursor, len: usize) ![]const u8 {
-        if (self.off + len > self.buf.len) return error.Truncated;
+        if (len > self.buf.len - self.off) return error.Truncated;
         defer self.off += len;
         return self.buf[self.off..][0..len];
     }
@@ -357,6 +360,106 @@ fn transportSerializedBytes(t: *const mmio.Transport) usize {
     const queue_state_bytes = @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
     return @sizeOf(u64) + 5 * @sizeOf(u32) + 2 * @sizeOf(u8) +
         t.queues.len * queue_state_bytes;
+}
+
+// =============================================================================
+// Virtio PCI transport
+// =============================================================================
+
+fn pciTransportSerializedBytes(device: *const pci.VirtioPciDevice) usize {
+    const transport = device.transport;
+    const queue_bytes = 3 * @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
+    return device.config.len + 5 * @sizeOf(u32) + 2 * @sizeOf(u64) +
+        2 * @sizeOf(u16) + 3 * @sizeOf(u8) +
+        transport.queues.len * queue_bytes + transport.device_config.len;
+}
+
+pub fn serializePciDevice(alloc: Allocator, device: *const pci.VirtioPciDevice) ![]u8 {
+    const transport = device.transport;
+    assert(transport.queues.len > 0);
+    assert(transport.queues.len <= pci.virtio_pci.VirtioPciTransport.MAX_QUEUES);
+    assert(transport.device_config.len <= std.math.maxInt(u32));
+    const serialized_bytes = pciTransportSerializedBytes(device);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try out.bytes(&device.config);
+    try out.int(u32, device.bar0_addr);
+    try out.int(u32, transport.device_id);
+    try out.int(u64, transport.device_features);
+    try out.int(u64, transport.driver_features);
+    try out.int(u32, transport.device_feature_select);
+    try out.int(u32, transport.driver_feature_select);
+    try out.int(u8, @bitCast(transport.status));
+    try out.int(u8, transport.config_generation);
+    try out.int(u16, transport.queue_select);
+    try out.int(u16, transport.num_queues);
+    try out.int(u8, @bitCast(transport.isr_status));
+    for (transport.queues) |queue| {
+        try out.int(u16, queue.size);
+        try out.int(u16, queue.size_max);
+        try out.int(u8, @intFromBool(queue.enable));
+        try out.int(u16, queue.notify_off);
+        try out.int(u64, queue.desc_addr);
+        try out.int(u64, queue.driver_addr);
+        try out.int(u64, queue.device_addr);
+    }
+    try out.int(u32, @intCast(transport.device_config.len));
+    try out.bytes(transport.device_config);
+    assert(out.buf.items.len == serialized_bytes);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendPciDeviceSection(
+    builder: *Builder,
+    alloc: Allocator,
+    name: []const u8,
+    device: *const pci.VirtioPciDevice,
+) !void {
+    const data = try serializePciDevice(alloc, device);
+    defer alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializePciDevice(
+    _: Allocator,
+    device: *pci.VirtioPciDevice,
+    data: []const u8,
+) !void {
+    var cur = Cursor{ .buf = data };
+    const config = try cur.bytes(device.config.len);
+    @memcpy(&device.config, config);
+    device.bar0_addr = try cur.int(u32);
+    const transport = device.transport;
+    if (try cur.int(u32) != transport.device_id) return error.Mismatch;
+    if (try cur.int(u64) != transport.device_features) return error.Mismatch;
+    transport.driver_features = try cur.int(u64);
+    transport.device_feature_select = try cur.int(u32);
+    transport.driver_feature_select = try cur.int(u32);
+    transport.status = @bitCast(try cur.int(u8));
+    transport.config_generation = try cur.int(u8);
+    transport.queue_select = try cur.int(u16);
+    const queue_count = try cur.int(u16);
+    if (queue_count != transport.num_queues or queue_count != transport.queues.len) {
+        return error.Mismatch;
+    }
+    transport.isr_status = @bitCast(try cur.int(u8));
+    for (transport.queues) |*queue| {
+        queue.size = try cur.int(u16);
+        const size_max = try cur.int(u16);
+        if (size_max != queue.size_max or queue.size > size_max) return error.Mismatch;
+        queue.enable = try cur.int(u8) != 0;
+        queue.notify_off = try cur.int(u16);
+        queue.desc_addr = try cur.int(u64);
+        queue.driver_addr = try cur.int(u64);
+        queue.device_addr = try cur.int(u64);
+    }
+    const config_len = try cur.int(u32);
+    if (config_len != transport.device_config.len) return error.Mismatch;
+    @memcpy(transport.device_config, try cur.bytes(config_len));
+    if (cur.off != cur.buf.len) return error.Mismatch;
 }
 
 // =============================================================================
@@ -777,6 +880,11 @@ pub const NetCodec = DeviceCodec(virtio.Net, appendNetSection, deserializeNet);
 pub const InputCodec = DeviceCodec(virtio.Input, appendInputSection, deserializeInput);
 pub const P9Codec = DeviceCodec(virtio.P9, appendP9Section, deserializeP9);
 pub const GpuCodec = DeviceCodec(virtio.Gpu, appendGpuSection, deserializeGpu);
+pub const PciDeviceCodec = DeviceCodec(
+    pci.VirtioPciDevice,
+    appendPciDeviceSection,
+    deserializePciDevice,
+);
 
 // =============================================================================
 // Tests
@@ -798,6 +906,47 @@ test "snapshot: container roundtrip and unknown sections" {
     try testing.expect(r.section("gamma") == null);
 
     try testing.expectError(error.BadMagic, Reader.init("XXXXXXXX\x01\x00\x00\x00"));
+}
+
+test "snapshot: oversized section is rejected without integer overflow" {
+    var bytes: [MAGIC.len + 4 + 1 + 1 + 8]u8 = @splat(0);
+    @memcpy(bytes[0..MAGIC.len], MAGIC);
+    std.mem.writeInt(u32, bytes[MAGIC.len..][0..4], VERSION, .little);
+    bytes[MAGIC.len + 4] = 1;
+    bytes[MAGIC.len + 5] = 'x';
+    std.mem.writeInt(u64, bytes[bytes.len - 8 ..], std.math.maxInt(u64), .little);
+    const reader = try Reader.init(&bytes);
+    try testing.expect(reader.section("x") == null);
+}
+
+test "snapshot: virtio PCI transport roundtrip" {
+    const first = try pci.VirtioPciDevice.init(testing.allocator, 2, 0x55aa, 2, 8);
+    defer first.deinit();
+    const second = try pci.VirtioPciDevice.init(testing.allocator, 2, 0x55aa, 2, 8);
+    defer second.deinit();
+    first.writeConfig(0x10, 4, 0xd000_0000);
+    first.transport.driver_features = 0x1122_3344_5566_7788;
+    first.transport.status = .{ .acknowledge = true, .driver_ok = true };
+    first.transport.queue_select = 1;
+    first.transport.queues[1].size = 128;
+    first.transport.queues[1].enable = true;
+    first.transport.queues[1].desc_addr = 0x1000;
+    first.transport.queues[1].driver_addr = 0x2000;
+    first.transport.queues[1].device_addr = 0x3000;
+    @memcpy(first.transport.device_config, "pci-test");
+
+    const bytes = try serializePciDevice(testing.allocator, first);
+    defer testing.allocator.free(bytes);
+    try deserializePciDevice(testing.allocator, second, bytes);
+    try testing.expectEqual(first.bar0_addr, second.bar0_addr);
+    try testing.expectEqual(first.transport.driver_features, second.transport.driver_features);
+    try testing.expectEqual(first.transport.status, second.transport.status);
+    try testing.expectEqualDeep(first.transport.queues, second.transport.queues);
+    try testing.expectEqualSlices(
+        u8,
+        first.transport.device_config,
+        second.transport.device_config,
+    );
 }
 
 test "snapshot: gic state roundtrip" {

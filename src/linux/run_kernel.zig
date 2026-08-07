@@ -121,6 +121,22 @@ pub fn executeFirmwareSmoke(
     if (active_scanout.width == 0 or active_scanout.height == 0) {
         return error.FirmwareDidNotProduceScanout;
     }
+    try vm.verifySnapshotRoundTrip(allocator);
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = 100 * std.time.ns_per_ms },
+        .clock = .awake,
+    }, global.io()) catch {};
+    if (vm.state() != .running or vm.copyScanout(pixels) == null) {
+        return error.FirmwareSnapshotResumeFailed;
+    }
+    var snapshot_path_buffer: [128]u8 = undefined;
+    const snapshot_path = try std.fmt.bufPrint(
+        &snapshot_path_buffer,
+        "/tmp/bobrvm-kvm-snapshot-smoke-{}.img",
+        .{std.os.linux.getpid()},
+    );
+    defer std.Io.Dir.cwd().deleteFile(global.io(), snapshot_path) catch {};
+    try vm.suspendToDisk(snapshot_path);
     vm.requestStop();
     if (try vm.join() != .stopped) return error.UnexpectedRunOutcome;
     const primary = vm.fastBlockStats();
@@ -134,6 +150,48 @@ pub fn executeFirmwareSmoke(
     if (primary.kicks == 0 and vm.secondaryBlockNotifications() == 0) {
         return error.FirmwareDidNotProbeStorage;
     }
+    try verifyFirmwareSnapshotRestore(
+        allocator,
+        firmware_path,
+        disk_path,
+        iso_path,
+        snapshot_path,
+        pixels,
+    );
+}
+
+fn verifyFirmwareSnapshotRestore(
+    allocator: std.mem.Allocator,
+    firmware_path: []const u8,
+    disk_path: []const u8,
+    iso_path: []const u8,
+    snapshot_path: []const u8,
+    pixels: []u8,
+) !void {
+    var output = Stdout{};
+    const restored = try VM.create(allocator, .{
+        .memory_bytes = memory_bytes,
+        .firmware_path = firmware_path,
+        .disk_path = disk_path,
+        .disk2_path = iso_path,
+        .disk2_read_only = true,
+        .network_enabled = true,
+        .display_enabled = true,
+        .restore_path = snapshot_path,
+        .command_line = command_line,
+        .exits_max = exits_max,
+    }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
+    defer restored.destroy();
+    try restored.start();
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = 100 * std.time.ns_per_ms },
+        .clock = .awake,
+    }, global.io()) catch {};
+    if (restored.state() != .running or restored.copyScanout(pixels) == null) {
+        return error.FirmwareSnapshotRestoreFailed;
+    }
+    restored.requestStop();
+    if (try restored.join() != .stopped) return error.UnexpectedRunOutcome;
 }
 
 pub fn executeStopSmoke(allocator: std.mem.Allocator, kernel_path: []const u8) !void {

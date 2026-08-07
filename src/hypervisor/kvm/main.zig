@@ -16,9 +16,77 @@ pub const c = @cImport({
 pub const API_VERSION: c_int = 12;
 
 const kick_signal = std.posix.SIG.USR1;
+const get_irqchip_ioctl = ioctlCode(3, 0x62, @sizeOf(IrqChipState));
+const set_irqchip_ioctl = ioctlCode(2, 0x63, @sizeOf(IrqChipState));
 var kick_handler_state = std.atomic.Value(u8).init(0);
 
+fn ioctlCode(direction: u2, number: u8, size: usize) c_ulong {
+    assert(size < 1 << 14);
+    return (@as(c_ulong, direction) << 30) |
+        (@as(c_ulong, size) << 16) |
+        (@as(c_ulong, 0xae) << 8) |
+        number;
+}
+
 pub const Error = OpenError || CreateError || FastPathError || InterruptError || RunError;
+
+pub const SnapshotError = error{
+    CaptureVcpuFailed,
+    CaptureVmFailed,
+    MsrCountMismatch,
+    MsrListTooLarge,
+    RestoreVcpuFailed,
+    RestoreVmFailed,
+};
+
+pub const msr_entries_max: usize = 1024;
+
+pub const MsrState = extern struct {
+    count: u32 = 0,
+    entries: [msr_entries_max]c.struct_kvm_msr_entry =
+        std.mem.zeroes([msr_entries_max]c.struct_kvm_msr_entry),
+};
+
+/// Architectural state required to resume one x86 KVM vCPU.
+///
+/// This is serialized only by the versioned x86 snapshot format. All fields use
+/// Linux UAPI layouts so capture and restore stay field-complete as KVM evolves.
+pub const VcpuState = extern struct {
+    regs: c.struct_kvm_regs = std.mem.zeroes(c.struct_kvm_regs),
+    sregs: c.struct_kvm_sregs = std.mem.zeroes(c.struct_kvm_sregs),
+    fpu: c.struct_kvm_fpu = std.mem.zeroes(c.struct_kvm_fpu),
+    xsave: c.struct_kvm_xsave = std.mem.zeroes(c.struct_kvm_xsave),
+    xcrs: c.struct_kvm_xcrs = std.mem.zeroes(c.struct_kvm_xcrs),
+    lapic: c.struct_kvm_lapic_state = std.mem.zeroes(c.struct_kvm_lapic_state),
+    events: c.struct_kvm_vcpu_events = std.mem.zeroes(c.struct_kvm_vcpu_events),
+    debug: c.struct_kvm_debugregs = std.mem.zeroes(c.struct_kvm_debugregs),
+    mp: c.struct_kvm_mp_state = std.mem.zeroes(c.struct_kvm_mp_state),
+    msrs: MsrState = .{},
+};
+
+pub const IrqChipState = extern struct {
+    chip_id: u32 = 0,
+    padding: u32 = 0,
+    data: [512]u8 = @splat(0),
+};
+
+pub const VmState = extern struct {
+    irqchips: [3]IrqChipState = @splat(.{}),
+    pit: c.struct_kvm_pit_state2 = std.mem.zeroes(c.struct_kvm_pit_state2),
+    clock: c.struct_kvm_clock_data = std.mem.zeroes(c.struct_kvm_clock_data),
+};
+
+const MsrIndexList = extern struct {
+    count: u32 = msr_entries_max,
+    indices: [msr_entries_max]u32 = @splat(0),
+};
+
+const MsrIo = extern struct {
+    count: u32 = 0,
+    padding: u32 = 0,
+    entries: [msr_entries_max]c.struct_kvm_msr_entry =
+        std.mem.zeroes([msr_entries_max]c.struct_kvm_msr_entry),
+};
 
 pub const OpenError = error{
     AccessDenied,
@@ -178,6 +246,20 @@ pub const Kvm = struct {
             return error.GetCpuidFailed;
         }
         return cpuid;
+    }
+
+    pub fn supportedMsrIndices(
+        self: *const Kvm,
+        output: *[msr_entries_max]u32,
+    ) SnapshotError![]const u32 {
+        var list = MsrIndexList{};
+        if (c.ioctl(self.fd, c.KVM_GET_MSR_INDEX_LIST, &list) < 0) {
+            if (list.count > list.indices.len) return error.MsrListTooLarge;
+            return error.CaptureVcpuFailed;
+        }
+        if (list.count > list.indices.len) return error.MsrListTooLarge;
+        @memcpy(output[0..list.count], list.indices[0..list.count]);
+        return output[0..list.count];
     }
 
     pub fn vcpuLimits(self: *const Kvm) VcpuLimits {
@@ -357,6 +439,45 @@ pub const VM = struct {
         };
         if (c.ioctl(self.fd, c.KVM_IRQ_LINE, &irq_level) < 0) {
             return error.SetIrqFailed;
+        }
+    }
+
+    pub fn captureState(self: *VM) SnapshotError!VmState {
+        var state = VmState{};
+        const chip_ids = [_]u32{
+            c.KVM_IRQCHIP_PIC_MASTER,
+            c.KVM_IRQCHIP_PIC_SLAVE,
+            c.KVM_IRQCHIP_IOAPIC,
+        };
+        for (&state.irqchips, chip_ids) |*chip, chip_id| {
+            chip.chip_id = chip_id;
+            if (c.ioctl(self.fd, get_irqchip_ioctl, chip) < 0) {
+                return error.CaptureVmFailed;
+            }
+        }
+        if (c.ioctl(self.fd, c.KVM_GET_PIT2, &state.pit) < 0) {
+            return error.CaptureVmFailed;
+        }
+        if (c.ioctl(self.fd, c.KVM_GET_CLOCK, &state.clock) < 0) {
+            return error.CaptureVmFailed;
+        }
+        return state;
+    }
+
+    pub fn restoreState(self: *VM, state: *const VmState) SnapshotError!void {
+        var clock = state.clock;
+        if (c.ioctl(self.fd, c.KVM_SET_CLOCK, &clock) < 0) {
+            return error.RestoreVmFailed;
+        }
+        for (state.irqchips) |saved| {
+            var chip = saved;
+            if (c.ioctl(self.fd, set_irqchip_ioctl, &chip) < 0) {
+                return error.RestoreVmFailed;
+            }
+        }
+        var pit = state.pit;
+        if (c.ioctl(self.fd, c.KVM_SET_PIT2, &pit) < 0) {
+            return error.RestoreVmFailed;
         }
     }
 
@@ -604,6 +725,69 @@ pub const Vcpu = struct {
         var state = c.struct_kvm_mp_state{ .mp_state = c.KVM_MP_STATE_UNINITIALIZED };
         if (c.ioctl(self.fd, c.KVM_SET_MP_STATE, &state) < 0) {
             return error.SetMpStateFailed;
+        }
+    }
+
+    pub fn captureState(
+        self: *Vcpu,
+        msr_indices: []const u32,
+        state: *VcpuState,
+    ) SnapshotError!void {
+        if (msr_indices.len > msr_entries_max) return error.MsrListTooLarge;
+        state.* = .{};
+        if (c.ioctl(self.fd, c.KVM_GET_REGS, &state.regs) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_SREGS, &state.sregs) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_FPU, &state.fpu) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_XSAVE, &state.xsave) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_XCRS, &state.xcrs) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_LAPIC, &state.lapic) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_VCPU_EVENTS, &state.events) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_DEBUGREGS, &state.debug) < 0 or
+            c.ioctl(self.fd, c.KVM_GET_MP_STATE, &state.mp) < 0)
+        {
+            return error.CaptureVcpuFailed;
+        }
+        var msrs = MsrIo{ .count = @intCast(msr_indices.len) };
+        for (msr_indices, msrs.entries[0..msr_indices.len]) |index, *entry| {
+            entry.index = index;
+        }
+        const captured = c.ioctl(self.fd, c.KVM_GET_MSRS, &msrs);
+        if (captured < 0) return error.CaptureVcpuFailed;
+        if (captured != msrs.count) return error.MsrCountMismatch;
+        state.msrs.count = msrs.count;
+        @memcpy(state.msrs.entries[0..msrs.count], msrs.entries[0..msrs.count]);
+    }
+
+    pub fn restoreState(self: *Vcpu, state: *const VcpuState) SnapshotError!void {
+        if (state.msrs.count > msr_entries_max) return error.MsrListTooLarge;
+        var sregs = state.sregs;
+        var fpu = state.fpu;
+        var xsave = state.xsave;
+        var xcrs = state.xcrs;
+        var lapic = state.lapic;
+        var events = state.events;
+        var debug = state.debug;
+        var regs = state.regs;
+        var mp = state.mp;
+        if (c.ioctl(self.fd, c.KVM_SET_SREGS, &sregs) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_FPU, &fpu) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_XSAVE, &xsave) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_XCRS, &xcrs) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_LAPIC, &lapic) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_VCPU_EVENTS, &events) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_DEBUGREGS, &debug) < 0)
+        {
+            return error.RestoreVcpuFailed;
+        }
+        var msrs = MsrIo{ .count = state.msrs.count };
+        @memcpy(msrs.entries[0..msrs.count], state.msrs.entries[0..msrs.count]);
+        const restored = c.ioctl(self.fd, c.KVM_SET_MSRS, &msrs);
+        if (restored < 0) return error.RestoreVcpuFailed;
+        if (restored != msrs.count) return error.MsrCountMismatch;
+        if (c.ioctl(self.fd, c.KVM_SET_REGS, &regs) < 0 or
+            c.ioctl(self.fd, c.KVM_SET_MP_STATE, &mp) < 0)
+        {
+            return error.RestoreVcpuFailed;
         }
     }
 

@@ -223,6 +223,13 @@ const exits_max: u64 = 100_000_000;
 const output_pending_bytes: usize = 64 * 1024;
 const console_history_bytes: usize = 64 * 1024;
 
+const SnapshotStatus = enum(u8) {
+    idle,
+    running,
+    succeeded,
+    failed,
+};
+
 const State = struct {
     allocator: std.mem.Allocator,
     memory_bytes: usize,
@@ -237,6 +244,7 @@ const State = struct {
     disk_path: ?[]const u8,
     iso_path: ?[]const u8,
     shared_dir: ?[]const u8,
+    restore_path: ?[]const u8,
     network_enabled: bool,
     forwards: [AppConfig.MAX_FORWARDS]mininat.Forward,
     forward_count: u8,
@@ -256,6 +264,7 @@ const State = struct {
     kernel_entry: ?*c.GtkEntry = null,
     initrd_entry: ?*c.GtkEntry = null,
     shared_entry: ?*c.GtkEntry = null,
+    restore_entry: ?*c.GtkEntry = null,
     forward_entry: ?*c.GtkEntry = null,
     memory_spin: ?*c.GtkSpinButton = null,
     vcpu_spin: ?*c.GtkSpinButton = null,
@@ -272,6 +281,7 @@ const State = struct {
     trim_button: ?*c.GtkWidget = null,
     sync_time_button: ?*c.GtkWidget = null,
     send_file_button: ?*c.GtkWidget = null,
+    snapshot_button: ?*c.GtkWidget = null,
     guest_tools: ?*c.GtkLabel = null,
     clipboard: ?*c.GdkClipboard = null,
     clipboard_lock: std.Io.Mutex = .init,
@@ -291,6 +301,10 @@ const State = struct {
     frame_width: u32 = 0,
     frame_height: u32 = 0,
     frame_generation: u64 = 0,
+    snapshot_thread: ?std.Thread = null,
+    snapshot_status: std.atomic.Value(SnapshotStatus) =
+        std.atomic.Value(SnapshotStatus).init(.idle),
+    snapshot_error: ?anyerror = null,
     closing: bool = false,
 
     fn start(self: *State) void {
@@ -322,6 +336,7 @@ const State = struct {
             .disk2_path = self.iso_path,
             .disk2_read_only = true,
             .shared_dir = self.shared_dir,
+            .restore_path = self.restore_path,
             .network_enabled = self.network_enabled,
             .forwards = self.forwards[0..self.forward_count],
             .display_enabled = true,
@@ -334,6 +349,8 @@ const State = struct {
             self.setError(err);
             return;
         };
+        self.restore_path = null;
+        setEntryValue(self, self.restore_entry.?, null);
         self.vm = vm;
         vm.setClipboardHandlers(guestClipboard, requestHostClipboard, self);
         vm.start() catch |err| {
@@ -372,6 +389,7 @@ const State = struct {
         self.kernel_path = entryValue(self.kernel_entry.?);
         self.initrd_path = entryValue(self.initrd_entry.?);
         self.shared_dir = entryValue(self.shared_entry.?);
+        self.restore_path = entryValue(self.restore_entry.?);
         const memory_mib = c.gtk_spin_button_get_value_as_int(self.memory_spin.?);
         const vcpu_count = c.gtk_spin_button_get_value_as_int(self.vcpu_spin.?);
         const display_width_value = c.gtk_spin_button_get_value_as_int(self.display_width_spin.?);
@@ -438,7 +456,9 @@ const State = struct {
 
     fn saveConfiguration(self: *State) void {
         if (!self.readForm()) return;
-        const name = entryValue(self.vm_name_entry.?) orelse return self.setError(error.InvalidName);
+        const name = entryValue(self.vm_name_entry.?) orelse {
+            return self.setError(error.InvalidName);
+        };
         const firmware = self.firmware_path orelse if (self.iso_path != null or
             self.disk_path != null and self.kernel_path == null)
             defaultFirmwarePath()
@@ -505,6 +525,8 @@ const State = struct {
         setEntryValue(self, self.kernel_entry.?, config.kernel_path);
         setEntryValue(self, self.initrd_entry.?, config.initrd_path);
         setEntryValue(self, self.shared_entry.?, config.shared_dir);
+        setEntryValue(self, self.restore_entry.?, null);
+        self.restore_path = null;
         c.gtk_spin_button_set_value(self.memory_spin.?, @floatFromInt(config.memory_mb));
         c.gtk_spin_button_set_value(self.vcpu_spin.?, @floatFromInt(config.vcpu_count));
         c.gtk_spin_button_set_value(
@@ -640,6 +662,10 @@ const State = struct {
             .ready => "Guest tools: ready",
             .protocol_error => "Guest tools: protocol error",
         });
+        if (self.snapshot_status.load(.acquire) == .running) {
+            self.setManagementControls(false);
+            return;
+        }
         self.setManagementControls(vm.guestManagementReady());
         const file_transfer = vm.guestToolsCapabilities() &
             agent.native.HostCapability.file_transfer != 0;
@@ -655,7 +681,51 @@ const State = struct {
         c.gtk_widget_set_sensitive(self.reboot_button.?, sensitive);
         c.gtk_widget_set_sensitive(self.trim_button.?, sensitive);
         c.gtk_widget_set_sensitive(self.sync_time_button.?, sensitive);
+        c.gtk_widget_set_sensitive(self.snapshot_button.?, sensitive);
         if (!enabled) c.gtk_widget_set_sensitive(self.send_file_button.?, c.FALSE);
+    }
+
+    fn beginSnapshot(self: *State, directory: []const u8) void {
+        const vm = self.vm orelse return;
+        if (self.snapshot_status.load(.acquire) != .idle) return;
+        const path = self.allocator.dupe(u8, directory) catch {
+            return self.setError(error.OutOfMemory);
+        };
+        self.snapshot_error = null;
+        self.snapshot_status.store(.running, .release);
+        self.snapshot_thread = std.Thread.spawn(
+            .{},
+            snapshotThreadMain,
+            .{ self, vm, path },
+        ) catch |err| {
+            self.allocator.free(path);
+            self.snapshot_status.store(.idle, .release);
+            return self.setError(err);
+        };
+        c.gtk_widget_set_sensitive(self.pause_button.?, c.FALSE);
+        c.gtk_widget_set_sensitive(self.stop_button.?, c.FALSE);
+        self.setManagementControls(false);
+        c.gtk_label_set_text(self.status.?, "Creating quiesced snapshot…");
+    }
+
+    fn finishSnapshot(self: *State) void {
+        const status = self.snapshot_status.load(.acquire);
+        if (status == .idle or status == .running) return;
+        if (self.snapshot_thread) |thread| thread.join();
+        self.snapshot_thread = null;
+        self.snapshot_status.store(.idle, .release);
+        if (status == .failed) {
+            self.setError(self.snapshot_error orelse error.SnapshotFailed);
+        } else {
+            c.gtk_label_set_text(self.status.?, "Snapshot created");
+        }
+        if (self.closing) {
+            if (self.vm) |vm| vm.requestStop();
+        } else {
+            c.gtk_widget_set_sensitive(self.pause_button.?, c.TRUE);
+            c.gtk_widget_set_sensitive(self.stop_button.?, c.TRUE);
+            self.refreshGuestTools();
+        }
     }
 
     fn finish(self: *State) void {
@@ -890,6 +960,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .disk_path = config.disk_path,
         .iso_path = config.iso_path,
         .shared_dir = config.shared_dir,
+        .restore_path = config.restore_path,
         .network_enabled = config.network_enabled,
         .forwards = config.forwards,
         .forward_count = config.forward_count,
@@ -910,6 +981,10 @@ pub fn main(minimal: std.process.Init.Minimal) void {
     defer c.g_object_unref(app);
     _ = c.g_signal_connect_data(app, "activate", @ptrCast(&activate), &state, null, 0);
     const status = c.g_application_run(@ptrCast(app), 0, null);
+    if (state.snapshot_thread) |thread| {
+        thread.join();
+        state.snapshot_thread = null;
+    }
     if (state.vm) |vm| {
         vm.requestStop();
         state.finish();
@@ -1016,6 +1091,15 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         &chooseSharedClicked,
     ) orelse return;
     state.shared_entry = shared_entry;
+    const restore_entry = addPathRow(
+        box,
+        state,
+        "Restore Snapshot",
+        "Optional snapshot directory for the next start",
+        state.restore_path,
+        &chooseRestoreClicked,
+    ) orelse return;
+    state.restore_entry = restore_entry;
     const forward_row_widget = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
     const forward_row: *c.GtkBox = @ptrCast(forward_row_widget);
     const forward_label = c.gtk_label_new("Port Forwards") orelse return;
@@ -1111,6 +1195,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const trim_button = c.gtk_button_new_with_label("Trim") orelse return;
     const sync_time_button = c.gtk_button_new_with_label("Sync Time") orelse return;
     const send_file_button = c.gtk_button_new_with_label("Send File…") orelse return;
+    const snapshot_button = c.gtk_button_new_with_label("Snapshot…") orelse return;
     state.start_button = start_button;
     state.pause_button = pause_button;
     state.stop_button = stop_button;
@@ -1119,6 +1204,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     state.trim_button = trim_button;
     state.sync_time_button = sync_time_button;
     state.send_file_button = send_file_button;
+    state.snapshot_button = snapshot_button;
     _ = c.g_signal_connect_data(start_button, "clicked", @ptrCast(&startClicked), state, null, 0);
     _ = c.g_signal_connect_data(pause_button, "clicked", @ptrCast(&pauseClicked), state, null, 0);
     _ = c.g_signal_connect_data(stop_button, "clicked", @ptrCast(&stopClicked), state, null, 0);
@@ -1155,6 +1241,14 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         null,
         0,
     );
+    _ = c.g_signal_connect_data(
+        snapshot_button,
+        "clicked",
+        @ptrCast(&snapshotClicked),
+        state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(controls), start_button);
     c.gtk_box_append(@ptrCast(controls), pause_button);
     c.gtk_box_append(@ptrCast(controls), stop_button);
@@ -1163,6 +1257,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(controls), trim_button);
     c.gtk_box_append(@ptrCast(controls), sync_time_button);
     c.gtk_box_append(@ptrCast(controls), send_file_button);
+    c.gtk_box_append(@ptrCast(controls), snapshot_button);
     const status_widget = c.gtk_label_new("Ready") orelse return;
     const status: *c.GtkLabel = @ptrCast(status_widget);
     state.status = status;
@@ -1370,6 +1465,53 @@ fn sendFileChosen(
     c.gtk_label_set_text(state.status.?, "File offered to guest");
 }
 
+fn snapshotClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (state.vm == null or state.snapshot_status.load(.acquire) != .idle) return;
+    const dialog = c.gtk_file_chooser_native_new(
+        "Choose snapshot directory",
+        state.window.?,
+        c.GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "Snapshot",
+        "Cancel",
+    ) orelse return;
+    _ = c.g_signal_connect_data(
+        dialog,
+        "response",
+        @ptrCast(&snapshotDirectoryChosen),
+        state,
+        null,
+        0,
+    );
+    c.gtk_native_dialog_show(dialog);
+}
+
+fn snapshotDirectoryChosen(
+    dialog: *c.GtkNativeDialog,
+    response: c_int,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    defer c.g_object_unref(dialog);
+    defer c.gtk_native_dialog_destroy(dialog);
+    if (response != c.GTK_RESPONSE_ACCEPT) return;
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const file = c.gtk_file_chooser_get_file(@ptrCast(dialog)) orelse return;
+    defer c.g_object_unref(file);
+    const path = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path);
+    state.beginSnapshot(std.mem.span(path));
+}
+
+fn snapshotThreadMain(state: *State, vm: *VM, path: []u8) void {
+    defer state.allocator.free(path);
+    vm.snapshotQuiesced(path) catch |err| {
+        state.snapshot_error = err;
+        state.snapshot_status.store(.failed, .release);
+        return;
+    };
+    state.snapshot_status.store(.succeeded, .release);
+}
+
 fn guestClipboard(text: []const u8, userdata: ?*anyopaque) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
     if (text.len > agent.native.clipboard_text_bytes_max) return;
@@ -1451,6 +1593,11 @@ fn chooseInitrdClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void
 fn chooseSharedClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
     chooseFolder(state, state.shared_entry.?, "Choose shared host folder");
+}
+
+fn chooseRestoreClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    chooseFolder(state, state.restore_entry.?, "Choose snapshot directory");
 }
 
 fn createDiskClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
@@ -1554,6 +1701,10 @@ fn closeRequest(_: *c.GtkWindow, userdata: ?*anyopaque) callconv(.c) c.gboolean 
     const state: *State = @ptrCast(@alignCast(userdata orelse return c.FALSE));
     const vm = state.vm orelse return c.FALSE;
     state.closing = true;
+    if (state.snapshot_status.load(.acquire) == .running) {
+        c.gtk_label_set_text(state.status.?, "Finishing snapshot before closing…");
+        return c.TRUE;
+    }
     vm.requestStop();
     c.gtk_label_set_text(state.status.?, "Stopping…");
     return c.TRUE;
@@ -1562,6 +1713,7 @@ fn closeRequest(_: *c.GtkWindow, userdata: ?*anyopaque) callconv(.c) c.gboolean 
 fn tick(userdata: ?*anyopaque) callconv(.c) c.gboolean {
     const state: *State = @ptrCast(@alignCast(userdata orelse return c.G_SOURCE_REMOVE));
     state.flushOutput();
+    state.finishSnapshot();
     const vm = state.vm orelse return c.G_SOURCE_REMOVE;
     state.refreshDisplay();
     state.refreshGuestTools();

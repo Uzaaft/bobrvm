@@ -3,12 +3,14 @@
 const std = @import("std");
 const agent = @import("../../agent/main.zig");
 const callback_binding = @import("../../callback.zig");
+const file_compat = @import("../../compat/file.zig");
 const global = @import("../../global.zig");
 const GuestMemory = @import("../../guest_memory.zig").GuestMemory;
 const kvm = @import("../../hypervisor/kvm/main.zig");
 const mininat = @import("../../net/mininat.zig");
 const pci = @import("../../pci/main.zig");
 const virtio = @import("../../virtio/main.zig");
+const snapshot = @import("../snapshot.zig");
 const boot = @import("boot.zig");
 const mps = @import("mps.zig");
 
@@ -59,6 +61,16 @@ const acpi_timer_frequency_hz: u64 = 3_579_545;
 const acpi_timer_mask: u32 = 0x00ff_ffff;
 const firmware_address_end: u64 = 0x1_0000_0000;
 const firmware_bytes_max: usize = 16 * 1024 * 1024;
+const suspend_magic = "BBRXSUS1";
+const suspend_version: u32 = 1;
+const suspend_header_bytes: usize = 8 + 4 + 3 * @sizeOf(u64);
+const snapshot_state_bytes_max: u64 = 128 * 1024 * 1024;
+const snapshot_chunk_bytes: usize = 64 * 1024;
+const ficlone_ioctl: c_ulong = 0x4004_9409;
+
+const SuspendHeader = struct {
+    state_len: u64,
+};
 
 pub const SerialSink = struct {
     userdata: *anyopaque,
@@ -118,6 +130,73 @@ const Serial = struct {
     }
 };
 
+const EmulatedState = extern struct {
+    pci_config_address: u32 = 0,
+    chipset_config: [2][4][256]u8 = @splat(@splat(@splat(0))),
+    serial_rx: [Serial.capacity]u8 = @splat(0),
+    serial_rx_head: u32 = 0,
+    serial_rx_len: u32 = 0,
+    serial_interrupt_enable: u8 = 0,
+    serial_line_control: u8 = 0,
+    serial_modem_control: u8 = 0,
+    serial_scratch: u8 = 0,
+    serial_divisor_low: u8 = 1,
+    serial_divisor_high: u8 = 0,
+    cmos_index: u8 = 0,
+    cmos_nmi_disabled: u8 = 0,
+    cmos_data: [128]u8 = @splat(0),
+    irq_flags: u32 = 0,
+};
+
+fn SnapshotSection(
+    comptime section_name: []const u8,
+    comptime field_name: []const u8,
+    comptime Codec: type,
+) type {
+    return struct {
+        const name = section_name;
+
+        fn capture(machine: anytype, alloc: std.mem.Allocator, builder: *snapshot.Builder) !void {
+            const device: *const Codec.Device = @field(machine, field_name) orelse return;
+            try Codec.append(builder, alloc, section_name, device);
+        }
+
+        fn restore(
+            machine: anytype,
+            alloc: std.mem.Allocator,
+            reader: *const snapshot.Reader,
+        ) !void {
+            const data = reader.section(section_name) orelse {
+                if (@field(machine, field_name) != null) return error.Corrupt;
+                return;
+            };
+            const device: *Codec.Device = @field(machine, field_name) orelse return error.Mismatch;
+            try Codec.decode(alloc, device, data);
+        }
+    };
+}
+
+const snapshot_sections = .{
+    SnapshotSection("blk1", "block", snapshot.BlockCodec),
+    SnapshotSection("blk2", "block2", snapshot.BlockCodec),
+    SnapshotSection("net", "net", snapshot.NetCodec),
+    SnapshotSection("gpu", "gpu", snapshot.GpuCodec),
+    SnapshotSection("kbd", "keyboard", snapshot.InputCodec),
+    SnapshotSection("mouse", "tablet", snapshot.InputCodec),
+    SnapshotSection("p9", "share", snapshot.P9Codec),
+    SnapshotSection("rng", "rng", snapshot.RngCodec),
+    SnapshotSection("console", "console", snapshot.ConsoleCodec),
+    SnapshotSection("pci_blk1", "pci_block", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_blk2", "pci_block2", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_net", "pci_net", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_gpu", "pci_gpu", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_kbd", "pci_keyboard", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_mouse", "pci_tablet", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_p9", "pci_share", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_rng", "pci_rng", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_console", "pci_console", snapshot.PciDeviceCodec),
+};
+
 pub const Machine = struct {
     allocator: std.mem.Allocator,
     host: kvm.Kvm,
@@ -139,6 +218,8 @@ pub const Machine = struct {
     cmos_data: [128]u8 = initCmosData(),
     block: ?*virtio.Block = null,
     pci_block: ?*pci.VirtioPciDevice = null,
+    block_path: ?[]u8 = null,
+    block_read_only: bool = false,
     block_lock: std.Io.Mutex = .init,
     block_kick_event: ?kvm.EventFd = null,
     block_irq_event: ?kvm.EventFd = null,
@@ -155,6 +236,8 @@ pub const Machine = struct {
     block_notify_mmio_exits: u64 = 0,
     block2: ?*virtio.Block = null,
     pci_block2: ?*pci.VirtioPciDevice = null,
+    block2_path: ?[]u8 = null,
+    block2_read_only: bool = true,
     block2_irq_desired: bool = false,
     block2_irq_injected: bool = false,
     block2_notifications: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -210,6 +293,7 @@ pub const Machine = struct {
         debug_line_len: usize = 0,
         thread: ?std.Thread = null,
         thread_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        parked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         run_error: ?RunError = null,
     };
 
@@ -416,8 +500,10 @@ pub const Machine = struct {
         if (self.net) |net| net.deinit();
         if (self.pci_block2) |device| device.deinit();
         if (self.block2) |block| block.deinit();
+        if (self.block2_path) |path| self.allocator.free(path);
         if (self.pci_block) |device| device.deinit();
         if (self.block) |block| block.deinit();
+        if (self.block_path) |path| self.allocator.free(path);
         for (self.vcpus) |*slot| slot.vcpu.deinit();
         self.allocator.free(self.vcpus);
         self.vm.deinit();
@@ -444,6 +530,8 @@ pub const Machine = struct {
         std.debug.assert(self.block == null);
         std.debug.assert(self.pci_block == null);
 
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
         const block = try virtio.Block.init(allocator);
         errdefer block.deinit();
         try block.attachDisk(path, read_only);
@@ -464,9 +552,12 @@ pub const Machine = struct {
         block.setIrqCallback(virtio.mmio.Irq.initRaw(blockIrq, self));
         self.block = block;
         self.pci_block = device;
+        self.block_path = path_copy;
+        self.block_read_only = read_only;
         errdefer {
             self.block = null;
             self.pci_block = null;
+            self.block_path = null;
         }
 
         if (self.host.capabilities.supportsFastDevicePath()) {
@@ -486,6 +577,8 @@ pub const Machine = struct {
         std.debug.assert(self.block2 == null);
         std.debug.assert(self.pci_block2 == null);
 
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
         const block = try virtio.Block.init(allocator);
         errdefer block.deinit();
         try block.attachDisk(path, read_only);
@@ -507,6 +600,8 @@ pub const Machine = struct {
         block.setIrqCallback(virtio.mmio.Irq.initRaw(block2Irq, self));
         self.block2 = block;
         self.pci_block2 = device;
+        self.block2_path = path_copy;
+        self.block2_read_only = read_only;
     }
 
     /// The machine address must remain stable until deinit because callbacks retain it.
@@ -1061,6 +1156,431 @@ pub const Machine = struct {
         return true;
     }
 
+    /// Serialize KVM, emulated chipset, PCI, and virtio state while every
+    /// vCPU is parked. Guest RAM is streamed separately by the suspend layer.
+    pub fn captureState(self: *Machine, allocator: std.mem.Allocator) ![]u8 {
+        if (self.run_state.load(.acquire) != .paused) return error.NotPaused;
+        try self.waitUntilVcpusParked();
+        const fast_path_enabled = self.block_fast_enabled;
+        if (fast_path_enabled) self.stopBlockFastPath();
+        errdefer if (fast_path_enabled) self.restartBlockFastPath();
+
+        self.exit_lock.lockUncancelable(global.io());
+        defer self.exit_lock.unlock(global.io());
+        var builder = try snapshot.Builder.init(allocator);
+        defer builder.deinit();
+        var vm_state = try self.vm.captureState();
+        try builder.section("x86vm", std.mem.asBytes(&vm_state));
+        var msr_storage: [kvm.msr_entries_max]u32 = undefined;
+        const msr_indices = try self.host.supportedMsrIndices(&msr_storage);
+        for (self.vcpus, 0..) |*slot, index| {
+            var state = kvm.VcpuState{};
+            try slot.vcpu.captureState(msr_indices, &state);
+            var name_buffer: [16]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buffer, "x86cpu{}", .{index}) catch unreachable;
+            try builder.section(name, std.mem.asBytes(&state));
+        }
+        var emulated = self.captureEmulatedState();
+        try builder.section("x86emu", std.mem.asBytes(&emulated));
+        inline for (snapshot_sections) |Section| try Section.capture(self, allocator, &builder);
+        const result = try builder.finish();
+        if (fast_path_enabled) try self.startBlockFastPath();
+        return result;
+    }
+
+    /// Restore state onto an identically configured machine before its first
+    /// KVM_RUN, or while all running vCPUs are parked.
+    pub fn applyState(self: *Machine, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        const state = self.run_state.load(.acquire);
+        if (state != .idle and state != .paused) return error.NotPaused;
+        if (state == .paused) try self.waitUntilVcpusParked();
+        const fast_path_enabled = self.block_fast_enabled;
+        if (fast_path_enabled) self.stopBlockFastPath();
+        errdefer if (fast_path_enabled) self.restartBlockFastPath();
+
+        self.exit_lock.lockUncancelable(global.io());
+        defer self.exit_lock.unlock(global.io());
+        const reader = try snapshot.Reader.init(bytes);
+        const vm_bytes = reader.section("x86vm") orelse return error.Corrupt;
+        if (vm_bytes.len != @sizeOf(kvm.VmState)) return error.Corrupt;
+        var vm_state: kvm.VmState = undefined;
+        @memcpy(std.mem.asBytes(&vm_state), vm_bytes);
+        try self.vm.restoreState(&vm_state);
+        try self.restoreVcpuSections(&reader);
+        const emulated_bytes = reader.section("x86emu") orelse return error.Corrupt;
+        if (emulated_bytes.len != @sizeOf(EmulatedState)) return error.Corrupt;
+        var emulated: EmulatedState = undefined;
+        @memcpy(std.mem.asBytes(&emulated), emulated_bytes);
+        try self.restoreEmulatedState(&emulated);
+        inline for (snapshot_sections) |Section| {
+            Section.restore(self, allocator, &reader) catch |err| {
+                log.err("failed to restore snapshot section {s}: {}", .{ Section.name, err });
+                return err;
+            };
+        }
+        if (fast_path_enabled) try self.startBlockFastPath();
+    }
+
+    /// Write a sparse suspend image containing versioned machine state, RAM,
+    /// and writable firmware storage. The caller must keep the VM paused.
+    pub fn suspendToDisk(self: *Machine, path: []const u8) !void {
+        if (self.run_state.load(.acquire) != .paused) return error.NotPaused;
+        const state = try self.captureState(self.allocator);
+        defer self.allocator.free(state);
+        const firmware = self.firmware_memory orelse self.memory[0..0];
+        const io = global.io();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+
+        var header: [suspend_header_bytes]u8 = undefined;
+        @memcpy(header[0..suspend_magic.len], suspend_magic);
+        std.mem.writeInt(u32, header[8..12], suspend_version, .little);
+        std.mem.writeInt(u64, header[12..20], state.len, .little);
+        std.mem.writeInt(u64, header[20..28], self.memory.len, .little);
+        std.mem.writeInt(u64, header[28..36], firmware.len, .little);
+        try file.writePositionalAll(io, &header, 0);
+        try file.writePositionalAll(io, state, header.len);
+        var offset: u64 = header.len + state.len;
+        _ = try writeSparse(file, self.memory, offset);
+        offset += self.memory.len;
+        _ = try writeSparse(file, firmware, offset);
+        offset += firmware.len;
+        if (std.c.ftruncate(file.handle, @intCast(offset)) != 0) return error.TruncateFailed;
+    }
+
+    /// Validate a suspend image before any associated disk state is replaced.
+    pub fn validateSuspendImage(
+        path: []const u8,
+        memory_bytes: usize,
+        firmware_bytes: usize,
+    ) !void {
+        const io = global.io();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        defer file.close(io);
+        _ = try readSuspendHeader(file, memory_bytes, firmware_bytes);
+    }
+
+    /// Restore a suspend image onto a freshly configured machine before it runs.
+    pub fn restoreFromDisk(self: *Machine, path: []const u8) !void {
+        if (self.run_state.load(.acquire) != .idle) return error.InvalidState;
+        const io = global.io();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        defer file.close(io);
+        const firmware = self.firmware_memory orelse self.memory[0..0];
+        const header = try readSuspendHeader(file, self.memory.len, firmware.len);
+        const state = try self.allocator.alloc(u8, @intCast(header.state_len));
+        defer self.allocator.free(state);
+        if (try file.readPositionalAll(io, state, suspend_header_bytes) != state.len) {
+            return error.BadSnapshot;
+        }
+        var offset: u64 = suspend_header_bytes + state.len;
+        try readSnapshotBytes(file, self.memory, offset);
+        offset += self.memory.len;
+        try readSnapshotBytes(file, firmware, offset);
+        try self.applyState(self.allocator, state);
+    }
+
+    /// Freeze guest filesystems, snapshot the complete VM and writable disks,
+    /// then resume and thaw. The VM keeps running after a successful capture.
+    pub fn snapshotToQuiesced(self: *Machine, directory: []const u8) !void {
+        if (self.run_state.load(.acquire) != .running) return error.InvalidState;
+        const qga = self.qga orelse return error.AgentUnavailable;
+        if (!qga.isConnected()) return error.AgentUnavailable;
+        const freeze_request = qga.freezeFilesystems();
+        try self.waitForQgaResponse(qga, freeze_request);
+        var needs_thaw = true;
+        var paused = false;
+        defer if (needs_thaw) {
+            if (paused) _ = self.requestResume();
+            self.thawAfterSnapshot(qga);
+        };
+        if (!self.requestPause()) return error.InvalidState;
+        paused = true;
+        try self.waitUntilVcpusParked();
+        try self.snapshotTo(directory);
+        if (!self.requestResume()) return error.InvalidState;
+        paused = false;
+        const thaw_request = qga.thawFilesystems();
+        needs_thaw = false;
+        try self.waitForQgaResponse(qga, thaw_request);
+    }
+
+    fn snapshotTo(self: *Machine, directory: []const u8) !void {
+        const io = global.io();
+        std.Io.Dir.cwd().createDir(io, directory, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        var path_buffer: [1024]u8 = undefined;
+        const state_path = try std.fmt.bufPrint(&path_buffer, "{s}/state.img", .{directory});
+        try self.suspendToDisk(state_path);
+        try self.cloneSnapshotDisks(directory);
+    }
+
+    fn cloneSnapshotDisks(self: *Machine, directory: []const u8) !void {
+        const Disk = struct { orig: []const u8, copy: []const u8 };
+        const candidates = [_]struct { path: ?[]const u8, read_only: bool }{
+            .{ .path = self.block_path, .read_only = self.block_read_only },
+            .{ .path = self.block2_path, .read_only = self.block2_read_only },
+        };
+        var disks: [2]Disk = undefined;
+        var names: [2][32]u8 = undefined;
+        var count: usize = 0;
+        var path_buffer: [1024]u8 = undefined;
+        for (candidates) |candidate| {
+            const source = candidate.path orelse continue;
+            if (candidate.read_only) continue;
+            const name = std.fmt.bufPrint(&names[count], "disk{}.raw", .{count}) catch unreachable;
+            const destination = try std.fmt.bufPrint(
+                &path_buffer,
+                "{s}/{s}",
+                .{ directory, name },
+            );
+            try cloneFile(source, destination);
+            disks[count] = .{ .orig = source, .copy = name };
+            count += 1;
+        }
+        const meta = .{ .disks = disks[0..count] };
+        const bytes = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            meta,
+            .{ .whitespace = .indent_2 },
+        );
+        defer self.allocator.free(bytes);
+        const meta_path = try std.fmt.bufPrint(&path_buffer, "{s}/meta.json", .{directory});
+        const file = try std.Io.Dir.cwd().createFile(global.io(), meta_path, .{});
+        defer file.close(global.io());
+        try file.writePositionalAll(global.io(), bytes, 0);
+    }
+
+    pub fn restoreSnapshotDisks(
+        allocator: std.mem.Allocator,
+        directory: []const u8,
+        disk_path: ?[]const u8,
+        disk2_path: ?[]const u8,
+    ) !void {
+        var path_buffer: [1024]u8 = undefined;
+        const meta_path = try std.fmt.bufPrint(&path_buffer, "{s}/meta.json", .{directory});
+        const file = try std.Io.Dir.cwd().openFile(
+            global.io(),
+            meta_path,
+            .{ .mode = .read_only },
+        );
+        defer file.close(global.io());
+        const bytes = try file_compat.readToEndAlloc(file, allocator, 1024 * 1024);
+        defer allocator.free(bytes);
+        const Meta = struct {
+            disks: []struct { orig: []const u8, copy: []const u8 },
+        };
+        var parsed = try std.json.parseFromSlice(Meta, allocator, bytes, .{});
+        defer parsed.deinit();
+        if (parsed.value.disks.len > 2) return error.InvalidSnapshotMetadata;
+        var sources: [2][1024]u8 = undefined;
+        for (parsed.value.disks, 0..) |entry, index| {
+            const expected = (disk_path != null and std.mem.eql(u8, entry.orig, disk_path.?)) or
+                (disk2_path != null and std.mem.eql(u8, entry.orig, disk2_path.?));
+            if (!expected or entry.copy.len == 0 or
+                !std.mem.eql(u8, entry.copy, std.fs.path.basename(entry.copy)))
+            {
+                return error.InvalidSnapshotMetadata;
+            }
+            for (parsed.value.disks[0..index]) |previous| {
+                if (std.mem.eql(u8, entry.orig, previous.orig) or
+                    std.mem.eql(u8, entry.copy, previous.copy))
+                {
+                    return error.InvalidSnapshotMetadata;
+                }
+            }
+            const source = try std.fmt.bufPrint(
+                &sources[index],
+                "{s}/{s}",
+                .{ directory, entry.copy },
+            );
+            const source_file = try std.Io.Dir.cwd().openFile(
+                global.io(),
+                source,
+                .{ .mode = .read_only },
+            );
+            source_file.close(global.io());
+        }
+        for (parsed.value.disks, 0..) |entry, index| {
+            try cloneFile(sources[index][0 .. directory.len + 1 + entry.copy.len], entry.orig);
+        }
+    }
+
+    pub fn cloneFile(source_path: []const u8, destination_path: []const u8) !void {
+        const io = global.io();
+        const cwd = std.Io.Dir.cwd();
+        const source = try cwd.openFile(io, source_path, .{ .mode = .read_only });
+        defer source.close(io);
+        if (cwd.openFile(io, destination_path, .{ .mode = .read_only })) |existing| {
+            defer existing.close(io);
+            const source_stat = try source.stat(io);
+            const destination_stat = try existing.stat(io);
+            if (source_stat.inode == destination_stat.inode) {
+                return error.SourceIsDestination;
+            }
+        } else |_| {}
+        {
+            var destination = try cwd.createFileAtomic(io, destination_path, .{ .replace = true });
+            defer destination.deinit(io);
+            if (kvm.c.ioctl(
+                destination.file.handle,
+                ficlone_ioctl,
+                @as(c_ulong, @intCast(source.handle)),
+            ) == 0) {
+                try destination.replace(io);
+                return;
+            }
+        }
+        try cwd.copyFile(source_path, cwd, destination_path, io, .{ .replace = true });
+    }
+
+    fn waitForQgaResponse(
+        self: *Machine,
+        qga: *agent.Qga,
+        request: agent.Qga.WatchedRequest,
+    ) !void {
+        var waited_ms: u32 = 0;
+        while (!qga.watchedResponseReady(request)) : (waited_ms += 2) {
+            if (waited_ms >= 5000) return error.AgentTimeout;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 2 * std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+        }
+        _ = self;
+        if (qga.watchedResponseFailed(request)) return error.AgentRejected;
+    }
+
+    fn thawAfterSnapshot(self: *Machine, qga: *agent.Qga) void {
+        const request = qga.thawFilesystems();
+        self.waitForQgaResponse(qga, request) catch |err| {
+            log.err("failed to thaw guest filesystems after snapshot: {}", .{err});
+        };
+    }
+
+    fn restoreVcpuSections(self: *Machine, reader: *const snapshot.Reader) !void {
+        for (self.vcpus, 0..) |*slot, index| {
+            var name_buffer: [16]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buffer, "x86cpu{}", .{index}) catch unreachable;
+            const data = reader.section(name) orelse return error.Corrupt;
+            if (data.len != @sizeOf(kvm.VcpuState)) return error.Corrupt;
+            var state: kvm.VcpuState = undefined;
+            @memcpy(std.mem.asBytes(&state), data);
+            try slot.vcpu.restoreState(&state);
+        }
+    }
+
+    fn waitUntilVcpusParked(self: *Machine) !void {
+        var waited_ms: u32 = 0;
+        while (waited_ms < 2000) : (waited_ms += 1) {
+            var all_parked = true;
+            for (self.vcpus) |*slot| all_parked = all_parked and slot.parked.load(.acquire);
+            if (all_parked) return;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+        }
+        return error.Timeout;
+    }
+
+    fn restartBlockFastPath(self: *Machine) void {
+        self.startBlockFastPath() catch self.block_worker_failed.store(true, .release);
+    }
+
+    fn captureEmulatedState(self: *Machine) EmulatedState {
+        var result = EmulatedState{
+            .pci_config_address = self.pci_config.address,
+            .chipset_config = self.chipset_config,
+            .serial_rx = self.serial.rx,
+            .serial_rx_head = @intCast(self.serial.rx_head),
+            .serial_rx_len = @intCast(self.serial.rx_len),
+            .serial_interrupt_enable = self.serial.interrupt_enable,
+            .serial_line_control = self.serial.line_control,
+            .serial_modem_control = self.serial.modem_control,
+            .serial_scratch = self.serial.scratch,
+            .serial_divisor_low = self.serial.divisor_low,
+            .serial_divisor_high = self.serial.divisor_high,
+            .cmos_index = self.cmos_index,
+            .cmos_nmi_disabled = @intFromBool(self.cmos_nmi_disabled),
+            .cmos_data = self.cmos_data,
+        };
+        const values = [_]bool{
+            self.serial_irq_injected,
+            self.block_irq_desired,
+            self.block_irq_injected,
+            self.block2_irq_desired,
+            self.block2_irq_injected,
+            self.net_irq_desired,
+            self.net_irq_injected,
+            self.gpu_irq_desired,
+            self.gpu_irq_injected,
+            self.keyboard_irq_desired,
+            self.keyboard_irq_injected,
+            self.tablet_irq_desired,
+            self.tablet_irq_injected,
+            self.share_irq_desired,
+            self.share_irq_injected,
+            self.rng_irq_desired,
+            self.rng_irq_injected,
+            self.console_irq_desired,
+            self.console_irq_injected,
+        };
+        for (values, 0..) |value, index| {
+            result.irq_flags |= @as(u32, @intFromBool(value)) << @intCast(index);
+        }
+        return result;
+    }
+
+    fn restoreEmulatedState(self: *Machine, state: *const EmulatedState) !void {
+        if (state.serial_rx_head >= Serial.capacity or state.serial_rx_len > Serial.capacity or
+            state.cmos_index > std.math.maxInt(u7) or state.cmos_nmi_disabled > 1 or
+            state.irq_flags >> 19 != 0)
+        {
+            return error.Corrupt;
+        }
+        self.pci_config.address = state.pci_config_address;
+        self.chipset_config = state.chipset_config;
+        self.serial.rx = state.serial_rx;
+        self.serial.rx_head = state.serial_rx_head;
+        self.serial.rx_len = state.serial_rx_len;
+        self.serial.interrupt_enable = state.serial_interrupt_enable;
+        self.serial.line_control = state.serial_line_control;
+        self.serial.modem_control = state.serial_modem_control;
+        self.serial.scratch = state.serial_scratch;
+        self.serial.divisor_low = state.serial_divisor_low;
+        self.serial.divisor_high = state.serial_divisor_high;
+        self.cmos_index = @intCast(state.cmos_index);
+        self.cmos_nmi_disabled = state.cmos_nmi_disabled != 0;
+        self.cmos_data = state.cmos_data;
+        const values = [_]*bool{
+            &self.serial_irq_injected,
+            &self.block_irq_desired,
+            &self.block_irq_injected,
+            &self.block2_irq_desired,
+            &self.block2_irq_injected,
+            &self.net_irq_desired,
+            &self.net_irq_injected,
+            &self.gpu_irq_desired,
+            &self.gpu_irq_injected,
+            &self.keyboard_irq_desired,
+            &self.keyboard_irq_injected,
+            &self.tablet_irq_desired,
+            &self.tablet_irq_injected,
+            &self.share_irq_desired,
+            &self.share_irq_injected,
+            &self.rng_irq_desired,
+            &self.rng_irq_injected,
+            &self.console_irq_desired,
+            &self.console_irq_injected,
+        };
+        for (values, 0..) |value, index| {
+            value.* = state.irq_flags & (@as(u32, 1) << @intCast(index)) != 0;
+        }
+    }
+
     fn vcpuThreadMain(
         self: *Machine,
         index: usize,
@@ -1091,7 +1611,9 @@ pub const Machine = struct {
             switch (self.run_state.load(.acquire)) {
                 .running => {},
                 .paused => {
+                    slot.parked.store(true, .release);
                     self.waitWhilePaused();
+                    slot.parked.store(false, .release);
                     continue;
                 },
                 .guest_shutdown => return .guest_shutdown,
@@ -2354,6 +2876,7 @@ pub const Machine = struct {
 
     fn startBlockFastPath(self: *Machine) (kvm.FastPathError || std.Thread.SpawnError)!void {
         std.debug.assert(!self.block_fast_enabled);
+        self.block_worker_stop.store(false, .release);
         const device = self.pci_block orelse unreachable;
         const notify_address = blockNotifyAddress(device.getBar0Addr()) orelse unreachable;
 
@@ -2534,6 +3057,60 @@ pub const Machine = struct {
         };
     }
 };
+
+fn readSuspendHeader(
+    file: std.Io.File,
+    memory_bytes: usize,
+    firmware_bytes: usize,
+) !SuspendHeader {
+    const io = global.io();
+    var bytes: [suspend_header_bytes]u8 = undefined;
+    if (try file.readPositionalAll(io, &bytes, 0) != bytes.len or
+        !std.mem.eql(u8, bytes[0..8], suspend_magic))
+    {
+        return error.BadSnapshot;
+    }
+    if (std.mem.readInt(u32, bytes[8..12], .little) != suspend_version) {
+        return error.BadSnapshotVersion;
+    }
+    const state_len = std.mem.readInt(u64, bytes[12..20], .little);
+    const ram_len = std.mem.readInt(u64, bytes[20..28], .little);
+    const firmware_len = std.mem.readInt(u64, bytes[28..36], .little);
+    if (state_len == 0 or state_len > snapshot_state_bytes_max or
+        ram_len != memory_bytes or firmware_len != firmware_bytes)
+    {
+        return error.SnapshotConfigurationMismatch;
+    }
+    var expected_len = std.math.add(u64, suspend_header_bytes, state_len) catch {
+        return error.BadSnapshot;
+    };
+    expected_len = std.math.add(u64, expected_len, ram_len) catch return error.BadSnapshot;
+    expected_len = std.math.add(u64, expected_len, firmware_len) catch return error.BadSnapshot;
+    if ((try file.stat(io)).size != expected_len) return error.BadSnapshot;
+    return .{ .state_len = state_len };
+}
+
+fn writeSparse(file: std.Io.File, bytes: []const u8, base: u64) !usize {
+    var offset: usize = 0;
+    var written: usize = 0;
+    while (offset < bytes.len) : (offset += snapshot_chunk_bytes) {
+        const chunk = bytes[offset..@min(offset + snapshot_chunk_bytes, bytes.len)];
+        if (std.mem.allEqual(u8, chunk, 0)) continue;
+        try file.writePositionalAll(global.io(), chunk, base + offset);
+        written += chunk.len;
+    }
+    return written;
+}
+
+fn readSnapshotBytes(file: std.Io.File, destination: []u8, base: u64) !void {
+    var offset: usize = 0;
+    while (offset < destination.len) : (offset += snapshot_chunk_bytes) {
+        const chunk = destination[offset..@min(offset + snapshot_chunk_bytes, destination.len)];
+        if (try file.readPositionalAll(global.io(), chunk, base + offset) != chunk.len) {
+            return error.BadSnapshot;
+        }
+    }
+}
 
 test "x86 machine GDT contains flat code and data segments" {
     var memory = [_]u8{0} ** 4096;

@@ -18,6 +18,7 @@ initrd_path: ?[]const u8 = null,
 disk_path: ?[]const u8 = null,
 iso_path: ?[]const u8 = null,
 shared_dir: ?[]const u8 = null,
+restore_path: ?[]const u8 = null,
 network_enabled: bool = true,
 forwards: [MAX_FORWARDS]mininat.Forward = @splat(.{ .host_port = 0, .guest_port = 0 }),
 forward_count: u8 = 0,
@@ -67,6 +68,8 @@ pub fn parse(args: []const []const u8) ParseError!AppConfig {
             result.iso_path = value;
         } else if (std.mem.eql(u8, argument, "--share")) {
             result.shared_dir = value;
+        } else if (std.mem.eql(u8, argument, "--restore")) {
+            result.restore_path = value;
         } else if (std.mem.eql(u8, argument, "--forward")) {
             if (result.forward_count == MAX_FORWARDS) return error.InvalidArgument;
             result.forwards[result.forward_count] = try parseForward(value);
@@ -196,5 +199,13 @@ test "display and GPU memory use shared validation" {
     try std.testing.expectError(
         error.InvalidArgument,
         parse(&.{ "--display", "8192x8192", "--gpu-memory", "64" }),
+    );
+}
+
+test "snapshot restore directory is accepted" {
+    const result = try parse(&.{ "--restore", "/vms/snapshots/before-upgrade" });
+    try std.testing.expectEqualStrings(
+        "/vms/snapshots/before-upgrade",
+        result.restore_path.?,
     );
 }
