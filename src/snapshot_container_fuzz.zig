@@ -7,27 +7,35 @@ const input_bytes_max = 1024;
 const query_bytes_max = 32;
 const generated_sections_max = 8;
 
-fn modelSection(bytes: []const u8, query: []const u8) ?[]const u8 {
+const ModelResult = struct {
+    valid: bool,
+    data: ?[]const u8,
+};
+
+fn modelSection(bytes: []const u8, query: []const u8) ModelResult {
     var offset: usize = header_bytes;
+    var found: ?[]const u8 = null;
     while (offset < bytes.len) {
         const name_len = bytes[offset];
         offset += 1;
         const remaining_name = bytes.len - offset;
-        if (name_len > remaining_name) return null;
+        if (name_len > remaining_name) return .{ .valid = false, .data = null };
         const name = bytes[offset..][0..name_len];
         offset += name_len;
 
         const remaining_header = bytes.len - offset;
-        if (remaining_header < @sizeOf(u64)) return null;
+        if (remaining_header < @sizeOf(u64)) return .{ .valid = false, .data = null };
         const data_len_u64 = std.mem.readInt(u64, bytes[offset..][0..8], .little);
         offset += @sizeOf(u64);
         const remaining_data = bytes.len - offset;
-        if (data_len_u64 > remaining_data) return null;
+        if (data_len_u64 > remaining_data) return .{ .valid = false, .data = null };
         const data_len: usize = @intCast(data_len_u64);
-        if (std.mem.eql(u8, name, query)) return bytes[offset..][0..data_len];
+        if (found == null and std.mem.eql(u8, name, query)) {
+            found = bytes[offset..][0..data_len];
+        }
         offset += data_len;
     }
-    return null;
+    return .{ .valid = true, .data = found };
 }
 
 fn checkInit(bytes: []const u8) !void {
@@ -40,17 +48,23 @@ fn checkInit(bytes: []const u8) !void {
         container.VERSION)
     {
         try testing.expectError(error.BadVersion, result);
+    } else if (!modelSection(bytes, &.{}).valid) {
+        try testing.expectError(error.Malformed, result);
     } else {
         _ = try result;
     }
 }
 
 fn expectSection(bytes: []const u8, query: []const u8) !void {
-    const reader = try container.Reader.init(bytes);
     const expected = modelSection(bytes, query);
+    if (!expected.valid) {
+        try testing.expectError(error.Malformed, container.Reader.init(bytes));
+        return;
+    }
+    const reader = try container.Reader.init(bytes);
     const actual = reader.section(query);
-    try testing.expectEqual(expected == null, actual == null);
-    if (expected) |expected_data| {
+    try testing.expectEqual(expected.data == null, actual == null);
+    if (expected.data) |expected_data| {
         try testing.expectEqualSlices(u8, expected_data, actual.?);
     }
 }

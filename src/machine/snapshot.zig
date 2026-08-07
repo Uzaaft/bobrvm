@@ -783,8 +783,26 @@ test "snapshot: malformed section size does not overflow" {
     bytes[MAGIC.len + 5] = 'x';
     std.mem.writeInt(u64, bytes[bytes.len - 8 ..][0..8], std.math.maxInt(u64), .little);
 
-    const reader = try Reader.init(&bytes);
-    try testing.expect(reader.section("x") == null);
+    try testing.expectError(error.Malformed, Reader.init(&bytes));
+}
+
+test "snapshot: reader rejects a malformed suffix after a valid section" {
+    var bytes: [MAGIC.len + @sizeOf(u32) + 1 + 1 + @sizeOf(u64) + 1 + 1]u8 = undefined;
+    @memcpy(bytes[0..MAGIC.len], MAGIC);
+    std.mem.writeInt(u32, bytes[MAGIC.len..][0..4], VERSION, .little);
+
+    var offset: usize = MAGIC.len + @sizeOf(u32);
+    bytes[offset] = 1;
+    offset += 1;
+    bytes[offset] = 'x';
+    offset += 1;
+    std.mem.writeInt(u64, bytes[offset..][0..8], 1, .little);
+    offset += @sizeOf(u64);
+    bytes[offset] = 'a';
+    offset += 1;
+    bytes[offset] = 0xFF;
+
+    try testing.expectError(error.Malformed, Reader.init(&bytes));
 }
 
 test "snapshot: builder rejects section names above the wire limit" {

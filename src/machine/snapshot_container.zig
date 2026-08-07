@@ -8,11 +8,12 @@ pub const VERSION: u32 = 1;
 pub const Reader = struct {
     bytes: []const u8,
 
-    pub fn init(bytes: []const u8) error{ Truncated, BadMagic, BadVersion }!Reader {
+    pub fn init(bytes: []const u8) error{ Truncated, BadMagic, BadVersion, Malformed }!Reader {
         if (bytes.len < MAGIC.len + @sizeOf(u32)) return error.Truncated;
         if (!std.mem.eql(u8, bytes[0..MAGIC.len], MAGIC)) return error.BadMagic;
         const version = std.mem.readInt(u32, bytes[MAGIC.len..][0..4], .little);
         if (version != VERSION) return error.BadVersion;
+        try validateSections(bytes);
         return .{ .bytes = bytes };
     }
 
@@ -36,5 +37,20 @@ pub const Reader = struct {
             off += size_usize;
         }
         return null;
+    }
+
+    fn validateSections(bytes: []const u8) error{Malformed}!void {
+        var off: usize = MAGIC.len + @sizeOf(u32);
+        while (off < bytes.len) {
+            const name_len = bytes[off];
+            off += 1;
+            if (name_len > bytes.len - off) return error.Malformed;
+            off += name_len;
+            if (@sizeOf(u64) > bytes.len - off) return error.Malformed;
+            const size = std.mem.readInt(u64, bytes[off..][0..8], .little);
+            off += @sizeOf(u64);
+            if (size > bytes.len - off) return error.Malformed;
+            off += @intCast(size);
+        }
     }
 };
