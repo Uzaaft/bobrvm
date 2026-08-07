@@ -36,7 +36,8 @@ pub fn main() noreturn {
         restart();
     }
     if (linux.errno(linux.mount("devtmpfs", "/newroot/dev", "devtmpfs", 0, 0)) != .SUCCESS or
-        linux.errno(linux.mount("proc", "/newroot/proc", "proc", 0, 0)) != .SUCCESS)
+        linux.errno(linux.mount("proc", "/newroot/proc", "proc", 0, 0)) != .SUCCESS or
+        linux.errno(linux.mount("sysfs", "/newroot/sys", "sysfs", 0, 0)) != .SUCCESS)
     {
         if (debug_port_available) emit("BOBRVM_PSEUDOFS_MOUNT_FAILED\n");
         restart();

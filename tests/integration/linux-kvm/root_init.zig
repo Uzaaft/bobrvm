@@ -13,6 +13,11 @@ const gateway_ip = [4]u8{ 10, 0, 2, 2 };
 
 pub fn main() noreturn {
     const debug_port_available = linux.syscall3(.ioperm, 0xe9, 1, 1) == 0;
+    if (!readExactSmall("/sys/devices/system/cpu/online", "0-1\n")) {
+        if (debug_port_available) emit("BOBRVM_SMP_FAILED\n");
+        restart();
+    }
+    if (debug_port_available) emit("BOBRVM_SMP_OK\n");
     if (!readExact("/rootfs-marker", rootfs_contents)) {
         if (debug_port_available) emit("BOBRVM_ROOTFS_CONTENT_FAILED\n");
         restart();
@@ -177,6 +182,19 @@ fn readExact(path: [:0]const u8, expected: []const u8) bool {
     defer _ = linux.close(fd);
 
     var buffer: [rootfs_contents.len]u8 = undefined;
+    const count = linux.read(fd, &buffer, buffer.len);
+    if (linux.errno(count) != .SUCCESS or count != expected.len) return false;
+    return std.mem.eql(u8, buffer[0..expected.len], expected);
+}
+
+fn readExactSmall(path: [:0]const u8, expected: []const u8) bool {
+    if (expected.len > 32) return false;
+    const result = linux.open(path, .{}, 0);
+    if (linux.errno(result) != .SUCCESS) return false;
+    const fd: i32 = @intCast(result);
+    defer _ = linux.close(fd);
+
+    var buffer: [32]u8 = undefined;
     const count = linux.read(fd, &buffer, buffer.len);
     if (linux.errno(count) != .SUCCESS or count != expected.len) return false;
     return std.mem.eql(u8, buffer[0..expected.len], expected);

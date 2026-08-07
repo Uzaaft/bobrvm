@@ -31,6 +31,7 @@ pub const State = enum(u8) {
 
 pub const Config = struct {
     memory_bytes: usize,
+    vcpu_count: u8 = 2,
     kernel_path: []const u8,
     initrd_path: ?[]const u8 = null,
     disk_path: ?[]const u8 = null,
@@ -70,7 +71,9 @@ pub fn create(
     const self = try allocator.create(VM);
     errdefer allocator.destroy(self);
     const machine = try x86.Machine.init(
+        allocator,
         config.memory_bytes,
+        config.vcpu_count,
         image,
         config.command_line,
         initrd,

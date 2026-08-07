@@ -60,6 +60,10 @@ serial-console history and forwards text and navigation keys through the shared 
 16550 UART. Closing its window requests an immediate vCPU exit and joins the VM before
 releasing resources.
 
+Direct boot uses two KVM vCPUs by default and exposes their topology through an Intel
+MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable
+host-monotonic samples of VM creation and start-to-root-readiness latency.
+
 ## Run a Linux guest
 
 `bobrvm run` starts a headless VM attached to the guest console. Press

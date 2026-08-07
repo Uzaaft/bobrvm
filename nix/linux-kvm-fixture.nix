@@ -19,7 +19,8 @@ runCommand "bobrvm-linux-kvm-fixture" {
     "$out/root/modules" \
     "$out/root/newroot" \
     "$out/rootfs/dev" \
-    "$out/rootfs/proc"
+    "$out/rootfs/proc" \
+    "$out/rootfs/sys"
   zig build-exe "$init" \
     -target x86_64-linux-musl \
     -O ReleaseSmall \

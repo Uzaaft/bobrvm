@@ -15,13 +15,16 @@ output_file="$test_dir/output"
 disk_copy="$test_dir/disk"
 console_disk_copy="$test_dir/console-disk"
 network_disk_copy="$test_dir/network-disk"
+benchmark_disk_copy="$test_dir/benchmark-disk"
 trap 'rm -rf "$test_dir"' EXIT
 cp "$4" "$disk_copy"
 cp "$4" "$console_disk_copy"
 cp "$4" "$network_disk_copy"
+cp "$4" "$benchmark_disk_copy"
 chmod u+w "$disk_copy"
 chmod u+w "$console_disk_copy"
 chmod u+w "$network_disk_copy"
+chmod u+w "$benchmark_disk_copy"
 command=("$1" run-kernel "$2" "$3" "$disk_copy")
 
 set +e
@@ -35,8 +38,13 @@ if [[ "$status" -ne 0 ]]; then
     exit 1
 fi
 expected_marker="BOBRVM_ROOTFS_BOOT_OK"
+smp_marker="BOBRVM_SMP_OK"
 if ! grep -q "^$expected_marker$" "$output_file"; then
     echo "error: $expected_marker was not observed (status $status)" >&2
+    exit 1
+fi
+if ! grep -q "^$smp_marker$" "$output_file"; then
+    echo "error: $smp_marker was not observed (status $status)" >&2
     exit 1
 fi
 fast_path_marker="BOBRVM_KVM_FAST_BLOCK_OK"
@@ -114,4 +122,24 @@ if ! grep -q "^$network_marker$" "$network_output"; then
     exit 1
 fi
 
-echo "Linux KVM E2E: rootfs fast-block lifecycle-stop console-input network"
+benchmark_output="$test_dir/benchmark-output"
+set +e
+timeout 15s \
+    "$1" kvm-boot-benchmark "$2" "$3" "$benchmark_disk_copy" \
+    >"$benchmark_output" 2>&1
+benchmark_status="$?"
+set -e
+cat "$benchmark_output"
+if [[ "$benchmark_status" -ne 0 ]]; then
+    echo "error: KVM boot benchmark exited with status $benchmark_status" >&2
+    exit 1
+fi
+benchmark_pattern='^KVM boot benchmark: samples=3 vcpus=2 '
+benchmark_pattern+='create_us_min=[0-9]+ boot_us_min=[0-9]+ '
+benchmark_pattern+='boot_us_median=[0-9]+ total_us_min=[0-9]+$'
+if ! grep -Eq "$benchmark_pattern" "$benchmark_output"; then
+    echo "error: KVM boot benchmark result was not observed" >&2
+    exit 1
+fi
+
+echo "Linux KVM E2E: smp rootfs fast-block lifecycle-stop console-input network benchmark"

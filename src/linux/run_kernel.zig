@@ -7,11 +7,21 @@ const VM = @import("VM.zig");
 
 const memory_bytes: usize = 512 * 1024 * 1024;
 const exits_max: u64 = 100_000_000;
+const benchmark_samples: usize = 3;
 pub const command_line =
     "console=ttyS0,115200 earlycon=uart,io,0x3f8,115200n8 " ++
     "nokaslr acpi=off pci=conf1 panic=-1 reboot=t";
 
 pub const Error = VM.CreateError || VM.StartError || VM.JoinError;
+
+pub const BootBenchmark = struct {
+    samples: usize,
+    vcpus: u8,
+    create_us_min: u64,
+    boot_us_min: u64,
+    boot_us_median: u64,
+    total_us_min: u64,
+};
 
 pub fn execute(
     allocator: std.mem.Allocator,
@@ -102,6 +112,70 @@ pub fn executeNetworkSmoke(
     if (try vm.join() != .guest_shutdown) return error.UnexpectedRunOutcome;
 }
 
+pub fn executeBootBenchmark(
+    allocator: std.mem.Allocator,
+    kernel_path: []const u8,
+    initrd_path: []const u8,
+    disk_path: []const u8,
+) !BootBenchmark {
+    const vcpu_count: u8 = 2;
+    var create_ns: [benchmark_samples]u64 = undefined;
+    var boot_ns: [benchmark_samples]u64 = undefined;
+    var total_ns: [benchmark_samples]u64 = undefined;
+
+    for (0..benchmark_samples) |index| {
+        var output = BootOutput{};
+        const create_start_ns = monotonicNs();
+        const vm = try VM.create(allocator, .{
+            .memory_bytes = memory_bytes,
+            .vcpu_count = vcpu_count,
+            .kernel_path = kernel_path,
+            .initrd_path = initrd_path,
+            .disk_path = disk_path,
+            .command_line = command_line,
+            .exits_max = exits_max,
+        }, x86.SerialSink.bind(BootOutput, &output, BootOutput.write));
+        defer vm.destroy();
+        const boot_start_ns = monotonicNs();
+        try vm.start();
+        if (!waitForSignal(vm, &output.ready, 500)) return error.BootReadyTimeout;
+        const ready_ns = output.ready_ns.load(.acquire);
+        vm.requestStop();
+        _ = try vm.join();
+
+        create_ns[index] = boot_start_ns - create_start_ns;
+        boot_ns[index] = ready_ns - boot_start_ns;
+        total_ns[index] = ready_ns - create_start_ns;
+    }
+    sortSamples(&create_ns);
+    sortSamples(&boot_ns);
+    sortSamples(&total_ns);
+    return .{
+        .samples = benchmark_samples,
+        .vcpus = vcpu_count,
+        .create_us_min = create_ns[0] / std.time.ns_per_us,
+        .boot_us_min = boot_ns[0] / std.time.ns_per_us,
+        .boot_us_median = boot_ns[benchmark_samples / 2] / std.time.ns_per_us,
+        .total_us_min = total_ns[0] / std.time.ns_per_us,
+    };
+}
+
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
+fn sortSamples(samples: *[benchmark_samples]u64) void {
+    for (1..samples.len) |index| {
+        const value = samples[index];
+        var destination = index;
+        while (destination > 0 and samples[destination - 1] > value) {
+            samples[destination] = samples[destination - 1];
+            destination -= 1;
+        }
+        samples[destination] = value;
+    }
+}
+
 fn waitForSignal(vm: *VM, signal: *const std.atomic.Value(bool), polls_max: usize) bool {
     for (0..polls_max) |_| {
         if (signal.load(.acquire)) return true;
@@ -156,6 +230,29 @@ const SmokeOutput = struct {
             } else {
                 index.* = @intFromBool(byte == marker[0]);
             }
+        }
+    }
+};
+
+const BootOutput = struct {
+    const marker = "BOBRVM_ROOTFS_BOOT_OK";
+
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ready_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    marker_index: usize = 0,
+
+    fn write(self: *BootOutput, bytes: []const u8) void {
+        if (self.ready.load(.acquire)) return;
+        for (bytes) |byte| {
+            if (byte == marker[self.marker_index]) {
+                self.marker_index += 1;
+                if (self.marker_index != marker.len) continue;
+                self.ready_ns.store(monotonicNs(), .release);
+                self.ready.store(true, .release);
+                self.marker_index = 0;
+                return;
+            }
+            self.marker_index = @intFromBool(byte == marker[0]);
         }
     }
 };

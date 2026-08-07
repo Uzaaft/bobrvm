@@ -8,6 +8,8 @@ clean filesystem and verifies the persisted file without repairing the image. A 
 queues input through the emulated 16550 UART and requires the guest tty driver to read it.
 A third boot sends an ARP request through virtio-net and requires the built-in user-mode gateway
 to reply, without TAP setup or elevated host privileges.
+The runner also verifies two online guest CPUs and records three host-monotonic samples from vCPU
+start to the writable-root readiness marker.
 
 ```bash
 nix build path:.#linux-kvm-fixture

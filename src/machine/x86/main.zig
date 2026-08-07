@@ -9,6 +9,7 @@ const mininat = @import("../../net/mininat.zig");
 const pci = @import("../../pci/main.zig");
 const virtio = @import("../../virtio/main.zig");
 const boot = @import("boot.zig");
+const mps = @import("mps.zig");
 
 const gdt_address: u64 = 0x500;
 const pci_block_slot: u5 = 1;
@@ -78,11 +79,13 @@ const Serial = struct {
 };
 
 pub const Machine = struct {
+    allocator: std.mem.Allocator,
     host: kvm.Kvm,
     vm: kvm.VM,
-    vcpu: kvm.Vcpu,
+    vcpus: []VcpuSlot,
     memory: []align(std.heap.page_size_min) u8,
     layout: boot.Layout,
+    exit_lock: std.Io.Mutex = .init,
     pci_config: pci.x86_config.LegacyConfig = .{},
     serial: Serial = .{},
     serial_lock: std.Io.Mutex = .init,
@@ -111,17 +114,36 @@ pub const Machine = struct {
     net_irq_desired: bool = false,
     net_irq_injected: bool = false,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    vcpu_thread_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    exits_total: u64 = 0,
-    mmio_exits_total: u64 = 0,
+    run_state: std.atomic.Value(RunState) = std.atomic.Value(RunState).init(.idle),
+    exits_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    mmio_exits_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_mmio_address: ?u64 = null,
 
-    pub const InitError = kvm.OpenError || kvm.CreateError || boot.LoadError;
+    const VcpuSlot = struct {
+        vcpu: kvm.Vcpu,
+        debug_line: [128]u8 = undefined,
+        debug_line_len: usize = 0,
+        thread: ?std.Thread = null,
+        thread_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        run_error: ?RunError = null,
+    };
+
+    const RunState = enum(u8) {
+        idle,
+        running,
+        guest_shutdown,
+        stopped,
+        failed,
+    };
+
+    pub const InitError = kvm.OpenError || kvm.CreateError || boot.LoadError ||
+        mps.WriteError || std.mem.Allocator.Error || error{InvalidVcpuCount};
     pub const AttachDiskError = virtio.Block.Error || std.Io.File.StatError ||
         kvm.FastPathError || std.Thread.SpawnError;
     pub const AttachNetworkError = virtio.Net.Error || std.Thread.SpawnError;
     pub const SerialInputError = kvm.InterruptError;
-    pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError || error{
+    pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError ||
+        std.Thread.SpawnError || error{
         ExitLimitReached,
         InternalError,
         InvalidIoExit,
@@ -144,7 +166,9 @@ pub const Machine = struct {
     };
 
     pub fn init(
+        allocator: std.mem.Allocator,
         memory_bytes: usize,
+        vcpu_count: u8,
         image: boot.Image,
         command_line: []const u8,
         initrd: ?[]const u8,
@@ -153,25 +177,57 @@ pub const Machine = struct {
         errdefer host.deinit();
         var vm = try host.createVm();
         errdefer vm.deinit();
+        const limits = host.vcpuLimits();
+        if (vcpu_count == 0 or vcpu_count > mps.cpu_count_max or
+            vcpu_count > limits.maximum or vcpu_count > limits.id_max)
+        {
+            return error.InvalidVcpuCount;
+        }
         const memory = try vm.mapMemory(0, 0, memory_bytes);
         try vm.createPcInterrupts();
 
         const layout = try image.load(memory, command_line, initrd);
         writeGdt(memory);
-        var cpuid = try host.supportedCpuid();
-        var vcpu = try vm.createVcpu(0);
-        errdefer vcpu.deinit();
-        try vcpu.setCpuid(&cpuid);
-        try vcpu.setProtectedModeEntry(
-            layout.entry_address,
-            layout.boot_params_address,
-            gdt_address,
-        );
+        if (mps.table_address + mps.bytes_max > memory.len) return error.BufferTooSmall;
+        const table_offset: usize = @intCast(mps.table_address);
+        _ = try mps.write(memory[table_offset..][0..mps.bytes_max], vcpu_count);
+        const cpuid = try host.supportedCpuid();
+        const vcpus = try allocator.alloc(VcpuSlot, vcpu_count);
+        errdefer allocator.free(vcpus);
+        var initialized: usize = 0;
+        errdefer for (vcpus[0..initialized]) |*slot| slot.vcpu.deinit();
+        for (vcpus, 0..) |*slot, index| {
+            var vcpu = try vm.createVcpu(@intCast(index));
+            var vcpu_cpuid = cpuid;
+            vcpu_cpuid.setTopology(@intCast(index), vcpu_count);
+            vcpu.setCpuid(&vcpu_cpuid) catch |err| {
+                vcpu.deinit();
+                return err;
+            };
+            if (index == 0) {
+                vcpu.setProtectedModeEntry(
+                    layout.entry_address,
+                    layout.boot_params_address,
+                    gdt_address,
+                ) catch |err| {
+                    vcpu.deinit();
+                    return err;
+                };
+            } else {
+                vcpu.setApplicationProcessorState() catch |err| {
+                    vcpu.deinit();
+                    return err;
+                };
+            }
+            slot.* = .{ .vcpu = vcpu };
+            initialized += 1;
+        }
 
         return .{
+            .allocator = allocator,
             .host = host,
             .vm = vm,
-            .vcpu = vcpu,
+            .vcpus = vcpus,
             .memory = memory,
             .layout = layout,
         };
@@ -184,7 +240,8 @@ pub const Machine = struct {
         if (self.net) |net| net.deinit();
         if (self.pci_block) |device| device.deinit();
         if (self.block) |block| block.deinit();
-        self.vcpu.deinit();
+        for (self.vcpus) |*slot| slot.vcpu.deinit();
+        self.allocator.free(self.vcpus);
         self.vm.deinit();
         self.host.deinit();
         self.memory = undefined;
@@ -215,6 +272,7 @@ pub const Machine = struct {
         errdefer device.deinit();
         device.writeConfig(0x10, 4, pci_bar_initial);
         device.config[0x3c] = pci_block_irq;
+        device.config[0x3d] = 1;
         device.transport.setDeviceConfig(std.mem.asBytes(&block.config));
         block.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
         block.setIrqCallback(virtio.mmio.Irq.initRaw(blockIrq, self));
@@ -251,6 +309,7 @@ pub const Machine = struct {
         errdefer device.deinit();
         device.writeConfig(0x10, 4, pci_net_bar_initial);
         device.config[0x3c] = pci_net_irq;
+        device.config[0x3d] = 1;
         device.transport.setDeviceConfig(std.mem.asBytes(&net.config));
         device.transport.setNotifyCallback(netNotify, self);
         net.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
@@ -294,53 +353,144 @@ pub const Machine = struct {
     }
 
     pub fn run(self: *Machine, serial: SerialSink, exits_max: u64) RunError!RunOutcome {
-        self.vcpu_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
-        defer self.vcpu_thread_id.store(0, .release);
+        if (self.run_state.cmpxchgStrong(.idle, .running, .acq_rel, .acquire) != null) {
+            return error.InternalError;
+        }
+        for (self.vcpus[1..], 1..) |*slot, index| {
+            if (self.run_state.load(.acquire) != .running) break;
+            slot.thread = std.Thread.spawn(.{}, vcpuThreadMain, .{
+                self,
+                index,
+                serial,
+                exits_max,
+            }) catch |err| {
+                slot.run_error = err;
+                self.finishRun(.failed);
+                self.joinVcpuThreads();
+                return err;
+            };
+        }
 
-        while (self.exits_total < exits_max) {
-            self.vcpu.clearExitRequest();
+        if (self.run_state.load(.acquire) == .running) {
+            const result = self.runVcpu(0, serial, exits_max);
+            if (result) |outcome| {
+                self.finishRun(runState(outcome));
+            } else |err| {
+                self.vcpus[0].run_error = err;
+                self.finishRun(.failed);
+            }
+        }
+        self.joinVcpuThreads();
+        for (self.vcpus) |slot| if (slot.run_error) |err| return err;
+        return switch (self.run_state.load(.acquire)) {
+            .guest_shutdown => .guest_shutdown,
+            .stopped => .stopped,
+            else => error.InternalError,
+        };
+    }
+
+    /// Stop every running vCPU from another thread without waiting for another VM exit.
+    pub fn requestStop(self: *Machine) void {
+        self.stop_requested.store(true, .release);
+        self.finishRun(.stopped);
+    }
+
+    fn vcpuThreadMain(
+        self: *Machine,
+        index: usize,
+        serial: SerialSink,
+        exits_max: u64,
+    ) void {
+        const result = self.runVcpu(index, serial, exits_max);
+        if (result) |outcome| {
+            self.finishRun(runState(outcome));
+        } else |err| {
+            self.vcpus[index].run_error = err;
+            self.finishRun(.failed);
+        }
+    }
+
+    fn runVcpu(
+        self: *Machine,
+        index: usize,
+        serial: SerialSink,
+        exits_max: u64,
+    ) RunError!RunOutcome {
+        const slot = &self.vcpus[index];
+        slot.thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
+        defer slot.thread_id.store(0, .release);
+
+        while (true) {
+            slot.vcpu.clearExitRequest();
+            switch (self.run_state.load(.acquire)) {
+                .running => {},
+                .guest_shutdown => return .guest_shutdown,
+                .stopped, .failed => return .stopped,
+                .idle => return error.InternalError,
+            }
             if (self.stop_requested.load(.acquire)) return .stopped;
-            if (self.net_wakeup.swap(false, .acq_rel)) {
-                self.processNet();
-                try self.syncNetIrq();
-            }
-            if (self.block_worker_failed.load(.acquire)) {
-                return error.FastDevicePathFailed;
-            }
-            self.exits_total += 1;
-            const exit = self.vcpu.runOnce() catch |err| switch (err) {
-                error.Interrupted => {
-                    if (self.stop_requested.load(.acquire)) return .stopped;
-                    if (self.net_wakeup.swap(false, .acq_rel)) {
-                        self.processNet();
-                        try self.syncNetIrq();
-                        continue;
-                    }
-                    return err;
+            try self.processAsyncDevices();
+            if (self.block_worker_failed.load(.acquire)) return error.FastDevicePathFailed;
+
+            const exit = slot.vcpu.runOnce() catch |err| switch (err) {
+                error.Interrupted => continue,
+                error.WouldBlock => {
+                    std.Thread.yield() catch {};
+                    continue;
                 },
                 else => return err,
             };
+            if (self.exits_total.fetchAdd(1, .monotonic) >= exits_max) {
+                return error.ExitLimitReached;
+            }
+            if (exit == .halted or exit == .interrupted) continue;
+            if (exit == .shutdown) return .guest_shutdown;
+
+            self.exit_lock.lockUncancelable(global.io());
+            defer self.exit_lock.unlock(global.io());
             switch (exit) {
-                .io => try self.handleIo(serial),
-                .halted, .interrupted => continue,
-                .shutdown => return .guest_shutdown,
+                .io => try self.handleIo(&slot.vcpu, index, serial),
+                .mmio => try self.handleMmio(&slot.vcpu),
                 .internal_error => return error.InternalError,
-                .mmio => try self.handleMmio(),
                 .unknown => return error.UnknownExit,
+                .halted, .interrupted, .shutdown => unreachable,
             }
             try self.syncBlockIrq();
             if (self.net_wakeup.swap(false, .acq_rel)) self.processNet();
             try self.syncNetIrq();
         }
-        return error.ExitLimitReached;
     }
 
-    /// Stop a running vCPU from another thread without waiting for another VM exit.
-    pub fn requestStop(self: *Machine) void {
-        self.stop_requested.store(true, .release);
-        self.vcpu.requestExit();
-        const thread_id = self.vcpu_thread_id.load(.acquire);
-        if (thread_id != 0) kvm.interruptThread(thread_id);
+    fn processAsyncDevices(self: *Machine) RunError!void {
+        if (!self.net_wakeup.swap(false, .acq_rel)) return;
+        self.exit_lock.lockUncancelable(global.io());
+        defer self.exit_lock.unlock(global.io());
+        self.processNet();
+        try self.syncNetIrq();
+    }
+
+    fn finishRun(self: *Machine, state: RunState) void {
+        if (self.run_state.cmpxchgStrong(.running, state, .acq_rel, .acquire) != null) return;
+        const current_id: u32 = @intCast(std.Thread.getCurrentId());
+        for (self.vcpus) |*slot| {
+            slot.vcpu.requestExit();
+            const thread_id = slot.thread_id.load(.acquire);
+            if (thread_id != 0 and thread_id != current_id) kvm.interruptThread(thread_id);
+        }
+    }
+
+    fn joinVcpuThreads(self: *Machine) void {
+        for (self.vcpus[1..]) |*slot| {
+            if (slot.thread) |thread| thread.join();
+            slot.thread = null;
+        }
+    }
+
+    fn runState(outcome: RunOutcome) RunState {
+        return switch (outcome) {
+            .guest_shutdown => .guest_shutdown,
+            .stopped => .stopped,
+        };
     }
 
     /// Queue host input for the guest's 16550 receive register.
@@ -362,10 +512,15 @@ pub const Machine = struct {
         };
     }
 
-    fn handleIo(self: *Machine, serial: SerialSink) RunError!void {
-        const access = self.vcpu.ioExit() orelse return error.InvalidIoExit;
+    fn handleIo(
+        self: *Machine,
+        vcpu: *kvm.Vcpu,
+        vcpu_index: usize,
+        serial: SerialSink,
+    ) RunError!void {
+        const access = vcpu.ioExit() orelse return error.InvalidIoExit;
         switch (access.direction) {
-            .write => try self.handleIoWrite(access, serial),
+            .write => try self.handleIoWrite(access, vcpu_index, serial),
             .read => try self.handleIoRead(access),
         }
     }
@@ -373,10 +528,11 @@ pub const Machine = struct {
     fn handleIoWrite(
         self: *Machine,
         access: kvm.IoExit,
+        vcpu_index: usize,
         serial: SerialSink,
     ) (kvm.FastPathError || kvm.InterruptError)!void {
         if (access.size == 1 and access.port == 0xe9) {
-            serial.write(access.data);
+            self.writeDebugOutput(vcpu_index, access.data, serial);
         }
 
         if (access.count != 1) return;
@@ -477,9 +633,9 @@ pub const Machine = struct {
         self.serial_irq_injected = desired;
     }
 
-    fn handleMmio(self: *Machine) RunError!void {
-        const access = self.vcpu.mmioExit() orelse return error.InvalidMmioExit;
-        self.mmio_exits_total += 1;
+    fn handleMmio(self: *Machine, vcpu: *kvm.Vcpu) RunError!void {
+        const access = vcpu.mmioExit() orelse return error.InvalidMmioExit;
+        _ = self.mmio_exits_total.fetchAdd(1, .monotonic);
         self.last_mmio_address = access.address;
         if (self.handlePciBar(access)) return;
         handleAbsentMmio(access);
@@ -684,9 +840,10 @@ pub const Machine = struct {
 
     fn wakeNet(self: *Machine) void {
         self.net_wakeup.store(true, .release);
-        const thread_id = self.vcpu_thread_id.load(.acquire);
+        const primary = &self.vcpus[0];
+        const thread_id = primary.thread_id.load(.acquire);
         if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
-        self.vcpu.requestExit();
+        primary.vcpu.requestExit();
         kvm.interruptThread(thread_id);
     }
 
@@ -727,6 +884,26 @@ pub const Machine = struct {
         block.transport.interrupt_status = @bitCast(current & ~result);
         if (@as(u32, @bitCast(block.transport.interrupt_status)) == 0) {
             self.block_irq_desired = false;
+        }
+    }
+
+    fn writeDebugOutput(
+        self: *Machine,
+        vcpu_index: usize,
+        bytes: []const u8,
+        serial: SerialSink,
+    ) void {
+        const slot = &self.vcpus[vcpu_index];
+        for (bytes) |byte| {
+            if (slot.debug_line_len == slot.debug_line.len) {
+                serial.write(&slot.debug_line);
+                slot.debug_line_len = 0;
+            }
+            slot.debug_line[slot.debug_line_len] = byte;
+            slot.debug_line_len += 1;
+            if (byte != '\n') continue;
+            serial.write(slot.debug_line[0..slot.debug_line_len]);
+            slot.debug_line_len = 0;
         }
     }
 

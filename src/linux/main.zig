@@ -71,6 +71,22 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeAll("KVM network: guest reached the built-in gateway\n");
         return;
     }
+    if (std.mem.eql(u8, command, "kvm-boot-benchmark")) {
+        const kernel_path = args.next() orelse return missingBootBenchmarkArgument();
+        const initrd_path = args.next() orelse return missingBootBenchmarkArgument();
+        const disk_path = args.next() orelse return missingBootBenchmarkArgument();
+        const result = run_kernel.executeBootBenchmark(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            disk_path,
+        ) catch |err| {
+            printNamedError("KVM boot benchmark", err);
+            std.process.exit(1);
+        };
+        printBootBenchmark(result);
+        return;
+    }
     if (std.mem.eql(u8, command, "run-kernel")) {
         const kernel_path = args.next() orelse {
             writeAll("error: run-kernel requires a bzImage path\n");
@@ -175,6 +191,29 @@ fn missingNetworkSmokeArgument() noreturn {
     std.process.exit(1);
 }
 
+fn missingBootBenchmarkArgument() noreturn {
+    writeAll("error: kvm-boot-benchmark requires bzImage, initrd, and disk paths\n");
+    std.process.exit(1);
+}
+
+fn printBootBenchmark(result: run_kernel.BootBenchmark) void {
+    var buffer: [256]u8 = undefined;
+    const output = std.fmt.bufPrint(
+        &buffer,
+        "KVM boot benchmark: samples={d} vcpus={d} create_us_min={d} " ++
+            "boot_us_min={d} boot_us_median={d} total_us_min={d}\n",
+        .{
+            result.samples,
+            result.vcpus,
+            result.create_us_min,
+            result.boot_us_min,
+            result.boot_us_median,
+            result.total_us_min,
+        },
+    ) catch unreachable;
+    writeAll(output);
+}
+
 fn printUsage() void {
     writeAll(
         \\bobrvm - fast Linux virtualization
@@ -187,6 +226,7 @@ fn printUsage() void {
         \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
         \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
         \\  kvm-network-smoke <bzImage> <initrd> <disk>  Verify built-in NAT
+        \\  kvm-boot-benchmark <bzImage> <initrd> <disk>  Measure boot readiness
         \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
         \\  version     Show version information
         \\  help        Show this help message

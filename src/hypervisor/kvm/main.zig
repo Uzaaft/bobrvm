@@ -41,6 +41,7 @@ pub const CreateError = error{
     MemoryAlreadyMapped,
     RegisterMemoryFailed,
     SetCpuidFailed,
+    SetMpStateFailed,
 };
 
 pub const Cpuid = extern struct {
@@ -50,11 +51,33 @@ pub const Cpuid = extern struct {
         std.mem.zeroes([entries_max]c.struct_kvm_cpuid_entry2),
 
     const entries_max = 256;
+
+    pub fn setTopology(self: *Cpuid, cpu_id: u8, cpu_count: u8) void {
+        assert(cpu_count > 0);
+        assert(cpu_id < cpu_count);
+        for (self.entries[0..self.nent]) |*entry| switch (entry.function) {
+            0x0000_0001 => {
+                entry.ebx &= 0x0000_ffff;
+                entry.ebx |= @as(u32, cpu_count) << 16;
+                entry.ebx |= @as(u32, cpu_id) << 24;
+                if (cpu_count > 1) entry.edx |= @as(u32, 1) << 28;
+            },
+            0x0000_000b, 0x0000_001f => entry.edx = cpu_id,
+            0x8000_001e => {
+                entry.eax = cpu_id;
+                entry.ebx = (entry.ebx & 0xffff_ff00) | cpu_id;
+            },
+            else => {},
+        };
+    }
 };
 
 pub const RunError = error{
     Interrupted,
+    InvalidVcpuState,
     RunFailed,
+    VcpuUninitialized,
+    WouldBlock,
 };
 
 pub const InterruptError = error{SetIrqFailed};
@@ -72,6 +95,12 @@ pub const Capability = enum(c_int) {
     ioeventfd = c.KVM_CAP_IOEVENTFD,
     immediate_exit = c.KVM_CAP_IMMEDIATE_EXIT,
     x86_user_space_msr = c.KVM_CAP_X86_USER_SPACE_MSR,
+};
+
+pub const VcpuLimits = struct {
+    recommended: u32,
+    maximum: u32,
+    id_max: u32,
 };
 
 pub const Capabilities = struct {
@@ -151,8 +180,20 @@ pub const Kvm = struct {
         return cpuid;
     }
 
+    pub fn vcpuLimits(self: *const Kvm) VcpuLimits {
+        const recommended = checkExtensionValue(self.fd, c.KVM_CAP_NR_VCPUS, 4);
+        const maximum = checkExtensionValue(self.fd, c.KVM_CAP_MAX_VCPUS, recommended);
+        const id_max = checkExtensionValue(self.fd, c.KVM_CAP_MAX_VCPU_ID, maximum);
+        return .{ .recommended = recommended, .maximum = maximum, .id_max = id_max };
+    }
+
     fn checkExtension(fd: std.posix.fd_t, capability: Capability) bool {
         return c.ioctl(fd, c.KVM_CHECK_EXTENSION, @intFromEnum(capability)) > 0;
+    }
+
+    fn checkExtensionValue(fd: std.posix.fd_t, capability: c_int, fallback: u32) u32 {
+        const value = c.ioctl(fd, c.KVM_CHECK_EXTENSION, capability);
+        return if (value > 0) @intCast(value) else fallback;
     }
 
     fn openError() OpenError {
@@ -505,10 +546,20 @@ pub const Vcpu = struct {
         }
     }
 
+    pub fn setApplicationProcessorState(self: *Vcpu) CreateError!void {
+        var state = c.struct_kvm_mp_state{ .mp_state = c.KVM_MP_STATE_UNINITIALIZED };
+        if (c.ioctl(self.fd, c.KVM_SET_MP_STATE, &state) < 0) {
+            return error.SetMpStateFailed;
+        }
+    }
+
     pub fn runOnce(self: *Vcpu) RunError!ExitReason {
         if (c.ioctl(self.fd, c.KVM_RUN, @as(c_ulong, 0)) < 0) {
             return switch (std.c.errno(@as(c_int, -1))) {
                 .INTR => error.Interrupted,
+                .AGAIN => error.WouldBlock,
+                .INVAL => error.InvalidVcpuState,
+                .NOEXEC => error.VcpuUninitialized,
                 else => error.RunFailed,
             };
         }
@@ -615,6 +666,21 @@ pub fn runSmoke() (Error || error{ UnexpectedExit, UnexpectedIo })!void {
 
 test "KVM API version matches the stable userspace contract" {
     try std.testing.expectEqual(API_VERSION, c.KVM_API_VERSION);
+}
+
+test "CPUID topology gives every vCPU a distinct APIC identity" {
+    var cpuid = Cpuid{ .nent = 4 };
+    cpuid.entries[0].function = 1;
+    cpuid.entries[1].function = 0xb;
+    cpuid.entries[2].function = 0x1f;
+    cpuid.entries[3].function = 0x8000_001e;
+    cpuid.setTopology(1, 2);
+
+    try std.testing.expectEqual(@as(u32, 1), cpuid.entries[0].ebx >> 24);
+    try std.testing.expectEqual(@as(u32, 2), (cpuid.entries[0].ebx >> 16) & 0xff);
+    try std.testing.expectEqual(@as(u32, 1), cpuid.entries[1].edx);
+    try std.testing.expectEqual(@as(u32, 1), cpuid.entries[2].edx);
+    try std.testing.expectEqual(@as(u32, 1), cpuid.entries[3].eax);
 }
 
 test "KVM requires userspace guest memory" {
