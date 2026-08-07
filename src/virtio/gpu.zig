@@ -687,7 +687,7 @@ pub const Gpu = struct {
 
     pub const Error = Allocator.Error;
     pub const QUEUE_SIZE: u16 = 256;
-    pub const MAX_RESOURCE_DIM: u32 = 8192;
+    pub const MAX_RESOURCE_DIM: u32 = config_policy.display_dimension_max;
     pub const MAX_BACKING_ENTRIES: u32 = 16384;
 
     pub fn init(alloc: Allocator, enable_virgl: bool) Error!*Gpu {
@@ -866,7 +866,7 @@ pub const Gpu = struct {
 
     /// Minimum live-resize dimension: below this guests produce unusable
     /// modes and some fbcon setups wedge.
-    pub const MIN_DISPLAY_DIM: u32 = 320;
+    pub const MIN_DISPLAY_DIM: u32 = config_policy.display_dimension_min;
 
     /// Live guest resolution change (host window resized). Updates the
     /// advertised display info, flags VIRTIO_GPU_EVENT_DISPLAY, and raises

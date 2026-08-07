@@ -8,6 +8,9 @@ const AppConfig = @This();
 
 memory_bytes: usize = config_policy.memory_bytes_default,
 vcpu_count: u8 = config_policy.vcpu_count_default,
+display_width: u32 = config_policy.display_width_default,
+display_height: u32 = config_policy.display_height_default,
+gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
 firmware_path: ?[]const u8 = null,
 vars_path: ?[]const u8 = null,
 kernel_path: ?[]const u8 = null,
@@ -82,6 +85,23 @@ pub fn parse(args: []const []const u8) ParseError!AppConfig {
             result.vcpu_count = std.fmt.parseInt(u8, value, 10) catch {
                 return error.InvalidArgument;
             };
+        } else if (std.mem.eql(u8, argument, "--display")) {
+            const separator = std.mem.indexOfScalar(u8, value, 'x') orelse {
+                return error.InvalidArgument;
+            };
+            result.display_width = std.fmt.parseInt(u32, value[0..separator], 10) catch {
+                return error.InvalidArgument;
+            };
+            result.display_height = std.fmt.parseInt(u32, value[separator + 1 ..], 10) catch {
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, argument, "--gpu-memory")) {
+            const memory_mib = std.fmt.parseInt(u64, value, 10) catch {
+                return error.InvalidArgument;
+            };
+            result.gpu_memory_bytes = std.math.mul(u64, memory_mib, 1024 * 1024) catch {
+                return error.InvalidArgument;
+            };
         } else {
             return error.InvalidArgument;
         }
@@ -90,7 +110,18 @@ pub fn parse(args: []const []const u8) ParseError!AppConfig {
         return error.InvalidArgument;
     }
     if (result.forward_count > 0) result.network_enabled = true;
-    if (result.memory_bytes == 0 or result.vcpu_count == 0) return error.InvalidArgument;
+    config_policy.validate(.{
+        .memory_bytes = std.math.cast(u64, result.memory_bytes) orelse {
+            return error.InvalidArgument;
+        },
+        .vcpu_count = result.vcpu_count,
+        .display_width = result.display_width,
+        .display_height = result.display_height,
+        .gpu_memory_bytes = result.gpu_memory_bytes,
+        .disk_path = result.disk_path,
+        .disk2_path = result.iso_path,
+        .disk2_read_only = true,
+    }) catch return error.InvalidArgument;
     return result;
 }
 
@@ -155,4 +186,15 @@ test "port forwards are validated and enable networking" {
     try std.testing.expectEqual(@as(u16, 22), result.forwards[0].guest_port);
     try std.testing.expectError(error.InvalidArgument, parseForward("0:22"));
     try std.testing.expectError(error.InvalidArgument, parseForward("22"));
+}
+
+test "display and GPU memory use shared validation" {
+    const result = try parse(&.{ "--display", "1920x1080", "--gpu-memory", "256" });
+    try std.testing.expectEqual(@as(u32, 1920), result.display_width);
+    try std.testing.expectEqual(@as(u32, 1080), result.display_height);
+    try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), result.gpu_memory_bytes);
+    try std.testing.expectError(
+        error.InvalidArgument,
+        parse(&.{ "--display", "8192x8192", "--gpu-memory", "64" }),
+    );
 }

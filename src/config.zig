@@ -10,6 +10,8 @@ pub const memory_bytes_default: u64 = 512 * 1024 * 1024;
 pub const vcpu_count_default: u8 = 2;
 pub const display_width_default: u32 = 1280;
 pub const display_height_default: u32 = 800;
+pub const display_dimension_min: u32 = 320;
+pub const display_dimension_max: u32 = 8192;
 pub const gpu_memory_bytes_default: u64 = 512 * 1024 * 1024;
 pub const gpu_memory_bytes_min: u64 = 64 * 1024 * 1024;
 pub const gpu_memory_bytes_max: u64 = 2048 * 1024 * 1024;
@@ -40,7 +42,13 @@ pub fn validate(values: Values) ValidationError!void {
 
     if (values.memory_bytes == 0) return error.InvalidMemory;
     if (values.vcpu_count == 0) return error.InvalidVcpuCount;
-    if ((values.display_width == 0) != (values.display_height == 0)) {
+    const display_enabled = values.display_width > 0 and values.display_height > 0;
+    if ((values.display_width == 0) != (values.display_height == 0) or
+        display_enabled and (values.display_width < display_dimension_min or
+            values.display_height < display_dimension_min or
+            values.display_width > display_dimension_max or
+            values.display_height > display_dimension_max))
+    {
         return error.InvalidDisplaySize;
     }
     if (values.gpu_memory_bytes != 0 and
@@ -48,6 +56,10 @@ pub fn validate(values: Values) ValidationError!void {
             values.gpu_memory_bytes > gpu_memory_bytes_max))
     {
         return error.InvalidGpuMemory;
+    }
+    if (display_enabled and values.gpu_memory_bytes > 0) {
+        const pixels = @as(u64, values.display_width) * values.display_height;
+        if (pixels * 4 > values.gpu_memory_bytes) return error.InvalidDisplaySize;
     }
     if (values.disk_path) |path| {
         if (isIsoPath(path) and !values.disk_read_only) return error.WritableIso;
@@ -94,6 +106,18 @@ fn endsWithAsciiIgnoreCase(value: []const u8, suffix: []const u8) bool {
 
 test "shared defaults validate" {
     try validate(.{});
+}
+
+test "display dimensions and framebuffer budget are bounded" {
+    try std.testing.expectError(error.InvalidDisplaySize, validate(.{
+        .display_width = display_dimension_min - 1,
+        .display_height = display_height_default,
+    }));
+    try std.testing.expectError(error.InvalidDisplaySize, validate(.{
+        .display_width = display_dimension_max,
+        .display_height = display_dimension_max,
+        .gpu_memory_bytes = gpu_memory_bytes_min,
+    }));
 }
 
 test "ISO safety is case insensitive" {

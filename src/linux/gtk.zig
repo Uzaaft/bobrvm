@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const agent = @import("../agent/main.zig");
+const config_policy = @import("../config.zig");
 const disk = @import("../disk.zig");
 const global = @import("../global.zig");
 const AppConfig = @import("AppConfig.zig");
@@ -221,14 +222,14 @@ const c = struct {
 const exits_max: u64 = 100_000_000;
 const output_pending_bytes: usize = 64 * 1024;
 const console_history_bytes: usize = 64 * 1024;
-const display_width: u32 = 1280;
-const display_height: u32 = 800;
-const display_bytes: usize = display_width * display_height * 4;
 
 const State = struct {
     allocator: std.mem.Allocator,
     memory_bytes: usize,
     vcpu_count: u8,
+    display_width: u32,
+    display_height: u32,
+    gpu_memory_bytes: u64,
     firmware_path: ?[]const u8,
     vars_path: ?[]const u8,
     kernel_path: ?[]const u8,
@@ -258,6 +259,9 @@ const State = struct {
     forward_entry: ?*c.GtkEntry = null,
     memory_spin: ?*c.GtkSpinButton = null,
     vcpu_spin: ?*c.GtkSpinButton = null,
+    display_width_spin: ?*c.GtkSpinButton = null,
+    display_height_spin: ?*c.GtkSpinButton = null,
+    gpu_memory_spin: ?*c.GtkSpinButton = null,
     disk_size_spin: ?*c.GtkSpinButton = null,
     network_check: ?*c.GtkCheckButton = null,
     start_button: ?*c.GtkWidget = null,
@@ -291,6 +295,10 @@ const State = struct {
 
     fn start(self: *State) void {
         if (self.vm != null) return;
+        self.ensureFrameBuffer() catch |err| {
+            self.setError(err);
+            return;
+        };
         const firmware_path = self.firmware_path orelse if (self.iso_path != null or
             self.disk_path != null and self.kernel_path == null)
             defaultFirmwarePath()
@@ -317,8 +325,9 @@ const State = struct {
             .network_enabled = self.network_enabled,
             .forwards = self.forwards[0..self.forward_count],
             .display_enabled = true,
-            .display_width = display_width,
-            .display_height = display_height,
+            .display_width = self.display_width,
+            .display_height = self.display_height,
+            .gpu_memory_bytes = self.gpu_memory_bytes,
             .command_line = self.command_line,
             .exits_max = exits_max,
         }, x86.SerialSink.bind(State, self, writeSerial)) catch |err| {
@@ -343,6 +352,20 @@ const State = struct {
         self.start();
     }
 
+    fn ensureFrameBuffer(self: *State) !void {
+        const pixels = try std.math.mul(
+            usize,
+            @intCast(self.display_width),
+            @intCast(self.display_height),
+        );
+        const bytes = try std.math.mul(usize, pixels, 4);
+        if (bytes == self.frame_pixels.len) return;
+        self.frame_pixels = try self.allocator.realloc(self.frame_pixels, bytes);
+        self.frame_width = 0;
+        self.frame_height = 0;
+        self.frame_generation = 0;
+    }
+
     fn readForm(self: *State) bool {
         self.iso_path = entryValue(self.iso_entry.?);
         self.disk_path = entryValue(self.disk_entry.?);
@@ -351,12 +374,33 @@ const State = struct {
         self.shared_dir = entryValue(self.shared_entry.?);
         const memory_mib = c.gtk_spin_button_get_value_as_int(self.memory_spin.?);
         const vcpu_count = c.gtk_spin_button_get_value_as_int(self.vcpu_spin.?);
-        if (memory_mib <= 0 or vcpu_count <= 0) {
+        const display_width_value = c.gtk_spin_button_get_value_as_int(self.display_width_spin.?);
+        const display_height_value = c.gtk_spin_button_get_value_as_int(self.display_height_spin.?);
+        const gpu_memory_mib = c.gtk_spin_button_get_value_as_int(self.gpu_memory_spin.?);
+        if (memory_mib <= 0 or vcpu_count <= 0 or display_width_value <= 0 or
+            display_height_value <= 0 or gpu_memory_mib <= 0)
+        {
             self.setError(error.InvalidConfig);
             return false;
         }
         self.memory_bytes = @as(usize, @intCast(memory_mib)) * 1024 * 1024;
         self.vcpu_count = @intCast(vcpu_count);
+        self.display_width = @intCast(display_width_value);
+        self.display_height = @intCast(display_height_value);
+        self.gpu_memory_bytes = @as(u64, @intCast(gpu_memory_mib)) * 1024 * 1024;
+        config_policy.validate(.{
+            .memory_bytes = self.memory_bytes,
+            .vcpu_count = self.vcpu_count,
+            .display_width = self.display_width,
+            .display_height = self.display_height,
+            .gpu_memory_bytes = self.gpu_memory_bytes,
+            .disk_path = self.disk_path,
+            .disk2_path = self.iso_path,
+            .disk2_read_only = true,
+        }) catch |err| {
+            self.setError(err);
+            return false;
+        };
         self.network_enabled = c.gtk_check_button_get_active(self.network_check.?) != c.FALSE;
         if (!self.readForwards()) return false;
         return true;
@@ -427,8 +471,9 @@ const State = struct {
             .enable_gpu = true,
             .enable_net = self.network_enabled,
             .shared_dir = self.shared_dir,
-            .display_width = display_width,
-            .display_height = display_height,
+            .display_width = self.display_width,
+            .display_height = self.display_height,
+            .gpu_memory_mb = self.gpu_memory_bytes / (1024 * 1024),
         };
         config.forward_count = self.forward_count;
         for (self.forwards[0..self.forward_count], 0..) |forward, index| {
@@ -462,6 +507,26 @@ const State = struct {
         setEntryValue(self, self.shared_entry.?, config.shared_dir);
         c.gtk_spin_button_set_value(self.memory_spin.?, @floatFromInt(config.memory_mb));
         c.gtk_spin_button_set_value(self.vcpu_spin.?, @floatFromInt(config.vcpu_count));
+        c.gtk_spin_button_set_value(
+            self.display_width_spin.?,
+            @floatFromInt(config.display_width),
+        );
+        c.gtk_spin_button_set_value(
+            self.display_height_spin.?,
+            @floatFromInt(config.display_height),
+        );
+        c.gtk_spin_button_set_value(self.gpu_memory_spin.?, @floatFromInt(config.gpu_memory_mb));
+        self.display_width = config.display_width;
+        self.display_height = config.display_height;
+        self.gpu_memory_bytes = config.gpu_memory_mb * 1024 * 1024;
+        c.gtk_drawing_area_set_content_width(
+            @ptrCast(self.display.?),
+            @intCast(self.display_width),
+        );
+        c.gtk_drawing_area_set_content_height(
+            @ptrCast(self.display.?),
+            @intCast(self.display_height),
+        );
         c.gtk_check_button_set_active(
             self.network_check.?,
             if (config.enable_net) c.TRUE else c.FALSE,
@@ -695,8 +760,8 @@ const State = struct {
         const widget_width = c.gtk_widget_get_width(widget);
         const widget_height = c.gtk_widget_get_height(widget);
         if (widget_width <= 0 or widget_height <= 0) return;
-        const frame_width = if (self.frame_width > 0) self.frame_width else display_width;
-        const frame_height = if (self.frame_height > 0) self.frame_height else display_height;
+        const frame_width = if (self.frame_width > 0) self.frame_width else self.display_width;
+        const frame_height = if (self.frame_height > 0) self.frame_height else self.display_height;
         const scale = @min(
             @as(f64, @floatFromInt(widget_width)) / @as(f64, @floatFromInt(frame_width)),
             @as(f64, @floatFromInt(widget_height)) / @as(f64, @floatFromInt(frame_height)),
@@ -787,11 +852,22 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeStderr(message);
         std.process.exit(1);
     };
-    const frame_pixels = std.heap.c_allocator.alloc(u8, display_bytes) catch {
+    const initial_pixels = std.math.mul(
+        usize,
+        @intCast(config.display_width),
+        @intCast(config.display_height),
+    ) catch {
+        writeStderr("error: invalid display size\n");
+        std.process.exit(1);
+    };
+    const initial_bytes = std.math.mul(usize, initial_pixels, 4) catch {
+        writeStderr("error: invalid display size\n");
+        std.process.exit(1);
+    };
+    const frame_pixels = std.heap.c_allocator.alloc(u8, initial_bytes) catch {
         writeStderr("error: unable to allocate display buffer\n");
         std.process.exit(1);
     };
-    defer std.heap.c_allocator.free(frame_pixels);
     const clipboard_text = std.heap.c_allocator.alloc(
         u8,
         agent.native.clipboard_text_bytes_max + 1,
@@ -804,6 +880,9 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .allocator = std.heap.c_allocator,
         .memory_bytes = config.memory_bytes,
         .vcpu_count = config.vcpu_count,
+        .display_width = config.display_width,
+        .display_height = config.display_height,
+        .gpu_memory_bytes = config.gpu_memory_bytes,
         .firmware_path = config.firmware_path,
         .vars_path = config.vars_path,
         .kernel_path = config.kernel_path,
@@ -819,6 +898,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .clipboard_text = clipboard_text,
     };
     defer {
+        state.allocator.free(state.frame_pixels);
         if (state.loaded_firmware_path) |path| state.allocator.free(path);
         if (state.loaded_vars_path) |path| state.allocator.free(path);
         if (state.loaded_command_line) |command| state.allocator.free(command);
@@ -963,6 +1043,33 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const network: *c.GtkCheckButton = @ptrCast(network_widget);
     c.gtk_check_button_set_active(network, if (state.network_enabled) c.TRUE else c.FALSE);
     state.network_check = network;
+    const graphics = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12) orelse return;
+    const display_width_label = c.gtk_label_new("Display Width") orelse return;
+    const display_width_widget = c.gtk_spin_button_new_with_range(
+        config_policy.display_dimension_min,
+        config_policy.display_dimension_max,
+        16,
+    ) orelse return;
+    const display_width_spin: *c.GtkSpinButton = @ptrCast(display_width_widget);
+    c.gtk_spin_button_set_value(display_width_spin, @floatFromInt(state.display_width));
+    state.display_width_spin = display_width_spin;
+    const display_height_label = c.gtk_label_new("Height") orelse return;
+    const display_height_widget = c.gtk_spin_button_new_with_range(
+        config_policy.display_dimension_min,
+        config_policy.display_dimension_max,
+        16,
+    ) orelse return;
+    const display_height_spin: *c.GtkSpinButton = @ptrCast(display_height_widget);
+    c.gtk_spin_button_set_value(display_height_spin, @floatFromInt(state.display_height));
+    state.display_height_spin = display_height_spin;
+    const gpu_memory_label = c.gtk_label_new("GPU Memory (MiB)") orelse return;
+    const gpu_memory_widget = c.gtk_spin_button_new_with_range(64, 2048, 64) orelse return;
+    const gpu_memory_spin: *c.GtkSpinButton = @ptrCast(gpu_memory_widget);
+    c.gtk_spin_button_set_value(
+        gpu_memory_spin,
+        @floatFromInt(state.gpu_memory_bytes / (1024 * 1024)),
+    );
+    state.gpu_memory_spin = gpu_memory_spin;
     const storage = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
     const disk_size_label = c.gtk_label_new("Disk (GiB)") orelse return;
     const disk_size_widget = c.gtk_spin_button_new_with_range(1, 4096, 1) orelse return;
@@ -985,6 +1092,12 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(hardware), vcpu_label);
     c.gtk_box_append(@ptrCast(hardware), vcpu_spin_widget);
     c.gtk_box_append(@ptrCast(hardware), network_widget);
+    c.gtk_box_append(@ptrCast(graphics), display_width_label);
+    c.gtk_box_append(@ptrCast(graphics), display_width_widget);
+    c.gtk_box_append(@ptrCast(graphics), display_height_label);
+    c.gtk_box_append(@ptrCast(graphics), display_height_widget);
+    c.gtk_box_append(@ptrCast(graphics), gpu_memory_label);
+    c.gtk_box_append(@ptrCast(graphics), gpu_memory_widget);
     c.gtk_box_append(@ptrCast(storage), disk_size_label);
     c.gtk_box_append(@ptrCast(storage), disk_size_widget);
     c.gtk_box_append(@ptrCast(storage), create_disk);
@@ -1059,8 +1172,8 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const display_widget = c.gtk_drawing_area_new() orelse return;
     const display: *c.GtkDrawingArea = @ptrCast(display_widget);
     state.display = display_widget;
-    c.gtk_drawing_area_set_content_width(display, @intCast(display_width));
-    c.gtk_drawing_area_set_content_height(display, @intCast(display_height));
+    c.gtk_drawing_area_set_content_width(display, @intCast(state.display_width));
+    c.gtk_drawing_area_set_content_height(display, @intCast(state.display_height));
     c.gtk_drawing_area_set_draw_func(display, drawDisplay, state, null);
     _ = c.g_signal_connect_data(
         display,
@@ -1087,6 +1200,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_set_vexpand(scrolled_widget, c.TRUE);
     c.gtk_scrolled_window_set_child(scrolled, console_widget);
     c.gtk_box_append(box, @ptrCast(hardware));
+    c.gtk_box_append(box, @ptrCast(graphics));
     c.gtk_box_append(box, @ptrCast(storage));
     c.gtk_box_append(box, @ptrCast(controls));
     c.gtk_box_append(box, @ptrCast(status));

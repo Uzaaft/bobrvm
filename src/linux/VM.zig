@@ -7,6 +7,7 @@ const VM = @This();
 
 const std = @import("std");
 const agent = @import("../agent/main.zig");
+const config_policy = @import("../config.zig");
 const file_compat = @import("../compat/file.zig");
 const global = @import("../global.zig");
 const boot = @import("../machine/x86/boot.zig");
@@ -51,14 +52,15 @@ pub const Config = struct {
     network_enabled: bool = false,
     forwards: []const mininat.Forward = &.{},
     display_enabled: bool = false,
-    display_width: u32 = 1280,
-    display_height: u32 = 800,
+    display_width: u32 = config_policy.display_width_default,
+    display_height: u32 = config_policy.display_height_default,
+    gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
     shared_dir: ?[]const u8 = null,
     command_line: []const u8,
     exits_max: u64,
 };
 
-pub const CreateError = boot.ParseError || x86.Machine.InitError ||
+pub const CreateError = boot.ParseError || config_policy.ValidationError || x86.Machine.InitError ||
     x86.Machine.AttachDiskError || x86.Machine.AttachNetworkError ||
     x86.Machine.AttachDisplayError || x86.Machine.AttachInputError ||
     x86.Machine.AttachRngError || x86.Machine.AttachGuestServicesError || error{
@@ -82,6 +84,19 @@ pub fn create(
     config: Config,
     serial: x86.SerialSink,
 ) CreateError!*VM {
+    try config_policy.validate(.{
+        .memory_bytes = std.math.cast(u64, config.memory_bytes) orelse {
+            return error.InvalidMemory;
+        },
+        .vcpu_count = config.vcpu_count,
+        .display_width = if (config.display_enabled) config.display_width else 0,
+        .display_height = if (config.display_enabled) config.display_height else 0,
+        .gpu_memory_bytes = if (config.display_enabled) config.gpu_memory_bytes else 0,
+        .disk_path = config.disk_path,
+        .disk_read_only = config.disk_read_only,
+        .disk2_path = config.disk2_path,
+        .disk2_read_only = config.disk2_read_only,
+    });
     if ((config.kernel_path == null) == (config.firmware_path == null)) {
         return error.InvalidBootConfig;
     }
@@ -153,7 +168,12 @@ pub fn create(
         try self.machine.attachDisk2(allocator, path, config.disk2_read_only);
     }
     if (config.display_enabled) {
-        try self.machine.attachDisplay(allocator, config.display_width, config.display_height);
+        try self.machine.attachDisplay(
+            allocator,
+            config.display_width,
+            config.display_height,
+            config.gpu_memory_bytes,
+        );
         try self.machine.attachInputDevices(allocator);
     }
     if (config.shared_dir) |path| try self.machine.attachSharedFolder(allocator, path);

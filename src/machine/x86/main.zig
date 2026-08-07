@@ -589,11 +589,12 @@ pub const Machine = struct {
         allocator: std.mem.Allocator,
         width: u32,
         height: u32,
+        gpu_memory_bytes: u64,
     ) AttachDisplayError!void {
         std.debug.assert(self.gpu == null);
         std.debug.assert(self.pci_gpu == null);
 
-        const gpu = try virtio.Gpu.init(allocator, false);
+        const gpu = try virtio.Gpu.initWithMemoryLimit(allocator, false, gpu_memory_bytes);
         errdefer gpu.deinit();
         gpu.setDisplaySize(width, height);
         gpu.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
