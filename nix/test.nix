@@ -28,6 +28,7 @@ stdenv.mkDerivation {
     zig build test-fuzz-virgl-decoder --fuzz=100K
     zig build test-fuzz-agent-protocol --fuzz=100K
     zig build test-fuzz-snapshot-container --fuzz=100K
+    zig build test-fuzz-p9 --fuzz=100K
     runHook postBuild
   '';
 
