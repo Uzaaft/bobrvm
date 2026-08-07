@@ -70,6 +70,7 @@ pub const CommonCfgReg = enum(u8) {
     queue_device_lo = 0x30,
     queue_device_hi = 0x34,
     queue_reset = 0x38,
+    _,
 };
 
 /// BAR region offsets (all in BAR0).
@@ -337,6 +338,7 @@ pub const VirtioPciTransport = struct {
             .queue_device_lo => if (self.currentQueue()) |q| @truncate(q.device_addr) else 0,
             .queue_device_hi => if (self.currentQueue()) |q| @truncate(q.device_addr >> 32) else 0,
             .queue_reset => 0,
+            else => 0,
         };
     }
 
@@ -410,7 +412,7 @@ pub const VirtioPciTransport = struct {
     }
 
     fn readDeviceConfig(self: *VirtioPciTransport, offset: u8, size: u8) u32 {
-        if (offset + size > self.device_config.len) return 0;
+        if (@as(usize, offset) + size > self.device_config.len) return 0;
 
         return switch (size) {
             1 => self.device_config[offset],
@@ -425,7 +427,7 @@ pub const VirtioPciTransport = struct {
     }
 
     fn writeDeviceConfig(self: *VirtioPciTransport, offset: u8, size: u8, value: u32) void {
-        if (offset + size > self.device_config.len) return;
+        if (@as(usize, offset) + size > self.device_config.len) return;
 
         switch (size) {
             1 => self.device_config[offset] = @truncate(value),
@@ -846,6 +848,26 @@ test "VirtioPciTransport common config read" {
     transport.device_feature_select = 0;
     const features_lo = transport.readBar(BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.device_feature), 4);
     try std.testing.expectEqual(@as(u32, 0x100), features_lo);
+}
+
+test "VirtioPciTransport ignores unnamed common configuration offsets" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, 0, 1, 64);
+    defer transport.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), transport.readBar(0x03, 1));
+    transport.writeBar(0x03, 1, std.math.maxInt(u32));
+    try std.testing.expectEqual(@as(u32, 0), transport.readBar(0x03, 1));
+}
+
+test "VirtioPciTransport rejects device config accesses crossing the BAR window" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, 0, 1, 256);
+    defer transport.deinit();
+
+    const last = BAR_DEVICE_CFG_OFFSET + BAR_DEVICE_CFG_SIZE - 1;
+    transport.writeBar(last, 1, 0xA5);
+    try std.testing.expectEqual(@as(u32, 0), transport.readBar(last, 4));
+    transport.writeBar(last, 4, 0);
+    try std.testing.expectEqual(@as(u32, 0xA5), transport.readBar(last, 1));
 }
 
 test "VirtioPciDevice init and config" {

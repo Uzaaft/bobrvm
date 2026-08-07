@@ -72,6 +72,7 @@ pub const ConfigReg = enum(u12) {
     cap_ptr = 0x34,
     interrupt_line = 0x3C,
     interrupt_pin = 0x3D,
+    _,
 };
 
 /// Decoded ECAM address.
@@ -171,7 +172,7 @@ pub const PciDevice = struct {
 
     pub fn read(self: *const PciDevice, offset: u12, size: u8) u64 {
         assert(size == 1 or size == 2 or size == 4);
-        assert(offset + size <= CONFIG_SPACE_SIZE);
+        if (@as(u64, offset) + size > CONFIG_SPACE_SIZE) return 0xFFFFFFFF;
 
         if (!self.present) {
             return 0xFFFFFFFF;
@@ -190,7 +191,7 @@ pub const PciDevice = struct {
 
     pub fn write(self: *PciDevice, offset: u12, size: u8, value: u64) void {
         assert(size == 1 or size == 2 or size == 4);
-        assert(offset + size <= CONFIG_SPACE_SIZE);
+        if (@as(u64, offset) + size > CONFIG_SPACE_SIZE) return;
 
         if (!self.present) return;
 
@@ -425,6 +426,23 @@ test "PciDevice virtio block" {
     // Read device ID
     const device_id = dev.read(@intFromEnum(ConfigReg.device_id), 2);
     try std.testing.expectEqual(@as(u64, 0x1001), device_id);
+}
+
+test "PciDevice accepts writes to unnamed configuration bytes" {
+    var dev = PciDevice.initVirtioBlock(PCI_MMIO_BASE);
+
+    dev.write(0x05, 1, 0xA5);
+
+    try std.testing.expectEqual(@as(u64, 0xA5), dev.read(0x05, 1));
+}
+
+test "PciDevice rejects accesses crossing configuration space" {
+    var dev = PciDevice.initVirtioBlock(PCI_MMIO_BASE);
+    const end = std.math.maxInt(u12);
+
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF), dev.read(end, 4));
+    dev.write(end, 4, 0);
+    try std.testing.expectEqual(@as(u64, 0xFF), dev.read(end, 1));
 }
 
 test "EcamHost basic" {
