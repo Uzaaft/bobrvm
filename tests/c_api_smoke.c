@@ -33,6 +33,19 @@ static void test_filename_sanitization(void) {
            BOBRVM_ERROR_INVALID_ARGUMENT);
     assert(bobrvm_filename_sanitize(NULL, output, sizeof(output), &length) ==
            BOBRVM_ERROR_INVALID_ARGUMENT);
+    assert(bobrvm_filename_sanitize("name", NULL, sizeof(output), &length) ==
+           BOBRVM_ERROR_INVALID_ARGUMENT);
+    assert(bobrvm_filename_sanitize("name", output, sizeof(output), NULL) ==
+           BOBRVM_ERROR_INVALID_ARGUMENT);
+}
+
+static void test_disk_errors(void) {
+    uint64_t size = 0;
+
+    assert(bobrvm_disk_create_sparse(NULL, 4096) == BOBRVM_ERROR_INVALID_ARGUMENT);
+    assert(bobrvm_disk_grow_raw(NULL, 4096) == BOBRVM_ERROR_INVALID_ARGUMENT);
+    assert(bobrvm_disk_logical_size(NULL, &size) == BOBRVM_ERROR_INVALID_ARGUMENT);
+    assert(bobrvm_disk_logical_size("/missing", NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
 }
 
 static void test_null_handles(void) {
@@ -49,8 +62,15 @@ static void test_null_handles(void) {
     assert(status.connection == BOBRVM_GUEST_TOOLS_DISCONNECTED);
     assert(status.capabilities == 0);
     assert(!bobrvm_vm_guest_management_ready(NULL));
+    bobrvm_vm_shutdown_graceful(NULL);
+    bobrvm_vm_guest_reboot(NULL);
+    bobrvm_vm_guest_trim(NULL);
+    bobrvm_vm_guest_sync_time(NULL);
     assert(bobrvm_vm_snapshot_quiesced(NULL, NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
     assert(bobrvm_vm_send_file(NULL, NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
+    bobrvm_vm_host_clipboard_changed(NULL);
+    bobrvm_vm_kick_vcpu(NULL, UINT32_MAX);
+    bobrvm_vm_force_exit_all(NULL);
     bobrvm_vm_stop(NULL);
     bobrvm_vm_request_stop(NULL);
     bobrvm_vm_finish_stop(NULL);
@@ -84,13 +104,20 @@ static void test_null_handles(void) {
 }
 
 int main(void) {
+    bobrvm_build_mode_e build_mode;
+
     bobrvm_init();
 
     assert(strcmp(bobrvm_version(), "0.1.0") == 0);
-    assert(bobrvm_build_mode() >= BOBRVM_BUILD_MODE_DEBUG);
-    assert(bobrvm_build_mode() <= BOBRVM_BUILD_MODE_RELEASE_SMALL);
+    build_mode = bobrvm_build_mode();
+    assert(build_mode >= BOBRVM_BUILD_MODE_DEBUG);
+    assert(build_mode <= BOBRVM_BUILD_MODE_RELEASE_SMALL);
+    assert(bobrvm_is_debug() ==
+           (build_mode == BOBRVM_BUILD_MODE_DEBUG ||
+            build_mode == BOBRVM_BUILD_MODE_RELEASE_SAFE));
     test_configuration();
     test_filename_sanitization();
+    test_disk_errors();
     test_null_handles();
 
     bobrvm_deinit();
