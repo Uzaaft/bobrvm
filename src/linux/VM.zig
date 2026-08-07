@@ -6,6 +6,7 @@
 const VM = @This();
 
 const std = @import("std");
+const agent = @import("../agent/main.zig");
 const file_compat = @import("../compat/file.zig");
 const global = @import("../global.zig");
 const boot = @import("../machine/x86/boot.zig");
@@ -60,7 +61,7 @@ pub const Config = struct {
 pub const CreateError = boot.ParseError || x86.Machine.InitError ||
     x86.Machine.AttachDiskError || x86.Machine.AttachNetworkError ||
     x86.Machine.AttachDisplayError || x86.Machine.AttachInputError ||
-    x86.Machine.AttachRngError || error{
+    x86.Machine.AttachRngError || x86.Machine.AttachGuestServicesError || error{
     OpenKernelFailed,
     ReadKernelFailed,
     OpenInitrdFailed,
@@ -157,6 +158,7 @@ pub fn create(
     }
     if (config.shared_dir) |path| try self.machine.attachSharedFolder(allocator, path);
     try self.machine.attachRng(allocator);
+    try self.machine.attachGuestServices(allocator);
     if (config.network_enabled) try self.machine.attachNetwork(allocator, config.forwards);
     return self;
 }
@@ -263,6 +265,34 @@ pub fn mmioExitStats(self: *const VM) x86.Machine.MmioExitStats {
 
 pub fn copyScanout(self: *VM, destination: []u8) ?x86.Machine.Scanout {
     return self.machine.copyScanout(destination);
+}
+
+pub fn guestToolsStatus(self: *const VM) agent.native.Status {
+    return self.machine.guestToolsStatus();
+}
+
+pub fn guestToolsCapabilities(self: *const VM) u64 {
+    return self.machine.guestToolsCapabilities();
+}
+
+pub fn guestManagementReady(self: *const VM) bool {
+    return self.machine.guestManagementReady();
+}
+
+pub fn requestGuestShutdown(self: *VM) void {
+    self.machine.requestGuestShutdown();
+}
+
+pub fn requestGuestReboot(self: *VM) void {
+    self.machine.requestGuestReboot();
+}
+
+pub fn trimGuestFilesystems(self: *VM) void {
+    self.machine.trimGuestFilesystems();
+}
+
+pub fn syncGuestTime(self: *VM) void {
+    self.machine.syncGuestTime();
 }
 
 pub fn injectKey(self: *VM, keycode: u16, pressed: bool) x86.Machine.InputError!void {

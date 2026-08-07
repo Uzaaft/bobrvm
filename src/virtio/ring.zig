@@ -40,11 +40,13 @@ pub const Desc = struct {
 
 /// Read one descriptor from the descriptor table.
 pub fn readDesc(qc: mmio.QueueConfig, idx: u16, get_mem: anytype) ?Desc {
+    if (idx >= qc.num) return null;
     const mem = get(get_mem, qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
     return decodeDesc(mem);
 }
 
 pub fn readDescMemory(qc: mmio.QueueConfig, idx: u16, memory: GuestMemory) ?Desc {
+    if (idx >= qc.num) return null;
     const mem = memory.get(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
     return decodeDesc(mem);
 }

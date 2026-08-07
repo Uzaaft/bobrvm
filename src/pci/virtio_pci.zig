@@ -89,6 +89,7 @@ pub const BAR0_SIZE: u32 = 0x1000;
 /// Queue configuration state.
 pub const QueueConfig = struct {
     size: u16 = 0,
+    size_max: u16 = 0,
     enable: bool = false,
     notify_off: u16 = 0,
     desc_addr: u64 = 0,
@@ -160,7 +161,7 @@ pub const VirtioPciTransport = struct {
     irq_callback: ?*const fn (userdata: ?*anyopaque) void,
     irq_userdata: ?*anyopaque,
 
-    pub const MAX_QUEUES = 8;
+    pub const MAX_QUEUES = 16;
     pub const MAX_QUEUE_SIZE: u16 = 256;
 
     const AllocationLayout = struct {
@@ -229,7 +230,10 @@ pub const VirtioPciTransport = struct {
     ) void {
         assert(queues.len > 0);
         assert(queues.len <= MAX_QUEUES);
-        @memset(queues, QueueConfig{ .size = MAX_QUEUE_SIZE });
+        @memset(queues, QueueConfig{
+            .size = MAX_QUEUE_SIZE,
+            .size_max = MAX_QUEUE_SIZE,
+        });
         @memset(device_config, 0);
 
         self.* = .{
@@ -363,7 +367,7 @@ pub const VirtioPciTransport = struct {
             },
             .queue_size => {
                 if (self.currentQueue()) |q| {
-                    q.size = @truncate(value);
+                    if (value > 0 and value <= q.size_max) q.size = @truncate(value);
                 }
             },
             .queue_enable => {
@@ -404,7 +408,8 @@ pub const VirtioPciTransport = struct {
             .queue_reset => {
                 if (value != 0) {
                     if (self.currentQueue()) |q| {
-                        q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
+                        const size_max = q.size_max;
+                        q.* = QueueConfig{ .size = size_max, .size_max = size_max };
                     }
                 }
             },
@@ -533,6 +538,14 @@ pub const VirtioPciTransport = struct {
     pub fn setDeviceConfig(self: *VirtioPciTransport, data: []const u8) void {
         const len = @min(data.len, self.device_config.len);
         @memcpy(self.device_config[0..len], data[0..len]);
+    }
+
+    pub fn setQueueSizeMax(self: *VirtioPciTransport, queue_index: u16, size: u16) void {
+        assert(queue_index < self.queues.len);
+        assert(size > 0);
+        assert(size <= MAX_QUEUE_SIZE);
+        self.queues[queue_index].size = size;
+        self.queues[queue_index].size_max = size;
     }
 };
 
@@ -843,6 +856,23 @@ test "VirtioPciTransport init" {
 
     try std.testing.expectEqual(@as(u32, 2), transport.device_id);
     try std.testing.expectEqual(@as(u16, 1), transport.num_queues);
+}
+
+test "VirtioPciTransport supports bounded multiport console queues" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 3, 0, 12, 12);
+    defer transport.deinit();
+
+    for (0..12) |queue_index| {
+        transport.setQueueSizeMax(@intCast(queue_index), 128);
+    }
+    transport.queue_select = 11;
+    transport.writeBar(
+        BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.queue_size),
+        2,
+        256,
+    );
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[11].size);
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[11].size_max);
 }
 
 test "virtio GPU uses the modern device id and display class" {

@@ -242,6 +242,11 @@ const State = struct {
     start_button: ?*c.GtkWidget = null,
     pause_button: ?*c.GtkWidget = null,
     stop_button: ?*c.GtkWidget = null,
+    shutdown_button: ?*c.GtkWidget = null,
+    reboot_button: ?*c.GtkWidget = null,
+    trim_button: ?*c.GtkWidget = null,
+    sync_time_button: ?*c.GtkWidget = null,
+    guest_tools: ?*c.GtkLabel = null,
     output_lock: std.Io.Mutex = .init,
     output_pending: [output_pending_bytes]u8 = undefined,
     output_head: usize = 0,
@@ -524,7 +529,31 @@ const State = struct {
         c.gtk_widget_set_sensitive(self.start_button.?, if (running) c.FALSE else c.TRUE);
         c.gtk_widget_set_sensitive(self.pause_button.?, if (running) c.TRUE else c.FALSE);
         c.gtk_widget_set_sensitive(self.stop_button.?, if (running) c.TRUE else c.FALSE);
+        self.setManagementControls(false);
         if (!running) c.gtk_button_set_label(@ptrCast(self.pause_button.?), "Pause");
+    }
+
+    fn refreshGuestTools(self: *State) void {
+        const vm = self.vm orelse {
+            c.gtk_label_set_text(self.guest_tools.?, "Guest tools: unavailable");
+            self.setManagementControls(false);
+            return;
+        };
+        c.gtk_label_set_text(self.guest_tools.?, switch (vm.guestToolsStatus()) {
+            .disconnected => "Guest tools: not connected",
+            .connecting => "Guest tools: connecting…",
+            .ready => "Guest tools: ready",
+            .protocol_error => "Guest tools: protocol error",
+        });
+        self.setManagementControls(vm.guestManagementReady());
+    }
+
+    fn setManagementControls(self: *State, enabled: bool) void {
+        const sensitive = if (enabled) c.TRUE else c.FALSE;
+        c.gtk_widget_set_sensitive(self.shutdown_button.?, sensitive);
+        c.gtk_widget_set_sensitive(self.reboot_button.?, sensitive);
+        c.gtk_widget_set_sensitive(self.trim_button.?, sensitive);
+        c.gtk_widget_set_sensitive(self.sync_time_button.?, sensitive);
     }
 
     fn finish(self: *State) void {
@@ -887,18 +916,58 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const start_button = c.gtk_button_new_with_label("Start") orelse return;
     const pause_button = c.gtk_button_new_with_label("Pause") orelse return;
     const stop_button = c.gtk_button_new_with_label("Stop") orelse return;
+    const shutdown_button = c.gtk_button_new_with_label("Shut Down Guest") orelse return;
+    const reboot_button = c.gtk_button_new_with_label("Reboot Guest") orelse return;
+    const trim_button = c.gtk_button_new_with_label("Trim") orelse return;
+    const sync_time_button = c.gtk_button_new_with_label("Sync Time") orelse return;
     state.start_button = start_button;
     state.pause_button = pause_button;
     state.stop_button = stop_button;
+    state.shutdown_button = shutdown_button;
+    state.reboot_button = reboot_button;
+    state.trim_button = trim_button;
+    state.sync_time_button = sync_time_button;
     _ = c.g_signal_connect_data(start_button, "clicked", @ptrCast(&startClicked), state, null, 0);
     _ = c.g_signal_connect_data(pause_button, "clicked", @ptrCast(&pauseClicked), state, null, 0);
     _ = c.g_signal_connect_data(stop_button, "clicked", @ptrCast(&stopClicked), state, null, 0);
+    _ = c.g_signal_connect_data(
+        shutdown_button,
+        "clicked",
+        @ptrCast(&shutdownGuestClicked),
+        state,
+        null,
+        0,
+    );
+    _ = c.g_signal_connect_data(
+        reboot_button,
+        "clicked",
+        @ptrCast(&rebootGuestClicked),
+        state,
+        null,
+        0,
+    );
+    _ = c.g_signal_connect_data(trim_button, "clicked", @ptrCast(&trimClicked), state, null, 0);
+    _ = c.g_signal_connect_data(
+        sync_time_button,
+        "clicked",
+        @ptrCast(&syncTimeClicked),
+        state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(controls), start_button);
     c.gtk_box_append(@ptrCast(controls), pause_button);
     c.gtk_box_append(@ptrCast(controls), stop_button);
+    c.gtk_box_append(@ptrCast(controls), shutdown_button);
+    c.gtk_box_append(@ptrCast(controls), reboot_button);
+    c.gtk_box_append(@ptrCast(controls), trim_button);
+    c.gtk_box_append(@ptrCast(controls), sync_time_button);
     const status_widget = c.gtk_label_new("Ready") orelse return;
     const status: *c.GtkLabel = @ptrCast(status_widget);
     state.status = status;
+    const guest_tools_widget = c.gtk_label_new("Guest tools: unavailable") orelse return;
+    const guest_tools: *c.GtkLabel = @ptrCast(guest_tools_widget);
+    state.guest_tools = guest_tools;
     const display_widget = c.gtk_drawing_area_new() orelse return;
     const display: *c.GtkDrawingArea = @ptrCast(display_widget);
     state.display = display_widget;
@@ -925,6 +994,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(box, @ptrCast(storage));
     c.gtk_box_append(box, @ptrCast(controls));
     c.gtk_box_append(box, @ptrCast(status));
+    c.gtk_box_append(box, guest_tools_widget);
     c.gtk_box_append(box, display_widget);
     c.gtk_box_append(box, scrolled_widget);
     c.gtk_window_set_child(window, @ptrCast(box));
@@ -1021,6 +1091,34 @@ fn pauseClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
         },
         else => {},
     }
+}
+
+fn shutdownGuestClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    vm.requestGuestShutdown();
+    c.gtk_label_set_text(state.status.?, "Guest shutdown requested");
+}
+
+fn rebootGuestClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    vm.requestGuestReboot();
+    c.gtk_label_set_text(state.status.?, "Guest reboot requested");
+}
+
+fn trimClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    vm.trimGuestFilesystems();
+    c.gtk_label_set_text(state.status.?, "Guest trim requested");
+}
+
+fn syncTimeClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    vm.syncGuestTime();
+    c.gtk_label_set_text(state.status.?, "Guest time synchronized");
 }
 
 fn loadClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
@@ -1174,6 +1272,7 @@ fn tick(userdata: ?*anyopaque) callconv(.c) c.gboolean {
     state.flushOutput();
     const vm = state.vm orelse return c.G_SOURCE_REMOVE;
     state.refreshDisplay();
+    state.refreshGuestTools();
     if (vm.state() != .stopped) return c.G_SOURCE_CONTINUE;
     state.finish();
     return c.G_SOURCE_REMOVE;

@@ -1,6 +1,7 @@
 //! Minimal x86 PC machine for direct Linux boot on KVM.
 
 const std = @import("std");
+const agent = @import("../../agent/main.zig");
 const callback_binding = @import("../../callback.zig");
 const global = @import("../../global.zig");
 const GuestMemory = @import("../../guest_memory.zig").GuestMemory;
@@ -40,6 +41,13 @@ const pci_share_bar_initial: u32 = 0xd006_0000;
 const pci_rng_slot: u5 = 9;
 const pci_rng_irq: u32 = 13;
 const pci_rng_bar_initial: u32 = 0xd007_0000;
+const pci_console_slot: u5 = 11;
+const pci_console_irq: u32 = 14;
+const pci_console_bar_initial: u32 = 0xd008_0000;
+const spice_port: u32 = 1;
+const qga_port: u32 = 2;
+const bobrvm_agent_port: u32 = 3;
+const bobrvm_clipboard_port: u32 = 4;
 const serial_irq: u32 = 4;
 const ovmf_debug_port: u16 = 0x402;
 const piix4_pm_function: u3 = 3;
@@ -178,6 +186,15 @@ pub const Machine = struct {
     pci_rng: ?*pci.VirtioPciDevice = null,
     rng_irq_desired: bool = false,
     rng_irq_injected: bool = false,
+    console: ?*virtio.Console = null,
+    pci_console: ?*pci.VirtioPciDevice = null,
+    console_wakeup: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    console_irq_desired: bool = false,
+    console_irq_injected: bool = false,
+    qga: ?*agent.Qga = null,
+    vdagent: ?agent.Vdagent = null,
+    native_agent: ?*agent.Native = null,
+    wayland_agent: ?*agent.Native = null,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     run_state: std.atomic.Value(RunState) = std.atomic.Value(RunState).init(.idle),
     state_mutex: std.Io.Mutex = .init,
@@ -221,6 +238,7 @@ pub const Machine = struct {
     pub const AttachInputError = virtio.Input.Error;
     pub const AttachShareError = std.mem.Allocator.Error;
     pub const AttachRngError = virtio.Rng.Error;
+    pub const AttachGuestServicesError = std.mem.Allocator.Error;
     pub const InputError = error{InputUnavailable};
     pub const SerialInputError = kvm.InterruptError;
     pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError ||
@@ -368,6 +386,21 @@ pub const Machine = struct {
     pub fn deinit(self: *Machine) void {
         self.stopBlockFastPath();
         if (self.net_enabled) self.nat.stop();
+        if (self.wayland_agent) |native| {
+            native.deinit();
+            self.allocator.destroy(native);
+        }
+        if (self.native_agent) |native| {
+            native.deinit();
+            self.allocator.destroy(native);
+        }
+        if (self.vdagent) |*vdagent| vdagent.deinit();
+        if (self.qga) |qga| {
+            qga.deinit();
+            self.allocator.destroy(qga);
+        }
+        if (self.pci_console) |device| device.deinit();
+        if (self.console) |console| console.deinit();
         if (self.pci_rng) |device| device.deinit();
         if (self.rng) |rng| rng.deinit();
         if (self.pci_share) |device| device.deinit();
@@ -664,6 +697,177 @@ pub const Machine = struct {
         self.pci_rng = device;
     }
 
+    /// Attach the multiport transport used by stock and bobrvm guest agents.
+    pub fn attachGuestServices(
+        self: *Machine,
+        allocator: std.mem.Allocator,
+    ) AttachGuestServicesError!void {
+        std.debug.assert(self.console == null);
+        std.debug.assert(self.pci_console == null);
+        const console = try virtio.Console.init(allocator, &.{
+            "com.redhat.spice.0",
+            "org.qemu.guest_agent.0",
+            "org.bobrvm.agent.0",
+            "org.bobrvm.clipboard.0",
+        });
+        errdefer console.deinit();
+        console.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
+        console.setIrqCallback(virtio.mmio.Irq.initRaw(consoleIrq, self));
+
+        const device = try pci.VirtioPciDevice.init(
+            allocator,
+            3,
+            console.transport.device_features,
+            @intCast(console.transport.queues.len),
+            @sizeOf(virtio.console.Config),
+        );
+        errdefer device.deinit();
+        device.writeConfig(0x10, 4, pci_console_bar_initial);
+        device.config[0x3c] = pci_console_irq;
+        device.config[0x3d] = 1;
+        for (device.transport.queues, 0..) |_, queue_index| {
+            device.transport.setQueueSizeMax(
+                @intCast(queue_index),
+                virtio.Console.QUEUE_SIZE,
+            );
+        }
+        device.transport.setDeviceConfig(std.mem.asBytes(&console.config));
+        device.transport.setNotifyCallback(consoleNotify, self);
+        self.console = console;
+        self.pci_console = device;
+        errdefer {
+            self.console = null;
+            self.pci_console = null;
+        }
+
+        try self.initGuestAgents(allocator);
+    }
+
+    fn initGuestAgents(self: *Machine, allocator: std.mem.Allocator) !void {
+        const qga = try allocator.create(agent.Qga);
+        qga.* = agent.Qga.init(
+            allocator,
+            callback_binding.Handler1(Machine, []const u8, void, qgaSend).bind(self),
+        );
+        errdefer {
+            qga.deinit();
+            allocator.destroy(qga);
+        }
+        self.qga = qga;
+        errdefer self.qga = null;
+
+        self.vdagent = agent.Vdagent.init(
+            allocator,
+            callback_binding.Handler1(Machine, []const u8, void, vdagentSend).bind(self),
+        );
+        errdefer {
+            self.vdagent.?.deinit();
+            self.vdagent = null;
+        }
+
+        const native = try allocator.create(agent.Native);
+        native.* = agent.Native.init(
+            allocator,
+            callback_binding.Handler1(Machine, []const u8, void, nativeAgentSend).bind(self),
+            .{ .capabilities = agent.native.Capability.file_transfer },
+        );
+        errdefer {
+            native.deinit();
+            allocator.destroy(native);
+        }
+        self.native_agent = native;
+        errdefer self.native_agent = null;
+
+        const wayland = try allocator.create(agent.Native);
+        wayland.* = agent.Native.init(
+            allocator,
+            callback_binding.Handler1(Machine, []const u8, void, waylandAgentSend).bind(self),
+            .{ .capabilities = agent.native.Capability.clipboard },
+        );
+        errdefer {
+            wayland.deinit();
+            allocator.destroy(wayland);
+        }
+        self.wayland_agent = wayland;
+        errdefer self.wayland_agent = null;
+
+        const console = self.console.?;
+        console.setPortOutput(
+            spice_port,
+            callback_binding.Handler1(Machine, []const u8, void, vdagentFeed).bind(self),
+        );
+        console.setPortOutput(
+            qga_port,
+            callback_binding.Handler1(Machine, []const u8, void, qgaFeed).bind(self),
+        );
+        console.setPortOutput(
+            bobrvm_agent_port,
+            callback_binding.Handler1(Machine, []const u8, void, nativeAgentFeed).bind(self),
+        );
+        console.setPortOutput(
+            bobrvm_clipboard_port,
+            callback_binding.Handler1(Machine, []const u8, void, waylandAgentFeed).bind(self),
+        );
+        qga.sync(@divTrunc(hostRealNs(), std.time.ns_per_ms));
+        qga.ping();
+        native.begin();
+        wayland.begin();
+    }
+
+    pub fn guestToolsStatus(self: *const Machine) agent.native.Status {
+        if (self.native_agent) |native| {
+            if (native.status() == .protocol_error) return .protocol_error;
+            if (native.status() == .ready) return .ready;
+        }
+        if (self.wayland_agent) |native| {
+            if (native.status() == .protocol_error) return .protocol_error;
+            if (native.status() == .ready) return .ready;
+        }
+        if (self.qga) |qga| if (qga.isConnected()) return .ready;
+        if (self.vdagent) |*vdagent| if (vdagent.isConnected()) return .ready;
+        if (self.native_agent) |native| return native.status();
+        if (self.wayland_agent) |native| return native.status();
+        return .disconnected;
+    }
+
+    pub fn guestToolsCapabilities(self: *const Machine) u64 {
+        var capabilities: u64 = 0;
+        if (self.native_agent) |native| capabilities |= native.capabilities();
+        if (self.wayland_agent) |native| capabilities |= native.capabilities();
+        if (self.qga) |qga| {
+            if (qga.isConnected()) capabilities |= agent.native.HostCapability.management;
+        }
+        if (self.vdagent) |*vdagent| {
+            if (vdagent.isConnected()) capabilities |= agent.native.HostCapability.clipboard;
+        }
+        return capabilities;
+    }
+
+    pub fn requestGuestShutdown(self: *Machine) void {
+        if (self.qga) |qga| qga.shutdown("powerdown");
+    }
+
+    pub fn requestGuestReboot(self: *Machine) void {
+        if (self.qga) |qga| qga.shutdown("reboot");
+    }
+
+    pub fn trimGuestFilesystems(self: *Machine) void {
+        if (self.qga) |qga| qga.trimFilesystems();
+    }
+
+    pub fn syncGuestTime(self: *Machine) void {
+        if (self.qga) |qga| qga.setTime(hostRealNs());
+    }
+
+    pub fn guestManagementReady(self: *const Machine) bool {
+        if (self.qga) |qga| return qga.isConnected();
+        return false;
+    }
+
+    fn hostRealNs() i64 {
+        return @intCast(std.Io.Clock.real.now(global.io()).nanoseconds);
+    }
+
     fn createInputDevice(
         self: *Machine,
         allocator: std.mem.Allocator,
@@ -881,13 +1085,15 @@ pub const Machine = struct {
             try self.syncInputIrqs();
             try self.syncShareIrq();
             try self.syncRngIrq();
+            try self.syncConsoleIrq();
         }
     }
 
     fn processAsyncDevices(self: *Machine) RunError!void {
         const network = self.net_wakeup.swap(false, .acq_rel);
         const input = self.input_wakeup.swap(false, .acq_rel);
-        if (!network and !input) return;
+        const console = self.console_wakeup.swap(false, .acq_rel);
+        if (!network and !input and !console) return;
         self.exit_lock.lockUncancelable(global.io());
         defer self.exit_lock.unlock(global.io());
         if (network) {
@@ -897,6 +1103,10 @@ pub const Machine = struct {
         if (input) {
             self.processInput();
             try self.syncInputIrqs();
+        }
+        if (console) {
+            self.processConsole();
+            try self.syncConsoleIrq();
         }
     }
 
@@ -1213,6 +1423,11 @@ pub const Machine = struct {
                 if (self.handleRngPciBar(device, rng, access)) return true;
             }
         }
+        if (self.pci_console) |device| {
+            if (self.console) |console| {
+                if (self.handleConsolePciBar(device, console, access)) return true;
+            }
+        }
         return false;
     }
 
@@ -1415,6 +1630,39 @@ pub const Machine = struct {
         return true;
     }
 
+    fn handleConsolePciBar(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        console: *virtio.Console,
+        access: kvm.MmioExit,
+    ) bool {
+        _ = self;
+        const bar_address: u64 = device.getBar0Addr();
+        if (bar_address == 0 or access.address < bar_address) return false;
+        const offset_u64 = access.address - bar_address;
+        if (offset_u64 >= pci.virtio_pci.BAR0_SIZE) return false;
+        const value = readIoValue(access.data) orelse return false;
+        const offset: u32 = @intCast(offset_u64);
+        if (access.direction == .read) {
+            if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+                device.transport.setDeviceConfig(std.mem.asBytes(&console.config));
+            }
+            const result = device.readBar0(offset, @intCast(access.data.len));
+            writeIoValue(access.data, result);
+            if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+                offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+            {
+                console.transport.write(
+                    @intFromEnum(virtio.mmio.Reg.interrupt_ack),
+                    result,
+                );
+            }
+        } else {
+            device.writeBar0(offset, @intCast(access.data.len), value);
+        }
+        return true;
+    }
+
     fn pciDevice(
         self: *Machine,
         address: pci.x86_config.ConfigAddress,
@@ -1429,6 +1677,7 @@ pub const Machine = struct {
             pci_tablet_slot => self.pci_tablet,
             pci_share_slot => self.pci_share,
             pci_rng_slot => self.pci_rng,
+            pci_console_slot => self.pci_console,
             else => null,
         };
     }
@@ -1819,6 +2068,101 @@ pub const Machine = struct {
         if (self.rng_irq_desired == self.rng_irq_injected) return;
         try self.vm.setIrqLine(pci_rng_irq, self.rng_irq_desired);
         self.rng_irq_injected = self.rng_irq_desired;
+    }
+
+    fn consoleNotify(queue_index: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_console orelse return;
+        const console = self.console orelse return;
+        if (queue_index >= device.transport.queues.len or
+            queue_index >= console.transport.queues.len) return;
+        syncConsoleQueues(device, console);
+        console.write(@intFromEnum(virtio.mmio.Reg.queue_notify), queue_index);
+    }
+
+    fn processConsole(self: *Machine) void {
+        const device = self.pci_console orelse return;
+        const console = self.console orelse return;
+        syncConsoleQueues(device, console);
+        console.pollTransmit();
+        console.pollReceive();
+    }
+
+    fn syncConsoleQueues(device: *pci.VirtioPciDevice, console: *virtio.Console) void {
+        for (device.transport.queues, 0..) |source, queue_index| {
+            const target = &console.transport.queues[queue_index];
+            target.num = source.size;
+            target.ready = source.enable;
+            target.desc_addr = source.desc_addr;
+            target.driver_addr = source.driver_addr;
+            target.device_addr = source.device_addr;
+        }
+    }
+
+    fn consoleIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_console orelse return;
+        const console = self.console orelse return;
+        device.transport.isr_status.queue_interrupt =
+            console.transport.interrupt_status.used_buffer;
+        device.transport.isr_status.config_change =
+            console.transport.interrupt_status.config_change;
+        self.console_irq_desired = level;
+    }
+
+    fn syncConsoleIrq(self: *Machine) kvm.InterruptError!void {
+        if (self.console_irq_desired == self.console_irq_injected) return;
+        try self.vm.setIrqLine(pci_console_irq, self.console_irq_desired);
+        self.console_irq_injected = self.console_irq_desired;
+    }
+
+    fn qgaSend(self: *Machine, data: []const u8) void {
+        const console = self.console orelse return;
+        console.queuePortInput(qga_port, data) catch return;
+        self.wakeConsole();
+    }
+
+    fn qgaFeed(self: *Machine, data: []const u8) void {
+        if (self.qga) |qga| qga.feed(data);
+    }
+
+    fn vdagentSend(self: *Machine, data: []const u8) void {
+        const console = self.console orelse return;
+        console.queuePortInput(spice_port, data) catch return;
+        self.wakeConsole();
+    }
+
+    fn vdagentFeed(self: *Machine, data: []const u8) void {
+        if (self.vdagent) |*vdagent| vdagent.feed(data);
+    }
+
+    fn nativeAgentSend(self: *Machine, data: []const u8) void {
+        const console = self.console orelse return;
+        console.queuePortInput(bobrvm_agent_port, data) catch return;
+        self.wakeConsole();
+    }
+
+    fn nativeAgentFeed(self: *Machine, data: []const u8) void {
+        if (self.native_agent) |native| native.feed(data);
+    }
+
+    fn waylandAgentSend(self: *Machine, data: []const u8) void {
+        const console = self.console orelse return;
+        console.queuePortInput(bobrvm_clipboard_port, data) catch return;
+        self.wakeConsole();
+    }
+
+    fn waylandAgentFeed(self: *Machine, data: []const u8) void {
+        if (self.wayland_agent) |native| native.feed(data);
+    }
+
+    fn wakeConsole(self: *Machine) void {
+        self.console_wakeup.store(true, .release);
+        const primary = &self.vcpus[0];
+        const thread_id = primary.thread_id.load(.acquire);
+        if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
+        primary.vcpu.requestExit();
+        kvm.interruptThread(thread_id);
     }
 
     fn syncNetIrq(self: *Machine) kvm.InterruptError!void {

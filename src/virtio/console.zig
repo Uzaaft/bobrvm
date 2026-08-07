@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const callback_binding = @import("../callback.zig");
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
@@ -170,7 +171,7 @@ pub const Console = struct {
     output: ?Output,
 
     /// Guest memory accessor.
-    guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
+    guest_memory: ?GuestMemory,
 
     /// Multiport: named ports 1..N (empty = plain single-port console).
     ports: []Port,
@@ -217,6 +218,16 @@ pub const Console = struct {
     }
     fn portTxQueue(port: u32) u32 {
         return 2 * (port + 1) + 1;
+    }
+
+    fn pendingEntries(qc: mmio.QueueConfig, last_avail: u16, avail_idx: u16) ?u16 {
+        if (qc.num == 0 or qc.num > QUEUE_SIZE) return null;
+        const pending = avail_idx -% last_avail;
+        if (pending > qc.num) {
+            log.warn("rejecting avail jump {} larger than queue {}", .{ pending, qc.num });
+            return null;
+        }
+        return pending;
     }
 
     /// `port_names`: names for extra ports 1..N (port 0 stays the hvc0
@@ -313,11 +324,12 @@ pub const Console = struct {
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(
-        self: *Console,
-        accessor: *const fn (u64, usize) ?[]u8,
-    ) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *Console, accessor: anytype) void {
+        self.guest_memory = switch (@typeInfo(@TypeOf(accessor))) {
+            .@"fn", .pointer => GuestMemory.bindGlobal(accessor),
+            .@"struct" => accessor,
+            else => @compileError("unsupported guest-memory accessor"),
+        };
     }
 
     pub fn setIrqCallback(self: *Console, irq: mmio.Irq) void {
@@ -437,9 +449,11 @@ pub const Console = struct {
         const get_mem = self.guest_memory orelse return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        const pending = pendingEntries(qc, self.mp_last_avail[qidx], avail_idx) orelse return;
         var processed: u32 = 0;
-        while (self.mp_last_avail[qidx] != avail_idx) : (processed += 1) {
+        while (processed < pending) : (processed += 1) {
             const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            if (head >= qc.num) break;
             const chain = ring.Chain.collect(qc, head, get_mem);
             if (chain.request(get_mem)) |req| {
                 if (req.len >= @sizeOf(ControlMsg)) {
@@ -496,20 +510,25 @@ pub const Console = struct {
         const get_mem = self.guest_memory orelse return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        const pending = pendingEntries(qc, self.mp_last_avail[qidx], avail_idx) orelse return;
         var sent: usize = 0;
-        while (self.mp_last_avail[qidx] != avail_idx and sent < self.ctrl_pending.items.len) {
+        while (sent < pending and sent < self.ctrl_pending.items.len) {
             const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            if (head >= qc.num) break;
             const chain = ring.Chain.collect(qc, head, get_mem);
             const resp = chain.response(get_mem) orelse {
                 ring.pushUsed(qc, head, 0, get_mem);
                 self.mp_last_avail[qidx] +%= 1;
                 continue;
             };
-            const pending = self.ctrl_pending.items[sent];
-            const total = @sizeOf(ControlMsg) + @as(usize, pending.payload_len);
+            const ctrl = self.ctrl_pending.items[sent];
+            const total = @sizeOf(ControlMsg) + @as(usize, ctrl.payload_len);
             if (resp.len < total) break;
-            @memcpy(resp[0..@sizeOf(ControlMsg)], std.mem.asBytes(&pending.msg));
-            @memcpy(resp[@sizeOf(ControlMsg)..][0..pending.payload_len], pending.payload[0..pending.payload_len]);
+            @memcpy(resp[0..@sizeOf(ControlMsg)], std.mem.asBytes(&ctrl.msg));
+            @memcpy(
+                resp[@sizeOf(ControlMsg)..][0..ctrl.payload_len],
+                ctrl.payload[0..ctrl.payload_len],
+            );
             ring.pushUsed(qc, head, @intCast(total), get_mem);
             self.mp_last_avail[qidx] +%= 1;
             sent += 1;
@@ -530,13 +549,15 @@ pub const Console = struct {
         const port = &self.ports[p - 1];
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        const pending = pendingEntries(qc, self.mp_last_avail[qidx], avail_idx) orelse return;
         var processed: u32 = 0;
-        while (self.mp_last_avail[qidx] != avail_idx) : (processed += 1) {
+        while (processed < pending) : (processed += 1) {
             const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            if (head >= qc.num) break;
             const chain = ring.Chain.collect(qc, head, get_mem);
             for (chain.slice()) |desc| {
                 if (desc.isWrite()) continue;
-                const data = get_mem(desc.addr, desc.len) orelse continue;
+                const data = get_mem.get(desc.addr, desc.len) orelse continue;
                 if (port.output) |output| output.call(data);
             }
             ring.pushUsed(qc, head, 0, get_mem);
@@ -563,15 +584,18 @@ pub const Console = struct {
         if (port.input_buffer.count == 0) return;
 
         const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        const pending = pendingEntries(qc, self.mp_last_avail[qidx], avail_idx) orelse return;
         var consumed: usize = 0;
         var delivered: u32 = 0;
-        while (self.mp_last_avail[qidx] != avail_idx and consumed < port.input_buffer.count) {
+        var processed: u16 = 0;
+        while (processed < pending and consumed < port.input_buffer.count) : (processed += 1) {
             const head = ring.availEntry(qc, self.mp_last_avail[qidx], get_mem) orelse break;
+            if (head >= qc.num) break;
             const chain = ring.Chain.collect(qc, head, get_mem);
             var written: u32 = 0;
             for (chain.slice()) |desc| {
                 if (!desc.isWrite()) continue;
-                const buf = get_mem(desc.addr, desc.len) orelse continue;
+                const buf = get_mem.get(desc.addr, desc.len) orelse continue;
                 const n = port.input_buffer.copyAt(consumed, buf);
                 if (n == 0) break;
                 consumed += n;
@@ -594,24 +618,34 @@ pub const Console = struct {
         defer self.input_mutex.unlock(global.io());
         if (self.input_buffer.count == 0) return;
 
-        const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
+        const avail_ring = get_mem.get(qc.driver_addr, 6) orelse return;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
+        const pending = pendingEntries(qc, self.receive_last_avail, avail_idx) orelse return;
 
         var last_avail_idx = self.receive_last_avail;
         var consumed: usize = 0;
         var delivered: u32 = 0;
+        var processed: u16 = 0;
 
-        while (last_avail_idx != avail_idx and consumed < self.input_buffer.count) {
+        while (processed < pending and consumed < self.input_buffer.count) : (processed += 1) {
             const ring_idx = last_avail_idx % qc.num;
-            const ring_entry = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse break;
+            const ring_entry = get_mem.get(
+                qc.driver_addr + 4 + @as(u64, ring_idx) * 2,
+                2,
+            ) orelse break;
             const desc_idx = std.mem.readInt(u16, ring_entry[0..2], .little);
+            if (desc_idx >= qc.num) break;
 
             // Fill this (device-writable) descriptor chain with input.
             var written: u32 = 0;
             var idx = desc_idx;
             var iterations: u16 = 0;
             while (iterations < qc.num and consumed < self.input_buffer.count) : (iterations += 1) {
-                const desc_mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse break;
+                if (idx >= qc.num) break;
+                const desc_mem = get_mem.get(
+                    qc.desc_addr + @as(u64, idx) * 16,
+                    16,
+                ) orelse break;
                 const buf_addr = std.mem.readInt(u64, desc_mem[0..8], .little);
                 const buf_len = std.mem.readInt(u32, desc_mem[8..12], .little);
                 const flags = std.mem.readInt(u16, desc_mem[12..14], .little);
@@ -619,7 +653,7 @@ pub const Console = struct {
 
                 // Only fill device-writable descriptors (VIRTQ_DESC_F_WRITE).
                 if ((flags & 2) != 0) {
-                    if (get_mem(buf_addr, buf_len)) |buf| {
+                    if (get_mem.get(buf_addr, buf_len)) |buf| {
                         const n = self.input_buffer.copyAt(consumed, buf);
                         consumed += n;
                         written += @intCast(n);
@@ -632,10 +666,13 @@ pub const Console = struct {
 
             // Report the buffer used, even if written == 0, to keep the
             // ring consistent with the driver's expectations.
-            const used_ring = get_mem(qc.device_addr, 6) orelse break;
+            const used_ring = get_mem.get(qc.device_addr, 6) orelse break;
             var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
             const used_ring_idx = used_idx % qc.num;
-            const used_entry = get_mem(qc.device_addr + 4 + @as(u64, used_ring_idx) * 8, 8) orelse break;
+            const used_entry = get_mem.get(
+                qc.device_addr + 4 + @as(u64, used_ring_idx) * 8,
+                8,
+            ) orelse break;
             std.mem.writeInt(u32, used_entry[0..4], desc_idx, .little);
             std.mem.writeInt(u32, used_entry[4..8], written, .little);
             used_idx +%= 1;
@@ -683,8 +720,12 @@ pub const Console = struct {
             var avail_idx: u16 = 0;
             var used_idx: u16 = 0;
             if (qc.ready) {
-                if (get_mem(qc.driver_addr, 6)) |a| avail_idx = std.mem.readInt(u16, a[2..4], .little);
-                if (get_mem(qc.device_addr, 6)) |u| used_idx = std.mem.readInt(u16, u[2..4], .little);
+                if (get_mem.get(qc.driver_addr, 6)) |a| {
+                    avail_idx = std.mem.readInt(u16, a[2..4], .little);
+                }
+                if (get_mem.get(qc.device_addr, 6)) |u| {
+                    used_idx = std.mem.readInt(u16, u[2..4], .little);
+                }
             }
             log.debug("q{}: ready={} num={} avail_idx={} used_idx={} last_avail={} desc=0x{x}", .{
                 @intFromEnum(qi),                                                           qc.ready,     qc.num, avail_idx, used_idx,
@@ -698,9 +739,9 @@ pub const Console = struct {
         const qc = self.transport.queues[@intFromEnum(QueueIdx.transmit)];
         if (!qc.ready or qc.num == 0) return false;
         const get_mem = self.guest_memory orelse return false;
-        const avail_ring = get_mem(qc.driver_addr, 6) orelse return false;
+        const avail_ring = get_mem.get(qc.driver_addr, 6) orelse return false;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
-        return avail_idx != self.transmit_last_avail;
+        return (pendingEntries(qc, self.transmit_last_avail, avail_idx) orelse 0) > 0;
     }
 
     fn processTransmitQueue(self: *Console) void {
@@ -713,28 +754,36 @@ pub const Console = struct {
         const get_mem = self.guest_memory orelse return;
 
         // Read available ring from guest memory
-        const avail_ring = get_mem(qc.driver_addr, 6) orelse {
+        const avail_ring = get_mem.get(qc.driver_addr, 6) orelse {
             log.warn("TX: can't read avail ring at 0x{x}", .{qc.driver_addr});
             return;
         };
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
+        const pending = pendingEntries(qc, self.transmit_last_avail, avail_idx) orelse return;
 
         // Process all available descriptors
         var last_avail_idx = self.transmit_last_avail;
         var processed: u32 = 0;
-        while (last_avail_idx != avail_idx) : (processed += 1) {
+        while (processed < pending) : (processed += 1) {
             const ring_idx = last_avail_idx % qc.num;
-            const ring_entry = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse break;
+            const ring_entry = get_mem.get(
+                qc.driver_addr + 4 + @as(u64, ring_idx) * 2,
+                2,
+            ) orelse break;
             const desc_idx = std.mem.readInt(u16, ring_entry[0..2], .little);
+            if (desc_idx >= qc.num) break;
 
             // Process this descriptor chain
             const total_len = self.processDescriptorChainGuest(qc, desc_idx, get_mem);
 
             // Add to used ring
-            const used_ring = get_mem(qc.device_addr, 6) orelse break;
+            const used_ring = get_mem.get(qc.device_addr, 6) orelse break;
             var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
             const used_ring_idx = used_idx % qc.num;
-            const used_entry = get_mem(qc.device_addr + 4 + @as(u64, used_ring_idx) * 8, 8) orelse break;
+            const used_entry = get_mem.get(
+                qc.device_addr + 4 + @as(u64, used_ring_idx) * 8,
+                8,
+            ) orelse break;
             std.mem.writeInt(u32, used_entry[0..4], desc_idx, .little);
             std.mem.writeInt(u32, used_entry[4..8], total_len, .little);
             used_idx +%= 1;
@@ -753,7 +802,7 @@ pub const Console = struct {
         self: *Console,
         qc: mmio.QueueConfig,
         head: u16,
-        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        get_mem: GuestMemory,
     ) u32 {
         var idx = head;
         var total_len: u32 = 0;
@@ -761,15 +810,16 @@ pub const Console = struct {
 
         // Walk the descriptor chain
         while (iterations < qc.num) : (iterations += 1) {
+            if (idx >= qc.num) break;
             // Read descriptor from guest memory (16 bytes each)
-            const desc_mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse break;
+            const desc_mem = get_mem.get(qc.desc_addr + @as(u64, idx) * 16, 16) orelse break;
             const buf_addr = std.mem.readInt(u64, desc_mem[0..8], .little);
             const buf_len = std.mem.readInt(u32, desc_mem[8..12], .little);
             const flags = std.mem.readInt(u16, desc_mem[12..14], .little);
             const next = std.mem.readInt(u16, desc_mem[14..16], .little);
 
             // Read data buffer from guest memory
-            if (get_mem(buf_addr, buf_len)) |data| {
+            if (get_mem.get(buf_addr, buf_len)) |data| {
                 if (self.output) |output| {
                     output.call(data);
                 }
@@ -917,6 +967,21 @@ fn pushTestAvail(base: u64, desc_idx: u16) void {
 fn testUsedIdx(base: u64) u16 {
     const used = TestMem.get(base + 0x800, 6).?;
     return std.mem.readInt(u16, used[2..4], .little);
+}
+
+test "Console rejects guest avail jumps larger than the queue" {
+    const console = try Console.init(std.testing.allocator, &.{});
+    defer console.deinit();
+    @memset(&TestMem.mem, 0);
+    console.setGuestMemory(TestMem.get);
+
+    const tx_base: u64 = 0x1000;
+    setupTestQueue(console, @intFromEnum(QueueIdx.transmit), tx_base);
+    const avail = TestMem.get(tx_base + 0x400, 6).?;
+    std.mem.writeInt(u16, avail[2..4], 9, .little);
+
+    try std.testing.expect(!console.hasPendingTx());
+    try std.testing.expectEqual(@as(u16, 0), console.transmit_last_avail);
 }
 
 var test_port_out: std.ArrayListUnmanaged(u8) = .empty;
