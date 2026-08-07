@@ -108,6 +108,10 @@ pub fn build(b: *std.Build) !void {
         "test-fuzz-p9",
         "Run 9P request decoder property tests",
     );
+    const virtio_mmio_fuzz_step = b.step(
+        "test-fuzz-virtio-mmio",
+        "Run virtio MMIO transport property tests",
+    );
 
     // Venus (KosmicKrisp) GPU backend — opt-in. When set, the GPU device routes
     // 3D contexts to virglrenderer(venus); the default build never links it.
@@ -469,6 +473,20 @@ pub fn build(b: *std.Build) !void {
     const run_p9_fuzz_tests = b.addRunArtifact(p9_fuzz_tests);
     test_step.dependOn(&run_p9_fuzz_tests.step);
     p9_fuzz_step.dependOn(&run_p9_fuzz_tests.step);
+
+    const virtio_mmio_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/virtio_mmio_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .error_tracing = false,
+    });
+    const virtio_mmio_fuzz_tests = b.addTest(.{
+        .root_module = virtio_mmio_fuzz_module,
+        .filters = test_filters,
+    });
+    const run_virtio_mmio_fuzz_tests = b.addRunArtifact(virtio_mmio_fuzz_tests);
+    test_step.dependOn(&run_virtio_mmio_fuzz_tests.step);
+    virtio_mmio_fuzz_step.dependOn(&run_virtio_mmio_fuzz_tests.step);
 
     const wayland_test_module = b.createModule(.{
         .root_source_file = b.path("src/guest_tools/wayland.zig"),
