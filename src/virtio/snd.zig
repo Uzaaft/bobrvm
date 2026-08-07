@@ -534,6 +534,7 @@ fn setupCtrlChain(snd: *Snd, req_len: u32, resp_len: u32) void {
         .driver_addr = 0x400,
         .device_addr = 0x600,
     };
+    snd.write(@intFromEnum(mmio.Reg.status), 0x0C);
 }
 
 /// Post avail entry for descriptor head 0 at position `pos` and bump the
@@ -714,6 +715,7 @@ test "Snd txq forwards PCM period to the sink and returns OK status" {
         .driver_addr = 0x400,
         .device_addr = 0x600,
     };
+    snd.write(@intFromEnum(mmio.Reg.status), 0x0C);
     // Avail: idx 1, ring[0] = head 0.
     std.mem.writeInt(u16, TestMem.mem[0x400..][2..4], 1, .little);
     std.mem.writeInt(u16, TestMem.mem[0x400..][4..6], 0, .little);
