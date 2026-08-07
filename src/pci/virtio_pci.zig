@@ -515,6 +515,9 @@ pub const VirtioPciTransport = struct {
     pub fn signalConfigChange(self: *VirtioPciTransport) void {
         self.isr_status.config_change = true;
         self.config_generation +%= 1;
+        if (self.irq_callback) |cb| {
+            cb(self.irq_userdata);
+        }
     }
 
     pub fn isReady(self: *VirtioPciTransport) bool {
@@ -902,6 +905,27 @@ test "VirtioPciTransport notifications require a ready driver" {
     transport.writeBar(BAR_NOTIFY_OFFSET, 4, 7);
     try std.testing.expectEqual(@as(usize, 1), state.notifications);
     try std.testing.expectEqual(@as(u32, 7), state.queue);
+}
+
+test "VirtioPciTransport config changes raise an interrupt" {
+    const State = struct {
+        irqs: usize = 0,
+
+        fn irq(userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.irqs += 1;
+        }
+    };
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, 0, 1, 64);
+    defer transport.deinit();
+    var state = State{};
+    transport.setIrqCallback(State.irq, &state);
+
+    transport.signalConfigChange();
+
+    try std.testing.expectEqual(@as(usize, 1), state.irqs);
+    try std.testing.expect(transport.isr_status.config_change);
+    try std.testing.expectEqual(@as(u8, 1), transport.config_generation);
 }
 
 test "VirtioPciTransport ignores unnamed common configuration offsets" {
