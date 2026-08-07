@@ -14,6 +14,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const config_policy = @import("config.zig");
 
 const log = std.log.scoped(.virtio_pci);
 
@@ -742,44 +743,12 @@ pub const VirtioPciDevice = struct {
         assert(size == 1 or size == 2 or size == 4);
         if (@as(usize, offset) + size > self.config.len) return;
 
-        switch (offset) {
-            0x04 => {
-                // Command register - allow setting bus master, memory enable
-                const cmd: u16 = @truncate(value);
-                self.setConfigU16(0x04, cmd & 0x0007); // Only bits 0-2
-            },
-            0x10 => {
-                // BAR0 sizing or address write
-                if (value == 0xFFFFFFFF) {
-                    // BAR sizing: return size mask (~(size-1) | type bits)
-                    // BAR0_SIZE is 4KB, so mask is 0xFFFFF000
-                    self.setConfigU32(0x10, 0xFFFFF000);
-                    log.debug("BAR0 sizing: returning 0xFFFFF000 (4KB)", .{});
-                } else {
-                    // Store BAR address (preserve low 4 bits as 0 for memory BAR)
-                    self.bar0_addr = @truncate(value & 0xFFFFF000);
-                    self.setConfigU32(0x10, self.bar0_addr);
-                    log.info("BAR0 assigned to 0x{x}", .{self.bar0_addr});
-                }
-            },
-            else => {
-                // Generic write for writable regions
-                if (offset < 0x40) {
-                    switch (size) {
-                        1 => self.config[offset] = @truncate(value),
-                        2 => {
-                            self.config[offset] = @truncate(value);
-                            self.config[offset + 1] = @truncate(value >> 8);
-                        },
-                        4 => {
-                            self.config[offset] = @truncate(value);
-                            self.config[offset + 1] = @truncate(value >> 8);
-                            self.config[offset + 2] = @truncate(value >> 16);
-                            self.config[offset + 3] = @truncate(value >> 24);
-                        },
-                        else => {},
-                    }
-                }
+        switch (config_policy.writeType0(&self.config, offset, size, value)) {
+            .none => {},
+            .bar0_probe => log.debug("BAR0 sizing: returning 0xFFFFF000 (4KB)", .{}),
+            .bar0_assigned => |address| {
+                self.bar0_addr = address;
+                log.info("BAR0 assigned to 0x{x}", .{address});
             },
         }
     }
@@ -973,6 +942,19 @@ test "VirtioPciDevice rejects config reads crossing its address space" {
         @as(u64, 0xFFFF_FFFF),
         dev.readConfig(std.math.maxInt(u12), 4),
     );
+}
+
+test "VirtioPciDevice preserves read-only identity and partial BAR bytes" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 0, 1, 64);
+    defer dev.deinit();
+
+    dev.writeConfig(0x00, 2, 0);
+    dev.writeConfig(0x12, 1, 0xAB);
+    dev.writeConfig(0x10, 1, 0x50);
+
+    try std.testing.expectEqual(@as(u64, 0x1AF4), dev.readConfig(0x00, 2));
+    try std.testing.expectEqual(@as(u64, 0x00AB_0000), dev.readConfig(0x10, 4));
+    try std.testing.expectEqual(@as(u32, 0x00AB_0000), dev.getBar0Addr());
 }
 
 test "VirtioPciDevice allocation profile" {

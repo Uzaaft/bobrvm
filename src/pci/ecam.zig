@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const config_policy = @import("config.zig");
 
 const log = std.log.scoped(.pci_ecam);
 
@@ -195,41 +196,7 @@ pub const PciDevice = struct {
 
         if (!self.present) return;
 
-        // Handle writes to specific registers
-        switch (@as(ConfigReg, @enumFromInt(offset))) {
-            .command => {
-                // Allow command register writes
-                const cmd: u16 = @truncate(value);
-                self.setU16(offset, cmd);
-                log.debug("PCI command write: 0x{x}", .{cmd});
-            },
-            .bar0, .bar1, .bar2, .bar3, .bar4, .bar5 => {
-                // BAR sizing: writing all 1s reads back size
-                if (value == 0xFFFFFFFF) {
-                    // Return BAR size (e.g., 4KB = ~0xFFF)
-                    self.setU32(offset, 0xFFFFF000);
-                } else {
-                    self.setU32(offset, @truncate(value));
-                }
-            },
-            else => {
-                // Generic write
-                switch (size) {
-                    1 => self.config[offset] = @truncate(value),
-                    2 => {
-                        self.config[offset] = @truncate(value);
-                        self.config[offset + 1] = @truncate(value >> 8);
-                    },
-                    4 => {
-                        self.config[offset] = @truncate(value);
-                        self.config[offset + 1] = @truncate(value >> 8);
-                        self.config[offset + 2] = @truncate(value >> 16);
-                        self.config[offset + 3] = @truncate(value >> 24);
-                    },
-                    else => {},
-                }
-            },
-        }
+        _ = config_policy.writeType0(&self.config, offset, size, value);
     }
 };
 
@@ -428,12 +395,26 @@ test "PciDevice virtio block" {
     try std.testing.expectEqual(@as(u64, 0x1001), device_id);
 }
 
-test "PciDevice accepts writes to unnamed configuration bytes" {
+test "PciDevice preserves read-only identity and partial BAR bytes" {
     var dev = PciDevice.initVirtioBlock(PCI_MMIO_BASE);
 
-    dev.write(0x05, 1, 0xA5);
+    dev.write(@intFromEnum(ConfigReg.vendor_id), 2, 0);
+    dev.write(@intFromEnum(ConfigReg.bar0) + 2, 1, 0xAB);
 
-    try std.testing.expectEqual(@as(u64, 0xA5), dev.read(0x05, 1));
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(VendorId.virtio)),
+        dev.read(@intFromEnum(ConfigReg.vendor_id), 2),
+    );
+    try std.testing.expectEqual(@as(u64, 0x10AB_0000), dev.read(
+        @intFromEnum(ConfigReg.bar0),
+        4,
+    ));
+
+    dev.write(@intFromEnum(ConfigReg.bar0), 1, 0x50);
+    try std.testing.expectEqual(@as(u64, 0x10AB_0000), dev.read(
+        @intFromEnum(ConfigReg.bar0),
+        4,
+    ));
 }
 
 test "PciDevice rejects accesses crossing configuration space" {

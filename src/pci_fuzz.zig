@@ -6,6 +6,12 @@ const virtio_pci = @import("pci/virtio_pci.zig");
 const operations_max = 32;
 const transport_features: u64 = 0x1122_3344_5566_7788 | (1 << 32);
 
+const ConfigWriteEffect = union(enum) {
+    none,
+    bar0_probe,
+    bar0_assigned: u32,
+};
+
 fn accessSize(smith: *testing.Smith) u8 {
     return switch (smith.valueRangeAtMost(u8, 0, 2)) {
         0 => 1,
@@ -24,41 +30,81 @@ fn writeLittle(bytes: []u8, offset: usize, size: u8, value: u64) void {
     for (0..size) |index| bytes[offset + index] = @truncate(value >> @intCast(index * 8));
 }
 
+fn configOffset(smith: *testing.Smith) u12 {
+    const boundaries = [_]u12{
+        0x00, 0x02, 0x04, 0x05, 0x0C, 0x0D, 0x0F, 0x10, 0x11,
+        0x12, 0x13, 0x14, 0x2C, 0x34, 0x3C, 0x3D, 0x40, 0xFFF,
+    };
+    if (smith.value(bool)) return smith.value(u12);
+    const index = smith.valueRangeAtMost(u8, 0, boundaries.len - 1);
+    return boundaries[index];
+}
+
 fn modelPciRead(config: []const u8, offset: u12, size: u8) u64 {
     if (@as(usize, offset) + size > config.len) return 0xFFFF_FFFF;
     return readLittle(config, offset, size);
 }
 
-fn modelPciWrite(config: []u8, offset: u12, size: u8, value: u64) void {
-    if (@as(usize, offset) + size > config.len) return;
-    switch (offset) {
-        @intFromEnum(ecam.ConfigReg.command) => writeLittle(config, offset, 2, value),
-        @intFromEnum(ecam.ConfigReg.bar0),
-        @intFromEnum(ecam.ConfigReg.bar1),
-        @intFromEnum(ecam.ConfigReg.bar2),
-        @intFromEnum(ecam.ConfigReg.bar3),
-        @intFromEnum(ecam.ConfigReg.bar4),
-        @intFromEnum(ecam.ConfigReg.bar5),
-        => writeLittle(config, offset, 4, if (value == 0xFFFF_FFFF) 0xFFFF_F000 else value),
-        else => writeLittle(config, offset, size, value),
+fn modelPciWrite(config: []u8, offset: u12, size: u8, value: u64) ConfigWriteEffect {
+    if (@as(usize, offset) + size > config.len) return .none;
+    if (offset == 0x10 and size == 4 and @as(u32, @truncate(value)) ==
+        std.math.maxInt(u32))
+    {
+        writeLittle(config, 0x10, 4, 0xFFFF_F000);
+        return .bar0_probe;
     }
+
+    var bar0_touched = false;
+    for (0..size) |index| {
+        const byte_offset = @as(usize, offset) + index;
+        const byte: u8 = @truncate(value >> @intCast(index * 8));
+        switch (byte_offset) {
+            0x04 => config[byte_offset] = byte & 0x07,
+            0x0C, 0x0D, 0x3C => config[byte_offset] = byte,
+            0x10...0x13 => {
+                config[byte_offset] = byte;
+                bar0_touched = true;
+            },
+            else => {},
+        }
+    }
+
+    if (!bar0_touched) return .none;
+    const address: u32 = @truncate(readLittle(config, 0x10, 4) & 0xFFFF_F000);
+    writeLittle(config, 0x10, 4, address);
+    return .{ .bar0_assigned = address };
 }
 
 fn checkPciConfig(smith: *testing.Smith) !void {
-    var device = ecam.PciDevice.initVirtioBlock(ecam.PCI_MMIO_BASE);
-    var model = device.config;
+    var legacy = ecam.PciDevice.initVirtioBlock(ecam.PCI_MMIO_BASE);
+    var legacy_model = legacy.config;
+    const modern = try virtio_pci.VirtioPciDevice.init(testing.allocator, 2, 2, 0, 2, 64);
+    defer modern.deinit();
+    var modern_model = modern.config;
+    var modern_bar0: u32 = 0;
     const operation_count = smith.valueRangeAtMost(u8, 1, operations_max);
     for (0..operation_count) |_| {
-        const offset = smith.value(u12);
+        const offset = configOffset(smith);
         const size = accessSize(smith);
         const value = smith.value(u64);
         if (smith.value(bool)) {
-            device.write(offset, size, value);
-            modelPciWrite(&model, offset, size, value);
+            legacy.write(offset, size, value);
+            _ = modelPciWrite(&legacy_model, offset, size, value);
+            modern.writeConfig(offset, size, value);
+            switch (modelPciWrite(&modern_model, offset, size, value)) {
+                .bar0_assigned => |address| modern_bar0 = address,
+                .none, .bar0_probe => {},
+            }
         }
-        try testing.expectEqual(modelPciRead(&model, offset, size), device.read(offset, size));
+        try testing.expectEqual(modelPciRead(&legacy_model, offset, size), legacy.read(offset, size));
+        try testing.expectEqual(
+            modelPciRead(&modern_model, offset, size),
+            modern.readConfig(offset, size),
+        );
+        try testing.expectEqual(modern_bar0, modern.getBar0Addr());
     }
-    try testing.expectEqualSlices(u8, &model, &device.config);
+    try testing.expectEqualSlices(u8, &legacy_model, &legacy.config);
+    try testing.expectEqualSlices(u8, &modern_model, &modern.config);
 }
 
 const QueueModel = struct {
