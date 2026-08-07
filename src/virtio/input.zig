@@ -433,8 +433,10 @@ pub const Input = struct {
 
     fn updateConfigData(self: *Input) void {
         @memset(&self.config.data, 0);
+        self.config.size = 0;
+        const select = std.enums.fromInt(ConfigSelect, self.config.select) orelse return;
 
-        switch (@as(ConfigSelect, @enumFromInt(self.config.select))) {
+        switch (select) {
             .id_name => {
                 const len = @min(self.name.len, self.config.data.len);
                 @memcpy(self.config.data[0..len], self.name[0..len]);
@@ -469,9 +471,7 @@ pub const Input = struct {
                     self.config.size = @intCast(bytes.len);
                 }
             },
-            else => {
-                self.config.size = 0;
-            },
+            else => {},
         }
     }
 
@@ -640,6 +640,18 @@ test "Input init mouse" {
     defer input.deinit();
 
     try std.testing.expectEqual(Subtype.mouse, input.subtype);
+}
+
+test "Input unknown config selector reports no data" {
+    const input = try Input.init(std.testing.allocator, .keyboard);
+    defer input.deinit();
+
+    const config_offset = @intFromEnum(mmio.Reg.config);
+    input.write(config_offset, std.math.maxInt(u8));
+
+    const config = input.read(config_offset);
+    try std.testing.expectEqual(@as(u8, std.math.maxInt(u8)), @as(u8, @truncate(config)));
+    try std.testing.expectEqual(@as(u8, 0), @as(u8, @truncate(config >> 16)));
 }
 
 test "Input tablet advertises absolute axes, buttons, and wheels" {
