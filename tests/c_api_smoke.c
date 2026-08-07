@@ -1,7 +1,13 @@
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE 1
+
 #include "bobrvm.h"
 
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void test_configuration(void) {
     bobrvm_vm_config_s config = bobrvm_vm_config_defaults();
@@ -46,6 +52,33 @@ static void test_disk_errors(void) {
     assert(bobrvm_disk_grow_raw(NULL, 4096) == BOBRVM_ERROR_INVALID_ARGUMENT);
     assert(bobrvm_disk_logical_size(NULL, &size) == BOBRVM_ERROR_INVALID_ARGUMENT);
     assert(bobrvm_disk_logical_size("/missing", NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
+}
+
+static void test_disk_operations(void) {
+    char directory[] = "/tmp/bobrvm-c-api-XXXXXX";
+    char path[1024];
+    char unsupported[1024];
+    uint64_t size = 0;
+    int length;
+
+    assert(mkdtemp(directory) != NULL);
+    length = snprintf(path, sizeof(path), "%s/disk.raw", directory);
+    assert(length > 0 && (size_t)length < sizeof(path));
+    length = snprintf(unsupported, sizeof(unsupported), "%s/disk.qcow2", directory);
+    assert(length > 0 && (size_t)length < sizeof(unsupported));
+
+    assert(bobrvm_disk_create_sparse(path, 4096) == BOBRVM_OK);
+    assert(bobrvm_disk_logical_size(path, &size) == BOBRVM_OK);
+    assert(size == 4096);
+    assert(bobrvm_disk_create_sparse(path, 4096) == BOBRVM_ERROR_ALREADY_EXISTS);
+    assert(bobrvm_disk_grow_raw(path, 8192) == BOBRVM_OK);
+    assert(bobrvm_disk_logical_size(path, &size) == BOBRVM_OK);
+    assert(size == 8192);
+    assert(bobrvm_disk_grow_raw(path, 4096) == BOBRVM_ERROR_CANNOT_SHRINK);
+    assert(bobrvm_disk_grow_raw(unsupported, 4096) == BOBRVM_ERROR_UNSUPPORTED_FORMAT);
+
+    assert(unlink(path) == 0);
+    assert(rmdir(directory) == 0);
 }
 
 static void test_null_handles(void) {
@@ -118,6 +151,7 @@ int main(void) {
     test_configuration();
     test_filename_sanitization();
     test_disk_errors();
+    test_disk_operations();
     test_null_handles();
 
     bobrvm_deinit();
