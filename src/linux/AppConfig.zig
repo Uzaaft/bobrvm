@@ -9,6 +9,7 @@ const AppConfig = @This();
 memory_bytes: usize = config_policy.memory_bytes_default,
 vcpu_count: u8 = config_policy.vcpu_count_default,
 firmware_path: ?[]const u8 = null,
+vars_path: ?[]const u8 = null,
 kernel_path: ?[]const u8 = null,
 initrd_path: ?[]const u8 = null,
 disk_path: ?[]const u8 = null,
@@ -51,6 +52,8 @@ pub fn parse(args: []const []const u8) ParseError!AppConfig {
         const value = args[index];
         if (std.mem.eql(u8, argument, "--firmware")) {
             result.firmware_path = value;
+        } else if (std.mem.eql(u8, argument, "--vars")) {
+            result.vars_path = value;
         } else if (std.mem.eql(u8, argument, "--kernel")) {
             result.kernel_path = value;
         } else if (std.mem.eql(u8, argument, "--initrd")) {

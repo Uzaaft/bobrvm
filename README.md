@@ -46,8 +46,8 @@ See [macos/README.md](macos/README.md) for Xcode and framework builds.
 
 The Linux package installs a dependency-light headless binary and a separate GTK
 application. Both use the same cancellable Zig VM lifecycle and KVM device model.
-The GTK application can select installer media, attach or create a sparse raw disk,
-configure memory, CPUs, and networking, and start or stop the VM:
+The GTK application manages a persistent VM library, installer media, sparse raw
+disks, shared folders, port forwards, memory, CPUs, networking, and pause/resume:
 
 ```sh
 bobrvm run-kernel bzImage initrd writable-root.raw
@@ -55,17 +55,20 @@ bobrvm-gtk
 ```
 
 For automation, the GTK executable also accepts `--iso`, `--disk`, `--kernel`,
-`--initrd`, `--memory`, and `--cpus`. The Nix development shell and package provide
-OVMF automatically; `BOBRVM_OVMF_FD` can override the firmware path.
+`--initrd`, `--share`, repeatable `--forward host:guest`, `--memory`, and `--cpus`.
+The Nix development shell and package provide OVMF automatically;
+`BOBRVM_OVMF_FD` and `BOBRVM_OVMF_VARS_FD` can override its images. Saving a VM
+creates a private writable variable store so UEFI boot entries survive restarts.
 
 The x86 host supports direct kernel boot and an OVMF firmware path with primary and
-secondary virtio-pci block devices, including read-only ISO installation media.
+secondary virtio-pci block devices, including read-only ISO installation media,
+plus virtio GPU, keyboard, tablet, entropy, networking, and 9p shared-folder devices.
 Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
 the vCPU thread. A virtio-net adapter uses the shared Zig user-mode NAT, with no TAP
-device or host privileges required. The GTK application displays a bounded
-serial-console history and forwards text and navigation keys through the shared Zig
-16550 UART. Closing its window requests an immediate vCPU exit and joins the VM before
-releasing resources.
+device or host privileges required. The GTK application presents the guest's
+virtio-GPU scanout with aspect-correct scaling, injects keyboard and absolute pointer
+events, and retains a bounded serial-console history. Closing its window requests an
+immediate vCPU exit and joins the VM before releasing resources.
 
 Direct boot uses two KVM vCPUs by default and exposes their topology through an Intel
 MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable

@@ -114,6 +114,8 @@ pub const Machine = struct {
     vm: kvm.VM,
     vcpus: []VcpuSlot,
     memory: []align(std.heap.page_size_min) u8,
+    firmware_memory: ?[]align(std.heap.page_size_min) u8 = null,
+    firmware_vars_bytes: usize = 0,
     exit_lock: std.Io.Mutex = .init,
     pci_config: pci.x86_config.LegacyConfig = .{},
     pci_config_reads: u64 = 0,
@@ -260,7 +262,10 @@ pub const Machine = struct {
             command_line: []const u8,
             initrd: ?[]const u8,
         },
-        firmware: []const u8,
+        firmware: struct {
+            bytes: []const u8,
+            vars_bytes: usize = 0,
+        },
     };
 
     pub fn init(
@@ -281,6 +286,8 @@ pub const Machine = struct {
         }
         const memory = try vm.mapMemory(0, 0, memory_bytes);
         try vm.createPcInterrupts();
+        var firmware_memory: ?[]align(std.heap.page_size_min) u8 = null;
+        var firmware_vars_bytes: usize = 0;
 
         const linux_layout: ?boot.Layout = switch (boot_source) {
             .linux => |linux| try linux.image.load(
@@ -289,14 +296,18 @@ pub const Machine = struct {
                 linux.initrd,
             ),
             .firmware => |firmware| firmware_boot: {
-                if (firmware.len == 0 or firmware.len > firmware_bytes_max or
-                    firmware.len % std.heap.page_size_min != 0)
+                if (firmware.bytes.len == 0 or firmware.bytes.len > firmware_bytes_max or
+                    firmware.bytes.len % std.heap.page_size_min != 0 or
+                    firmware.vars_bytes > firmware.bytes.len or
+                    firmware.vars_bytes % std.heap.page_size_min != 0)
                 {
                     return error.InvalidFirmware;
                 }
-                const address = firmware_address_end - firmware.len;
-                const mapped = try vm.mapMemory(1, address, firmware.len);
-                @memcpy(mapped, firmware);
+                const address = firmware_address_end - firmware.bytes.len;
+                const mapped = try vm.mapMemory(1, address, firmware.bytes.len);
+                @memcpy(mapped, firmware.bytes);
+                firmware_memory = mapped;
+                firmware_vars_bytes = firmware.vars_bytes;
                 break :firmware_boot null;
             },
         };
@@ -347,6 +358,8 @@ pub const Machine = struct {
             .vm = vm,
             .vcpus = vcpus,
             .memory = memory,
+            .firmware_memory = firmware_memory,
+            .firmware_vars_bytes = firmware_vars_bytes,
         };
     }
 
@@ -374,6 +387,15 @@ pub const Machine = struct {
         self.vm.deinit();
         self.host.deinit();
         self.memory = undefined;
+        self.firmware_memory = null;
+        self.firmware_vars_bytes = 0;
+    }
+
+    pub fn firmwareVariables(self: *Machine) ?[]const u8 {
+        if (self.firmware_vars_bytes == 0) return null;
+        const firmware = self.firmware_memory orelse return null;
+        std.debug.assert(self.firmware_vars_bytes <= firmware.len);
+        return firmware[0..self.firmware_vars_bytes];
     }
 
     /// The machine address must remain stable until deinit because device callbacks retain it.

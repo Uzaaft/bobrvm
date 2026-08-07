@@ -22,6 +22,8 @@ mkShell {
   name = "bobrvm";
 
   BOBRVM_OVMF_FD = lib.optionalString stdenv.hostPlatform.isLinux "${OVMF.fd}/FV/OVMF.fd";
+  BOBRVM_OVMF_VARS_FD =
+    lib.optionalString stdenv.hostPlatform.isLinux "${OVMF.fd}/FV/OVMF_VARS.fd";
 
   packages =
     [

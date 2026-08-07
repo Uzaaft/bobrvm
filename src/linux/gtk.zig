@@ -209,6 +209,7 @@ const State = struct {
     memory_bytes: usize,
     vcpu_count: u8,
     firmware_path: ?[]const u8,
+    vars_path: ?[]const u8,
     kernel_path: ?[]const u8,
     initrd_path: ?[]const u8,
     disk_path: ?[]const u8,
@@ -219,6 +220,7 @@ const State = struct {
     forward_count: u8,
     command_line: []const u8,
     loaded_firmware_path: ?[]u8 = null,
+    loaded_vars_path: ?[]const u8 = null,
     loaded_command_line: ?[]u8 = null,
     vm: ?*VM = null,
     window: ?*c.GtkWindow = null,
@@ -271,6 +273,7 @@ const State = struct {
             .memory_bytes = self.memory_bytes,
             .vcpu_count = self.vcpu_count,
             .firmware_path = firmware_path,
+            .vars_path = self.vars_path,
             .kernel_path = self.kernel_path,
             .initrd_path = self.initrd_path,
             .disk_path = self.disk_path,
@@ -362,11 +365,24 @@ const State = struct {
             defaultFirmwarePath()
         else
             null;
+        const vars_path_owned = if (firmware != null) vars: {
+            const template = defaultVarsTemplatePath() orelse {
+                return self.setError(error.FirmwareVariablesUnavailable);
+            };
+            break :vars SavedConfig.ensureVars(self.allocator, name, template) catch |err| {
+                return self.setError(err);
+            };
+        } else null;
+        var adopted_vars = false;
+        defer if (!adopted_vars) {
+            if (vars_path_owned) |path| self.allocator.free(path);
+        };
         var config = SavedConfig{
             .name = name,
             .memory_mb = self.memory_bytes / (1024 * 1024),
             .vcpu_count = self.vcpu_count,
             .firmware_path = firmware,
+            .vars_path = vars_path_owned,
             .disk_path = self.disk_path,
             .disk2_path = self.iso_path,
             .disk2_read_only = true,
@@ -387,6 +403,10 @@ const State = struct {
             };
         }
         config.save(self.allocator) catch |err| return self.setError(err);
+        if (self.loaded_vars_path) |path| self.allocator.free(path);
+        self.loaded_vars_path = vars_path_owned;
+        self.vars_path = vars_path_owned;
+        adopted_vars = true;
         self.refreshLibrary(name);
         c.gtk_label_set_text(self.status.?, "Configuration saved");
     }
@@ -423,15 +443,26 @@ const State = struct {
             self.allocator.dupe(u8, path) catch return self.setError(error.OutOfMemory)
         else
             null;
+        const vars_copy = if (config.vars_path) |path|
+            self.allocator.dupe(u8, path) catch {
+                if (firmware_copy) |firmware_path| self.allocator.free(firmware_path);
+                return self.setError(error.OutOfMemory);
+            }
+        else
+            null;
         const command_copy = self.allocator.dupe(u8, config.cmdline) catch {
             if (firmware_copy) |path| self.allocator.free(path);
+            if (vars_copy) |path| self.allocator.free(path);
             return self.setError(error.OutOfMemory);
         };
         if (self.loaded_firmware_path) |path| self.allocator.free(path);
+        if (self.loaded_vars_path) |path| self.allocator.free(path);
         if (self.loaded_command_line) |command| self.allocator.free(command);
         self.loaded_firmware_path = firmware_copy;
+        self.loaded_vars_path = vars_copy;
         self.loaded_command_line = command_copy;
         self.firmware_path = firmware_copy;
+        self.vars_path = vars_copy;
         self.command_line = command_copy;
         c.gtk_label_set_text(self.status.?, "Configuration loaded");
     }
@@ -680,6 +711,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .memory_bytes = config.memory_bytes,
         .vcpu_count = config.vcpu_count,
         .firmware_path = config.firmware_path,
+        .vars_path = config.vars_path,
         .kernel_path = config.kernel_path,
         .initrd_path = config.initrd_path,
         .disk_path = config.disk_path,
@@ -693,6 +725,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
     };
     defer {
         if (state.loaded_firmware_path) |path| state.allocator.free(path);
+        if (state.loaded_vars_path) |path| state.allocator.free(path);
         if (state.loaded_command_line) |command| state.allocator.free(command);
     }
     const app = c.gtk_application_new("com.bobrvm.Bobrvm", c.G_APPLICATION_DEFAULT_FLAGS) orelse {
@@ -1391,6 +1424,12 @@ fn writeStderr(bytes: []const u8) void {
 
 fn defaultFirmwarePath() ?[]const u8 {
     const value = std.c.getenv("BOBRVM_OVMF_FD") orelse return null;
+    const path = std.mem.span(value);
+    return if (path.len == 0) null else path;
+}
+
+fn defaultVarsTemplatePath() ?[]const u8 {
+    const value = std.c.getenv("BOBRVM_OVMF_VARS_FD") orelse return null;
     const path = std.mem.span(value);
     return if (path.len == 0) null else path;
 }

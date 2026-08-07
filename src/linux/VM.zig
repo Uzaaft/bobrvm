@@ -15,6 +15,9 @@ const x86 = @import("../machine/x86/main.zig");
 const kernel_bytes_max: usize = 512 * 1024 * 1024;
 const initrd_bytes_max: usize = 1024 * 1024 * 1024;
 const firmware_bytes_max: usize = 16 * 1024 * 1024;
+const variables_bytes_max: usize = 16 * 1024 * 1024;
+
+const log = std.log.scoped(.linux_vm);
 
 allocator: std.mem.Allocator,
 machine: x86.Machine,
@@ -23,6 +26,7 @@ thread: ?std.Thread = null,
 run_result: ?x86.Machine.RunError!x86.Machine.RunOutcome = null,
 state_value: std.atomic.Value(State) = std.atomic.Value(State).init(.ready),
 exits_max: u64,
+vars_path: ?[]u8 = null,
 
 pub const State = enum(u8) {
     ready,
@@ -36,6 +40,7 @@ pub const Config = struct {
     memory_bytes: usize,
     vcpu_count: u8 = 2,
     firmware_path: ?[]const u8 = null,
+    vars_path: ?[]const u8 = null,
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     disk_path: ?[]const u8 = null,
@@ -62,6 +67,8 @@ pub const CreateError = boot.ParseError || x86.Machine.InitError ||
     ReadInitrdFailed,
     OpenFirmwareFailed,
     ReadFirmwareFailed,
+    OpenVariablesFailed,
+    ReadVariablesFailed,
     InvalidBootConfig,
 };
 
@@ -92,6 +99,20 @@ pub fn create(
     else
         null;
     defer if (firmware) |bytes| allocator.free(bytes);
+    const variables = if (config.vars_path) |path|
+        try readFile(allocator, path, variables_bytes_max, .variables)
+    else
+        null;
+    defer if (variables) |bytes| allocator.free(bytes);
+    if (variables) |bytes| {
+        const firmware_bytes = firmware orelse return error.InvalidBootConfig;
+        if (bytes.len == 0 or bytes.len > firmware_bytes.len or
+            bytes.len % std.heap.page_size_min != 0)
+        {
+            return error.InvalidBootConfig;
+        }
+        @memcpy(firmware_bytes[0..bytes.len], bytes);
+    }
 
     const boot_source: x86.Machine.BootSource = if (kernel) |bytes|
         .{ .linux = .{
@@ -100,7 +121,13 @@ pub fn create(
             .initrd = initrd,
         } }
     else
-        .{ .firmware = firmware.? };
+        .{ .firmware = .{
+            .bytes = firmware.?,
+            .vars_bytes = if (variables) |bytes| bytes.len else 0,
+        } };
+
+    const vars_path = if (config.vars_path) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (vars_path) |path| allocator.free(path);
 
     const self = try allocator.create(VM);
     errdefer allocator.destroy(self);
@@ -115,6 +142,7 @@ pub fn create(
         .machine = machine,
         .serial = serial,
         .exits_max = config.exits_max,
+        .vars_path = vars_path,
     };
     errdefer self.machine.deinit();
     if (config.disk_path) |path| {
@@ -139,6 +167,7 @@ pub fn destroy(self: *VM) void {
         _ = self.join() catch {};
     }
     self.machine.deinit();
+    if (self.vars_path) |path| self.allocator.free(path);
     self.allocator.destroy(self);
 }
 
@@ -254,27 +283,41 @@ pub fn injectScroll(self: *VM, x: i32, y: i32) x86.Machine.InputError!void {
 
 fn threadMain(self: *VM) void {
     self.run_result = self.machine.run(self.serial, self.exits_max);
+    self.persistVariables() catch |err| {
+        log.err("failed to persist UEFI variables: {}", .{err});
+    };
     self.state_value.store(.stopped, .release);
+}
+
+fn persistVariables(self: *VM) !void {
+    const path = self.vars_path orelse return;
+    const bytes = self.machine.firmwareVariables() orelse return;
+    const file = try std.Io.Dir.cwd().createFile(global.io(), path, .{});
+    defer file.close(global.io());
+    try file.writePositionalAll(global.io(), bytes, 0);
 }
 
 fn readFile(
     allocator: std.mem.Allocator,
     path: []const u8,
     bytes_max: usize,
-    kind: enum { kernel, initrd, firmware },
+    kind: enum { kernel, initrd, firmware, variables },
 ) error{
     OpenKernelFailed,
     ReadKernelFailed,
     OpenInitrdFailed,
     ReadInitrdFailed,
     OpenFirmwareFailed,
+    OpenVariablesFailed,
     ReadFirmwareFailed,
+    ReadVariablesFailed,
 }![]u8 {
     const file = std.Io.Dir.cwd().openFile(global.io(), path, .{ .mode = .read_only }) catch {
         return switch (kind) {
             .kernel => error.OpenKernelFailed,
             .initrd => error.OpenInitrdFailed,
             .firmware => error.OpenFirmwareFailed,
+            .variables => error.OpenVariablesFailed,
         };
     };
     defer file.close(global.io());
@@ -282,6 +325,7 @@ fn readFile(
         .kernel => error.ReadKernelFailed,
         .initrd => error.ReadInitrdFailed,
         .firmware => error.ReadFirmwareFailed,
+        .variables => error.ReadVariablesFailed,
     };
 }
 

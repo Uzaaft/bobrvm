@@ -259,6 +259,41 @@ pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
     return std.fs.path.join(alloc, &.{ dir, filename });
 }
 
+pub fn getVarsPath(alloc: Allocator, name: []const u8) ![]const u8 {
+    try validateName(name);
+    const dir = try getConfigDir(alloc);
+    defer alloc.free(dir);
+    const filename = try std.fmt.allocPrint(alloc, "{s}.vars.fd", .{name});
+    defer alloc.free(filename);
+    return std.fs.path.join(alloc, &.{ dir, filename });
+}
+
+/// Create a private writable UEFI variable store once and return its owned path.
+pub fn ensureVars(alloc: Allocator, name: []const u8, template_path: []const u8) ![]const u8 {
+    const dir = try ensureConfigDir(alloc);
+    defer alloc.free(dir);
+    const vars_path = try getVarsPath(alloc, name);
+    errdefer alloc.free(vars_path);
+    const existing = std.Io.Dir.openFileAbsolute(global.io(), vars_path, .{}) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const template = try std.Io.Dir.cwd().openFile(global.io(), template_path, .{
+            .mode = .read_only,
+        });
+        defer template.close(global.io());
+        const bytes = try file_compat.readToEndAlloc(template, alloc, 16 * 1024 * 1024);
+        defer alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len % std.heap.page_size_min != 0) {
+            return error.InvalidFirmwareVariables;
+        }
+        const output = try std.Io.Dir.createFileAbsolute(global.io(), vars_path, .{});
+        defer output.close(global.io());
+        try output.writePositionalAll(global.io(), bytes, 0);
+        return vars_path;
+    };
+    existing.close(global.io());
+    return vars_path;
+}
+
 pub fn save(self: *const Config, alloc: Allocator) !void {
     if (self.name.len == 0) return ParseError.MissingName;
     try validateName(self.name);
@@ -331,6 +366,12 @@ pub fn delete(alloc: Allocator, name: []const u8) !void {
             log.err("VM '{s}' not found", .{name});
         }
         return err;
+    };
+    const vars_path = try getVarsPath(alloc, name);
+    defer alloc.free(vars_path);
+    std.Io.Dir.deleteFileAbsolute(global.io(), vars_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     };
 }
 

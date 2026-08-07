@@ -85,12 +85,14 @@ stdenv.mkDerivation (finalAttrs: {
       patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm-gtk"
       mkdir -p "$out/share/bobrvm"
       cp ${OVMF.fd}/FV/OVMF.fd "$out/share/bobrvm/OVMF.fd"
+      cp ${OVMF.fd}/FV/OVMF_VARS.fd "$out/share/bobrvm/OVMF_VARS.fd"
     ''}
     runHook postInstall
   '';
 
   preFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
     gappsWrapperArgs+=(--set BOBRVM_OVMF_FD "$out/share/bobrvm/OVMF.fd")
+    gappsWrapperArgs+=(--set BOBRVM_OVMF_VARS_FD "$out/share/bobrvm/OVMF_VARS.fd")
   '';
 
   meta = {
