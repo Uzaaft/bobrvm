@@ -50,7 +50,7 @@ pub fn execute(
 
     var machine = try x86.Machine.init(memory_bytes, image, command_line, initrd);
     defer machine.deinit();
-    if (disk_path) |path| try machine.attachDisk(allocator, path, true);
+    if (disk_path) |path| try machine.attachDisk(allocator, path, false);
     var output = Stdout{};
     try machine.run(x86.SerialSink.bind(Stdout, &output, Stdout.write), exits_max);
 }

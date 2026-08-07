@@ -1,11 +1,8 @@
-//! Deterministic initramfs payload for the Linux KVM boot test.
+//! Stage-1 initramfs payload for the Linux KVM root-filesystem test.
 
 const std = @import("std");
 
 const linux = std.os.linux;
-const init_marker = "BOBRVM_LINUX_INIT_OK\n";
-const disk_marker = "BOBRVM_DISK_READ_OK\n";
-const disk_contents = "bobrvm-disk-fixture\n";
 const module_paths = [_][:0]const u8{
     "/modules/virtio_ring.ko",
     "/modules/virtio.ko",
@@ -13,6 +10,10 @@ const module_paths = [_][:0]const u8{
     "/modules/virtio_pci_legacy_dev.ko",
     "/modules/virtio_pci.ko",
     "/modules/virtio_blk.ko",
+    "/modules/crc16.ko",
+    "/modules/mbcache.ko",
+    "/modules/jbd2.ko",
+    "/modules/ext4.ko",
 };
 
 pub fn main() noreturn {
@@ -24,9 +25,26 @@ pub fn main() noreturn {
         }
     }
 
-    if (readDiskMarker() and debug_port_available) emit(disk_marker);
-    if (debug_port_available) emit(init_marker);
-    std.posix.reboot(.{ .POWER_OFF = {} }) catch {};
+    if (linux.errno(linux.mount("/dev/vda", "/newroot", "ext4", 0, 0)) != .SUCCESS) {
+        if (debug_port_available) emit("BOBRVM_ROOTFS_MOUNT_FAILED\n");
+        restart();
+    }
+    if (linux.errno(linux.chroot("/newroot")) != .SUCCESS or
+        linux.errno(linux.chdir("/")) != .SUCCESS)
+    {
+        if (debug_port_available) emit("BOBRVM_ROOTFS_CHROOT_FAILED\n");
+        restart();
+    }
+
+    const argv = [_:null]?[*:0]const u8{"/init"};
+    const envp = [_:null]?[*:0]const u8{};
+    _ = linux.execve("/init", &argv, &envp);
+    if (debug_port_available) emit("BOBRVM_ROOTFS_EXEC_FAILED\n");
+    restart();
+}
+
+fn restart() noreturn {
+    std.posix.reboot(.{ .RESTART = {} }) catch {};
     linux.exit_group(1);
 }
 
@@ -41,15 +59,6 @@ fn loadModule(path: [:0]const u8) bool {
         0,
     );
     return linux.errno(result) == .SUCCESS;
-}
-
-fn readDiskMarker() bool {
-    const fd = openRead("/dev/vda") orelse return false;
-    defer _ = linux.close(fd);
-    var buffer: [disk_contents.len]u8 = undefined;
-    const result = linux.read(fd, &buffer, buffer.len);
-    if (linux.errno(result) != .SUCCESS or result != buffer.len) return false;
-    return std.mem.eql(u8, &buffer, disk_contents);
 }
 
 fn openRead(path: [:0]const u8) ?i32 {

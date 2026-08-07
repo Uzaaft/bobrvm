@@ -128,7 +128,7 @@ fn printUsage() void {
         \\Commands:
         \\  kvm-info    Validate KVM and show acceleration capabilities
         \\  kvm-smoke   Run a tiny x86 payload through KVM
-        \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [read-only-disk]
+        \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
         \\  version     Show version information
         \\  help        Show this help message
         \\

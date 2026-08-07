@@ -54,7 +54,6 @@ pub const Machine = struct {
     pub const AttachDiskError = virtio.Block.Error || std.Io.File.StatError;
     pub const RunError = kvm.RunError || kvm.InterruptError || error{
         ExitLimitReached,
-        GuestShutdown,
         InternalError,
         InvalidIoExit,
         InvalidMmioExit,
@@ -144,7 +143,7 @@ pub const Machine = struct {
             switch (try self.vcpu.runOnce()) {
                 .io => try self.handleIo(serial),
                 .halted, .interrupted => continue,
-                .shutdown => return error.GuestShutdown,
+                .shutdown => return,
                 .internal_error => return error.InternalError,
                 .mmio => try self.handleMmio(),
                 .unknown => return error.UnknownExit,
