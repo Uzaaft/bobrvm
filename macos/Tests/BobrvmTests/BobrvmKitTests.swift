@@ -1,0 +1,107 @@
+import XCTest
+@testable import Bobrvm
+
+final class BobrvmKitTests: XCTestCase {
+    func testErrorCodesMapToStableFailures() {
+        let expected: [(Int32, String)] = [
+            (1, "Invalid argument"),
+            (2, "Out of memory"),
+            (3, "Hypervisor initialization failed"),
+            (4, "Failed to create VM"),
+            (5, "Failed to create vCPU"),
+            (6, "Failed to map memory"),
+            (7, "Failed to create surface"),
+            (8, "Metal error"),
+            (9, "I/O error"),
+            (10, "The file already exists"),
+            (11, "Virtual disks cannot be safely shrunk"),
+            (12, "The disk format is unsupported"),
+            (13, "Operation not allowed in current state"),
+            (99, "Unknown error (99)"),
+        ]
+
+        for (code, description) in expected {
+            XCTAssertEqual(BobrvmError(code: code).errorDescription, description)
+        }
+    }
+
+    func testKeyEventsPreserveCFields() {
+        let event = KeyEvent(keycode: UInt32.max, modifiers: 0xA5A5, pressed: true)
+        let cEvent = event.toCStruct()
+
+        XCTAssertEqual(cEvent.keycode, UInt32.max)
+        XCTAssertEqual(cEvent.modifiers, 0xA5A5)
+        XCTAssertTrue(cEvent.pressed)
+    }
+
+    func testGuestToolCapabilitiesAreIndependent() {
+        let clipboard = UInt64(BOBRVM_GUEST_TOOLS_CLIPBOARD.rawValue)
+        let management = UInt64(BOBRVM_GUEST_TOOLS_MANAGEMENT.rawValue)
+        let status = GuestToolsStatus(
+            connection: .ready,
+            capabilities: clipboard | management
+        )
+
+        XCTAssertEqual(status.connection, .ready)
+        XCTAssertTrue(status.supportsClipboard)
+        XCTAssertFalse(status.supportsFileTransfer)
+        XCTAssertTrue(status.supportsManagement)
+    }
+
+    func testVMConfigPreservesScalarAndStringFields() {
+        let config = VMConfig(
+            memoryBytes: 3_221_225_472,
+            vcpuCount: 7,
+            displayWidth: 1_601,
+            displayHeight: 901,
+            gpuMemoryBytes: 257_949_696,
+            networkEnabled: true,
+            sharedFolderPath: "/tmp/shared",
+            firmwarePath: "/tmp/firmware.fd",
+            varsPath: "/tmp/vars.fd",
+            kernelPath: "/tmp/kernel",
+            initrdPath: "/tmp/initrd",
+            cmdline: "console=hvc0",
+            diskPath: "/tmp/disk.raw",
+            diskReadOnly: true,
+            isoPath: "/tmp/install.iso",
+            isoReadOnly: false
+        )
+
+        config.withCConfig { pointer in
+            let c = pointer.pointee
+            XCTAssertEqual(c.memory_bytes, config.memoryBytes)
+            XCTAssertEqual(c.vcpu_count, config.vcpuCount)
+            XCTAssertEqual(c.display_width, config.displayWidth)
+            XCTAssertEqual(c.display_height, config.displayHeight)
+            XCTAssertEqual(c.gpu_memory_bytes, config.gpuMemoryBytes)
+            XCTAssertEqual(c.enable_net, config.networkEnabled)
+            XCTAssertEqual(c.disk_read_only, config.diskReadOnly)
+            XCTAssertEqual(c.disk2_read_only, config.isoReadOnly)
+            XCTAssertEqual(String(cString: c.shared_dir), config.sharedFolderPath)
+            XCTAssertEqual(String(cString: c.firmware_path), config.firmwarePath)
+            XCTAssertEqual(String(cString: c.vars_path), config.varsPath)
+            XCTAssertEqual(String(cString: c.kernel_path), config.kernelPath)
+            XCTAssertEqual(String(cString: c.initrd_path), config.initrdPath)
+            XCTAssertEqual(String(cString: c.cmdline), config.cmdline)
+            XCTAssertEqual(String(cString: c.disk_path), config.diskPath)
+            XCTAssertEqual(String(cString: c.disk2_path), config.isoPath)
+        }
+    }
+
+    func testVMConfigKeepsAbsentStringsNull() {
+        let config = VMConfig()
+
+        config.withCConfig { pointer in
+            let c = pointer.pointee
+            XCTAssertNil(c.shared_dir)
+            XCTAssertNil(c.firmware_path)
+            XCTAssertNil(c.vars_path)
+            XCTAssertNil(c.kernel_path)
+            XCTAssertNil(c.initrd_path)
+            XCTAssertNil(c.cmdline)
+            XCTAssertNil(c.disk_path)
+            XCTAssertNil(c.disk2_path)
+        }
+    }
+}

@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A11000000000000000000001 /* BobrvmKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11000000000000000000002 /* BobrvmKitTests.swift */; };
 		8C0A30A63E02459EA9C8A11B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F4A5E5F7B684F5F9D1D3B2C /* AppDelegate.swift */; };
 		4C1634DDC4C8428890A068BE /* BobrvmApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C89AC307D3CA49F98C93FE8C /* BobrvmApp.swift */; };
 		666F50031EA548DCA6611421 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AE23A7114FB4192922CFF95 /* ContentView.swift */; };
@@ -32,6 +33,8 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		A11000000000000000000002 /* BobrvmKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmKitTests.swift; sourceTree = "<group>"; };
+		A11000000000000000000003 /* BobrvmTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BobrvmTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2F4A5E5F7B684F5F9D1D3B2C /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		9E5220B2D8584C4D9D4E7F3D /* Bobrvm.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Bobrvm.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C89AC307D3CA49F98C93FE8C /* BobrvmApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmApp.swift; sourceTree = "<group>"; };
@@ -62,6 +65,13 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A11000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		175DD03AE29A411399CBB48B /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -80,6 +90,7 @@
 			isa = PBXGroup;
 			children = (
 				9E5220B2D8584C4D9D4E7F3D /* Bobrvm.app */,
+				A11000000000000000000003 /* BobrvmTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -141,11 +152,20 @@
 				63E960C4E6BD4DE7951B6BFB /* App */,
 				A257CCA5C31F4DC891F20FED /* Bobrvm */,
 				E19FE60B32494F0D9397F0B4 /* BobrvmKit */,
+				A11000000000000000000005 /* BobrvmTests */,
 				UEFI00000000000000000003 /* Resources */,
 				56F95697E6344228A7F9BA1B /* Bobrvm.entitlements */,
 				8FEC2D045517435C872520F3 /* Frameworks */,
 				536C2A6DC9C94E1CAA8940DC /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		A11000000000000000000005 /* BobrvmTests */ = {
+			isa = PBXGroup;
+			children = (
+				A11000000000000000000002 /* BobrvmKitTests.swift */,
+			);
+			path = Tests/BobrvmTests;
 			sourceTree = "<group>";
 		};
 		UEFI00000000000000000003 /* Resources */ = {
@@ -160,6 +180,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A11000000000000000000006 /* BobrvmTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A11000000000000000000007 /* Build configuration list for PBXNativeTarget "BobrvmTests" */;
+			buildPhases = (
+				A11000000000000000000008 /* Sources */,
+				A11000000000000000000004 /* Frameworks */,
+				A11000000000000000000009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A1100000000000000000000A /* PBXTargetDependency */,
+			);
+			name = BobrvmTests;
+			productName = BobrvmTests;
+			productReference = A11000000000000000000003 /* BobrvmTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		C03BA6851272486DB520947E /* Bobrvm */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 585CDC75E0EF4B808BED577D /* Build configuration list for PBXNativeTarget "Bobrvm" */;
@@ -187,6 +225,10 @@
 				LastSwiftUpdateCheck = 1500;
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
+					A11000000000000000000006 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = C03BA6851272486DB520947E;
+					};
 					C03BA6851272486DB520947E = {
 						CreatedOnToolsVersion = 15.0;
 					};
@@ -205,11 +247,19 @@
 			projectRoot = "";
 			targets = (
 				C03BA6851272486DB520947E /* Bobrvm */,
+				A11000000000000000000006 /* BobrvmTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		A11000000000000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		5DDACF02F28B483E824D9101 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -223,6 +273,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A11000000000000000000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A11000000000000000000001 /* BobrvmKitTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		2CE875267EA5459496549DC9 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -247,7 +305,60 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXContainerItemProxy section */
+		A1100000000000000000000B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0E7B46878DA149578DE1FBBA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C03BA6851272486DB520947E;
+			remoteInfo = Bobrvm;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		A1100000000000000000000A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C03BA6851272486DB520947E /* Bobrvm */;
+			targetProxy = A1100000000000000000000B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		A1100000000000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.bobrvm.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.9;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Bobrvm.app/Contents/MacOS/Bobrvm";
+			};
+			name = Debug;
+		};
+		A1100000000000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.bobrvm.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.9;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Bobrvm.app/Contents/MacOS/Bobrvm";
+			};
+			name = Release;
+		};
 		869E5C3239734C8DA97088E2 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -258,7 +369,8 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				DEVELOPMENT_TEAM = "";
-				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_HARDENED_RUNTIME = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -362,6 +474,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A11000000000000000000007 /* Build configuration list for PBXNativeTarget "BobrvmTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1100000000000000000000C /* Debug */,
+				A1100000000000000000000D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		585CDC75E0EF4B808BED577D /* Build configuration list for PBXNativeTarget "Bobrvm" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
