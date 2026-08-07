@@ -13,6 +13,7 @@ const global = @import("../global.zig");
 const boot = @import("../machine/x86/boot.zig");
 const mininat = @import("../net/mininat.zig");
 const x86 = @import("../machine/x86/main.zig");
+const Audio = @import("Audio.zig");
 
 const kernel_bytes_max: usize = 512 * 1024 * 1024;
 const initrd_bytes_max: usize = 1024 * 1024 * 1024;
@@ -29,6 +30,7 @@ run_result: ?x86.Machine.RunError!x86.Machine.RunOutcome = null,
 state_value: std.atomic.Value(State) = std.atomic.Value(State).init(.ready),
 exits_max: u64,
 vars_path: ?[]u8 = null,
+audio: ?*Audio = null,
 
 pub const State = enum(u8) {
     ready,
@@ -57,6 +59,7 @@ pub const Config = struct {
     gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
     shared_dir: ?[]const u8 = null,
     restore_path: ?[]const u8 = null,
+    audio_enabled: bool = false,
     command_line: []const u8,
     exits_max: u64,
 };
@@ -64,7 +67,8 @@ pub const Config = struct {
 pub const CreateError = boot.ParseError || config_policy.ValidationError || x86.Machine.InitError ||
     x86.Machine.AttachDiskError || x86.Machine.AttachNetworkError ||
     x86.Machine.AttachDisplayError || x86.Machine.AttachInputError ||
-    x86.Machine.AttachRngError || x86.Machine.AttachGuestServicesError || error{
+    x86.Machine.AttachRngError || x86.Machine.AttachGuestServicesError ||
+    x86.Machine.AttachSoundError || error{
     OpenKernelFailed,
     ReadKernelFailed,
     OpenInitrdFailed,
@@ -215,6 +219,21 @@ pub fn create(
     if (config.shared_dir) |path| try self.machine.attachSharedFolder(allocator, path);
     try self.machine.attachRng(allocator);
     try self.machine.attachGuestServices(allocator);
+    if (config.audio_enabled) {
+        const audio = Audio.create(allocator) catch |err| audio: {
+            log.warn("host audio unavailable, using silent playback: {}", .{err});
+            break :audio null;
+        };
+        self.audio = audio;
+        errdefer if (audio) |value| {
+            value.destroy();
+            self.audio = null;
+        };
+        try self.machine.attachSound(
+            allocator,
+            if (audio) |value| value.playbackSink() else .{},
+        );
+    }
     if (config.network_enabled) try self.machine.attachNetwork(allocator, config.forwards);
     if (restore_file_path) |path| {
         self.machine.restoreFromDisk(path) catch |err| {
@@ -237,6 +256,7 @@ pub fn destroy(self: *VM) void {
         _ = self.join() catch {};
     }
     self.machine.deinit();
+    if (self.audio) |audio| audio.destroy();
     if (self.vars_path) |path| self.allocator.free(path);
     self.allocator.destroy(self);
 }

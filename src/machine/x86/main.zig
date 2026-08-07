@@ -46,6 +46,9 @@ const pci_rng_bar_initial: u32 = 0xd007_0000;
 const pci_console_slot: u5 = 11;
 const pci_console_irq: u32 = 14;
 const pci_console_bar_initial: u32 = 0xd008_0000;
+const pci_sound_slot: u5 = 12;
+const pci_sound_irq: u32 = 15;
+const pci_sound_bar_initial: u32 = 0xd009_0000;
 const spice_port: u32 = 1;
 const qga_port: u32 = 2;
 const bobrvm_agent_port: u32 = 3;
@@ -186,6 +189,7 @@ const snapshot_sections = .{
     SnapshotSection("p9", "share", snapshot.P9Codec),
     SnapshotSection("rng", "rng", snapshot.RngCodec),
     SnapshotSection("console", "console", snapshot.ConsoleCodec),
+    SnapshotSection("sound", "sound", snapshot.SndCodec),
     SnapshotSection("pci_blk1", "pci_block", snapshot.PciDeviceCodec),
     SnapshotSection("pci_blk2", "pci_block2", snapshot.PciDeviceCodec),
     SnapshotSection("pci_net", "pci_net", snapshot.PciDeviceCodec),
@@ -195,6 +199,7 @@ const snapshot_sections = .{
     SnapshotSection("pci_p9", "pci_share", snapshot.PciDeviceCodec),
     SnapshotSection("pci_rng", "pci_rng", snapshot.PciDeviceCodec),
     SnapshotSection("pci_console", "pci_console", snapshot.PciDeviceCodec),
+    SnapshotSection("pci_sound", "pci_sound", snapshot.PciDeviceCodec),
 };
 
 pub const Machine = struct {
@@ -275,6 +280,10 @@ pub const Machine = struct {
     console_wakeup: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     console_irq_desired: bool = false,
     console_irq_injected: bool = false,
+    sound: ?*virtio.Snd = null,
+    pci_sound: ?*pci.VirtioPciDevice = null,
+    sound_irq_desired: bool = false,
+    sound_irq_injected: bool = false,
     qga: ?*agent.Qga = null,
     vdagent: ?agent.Vdagent = null,
     native_agent: ?*agent.Native = null,
@@ -324,6 +333,7 @@ pub const Machine = struct {
     pub const AttachShareError = std.mem.Allocator.Error;
     pub const AttachRngError = virtio.Rng.Error;
     pub const AttachGuestServicesError = std.mem.Allocator.Error;
+    pub const AttachSoundError = virtio.Snd.Error;
     pub const InputError = error{InputUnavailable};
     pub const SerialInputError = kvm.InterruptError;
     pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError ||
@@ -486,6 +496,8 @@ pub const Machine = struct {
         }
         if (self.pci_console) |device| device.deinit();
         if (self.console) |console| console.deinit();
+        if (self.pci_sound) |device| device.deinit();
+        if (self.sound) |sound| sound.deinit();
         if (self.pci_rng) |device| device.deinit();
         if (self.rng) |rng| rng.deinit();
         if (self.pci_share) |device| device.deinit();
@@ -792,6 +804,36 @@ pub const Machine = struct {
         device.transport.setNotifyCallback(rngNotify, self);
         self.rng = rng;
         self.pci_rng = device;
+    }
+
+    /// Attach stereo 48 kHz PCM output through the host-provided playback sink.
+    pub fn attachSound(
+        self: *Machine,
+        allocator: std.mem.Allocator,
+        sink: virtio.snd.PlaybackSink,
+    ) AttachSoundError!void {
+        std.debug.assert(self.sound == null);
+        std.debug.assert(self.pci_sound == null);
+        const sound = try virtio.Snd.init(allocator);
+        errdefer sound.deinit();
+        sound.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
+        sound.setIrqCallback(virtio.mmio.Irq.initRaw(soundIrq, self));
+        sound.setSink(sink);
+        const device = try pci.VirtioPciDevice.init(
+            allocator,
+            25,
+            sound.transport.device_features,
+            @intCast(sound.transport.queues.len),
+            @sizeOf(virtio.snd.Config),
+        );
+        errdefer device.deinit();
+        device.writeConfig(0x10, 4, pci_sound_bar_initial);
+        device.config[0x3c] = pci_sound_irq;
+        device.config[0x3d] = 1;
+        device.transport.setDeviceConfig(std.mem.asBytes(&sound.config));
+        device.transport.setNotifyCallback(soundNotify, self);
+        self.sound = sound;
+        self.pci_sound = device;
     }
 
     /// Attach the multiport transport used by stock and bobrvm guest agents.
@@ -1527,6 +1569,8 @@ pub const Machine = struct {
             self.rng_irq_injected,
             self.console_irq_desired,
             self.console_irq_injected,
+            self.sound_irq_desired,
+            self.sound_irq_injected,
         };
         for (values, 0..) |value, index| {
             result.irq_flags |= @as(u32, @intFromBool(value)) << @intCast(index);
@@ -1537,7 +1581,7 @@ pub const Machine = struct {
     fn restoreEmulatedState(self: *Machine, state: *const EmulatedState) !void {
         if (state.serial_rx_head >= Serial.capacity or state.serial_rx_len > Serial.capacity or
             state.cmos_index > std.math.maxInt(u7) or state.cmos_nmi_disabled > 1 or
-            state.irq_flags >> 19 != 0)
+            state.irq_flags >> 21 != 0)
         {
             return error.Corrupt;
         }
@@ -1575,6 +1619,8 @@ pub const Machine = struct {
             &self.rng_irq_injected,
             &self.console_irq_desired,
             &self.console_irq_injected,
+            &self.sound_irq_desired,
+            &self.sound_irq_injected,
         };
         for (values, 0..) |value, index| {
             value.* = state.irq_flags & (@as(u32, 1) << @intCast(index)) != 0;
@@ -1657,6 +1703,7 @@ pub const Machine = struct {
             try self.syncShareIrq();
             try self.syncRngIrq();
             try self.syncConsoleIrq();
+            try self.syncSoundIrq();
         }
     }
 
@@ -1681,6 +1728,7 @@ pub const Machine = struct {
             try self.syncConsoleIrq();
         }
         if (gpu) try self.syncGpuIrq();
+        try self.syncSoundIrq();
     }
 
     fn finishRun(self: *Machine, state: RunState) void {
@@ -2001,6 +2049,11 @@ pub const Machine = struct {
                 if (self.handleConsolePciBar(device, console, access)) return true;
             }
         }
+        if (self.pci_sound) |device| {
+            if (self.sound) |sound| {
+                if (self.handleSoundPciBar(device, sound, access)) return true;
+            }
+        }
         return false;
     }
 
@@ -2236,6 +2289,36 @@ pub const Machine = struct {
         return true;
     }
 
+    fn handleSoundPciBar(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        sound: *virtio.Snd,
+        access: kvm.MmioExit,
+    ) bool {
+        _ = self;
+        const bar_address: u64 = device.getBar0Addr();
+        if (bar_address == 0 or access.address < bar_address) return false;
+        const offset_u64 = access.address - bar_address;
+        if (offset_u64 >= pci.virtio_pci.BAR0_SIZE) return false;
+        const value = readIoValue(access.data) orelse return false;
+        const offset: u32 = @intCast(offset_u64);
+        if (access.direction == .read) {
+            if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+                device.transport.setDeviceConfig(std.mem.asBytes(&sound.config));
+            }
+            const result = device.readBar0(offset, @intCast(access.data.len));
+            writeIoValue(access.data, result);
+            if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+                offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+            {
+                sound.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), result);
+            }
+        } else {
+            device.writeBar0(offset, @intCast(access.data.len), value);
+        }
+        return true;
+    }
+
     fn pciDevice(
         self: *Machine,
         address: pci.x86_config.ConfigAddress,
@@ -2251,6 +2334,7 @@ pub const Machine = struct {
             pci_share_slot => self.pci_share,
             pci_rng_slot => self.pci_rng,
             pci_console_slot => self.pci_console,
+            pci_sound_slot => self.pci_sound,
             else => null,
         };
     }
@@ -2691,6 +2775,39 @@ pub const Machine = struct {
         if (self.console_irq_desired == self.console_irq_injected) return;
         try self.vm.setIrqLine(pci_console_irq, self.console_irq_desired);
         self.console_irq_injected = self.console_irq_desired;
+    }
+
+    fn soundNotify(queue_index: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_sound orelse return;
+        const sound = self.sound orelse return;
+        if (queue_index >= device.transport.queues.len or
+            queue_index >= sound.transport.queues.len) return;
+        const source = device.transport.queues[queue_index];
+        const target = &sound.transport.queues[queue_index];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        sound.write(@intFromEnum(virtio.mmio.Reg.queue_notify), queue_index);
+    }
+
+    fn soundIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_sound orelse return;
+        const sound = self.sound orelse return;
+        device.transport.isr_status.queue_interrupt =
+            sound.transport.interrupt_status.used_buffer;
+        device.transport.isr_status.config_change =
+            sound.transport.interrupt_status.config_change;
+        self.sound_irq_desired = level;
+    }
+
+    fn syncSoundIrq(self: *Machine) kvm.InterruptError!void {
+        if (self.sound_irq_desired == self.sound_irq_injected) return;
+        try self.vm.setIrqLine(pci_sound_irq, self.sound_irq_desired);
+        self.sound_irq_injected = self.sound_irq_desired;
     }
 
     fn qgaSend(self: *Machine, data: []const u8) void {

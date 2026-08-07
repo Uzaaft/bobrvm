@@ -57,7 +57,8 @@ bobrvm-gtk
 
 For automation, the GTK executable also accepts `--iso`, `--disk`, `--kernel`,
 `--initrd`, `--share`, `--restore`, repeatable `--forward host:guest`, `--memory`,
-`--cpus`, `--display WxH`, and `--gpu-memory MiB`.
+`--cpus`, `--display WxH`, and `--gpu-memory MiB`. Stereo virtio-snd playback is
+enabled by default and can be disabled with `--no-audio`.
 The Nix development shell and package provide OVMF automatically;
 `BOBRVM_OVMF_FD` and `BOBRVM_OVMF_VARS_FD` can override its images. Saving a VM
 creates a private writable variable store so UEFI boot entries survive restarts.
@@ -65,7 +66,8 @@ creates a private writable variable store so UEFI boot entries survive restarts.
 The x86 host supports direct kernel boot and an OVMF firmware path with primary and
 secondary virtio-pci block devices, including read-only ISO installation media,
 plus virtio GPU, keyboard, tablet, entropy, networking, 9p shared-folder, and
-multiport console devices.
+multiport console devices. Guest PCM output is buffered away from the vCPU hot
+path and played through the desktop's default ALSA route.
 Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
 the vCPU thread. A virtio-net adapter uses the shared Zig user-mode NAT, with no TAP
 device or host privileges required. The GTK application presents the guest's

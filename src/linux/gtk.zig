@@ -246,6 +246,7 @@ const State = struct {
     shared_dir: ?[]const u8,
     restore_path: ?[]const u8,
     network_enabled: bool,
+    audio_enabled: bool,
     forwards: [AppConfig.MAX_FORWARDS]mininat.Forward,
     forward_count: u8,
     command_line: []const u8,
@@ -273,6 +274,7 @@ const State = struct {
     gpu_memory_spin: ?*c.GtkSpinButton = null,
     disk_size_spin: ?*c.GtkSpinButton = null,
     network_check: ?*c.GtkCheckButton = null,
+    audio_check: ?*c.GtkCheckButton = null,
     start_button: ?*c.GtkWidget = null,
     pause_button: ?*c.GtkWidget = null,
     stop_button: ?*c.GtkWidget = null,
@@ -338,6 +340,7 @@ const State = struct {
             .shared_dir = self.shared_dir,
             .restore_path = self.restore_path,
             .network_enabled = self.network_enabled,
+            .audio_enabled = self.audio_enabled,
             .forwards = self.forwards[0..self.forward_count],
             .display_enabled = true,
             .display_width = self.display_width,
@@ -420,6 +423,7 @@ const State = struct {
             return false;
         };
         self.network_enabled = c.gtk_check_button_get_active(self.network_check.?) != c.FALSE;
+        self.audio_enabled = c.gtk_check_button_get_active(self.audio_check.?) != c.FALSE;
         if (!self.readForwards()) return false;
         return true;
     }
@@ -490,6 +494,7 @@ const State = struct {
             .cmdline = self.command_line,
             .enable_gpu = true,
             .enable_net = self.network_enabled,
+            .enable_snd = self.audio_enabled,
             .shared_dir = self.shared_dir,
             .display_width = self.display_width,
             .display_height = self.display_height,
@@ -552,6 +557,11 @@ const State = struct {
         c.gtk_check_button_set_active(
             self.network_check.?,
             if (config.enable_net) c.TRUE else c.FALSE,
+        );
+        self.audio_enabled = config.enable_snd;
+        c.gtk_check_button_set_active(
+            self.audio_check.?,
+            if (config.enable_snd) c.TRUE else c.FALSE,
         );
         self.forward_count = config.forward_count;
         for (config.forwards[0..config.forward_count], 0..) |forward, index| {
@@ -962,6 +972,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .shared_dir = config.shared_dir,
         .restore_path = config.restore_path,
         .network_enabled = config.network_enabled,
+        .audio_enabled = config.audio_enabled,
         .forwards = config.forwards,
         .forward_count = config.forward_count,
         .command_line = config.command_line,
@@ -1127,6 +1138,10 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const network: *c.GtkCheckButton = @ptrCast(network_widget);
     c.gtk_check_button_set_active(network, if (state.network_enabled) c.TRUE else c.FALSE);
     state.network_check = network;
+    const audio_widget = c.gtk_check_button_new_with_label("Audio") orelse return;
+    const audio: *c.GtkCheckButton = @ptrCast(audio_widget);
+    c.gtk_check_button_set_active(audio, if (state.audio_enabled) c.TRUE else c.FALSE);
+    state.audio_check = audio;
     const graphics = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12) orelse return;
     const display_width_label = c.gtk_label_new("Display Width") orelse return;
     const display_width_widget = c.gtk_spin_button_new_with_range(
@@ -1176,6 +1191,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(hardware), vcpu_label);
     c.gtk_box_append(@ptrCast(hardware), vcpu_spin_widget);
     c.gtk_box_append(@ptrCast(hardware), network_widget);
+    c.gtk_box_append(@ptrCast(hardware), audio_widget);
     c.gtk_box_append(@ptrCast(graphics), display_width_label);
     c.gtk_box_append(@ptrCast(graphics), display_width_widget);
     c.gtk_box_append(@ptrCast(graphics), display_height_label);

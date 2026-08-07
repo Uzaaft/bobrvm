@@ -597,6 +597,56 @@ pub fn deserializeRng(_: Allocator, rng: *virtio.Rng, data: []const u8) !void {
     rng.last_avail = try cur.int(u16);
 }
 
+pub fn serializeSnd(alloc: Allocator, snd: *const virtio.Snd) ![]u8 {
+    const state = snd.snapshotState();
+    const serialized_bytes = transportSerializedBytes(snd.transport) +
+        6 * @sizeOf(u16) + 2 * @sizeOf(u32);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try serializeTransport(&out, snd.transport);
+    try out.int(u16, state.ctrl_last_avail);
+    try out.int(u16, state.tx_last_avail);
+    try out.int(u32, state.buffer_bytes);
+    try out.int(u32, state.period_bytes);
+    try out.int(u16, state.channels);
+    try out.int(u16, state.format);
+    try out.int(u16, state.rate);
+    try out.int(u16, state.stream_state);
+    assert(out.buf.items.len == serialized_bytes);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendSndSection(
+    builder: *Builder,
+    alloc: Allocator,
+    name: []const u8,
+    snd: *const virtio.Snd,
+) !void {
+    const data = try serializeSnd(alloc, snd);
+    defer alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializeSnd(_: Allocator, snd: *virtio.Snd, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, snd.transport);
+    const state = virtio.snd.SnapshotState{
+        .ctrl_last_avail = try cur.int(u16),
+        .tx_last_avail = try cur.int(u16),
+        .buffer_bytes = try cur.int(u32),
+        .period_bytes = try cur.int(u32),
+        .channels = @intCast(try cur.int(u16)),
+        .format = @intCast(try cur.int(u16)),
+        .rate = @intCast(try cur.int(u16)),
+        .stream_state = @intCast(try cur.int(u16)),
+    };
+    if (cur.off != cur.buf.len) return error.Mismatch;
+    try snd.restoreSnapshotState(state);
+}
+
 pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
     const serialized_bytes = transportSerializedBytes(&net.transport) + 2 * @sizeOf(u16);
     var out = Out{ .alloc = alloc };
@@ -876,6 +926,7 @@ pub const GicCodec = DeviceCodec(gic_mod.Gic, appendGicSection, deserializeGic);
 pub const ConsoleCodec = DeviceCodec(virtio.Console, appendConsoleSection, deserializeConsole);
 pub const BlockCodec = DeviceCodec(virtio.Block, appendBlockSection, deserializeBlock);
 pub const RngCodec = DeviceCodec(virtio.Rng, appendRngSection, deserializeRng);
+pub const SndCodec = DeviceCodec(virtio.Snd, appendSndSection, deserializeSnd);
 pub const NetCodec = DeviceCodec(virtio.Net, appendNetSection, deserializeNet);
 pub const InputCodec = DeviceCodec(virtio.Input, appendInputSection, deserializeInput);
 pub const P9Codec = DeviceCodec(virtio.P9, appendP9Section, deserializeP9);
@@ -1119,6 +1170,36 @@ test "snapshot: RNG device roundtrip" {
     try testing.expect(rng2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x6000_0000), rng2.transport.queues[0].driver_addr);
     try testing.expectEqual(@as(u16, 29), rng2.last_avail);
+}
+
+test "snapshot: sound device roundtrip" {
+    const sound = try virtio.Snd.init(testing.allocator);
+    defer sound.deinit();
+    sound.transport.status = @bitCast(@as(u8, 0x0f));
+    sound.transport.queues[2].ready = true;
+    sound.transport.queues[2].device_addr = 0x7000_0000;
+    try sound.restoreSnapshotState(.{
+        .ctrl_last_avail = 13,
+        .tx_last_avail = 17,
+        .buffer_bytes = 8192,
+        .period_bytes = 4096,
+        .channels = virtio.snd.CHANNELS,
+        .format = virtio.snd.FMT_S16,
+        .rate = virtio.snd.RATE_48000,
+        .stream_state = 3,
+    });
+    const data = try serializeSnd(testing.allocator, sound);
+    defer testing.allocator.free(data);
+
+    const restored = try virtio.Snd.init(testing.allocator);
+    defer restored.deinit();
+    try deserializeSnd(testing.allocator, restored, data);
+
+    const state = restored.snapshotState();
+    try testing.expectEqual(@as(u16, 13), state.ctrl_last_avail);
+    try testing.expectEqual(@as(u16, 17), state.tx_last_avail);
+    try testing.expect(restored.transport.queues[2].ready);
+    try testing.expectEqual(@as(u64, 0x7000_0000), restored.transport.queues[2].device_addr);
 }
 
 test "snapshot: RNG section assembly allocation profile" {

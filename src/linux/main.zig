@@ -1,8 +1,10 @@
 //! Linux command-line entry point.
 
 const std = @import("std");
+const global = @import("../global.zig");
 const kvm = @import("../hypervisor/kvm/main.zig");
 const run_kernel = @import("run_kernel.zig");
+const Audio = @import("Audio.zig");
 
 pub fn main(minimal: std.process.Init.Minimal) void {
     var args = minimal.args.iterate();
@@ -17,6 +19,14 @@ pub fn main(minimal: std.process.Init.Minimal) void {
             printError(err);
             std.process.exit(1);
         };
+        return;
+    }
+    if (std.mem.eql(u8, command, "audio-smoke")) {
+        runAudioSmoke() catch |err| {
+            printNamedError("audio smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("Audio smoke: played a 440 Hz stereo tone\n");
         return;
     }
     if (std.mem.eql(u8, command, "kvm-smoke")) {
@@ -259,6 +269,7 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  kvm-info    Validate KVM and show acceleration capabilities
+        \\  audio-smoke  Play a short tone through the Linux audio backend
         \\  kvm-smoke   Run a tiny x86 payload through KVM
         \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
         \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
@@ -271,6 +282,27 @@ fn printUsage() void {
         \\  help        Show this help message
         \\
     );
+}
+
+fn runAudioSmoke() !void {
+    const virtio_snd = @import("../virtio/snd.zig");
+    const frames = @divExact(virtio_snd.SAMPLE_RATE_HZ, 4);
+    var samples: [frames * 2]i16 = undefined;
+    for (0..frames) |frame| {
+        const phase = 2.0 * std.math.pi * 440.0 * @as(f64, @floatFromInt(frame)) /
+            @as(f64, @floatFromInt(virtio_snd.SAMPLE_RATE_HZ));
+        const sample: i16 = @intFromFloat(@sin(phase) * 8192.0);
+        samples[frame * 2] = sample;
+        samples[frame * 2 + 1] = sample;
+    }
+    const audio = try Audio.create(std.heap.c_allocator);
+    defer audio.destroy();
+    const sink = audio.playbackSink();
+    sink.on_period.?(std.mem.sliceAsBytes(&samples), sink.userdata);
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = 400 * std.time.ns_per_ms },
+        .clock = .awake,
+    }, global.io()) catch {};
 }
 
 fn writeAll(bytes: []const u8) void {

@@ -12,14 +12,13 @@
 //!   2: txq      (guest -> host PCM frames)
 //!   3: rxq      (advertised, idle — capture not implemented)
 //!
-//! Audio output is deliberately decoupled from any real audio backend: the
-//! device hands each period's PCM bytes to `sink.on_period`, if set. Unit
-//! tests capture into a buffer; a host CoreAudio/AVAudioEngine backend can be
-//! wired behind the same callback later (see CoreAudioSink stub below).
+//! Audio output is decoupled from the host backend: the device hands each
+//! validated PCM period to `sink.on_period`, if set.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
@@ -59,6 +58,12 @@ pub const FMT_S16: u8 = 5;
 // PCM frame rates (bit positions in virtio_snd_pcm_info.rates).
 pub const RATE_44100: u8 = 6;
 pub const RATE_48000: u8 = 7;
+
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
+pub const CHANNELS: u8 = 2;
+pub const FRAME_BYTES: u32 = CHANNELS * @sizeOf(i16);
+pub const PERIOD_BYTES_MAX: u32 = 256 * 1024;
+pub const BUFFER_BYTES_MAX: u32 = 16 * 1024 * 1024;
 
 // Channel map positions (virtio_snd_chmap_info.positions).
 pub const CHMAP_NONE: u8 = 0;
@@ -165,17 +170,8 @@ comptime {
 /// audio hardware dependency.
 pub const PlaybackSink = struct {
     on_period: ?*const fn (data: []const u8, userdata: ?*anyopaque) void = null,
+    latency_bytes: ?*const fn (userdata: ?*anyopaque) u32 = null,
     userdata: ?*anyopaque = null,
-};
-
-/// TODO: a real host playback sink. Wire an AVAudioEngine/CoreAudio output
-/// node here and feed `on_period` bytes into its ring buffer. Left as a stub
-/// so the device compiles and tests run without any audio device present.
-pub const CoreAudioSink = struct {
-    pub fn sink(_: *CoreAudioSink) PlaybackSink {
-        // Not yet implemented: acts as a silent sink.
-        return .{};
-    }
 };
 
 /// Per-stream negotiated parameters + lifecycle state.
@@ -188,6 +184,17 @@ const Stream = struct {
     format: u8 = FMT_S16,
     rate: u8 = RATE_48000,
     state: State = .unset,
+};
+
+pub const SnapshotState = extern struct {
+    ctrl_last_avail: u16,
+    tx_last_avail: u16,
+    buffer_bytes: u32,
+    period_bytes: u32,
+    channels: u8,
+    format: u8,
+    rate: u8,
+    stream_state: u8,
 };
 
 pub const Snd = struct {
@@ -206,14 +213,20 @@ pub const Snd = struct {
     sink: PlaybackSink,
 
     /// Guest memory accessor.
-    guest_memory: ?ring.GetMemFn,
+    guest_memory: ?GuestMemory,
 
     pub const Error = Allocator.Error;
 
     pub fn init(alloc: Allocator) Error!*Snd {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio.
         const virtio_version_1: u64 = 1 << 32;
-        const transport = try mmio.Transport.init(alloc, 25, virtio_version_1, NUM_QUEUES); // 25 = sound
+        // Virtio device ID 25 is sound.
+        const transport = try mmio.Transport.init(
+            alloc,
+            25,
+            virtio_version_1,
+            NUM_QUEUES,
+        );
         errdefer transport.deinit(alloc);
 
         const snd = try alloc.create(Snd);
@@ -240,8 +253,12 @@ pub const Snd = struct {
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(self: *Snd, accessor: ring.GetMemFn) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *Snd, accessor: anytype) void {
+        self.guest_memory = switch (@typeInfo(@TypeOf(accessor))) {
+            .@"fn", .pointer => GuestMemory.bindGlobal(accessor),
+            .@"struct" => accessor,
+            else => @compileError("unsupported guest-memory accessor"),
+        };
     }
 
     pub fn setIrqCallback(self: *Snd, irq: mmio.Irq) void {
@@ -251,6 +268,41 @@ pub const Snd = struct {
     /// Set the playback backend (defaults to a silent sink).
     pub fn setSink(self: *Snd, sink: PlaybackSink) void {
         self.sink = sink;
+    }
+
+    pub fn snapshotState(self: *const Snd) SnapshotState {
+        const stream = self.streams[0];
+        return .{
+            .ctrl_last_avail = self.ctrl_last_avail,
+            .tx_last_avail = self.tx_last_avail,
+            .buffer_bytes = stream.buffer_bytes,
+            .period_bytes = stream.period_bytes,
+            .channels = stream.channels,
+            .format = stream.format,
+            .rate = stream.rate,
+            .stream_state = @intFromEnum(stream.state),
+        };
+    }
+
+    pub fn restoreSnapshotState(self: *Snd, state: SnapshotState) !void {
+        if (state.stream_state > @intFromEnum(Stream.State.released)) return error.Corrupt;
+        if (state.stream_state != @intFromEnum(Stream.State.unset) and !validParams(
+            state.buffer_bytes,
+            state.period_bytes,
+            state.channels,
+            state.format,
+            state.rate,
+        )) return error.Corrupt;
+        self.ctrl_last_avail = state.ctrl_last_avail;
+        self.tx_last_avail = state.tx_last_avail;
+        self.streams[0] = .{
+            .buffer_bytes = state.buffer_bytes,
+            .period_bytes = state.period_bytes,
+            .channels = state.channels,
+            .format = state.format,
+            .rate = state.rate,
+            .state = @enumFromInt(state.stream_state),
+        };
     }
 
     // =========================================================================
@@ -315,7 +367,7 @@ pub const Snd = struct {
 
     /// Execute one control command chain; returns bytes written to the
     /// response (device-writable) descriptor.
-    fn processControlCommand(self: *Snd, qc: mmio.QueueConfig, head: u16, get_mem: ring.GetMemFn) u32 {
+    fn processControlCommand(self: *Snd, qc: mmio.QueueConfig, head: u16, get_mem: anytype) u32 {
         const chain = ring.Chain.collect(qc, head, get_mem);
         const req = chain.request(get_mem) orelse return 0;
         const resp = chain.response(get_mem) orelse return 0;
@@ -325,7 +377,13 @@ pub const Snd = struct {
         return switch (code) {
             R_JACK_INFO => self.cmdQueryInfo(req, resp, self.config.jacks, JackInfo, makeJackInfo),
             R_PCM_INFO => self.cmdQueryInfo(req, resp, self.config.streams, PcmInfo, makePcmInfo),
-            R_CHMAP_INFO => self.cmdQueryInfo(req, resp, self.config.chmaps, ChmapInfo, makeChmapInfo),
+            R_CHMAP_INFO => self.cmdQueryInfo(
+                req,
+                resp,
+                self.config.chmaps,
+                ChmapInfo,
+                makeChmapInfo,
+            ),
             R_PCM_SET_PARAMS => self.cmdSetParams(req, resp),
             R_PCM_PREPARE => self.cmdPcmLifecycle(req, resp, .prepared),
             R_PCM_START => self.cmdPcmLifecycle(req, resp, .running),
@@ -373,6 +431,16 @@ pub const Snd = struct {
         const p = std.mem.bytesToValue(SetParams, req[0..@sizeOf(SetParams)]);
         const sid = p.hdr.stream_id;
         if (sid >= self.streams.len) return writeStatus(resp, S_BAD_MSG);
+        if (self.streams[sid].state != .unset and self.streams[sid].state != .released) {
+            return writeStatus(resp, S_BAD_MSG);
+        }
+        if (p.features != 0 or !validParams(
+            p.buffer_bytes,
+            p.period_bytes,
+            p.channels,
+            p.format,
+            p.rate,
+        )) return writeStatus(resp, S_NOT_SUPP);
 
         self.streams[sid] = .{
             .buffer_bytes = p.buffer_bytes,
@@ -390,6 +458,9 @@ pub const Snd = struct {
         const h = std.mem.bytesToValue(PcmHdr, req[0..@sizeOf(PcmHdr)]);
         const sid = h.stream_id;
         if (sid >= self.streams.len) return writeStatus(resp, S_BAD_MSG);
+        if (!validTransition(self.streams[sid].state, new_state)) {
+            return writeStatus(resp, S_BAD_MSG);
+        }
 
         self.streams[sid].state = new_state;
         return writeStatus(resp, S_OK);
@@ -422,33 +493,47 @@ pub const Snd = struct {
     /// Consume one tx period buffer: skip the virtio_snd_pcm_xfer header in the
     /// readable descriptors, forward the PCM bytes to the sink, and write the
     /// virtio_snd_pcm_status into the writable descriptor.
-    fn processTxBuffer(self: *Snd, qc: mmio.QueueConfig, head: u16, get_mem: ring.GetMemFn) u32 {
+    fn processTxBuffer(self: *Snd, qc: mmio.QueueConfig, head: u16, get_mem: anytype) u32 {
         const chain = ring.Chain.collect(qc, head, get_mem);
 
         var status_mem: ?[]u8 = null;
-        // The xfer header (stream_id) leads the readable region; skip it, then
-        // everything after is PCM sample data.
-        var hdr_remaining: usize = @sizeOf(PcmXfer);
+        var header: [@sizeOf(PcmXfer)]u8 = undefined;
+        var header_len: usize = 0;
+        var status = S_OK;
 
         for (chain.slice()) |d| {
             if (d.isWrite()) {
-                if (status_mem == null) status_mem = get_mem(d.addr, d.len);
+                if (status_mem == null) status_mem = ring.get(get_mem, d.addr, d.len);
                 continue;
             }
-            var slice = get_mem(d.addr, d.len) orelse continue;
-            if (hdr_remaining > 0) {
-                const take = @min(slice.len, hdr_remaining);
-                hdr_remaining -= take;
+            var slice = ring.get(get_mem, d.addr, d.len) orelse continue;
+            if (header_len < header.len) {
+                const take = @min(slice.len, header.len - header_len);
+                @memcpy(header[header_len..][0..take], slice[0..take]);
+                header_len += take;
                 slice = slice[take..];
+                if (header_len == header.len) {
+                    const stream_id = std.mem.readInt(u32, &header, .little);
+                    if (stream_id >= self.streams.len or
+                        self.streams[stream_id].state != .running)
+                    {
+                        status = S_BAD_MSG;
+                    }
+                }
             }
-            if (slice.len > 0) {
+            if (status == S_OK and slice.len > 0) {
                 if (self.sink.on_period) |cb| cb(slice, self.sink.userdata);
             }
         }
+        if (header_len != header.len) status = S_BAD_MSG;
 
         if (status_mem) |sm| {
             if (sm.len >= @sizeOf(PcmStatus)) {
-                const st = PcmStatus{ .status = S_OK, .latency_bytes = 0 };
+                const latency = if (self.sink.latency_bytes) |cb|
+                    cb(self.sink.userdata)
+                else
+                    0;
+                const st = PcmStatus{ .status = status, .latency_bytes = latency };
                 @memcpy(sm[0..@sizeOf(PcmStatus)], std.mem.asBytes(&st));
                 return @sizeOf(PcmStatus);
             }
@@ -474,10 +559,33 @@ fn makePcmInfo(id: u32) PcmInfo {
     return .{
         .features = 0,
         .formats = @as(u64, 1) << FMT_S16,
-        .rates = (@as(u64, 1) << RATE_44100) | (@as(u64, 1) << RATE_48000),
+        .rates = @as(u64, 1) << RATE_48000,
         .direction = D_OUTPUT,
-        .channels_min = 2,
-        .channels_max = 2,
+        .channels_min = CHANNELS,
+        .channels_max = CHANNELS,
+    };
+}
+
+fn validParams(
+    buffer_bytes: u32,
+    period_bytes: u32,
+    channels: u8,
+    format: u8,
+    rate: u8,
+) bool {
+    return period_bytes >= FRAME_BYTES and period_bytes <= PERIOD_BYTES_MAX and
+        period_bytes % FRAME_BYTES == 0 and buffer_bytes >= period_bytes and
+        buffer_bytes <= BUFFER_BYTES_MAX and buffer_bytes % period_bytes == 0 and
+        channels == CHANNELS and format == FMT_S16 and rate == RATE_48000;
+}
+
+fn validTransition(current: Stream.State, requested: Stream.State) bool {
+    return switch (requested) {
+        .prepared => current == .params_set or current == .stopped,
+        .running => current == .prepared,
+        .stopped => current == .running,
+        .released => current == .prepared or current == .stopped,
+        .unset, .params_set => false,
     };
 }
 
@@ -607,7 +715,12 @@ test "Snd JACK_INFO and CHMAP_INFO queries" {
     setupCtrlChain(snd, @sizeOf(QueryInfo), 64);
 
     // JACK_INFO.
-    var q = QueryInfo{ .hdr = .{ .code = R_JACK_INFO }, .start_id = 0, .count = 1, .size = @sizeOf(JackInfo) };
+    var q = QueryInfo{
+        .hdr = .{ .code = R_JACK_INFO },
+        .start_id = 0,
+        .count = 1,
+        .size = @sizeOf(JackInfo),
+    };
     @memcpy(TestMem.mem[0x800..][0..@sizeOf(QueryInfo)], std.mem.asBytes(&q));
     postAvail(0);
     snd.write(@intFromEnum(mmio.Reg.queue_notify), CONTROLQ);
@@ -617,7 +730,12 @@ test "Snd JACK_INFO and CHMAP_INFO queries" {
     try testing.expectEqual(@as(u8, 1), TestMem.mem[0xA00 + @sizeOf(Hdr) + 16]);
 
     // CHMAP_INFO.
-    q = QueryInfo{ .hdr = .{ .code = R_CHMAP_INFO }, .start_id = 0, .count = 1, .size = @sizeOf(ChmapInfo) };
+    q = QueryInfo{
+        .hdr = .{ .code = R_CHMAP_INFO },
+        .start_id = 0,
+        .count = 1,
+        .size = @sizeOf(ChmapInfo),
+    };
     @memcpy(TestMem.mem[0x800..][0..@sizeOf(QueryInfo)], std.mem.asBytes(&q));
     postAvail(1);
     snd.write(@intFromEnum(mmio.Reg.queue_notify), CONTROLQ);
@@ -674,6 +792,55 @@ test "Snd SET_PARAMS then PREPARE/START stores params and returns OK" {
     try testing.expectEqual(Stream.State.running, snd.streams[0].state);
 }
 
+test "Snd rejects PCM parameters outside advertised host format" {
+    const sound = try Snd.init(testing.allocator);
+    defer sound.deinit();
+
+    TestMem.reset();
+    sound.setGuestMemory(TestMem.get);
+    setupCtrlChain(sound, @sizeOf(SetParams), 64);
+    const params = SetParams{
+        .hdr = .{ .hdr = .{ .code = R_PCM_SET_PARAMS }, .stream_id = 0 },
+        .buffer_bytes = 8192,
+        .period_bytes = 4096,
+        .features = 0,
+        .channels = CHANNELS,
+        .format = FMT_S16,
+        .rate = RATE_44100,
+        .padding = 0,
+    };
+    @memcpy(TestMem.mem[0x800..][0..@sizeOf(SetParams)], std.mem.asBytes(&params));
+    postAvail(0);
+    sound.write(@intFromEnum(mmio.Reg.queue_notify), CONTROLQ);
+
+    try testing.expectEqual(
+        S_NOT_SUPP,
+        std.mem.readInt(u32, TestMem.mem[0xA00..][0..4], .little),
+    );
+    try testing.expectEqual(Stream.State.unset, sound.streams[0].state);
+}
+
+test "Snd snapshot state roundtrips negotiated stream state" {
+    const sound = try Snd.init(testing.allocator);
+    defer sound.deinit();
+    sound.ctrl_last_avail = 7;
+    sound.tx_last_avail = 11;
+    sound.streams[0] = .{
+        .buffer_bytes = 8192,
+        .period_bytes = 4096,
+        .state = .running,
+    };
+
+    const restored = try Snd.init(testing.allocator);
+    defer restored.deinit();
+    try restored.restoreSnapshotState(sound.snapshotState());
+
+    try testing.expectEqual(@as(u16, 7), restored.ctrl_last_avail);
+    try testing.expectEqual(@as(u16, 11), restored.tx_last_avail);
+    try testing.expectEqual(Stream.State.running, restored.streams[0].state);
+    try testing.expectEqual(@as(u32, 4096), restored.streams[0].period_bytes);
+}
+
 test "Snd txq forwards PCM period to the sink and returns OK status" {
     const snd = try Snd.init(testing.allocator);
     defer snd.deinit();
@@ -692,6 +859,11 @@ test "Snd txq forwards PCM period to the sink and returns OK status" {
     };
     Cap.len = 0;
     snd.setSink(.{ .on_period = Cap.cb });
+    snd.streams[0] = .{
+        .buffer_bytes = 8192,
+        .period_bytes = 4096,
+        .state = .running,
+    };
 
     // Readable buffer at 0xC00: xfer header (stream_id 0) + 8 PCM bytes.
     const pcm = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
@@ -730,6 +902,9 @@ test "Snd txq forwards PCM period to the sink and returns OK status" {
 
     // Used ring advanced, reporting the status length.
     try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, TestMem.mem[0x600..][2..4], .little));
-    try testing.expectEqual(@as(u32, @sizeOf(PcmStatus)), std.mem.readInt(u32, TestMem.mem[0x600..][8..12], .little));
+    try testing.expectEqual(
+        @as(u32, @sizeOf(PcmStatus)),
+        std.mem.readInt(u32, TestMem.mem[0x600..][8..12], .little),
+    );
     try testing.expect(snd.transport.interrupt_status.used_buffer);
 }

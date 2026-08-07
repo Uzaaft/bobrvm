@@ -82,6 +82,7 @@ pub fn executeFirmwareSmoke(
         .disk2_read_only = true,
         .network_enabled = true,
         .display_enabled = true,
+        .audio_enabled = true,
         .command_line = command_line,
         .exits_max = exits_max,
     }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
@@ -177,6 +178,7 @@ fn verifyFirmwareSnapshotRestore(
         .disk2_read_only = true,
         .network_enabled = true,
         .display_enabled = true,
+        .audio_enabled = true,
         .restore_path = snapshot_path,
         .command_line = command_line,
         .exits_max = exits_max,

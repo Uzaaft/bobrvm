@@ -226,6 +226,9 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
+    if (target.result.os.tag == .linux) {
+        cli_module.linkSystemLibrary("alsa", dynamic_link_options);
+    }
 
     const cli_exe = b.addExecutable(.{
         .name = "bobrvm",
@@ -244,6 +247,7 @@ pub fn build(b: *std.Build) !void {
         });
         wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
         gtk_module.linkSystemLibrary("gtk4", dynamic_link_options);
+        gtk_module.linkSystemLibrary("alsa", dynamic_link_options);
         const gtk_exe = b.addExecutable(.{
             .name = "bobrvm-gtk",
             .root_module = gtk_module,

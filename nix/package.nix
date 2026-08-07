@@ -2,6 +2,7 @@
   lib,
   stdenv,
   OVMF,
+  alsa-lib,
   glib,
   gobject-introspection,
   gsettings-desktop-schemas,
@@ -59,6 +60,7 @@ stdenv.mkDerivation (finalAttrs: {
     lib.optional stdenv.hostPlatform.isDarwin libiconv
     ++ lib.optionals stdenv.hostPlatform.isLinux [
       glib
+      alsa-lib
       gsettings-desktop-schemas
       gtk4
     ];

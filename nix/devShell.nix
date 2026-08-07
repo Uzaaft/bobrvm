@@ -4,6 +4,7 @@
   stdenv,
   OVMF,
   adwaita-icon-theme,
+  alsa-lib,
   glib,
   gobject-introspection,
   gsettings-desktop-schemas,
@@ -38,6 +39,7 @@ mkShell {
     ]
     ++ lib.optionals stdenv.hostPlatform.isLinux [
       adwaita-icon-theme
+      alsa-lib
       glib
       gobject-introspection
       gsettings-desktop-schemas
