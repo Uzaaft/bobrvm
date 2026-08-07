@@ -15,6 +15,9 @@ pub const c = @cImport({
 
 pub const API_VERSION: c_int = 12;
 
+const kick_signal = std.posix.SIG.USR1;
+var kick_handler_state = std.atomic.Value(u8).init(0);
+
 pub const Error = OpenError || CreateError || FastPathError || InterruptError || RunError;
 
 pub const OpenError = error{
@@ -94,6 +97,7 @@ pub const Kvm = struct {
     capabilities: Capabilities,
 
     pub fn open() OpenError!Kvm {
+        installKickHandler();
         const fd = c.open("/dev/kvm", c.O_RDWR | c.O_CLOEXEC);
         if (fd < 0) return openError();
         errdefer _ = std.c.close(fd);
@@ -159,6 +163,27 @@ pub const Kvm = struct {
         };
     }
 };
+
+/// Interrupt the KVM_RUN ioctl owned by a Linux thread after setting immediate_exit.
+pub fn interruptThread(thread_id: u32) void {
+    _ = std.os.linux.tgkill(std.os.linux.getpid(), @intCast(thread_id), kick_signal);
+}
+
+fn installKickHandler() void {
+    if (kick_handler_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        const action = std.posix.Sigaction{
+            .handler = .{ .handler = kickSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(kick_signal, &action, null);
+        kick_handler_state.store(2, .release);
+        return;
+    }
+    while (kick_handler_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+}
+
+fn kickSignalHandler(_: std.posix.SIG) callconv(.c) void {}
 
 pub const VM = struct {
     fd: std.posix.fd_t,
@@ -411,6 +436,10 @@ pub const Vcpu = struct {
         @atomicStore(u8, &self.run.immediate_exit, 1, .release);
     }
 
+    pub fn clearExitRequest(self: *Vcpu) void {
+        @atomicStore(u8, &self.run.immediate_exit, 0, .release);
+    }
+
     pub fn setRealModeEntry(
         self: *Vcpu,
         instruction_pointer: u64,
@@ -477,7 +506,6 @@ pub const Vcpu = struct {
     }
 
     pub fn runOnce(self: *Vcpu) RunError!ExitReason {
-        self.run.immediate_exit = 0;
         if (c.ioctl(self.fd, c.KVM_RUN, @as(c_ulong, 0)) < 0) {
             return switch (std.c.errno(@as(c_int, -1))) {
                 .INTR => error.Interrupted,

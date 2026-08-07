@@ -56,4 +56,20 @@ if [[ "$persisted" != "bobrvm-root-write-ok" ]]; then
     exit 1
 fi
 
-echo "Linux KVM E2E: $expected_marker $fast_path_marker"
+lifecycle_output="$test_dir/lifecycle-output"
+set +e
+timeout 5s "$1" kvm-lifecycle-smoke "$2" >"$lifecycle_output" 2>&1
+lifecycle_status="$?"
+set -e
+cat "$lifecycle_output"
+if [[ "$lifecycle_status" -ne 0 ]]; then
+    echo "error: KVM lifecycle smoke exited with status $lifecycle_status" >&2
+    exit 1
+fi
+lifecycle_marker="KVM lifecycle: host stop joined cleanly"
+if ! grep -q "^$lifecycle_marker$" "$lifecycle_output"; then
+    echo "error: $lifecycle_marker was not observed" >&2
+    exit 1
+fi
+
+echo "Linux KVM E2E: $expected_marker $fast_path_marker lifecycle-stop"

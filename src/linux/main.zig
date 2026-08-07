@@ -27,6 +27,18 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeAll("KVM smoke: marker I/O exit followed by halt\n");
         return;
     }
+    if (std.mem.eql(u8, command, "kvm-lifecycle-smoke")) {
+        const kernel_path = args.next() orelse {
+            writeAll("error: kvm-lifecycle-smoke requires a bzImage path\n");
+            std.process.exit(1);
+        };
+        run_kernel.executeStopSmoke(std.heap.c_allocator, kernel_path) catch |err| {
+            printNamedError("KVM lifecycle smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM lifecycle: host stop joined cleanly\n");
+        return;
+    }
     if (std.mem.eql(u8, command, "run-kernel")) {
         const kernel_path = args.next() orelse {
             writeAll("error: run-kernel requires a bzImage path\n");
@@ -130,6 +142,7 @@ fn printUsage() void {
         \\Commands:
         \\  kvm-info    Validate KVM and show acceleration capabilities
         \\  kvm-smoke   Run a tiny x86 payload through KVM
+        \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
         \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
         \\  version     Show version information
         \\  help        Show this help message

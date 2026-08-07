@@ -1,26 +1,17 @@
 //! Linux direct-kernel boot command.
 
 const std = @import("std");
-const file_compat = @import("../compat/file.zig");
 const global = @import("../global.zig");
-const boot = @import("../machine/x86/boot.zig");
 const x86 = @import("../machine/x86/main.zig");
+const VM = @import("VM.zig");
 
 const memory_bytes: usize = 512 * 1024 * 1024;
-const kernel_bytes_max: usize = 512 * 1024 * 1024;
-const initrd_bytes_max: usize = 1024 * 1024 * 1024;
 const exits_max: u64 = 100_000_000;
-const command_line =
+pub const command_line =
     "console=ttyS0,115200 earlycon=uart,io,0x3f8,115200n8 " ++
     "nokaslr acpi=off pci=conf1 panic=-1 reboot=t";
 
-pub const Error = boot.ParseError || x86.Machine.InitError || x86.Machine.AttachDiskError ||
-    x86.Machine.RunError || error{
-    OpenKernelFailed,
-    ReadKernelFailed,
-    OpenInitrdFailed,
-    ReadInitrdFailed,
-};
+pub const Error = VM.CreateError || VM.StartError || VM.JoinError;
 
 pub fn execute(
     allocator: std.mem.Allocator,
@@ -28,52 +19,42 @@ pub fn execute(
     initrd_path: ?[]const u8,
     disk_path: ?[]const u8,
 ) Error!void {
-    const kernel = try readFile(
-        allocator,
-        kernel_path,
-        kernel_bytes_max,
-        .kernel,
-    );
-    defer allocator.free(kernel);
-    const image = try boot.Image.parse(kernel);
-
-    const initrd = if (initrd_path) |path|
-        try readFile(
-            allocator,
-            path,
-            initrd_bytes_max,
-            .initrd,
-        )
-    else
-        null;
-    defer if (initrd) |bytes| allocator.free(bytes);
-
-    var machine = try x86.Machine.init(memory_bytes, image, command_line, initrd);
-    defer machine.deinit();
-    if (disk_path) |path| try machine.attachDisk(allocator, path, false);
     var output = Stdout{};
-    try machine.run(x86.SerialSink.bind(Stdout, &output, Stdout.write), exits_max);
-    if (disk_path != null) output.writeFastBlockStats(machine.fastBlockStats());
+    const vm = try VM.create(allocator, .{
+        .memory_bytes = memory_bytes,
+        .kernel_path = kernel_path,
+        .initrd_path = initrd_path,
+        .disk_path = disk_path,
+        .command_line = command_line,
+        .exits_max = exits_max,
+    }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
+    defer vm.destroy();
+    try vm.start();
+    _ = try vm.join();
+    if (disk_path != null) output.writeFastBlockStats(vm.fastBlockStats());
 }
 
-fn readFile(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    bytes_max: usize,
-    kind: enum { kernel, initrd },
-) error{ OpenKernelFailed, ReadKernelFailed, OpenInitrdFailed, ReadInitrdFailed }![]u8 {
-    const file = std.Io.Dir.cwd().openFile(global.io(), path, .{
-        .mode = .read_only,
-    }) catch return switch (kind) {
-        .kernel => error.OpenKernelFailed,
-        .initrd => error.OpenInitrdFailed,
-    };
-    defer file.close(global.io());
-    return file_compat.readToEndAlloc(file, allocator, bytes_max) catch return switch (kind) {
-        .kernel => error.ReadKernelFailed,
-        .initrd => error.ReadInitrdFailed,
-    };
+pub fn executeStopSmoke(allocator: std.mem.Allocator, kernel_path: []const u8) !void {
+    var output = DiscardOutput{};
+    const vm = try VM.create(allocator, .{
+        .memory_bytes = 128 * 1024 * 1024,
+        .kernel_path = kernel_path,
+        .command_line = command_line,
+        .exits_max = exits_max,
+    }, x86.SerialSink.bind(DiscardOutput, &output, DiscardOutput.write));
+    defer vm.destroy();
+    try vm.start();
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = 50 * std.time.ns_per_ms },
+        .clock = .awake,
+    }, global.io()) catch {};
+    vm.requestStop();
+    if (try vm.join() != .stopped) return error.UnexpectedRunOutcome;
 }
+
+const DiscardOutput = struct {
+    fn write(_: *DiscardOutput, _: []const u8) void {}
+};
 
 const Stdout = struct {
     fn write(_: *Stdout, bytes: []const u8) void {

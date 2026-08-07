@@ -59,6 +59,8 @@ pub const Machine = struct {
     block_irq_desired: bool = false,
     block_irq_injected: bool = false,
     block_notify_mmio_exits: u64 = 0,
+    stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    vcpu_thread_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     exits_total: u64 = 0,
     mmio_exits_total: u64 = 0,
     last_mmio_address: ?u64 = null,
@@ -81,6 +83,11 @@ pub const Machine = struct {
         kicks: u64,
         interrupts: u64,
         notify_mmio_exits: u64,
+    };
+
+    pub const RunOutcome = enum {
+        guest_shutdown,
+        stopped,
     };
 
     pub fn init(
@@ -169,16 +176,28 @@ pub const Machine = struct {
         }
     }
 
-    pub fn run(self: *Machine, serial: SerialSink, exits_max: u64) RunError!void {
+    pub fn run(self: *Machine, serial: SerialSink, exits_max: u64) RunError!RunOutcome {
+        self.vcpu_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
+        defer self.vcpu_thread_id.store(0, .release);
+
         while (self.exits_total < exits_max) {
+            self.vcpu.clearExitRequest();
+            if (self.stop_requested.load(.acquire)) return .stopped;
             if (self.block_worker_failed.load(.acquire)) {
                 return error.FastDevicePathFailed;
             }
             self.exits_total += 1;
-            switch (try self.vcpu.runOnce()) {
+            const exit = self.vcpu.runOnce() catch |err| switch (err) {
+                error.Interrupted => if (self.stop_requested.load(.acquire))
+                    return .stopped
+                else
+                    return err,
+                else => return err,
+            };
+            switch (exit) {
                 .io => try self.handleIo(serial),
                 .halted, .interrupted => continue,
-                .shutdown => return,
+                .shutdown => return .guest_shutdown,
                 .internal_error => return error.InternalError,
                 .mmio => try self.handleMmio(),
                 .unknown => return error.UnknownExit,
@@ -186,6 +205,14 @@ pub const Machine = struct {
             try self.syncBlockIrq();
         }
         return error.ExitLimitReached;
+    }
+
+    /// Stop a running vCPU from another thread without waiting for another VM exit.
+    pub fn requestStop(self: *Machine) void {
+        self.stop_requested.store(true, .release);
+        self.vcpu.requestExit();
+        const thread_id = self.vcpu_thread_id.load(.acquire);
+        if (thread_id != 0) kvm.interruptThread(thread_id);
     }
 
     pub fn fastBlockStats(self: *const Machine) FastBlockStats {
