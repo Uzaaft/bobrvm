@@ -166,33 +166,33 @@ pub const P9Server = struct {
         off: usize = 0,
 
         fn u8v(self: *Reader) !u8 {
-            if (self.off + 1 > self.buf.len) return error.Truncated;
+            if (1 > self.buf.len - self.off) return error.Truncated;
             defer self.off += 1;
             return self.buf[self.off];
         }
         fn u16v(self: *Reader) !u16 {
-            if (self.off + 2 > self.buf.len) return error.Truncated;
+            if (2 > self.buf.len - self.off) return error.Truncated;
             defer self.off += 2;
             return std.mem.readInt(u16, self.buf[self.off..][0..2], .little);
         }
         fn u32v(self: *Reader) !u32 {
-            if (self.off + 4 > self.buf.len) return error.Truncated;
+            if (4 > self.buf.len - self.off) return error.Truncated;
             defer self.off += 4;
             return std.mem.readInt(u32, self.buf[self.off..][0..4], .little);
         }
         fn u64v(self: *Reader) !u64 {
-            if (self.off + 8 > self.buf.len) return error.Truncated;
+            if (8 > self.buf.len - self.off) return error.Truncated;
             defer self.off += 8;
             return std.mem.readInt(u64, self.buf[self.off..][0..8], .little);
         }
         fn str(self: *Reader) ![]const u8 {
             const len = try self.u16v();
-            if (self.off + len > self.buf.len) return error.Truncated;
+            if (len > self.buf.len - self.off) return error.Truncated;
             defer self.off += len;
             return self.buf[self.off..][0..len];
         }
         fn bytes(self: *Reader, len: usize) ![]const u8 {
-            if (self.off + len > self.buf.len) return error.Truncated;
+            if (len > self.buf.len - self.off) return error.Truncated;
             defer self.off += len;
             return self.buf[self.off..][0..len];
         }
@@ -363,9 +363,14 @@ pub const P9Server = struct {
     pub fn handle(self: *P9Server, req: []const u8, resp: []u8) usize {
         var w = Writer{ .buf = resp };
         if (req.len < 7) return lerror(&w, 0, L_EINVAL);
-        var r = Reader{ .buf = req, .off = 4 };
+        const declared_size = std.mem.readInt(u32, req[0..4], .little);
+        const tag = std.mem.readInt(u16, req[5..7], .little);
+        if (declared_size < 7 or declared_size > req.len or declared_size > self.msize) {
+            return lerror(&w, tag, L_EINVAL);
+        }
+        var r = Reader{ .buf = req[0..declared_size], .off = 4 };
         const msg_type = r.u8v() catch unreachable;
-        const tag = r.u16v() catch unreachable;
+        _ = r.u16v() catch unreachable;
 
         return self.dispatch(msg_type, tag, &r, &w) catch |err| switch (err) {
             error.Truncated => lerror(&w, tag, L_EINVAL),
@@ -1122,4 +1127,26 @@ test "p9: path escapes and unknown ops are rejected" {
     defer testing.allocator.free(req3);
     _ = srv.handle(req3, &resp);
     try testing.expectEqual(L_EBADF, std.mem.readInt(u32, resp[7..11], .little));
+}
+
+test "p9: request parsing is bounded by the declared message size" {
+    var root = [_]u8{'.'};
+    var server = P9Server.initEmbedded(testing.allocator, &root);
+    defer server.deinitEmbedded();
+    var response: [MSIZE_MAX]u8 = undefined;
+
+    var payload = TestPayload{};
+    const request = try tmsg(testing.allocator, Tflush, 42, payload.u16v(1).slice());
+    defer testing.allocator.free(request);
+    std.mem.writeInt(u32, request[0..4], 7, .little);
+
+    const response_len = server.handle(request, &response);
+    try testing.expectEqual(@as(usize, 11), response_len);
+    try testing.expectEqual(@as(u8, Tlerror + 1), response[4]);
+    try testing.expectEqual(@as(u16, 42), std.mem.readInt(u16, response[5..7], .little));
+    try testing.expectEqual(L_EINVAL, std.mem.readInt(u32, response[7..11], .little));
+
+    std.mem.writeInt(u32, request[0..4], @intCast(request.len + 1), .little);
+    _ = server.handle(request, &response);
+    try testing.expectEqual(L_EINVAL, std.mem.readInt(u32, response[7..11], .little));
 }
