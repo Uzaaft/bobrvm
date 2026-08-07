@@ -80,21 +80,43 @@ pub fn executeFirmwareSmoke(
         .disk_path = disk_path,
         .disk2_path = iso_path,
         .disk2_read_only = true,
+        .network_enabled = true,
         .display_enabled = true,
         .command_line = command_line,
         .exits_max = exits_max,
     }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
     defer vm.destroy();
     try vm.start();
-    std.Io.Clock.Duration.sleep(.{
-        .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
-        .clock = .awake,
-    }, global.io()) catch {};
-    if (vm.state() != .running) return error.FirmwareStoppedEarly;
     const pixels = try allocator.alloc(u8, 1280 * 800 * 4);
     defer allocator.free(pixels);
-    const scanout = vm.copyScanout(pixels) orelse return error.FirmwareDidNotProduceScanout;
-    if (scanout.width == 0 or scanout.height == 0) return error.FirmwareDidNotProduceScanout;
+    var scanout: ?x86.Machine.Scanout = null;
+    for (0..100) |attempt| {
+        scanout = vm.copyScanout(pixels);
+        if (scanout != null) {
+            std.log.info("firmware scanout ready after {} ms", .{attempt * 100});
+            break;
+        }
+        if (vm.state() != .running) return error.FirmwareStoppedEarly;
+        std.Io.Clock.Duration.sleep(.{
+            .raw = .{ .nanoseconds = 100 * std.time.ns_per_ms },
+            .clock = .awake,
+        }, global.io()) catch {};
+    }
+    const active_scanout = scanout orelse {
+        vm.requestStop();
+        _ = try vm.join();
+        output.writeFirmwareStats(
+            vm.pciConfigReads(),
+            vm.pciDeviceReads(),
+            vm.mmioExitStats(),
+            vm.fastBlockStats().kicks,
+            vm.secondaryBlockNotifications(),
+        );
+        return error.FirmwareDidNotProduceScanout;
+    };
+    if (active_scanout.width == 0 or active_scanout.height == 0) {
+        return error.FirmwareDidNotProduceScanout;
+    }
     vm.requestStop();
     if (try vm.join() != .stopped) return error.UnexpectedRunOutcome;
     const primary = vm.fastBlockStats();
@@ -360,18 +382,21 @@ const Stdout = struct {
         primary_kicks: u64,
         secondary_notifications: u64,
     ) void {
-        var buffer: [224]u8 = undefined;
+        var buffer: [320]u8 = undefined;
         const line = std.fmt.bufPrint(
             &buffer,
-            "BOBRVM_KVM_FIRMWARE pci_reads={d} devices={d},{d},{d},{d},{d} " ++
+            "BOBRVM_KVM_FIRMWARE pci_reads={d} " ++
+                "slots=2:{d},3:{d},5:{d},6:{d},7:{d},9:{d},10:{d} " ++
                 "mmio={d} last_mmio=0x{x} primary_kicks={d} secondary_kicks={d}\n",
             .{
                 pci_reads,
-                device_reads[0],
-                device_reads[1],
                 device_reads[2],
                 device_reads[3],
-                device_reads[4],
+                device_reads[5],
+                device_reads[6],
+                device_reads[7],
+                device_reads[9],
+                device_reads[10],
                 mmio.total,
                 mmio.last orelse 0,
                 primary_kicks,

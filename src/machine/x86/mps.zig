@@ -89,8 +89,6 @@ fn writeConfigTable(bytes: []u8, cpu_count: u8) void {
     offset += interrupt_entry_bytes;
     writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 3 << 2, io_apic_id, 10);
     offset += interrupt_entry_bytes;
-    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 4 << 2, io_apic_id, 9);
-    offset += interrupt_entry_bytes;
     writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 5 << 2, io_apic_id, 5);
     offset += interrupt_entry_bytes;
     writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 6 << 2, io_apic_id, 6);
@@ -100,6 +98,8 @@ fn writeConfigTable(bytes: []u8, cpu_count: u8) void {
     writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 8 << 2, io_apic_id, 12);
     offset += interrupt_entry_bytes;
     writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 9 << 2, io_apic_id, 13);
+    offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 10 << 2, io_apic_id, 9);
     offset += interrupt_entry_bytes;
     std.debug.assert(offset == bytes.len);
     bytes[7] = checksum(bytes);

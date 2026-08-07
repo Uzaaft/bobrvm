@@ -20,7 +20,9 @@ const pci_block_bar_initial: u32 = 0xd000_0000;
 const pci_block2_slot: u5 = 3;
 const pci_block2_irq: u32 = 10;
 const pci_block2_bar_initial: u32 = 0xd001_0000;
-const pci_net_slot: u5 = 4;
+// Keep firmware networking after display/input. EDK2 connects PCI controllers
+// in slot order, and a slow network driver must never delay the first scanout.
+const pci_net_slot: u5 = 10;
 const pci_net_irq: u32 = 9;
 const pci_net_bar_initial: u32 = 0xd002_0000;
 const pci_gpu_slot: u5 = 5;
@@ -1182,22 +1184,34 @@ pub const Machine = struct {
             }
         }
         if (self.pci_net) |device| {
-            if (self.net) |net| return self.handleNetPciBar(device, net, access);
+            if (self.net) |net| {
+                if (self.handleNetPciBar(device, net, access)) return true;
+            }
         }
         if (self.pci_gpu) |device| {
-            if (self.gpu) |gpu| return self.handleGpuPciBar(device, gpu, access);
+            if (self.gpu) |gpu| {
+                if (self.handleGpuPciBar(device, gpu, access)) return true;
+            }
         }
         if (self.pci_keyboard) |device| {
-            if (self.keyboard) |input| return self.handleInputPciBar(device, input, access);
+            if (self.keyboard) |input| {
+                if (self.handleInputPciBar(device, input, access)) return true;
+            }
         }
         if (self.pci_tablet) |device| {
-            if (self.tablet) |input| return self.handleInputPciBar(device, input, access);
+            if (self.tablet) |input| {
+                if (self.handleInputPciBar(device, input, access)) return true;
+            }
         }
         if (self.pci_share) |device| {
-            if (self.share) |share| return self.handleSharePciBar(device, share, access);
+            if (self.share) |share| {
+                if (self.handleSharePciBar(device, share, access)) return true;
+            }
         }
         if (self.pci_rng) |device| {
-            if (self.rng) |rng| return self.handleRngPciBar(device, rng, access);
+            if (self.rng) |rng| {
+                if (self.handleRngPciBar(device, rng, access)) return true;
+            }
         }
         return false;
     }

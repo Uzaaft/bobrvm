@@ -151,13 +151,13 @@ pub fn create(
     if (config.disk2_path) |path| {
         try self.machine.attachDisk2(allocator, path, config.disk2_read_only);
     }
-    if (config.network_enabled) try self.machine.attachNetwork(allocator, config.forwards);
     if (config.display_enabled) {
         try self.machine.attachDisplay(allocator, config.display_width, config.display_height);
         try self.machine.attachInputDevices(allocator);
     }
     if (config.shared_dir) |path| try self.machine.attachSharedFolder(allocator, path);
     try self.machine.attachRng(allocator);
+    if (config.network_enabled) try self.machine.attachNetwork(allocator, config.forwards);
     return self;
 }
 

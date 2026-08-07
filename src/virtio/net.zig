@@ -309,9 +309,14 @@ pub const Net = struct {
         const get_mem = self.guest_memory orelse return;
 
         const avail_idx = ring.availIdxMemory(qc, get_mem) orelse return;
+        const pending = avail_idx -% self.tx_last_avail;
+        if (pending > qc.num) {
+            log.warn("rejecting TX avail jump {} larger than queue {}", .{ pending, qc.num });
+            return;
+        }
         var processed: u32 = 0;
 
-        while (self.tx_last_avail != avail_idx) : (processed += 1) {
+        while (self.tx_last_avail != avail_idx and processed < qc.num) : (processed += 1) {
             const head = ring.availEntryMemory(qc, self.tx_last_avail, get_mem) orelse break;
             const chain = ring.Chain.collectMemory(qc, head, get_mem);
 
@@ -400,10 +405,15 @@ pub const Net = struct {
         if (self.rx_count == 0) return;
 
         const avail_idx = ring.availIdxMemory(qc, get_mem) orelse return;
+        const pending = avail_idx -% self.rx_last_avail;
+        if (pending > qc.num) {
+            log.warn("rejecting RX avail jump {} larger than queue {}", .{ pending, qc.num });
+            return;
+        }
         var last_avail = self.rx_last_avail;
         var delivered: usize = 0;
 
-        while (last_avail != avail_idx and delivered < self.rx_count) {
+        while (last_avail != avail_idx and delivered < self.rx_count and delivered < qc.num) {
             const head = ring.availEntryMemory(qc, last_avail, get_mem) orelse break;
             const chain = ring.Chain.collectMemory(qc, head, get_mem);
             const frame_index = (self.rx_head + delivered) % self.rx_frames.len;
