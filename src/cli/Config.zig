@@ -189,6 +189,7 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
             };
         } else {
             log.warn("unknown argument: {s}", .{arg});
+            return ParseError.InvalidArgument;
         }
     }
 
@@ -428,4 +429,63 @@ test "config paths enforce filename boundaries" {
         error.InvalidName,
         getConfigPath(std.testing.allocator, &name),
     );
+}
+
+test "CLI arguments project into VM configuration" {
+    // zig fmt: off
+    const argv = [_][*:0]const u8{
+        "--memory", "2048",
+        "--cpus", "4",
+        "--firmware", "/firmware.fd",
+        "--vars", "/vars.fd",
+        "--disk", "/disk.raw",
+        "--disk-readonly",
+        "--disk2", "/secondary.raw",
+        "--disk2-writable",
+        "--kernel", "/kernel",
+        "--initrd", "/initrd",
+        "--cmdline", "console=hvc0",
+        "--virgl",
+        "--sound",
+        "--share", "/shared",
+        "--restore", "/snapshot",
+        "--forward", "2222:22",
+        "--display", "1600x900",
+        "--gpu-memory", "1024",
+    };
+    // zig fmt: on
+    var args = (std.process.Args{ .vector = &argv }).iterate();
+
+    const parsed = try parseArgs(&args);
+
+    try std.testing.expectEqual(2048, parsed.memory_mb);
+    try std.testing.expectEqual(4, parsed.vcpu_count);
+    try std.testing.expectEqualStrings("/firmware.fd", parsed.firmware_path.?);
+    try std.testing.expectEqualStrings("/vars.fd", parsed.vars_path.?);
+    try std.testing.expectEqualStrings("/disk.raw", parsed.disk_path.?);
+    try std.testing.expect(parsed.disk_read_only);
+    try std.testing.expectEqualStrings("/secondary.raw", parsed.disk2_path.?);
+    try std.testing.expect(!parsed.disk2_read_only);
+    try std.testing.expectEqualStrings("/kernel", parsed.kernel_path.?);
+    try std.testing.expectEqualStrings("/initrd", parsed.initrd_path.?);
+    try std.testing.expectEqualStrings("console=hvc0", parsed.cmdline);
+    try std.testing.expect(parsed.enable_gpu);
+    try std.testing.expect(parsed.enable_virgl);
+    try std.testing.expect(parsed.enable_net);
+    try std.testing.expect(parsed.enable_snd);
+    try std.testing.expectEqualStrings("/shared", parsed.shared_dir.?);
+    try std.testing.expectEqualStrings("/snapshot", parsed.restore_path.?);
+    try std.testing.expectEqual(1, parsed.forward_count);
+    try std.testing.expectEqual(2222, parsed.forwards[0].host_port);
+    try std.testing.expectEqual(22, parsed.forwards[0].guest_port);
+    try std.testing.expectEqual(1600, parsed.display_width);
+    try std.testing.expectEqual(900, parsed.display_height);
+    try std.testing.expectEqual(1024, parsed.gpu_memory_mb);
+}
+
+test "CLI rejects unknown arguments" {
+    const argv = [_][*:0]const u8{"--memroy"};
+    var args = (std.process.Args{ .vector = &argv }).iterate();
+
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&args));
 }
