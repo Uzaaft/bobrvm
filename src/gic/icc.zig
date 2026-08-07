@@ -199,11 +199,16 @@ pub const IccHandler = struct {
     }
 };
 
+fn enableDistributorGroup1(gic: *Gic) void {
+    gic.distWrite(gic_module.GICD.CTLR, 4, gic_module.GICD.CTLR_ENABLE_G1NS);
+}
+
 test "ICC IAR1 honors its group enable and priority mask" {
     const gic = try Gic.init(std.testing.allocator, 1);
     defer gic.deinit();
     const handler = try IccHandler.init(std.testing.allocator, gic, 1);
     defer handler.deinit(std.testing.allocator);
+    enableDistributorGroup1(gic);
 
     const sgi_frame = gic_module.GICR.SGI_OFFSET;
     gic.redistWrite(sgi_frame + gic_module.GICR.ISENABLER0, 4, 1 << 5);
@@ -223,6 +228,7 @@ test "ICC HPPIR1 reports the highest pending interrupt without acknowledging it"
     defer gic.deinit();
     const handler = try IccHandler.init(std.testing.allocator, gic, 1);
     defer handler.deinit(std.testing.allocator);
+    enableDistributorGroup1(gic);
 
     const sgi_frame = gic_module.GICR.SGI_OFFSET;
     gic.redistWrite(sgi_frame + gic_module.GICR.ISENABLER0, 4, 1 << 5);
@@ -252,6 +258,7 @@ test "ICC split EOI mode keeps an interrupt active until DIR" {
     defer gic.deinit();
     const handler = try IccHandler.init(std.testing.allocator, gic, 1);
     defer handler.deinit(std.testing.allocator);
+    enableDistributorGroup1(gic);
     var eoi_record: EoiRecord = .{};
     gic.setEoiCallback(EoiRecord.record, &eoi_record);
 
