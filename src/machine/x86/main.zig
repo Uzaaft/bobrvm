@@ -169,6 +169,7 @@ pub const Machine = struct {
     pci_gpu: ?*pci.VirtioPciDevice = null,
     gpu_irq_desired: bool = false,
     gpu_irq_injected: bool = false,
+    gpu_wakeup: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     keyboard: ?*virtio.Input = null,
     pci_keyboard: ?*pci.VirtioPciDevice = null,
     keyboard_irq_desired: bool = false,
@@ -843,6 +844,44 @@ pub const Machine = struct {
         return capabilities;
     }
 
+    pub fn setClipboardHandlers(
+        self: *Machine,
+        on_guest_clipboard: *const fn ([]const u8, ?*anyopaque) void,
+        request_host_clipboard: *const fn (?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        if (self.vdagent) |*vdagent| {
+            vdagent.setClipboardHandlers(
+                agent.vdagent.GuestClipboard.initRaw(on_guest_clipboard, userdata),
+                agent.vdagent.HostClipboardRequest.initRaw(request_host_clipboard, userdata),
+            );
+        }
+        if (self.wayland_agent) |native| {
+            native.setClipboardHandlers(
+                agent.native.GuestClipboard.initRaw(on_guest_clipboard, userdata),
+                agent.native.HostClipboardRequest.initRaw(request_host_clipboard, userdata),
+            );
+        }
+    }
+
+    pub fn hostClipboardGrab(self: *Machine) void {
+        if (self.vdagent) |*vdagent| vdagent.hostClipboardGrab();
+        if (self.wayland_agent) |native| native.hostClipboardGrab();
+    }
+
+    pub fn sendHostClipboard(self: *Machine, text: []const u8) void {
+        if (self.vdagent) |*vdagent| vdagent.sendClipboard(text);
+        if (self.wayland_agent) |native| native.sendClipboard(text);
+    }
+
+    pub fn sendFileToGuest(self: *Machine, path: []const u8) !void {
+        const native = self.native_agent orelse return error.AgentUnavailable;
+        if (native.capabilities() & agent.native.HostCapability.file_transfer == 0) {
+            return error.AgentUnavailable;
+        }
+        try native.offerFile(path);
+    }
+
     pub fn requestGuestShutdown(self: *Machine) void {
         if (self.qga) |qga| qga.shutdown("powerdown");
     }
@@ -945,6 +984,15 @@ pub const Machine = struct {
             .generation = view.generation,
             .bytes = bytes,
         };
+    }
+
+    pub fn requestDisplayResize(self: *Machine, width: u32, height: u32) void {
+        const gpu = self.gpu orelse return;
+        self.exit_lock.lockUncancelable(global.io());
+        gpu.resizeDisplay(width, height);
+        self.exit_lock.unlock(global.io());
+        self.gpu_wakeup.store(true, .release);
+        self.wakePrimaryVcpu();
     }
 
     pub fn run(self: *Machine, serial: SerialSink, exits_max: u64) RunError!RunOutcome {
@@ -1093,7 +1141,8 @@ pub const Machine = struct {
         const network = self.net_wakeup.swap(false, .acq_rel);
         const input = self.input_wakeup.swap(false, .acq_rel);
         const console = self.console_wakeup.swap(false, .acq_rel);
-        if (!network and !input and !console) return;
+        const gpu = self.gpu_wakeup.swap(false, .acq_rel);
+        if (!network and !input and !console and !gpu) return;
         self.exit_lock.lockUncancelable(global.io());
         defer self.exit_lock.unlock(global.io());
         if (network) {
@@ -1108,6 +1157,7 @@ pub const Machine = struct {
             self.processConsole();
             try self.syncConsoleIrq();
         }
+        if (gpu) try self.syncGpuIrq();
     }
 
     fn finishRun(self: *Machine, state: RunState) void {
@@ -1991,6 +2041,10 @@ pub const Machine = struct {
 
     fn wakeInput(self: *Machine) void {
         self.input_wakeup.store(true, .release);
+        self.wakePrimaryVcpu();
+    }
+
+    fn wakePrimaryVcpu(self: *Machine) void {
         const primary = &self.vcpus[0];
         const thread_id = primary.thread_id.load(.acquire);
         if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
@@ -2158,11 +2212,7 @@ pub const Machine = struct {
 
     fn wakeConsole(self: *Machine) void {
         self.console_wakeup.store(true, .release);
-        const primary = &self.vcpus[0];
-        const thread_id = primary.thread_id.load(.acquire);
-        if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
-        primary.vcpu.requestExit();
-        kvm.interruptThread(thread_id);
+        self.wakePrimaryVcpu();
     }
 
     fn syncNetIrq(self: *Machine) kvm.InterruptError!void {
@@ -2203,11 +2253,7 @@ pub const Machine = struct {
 
     fn wakeNet(self: *Machine) void {
         self.net_wakeup.store(true, .release);
-        const primary = &self.vcpus[0];
-        const thread_id = primary.thread_id.load(.acquire);
-        if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
-        primary.vcpu.requestExit();
-        kvm.interruptThread(thread_id);
+        self.wakePrimaryVcpu();
     }
 
     fn blockIrq(level: bool, userdata: ?*anyopaque) void {

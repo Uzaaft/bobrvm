@@ -1,6 +1,7 @@
 //! Thin GTK host application for the shared Linux VM lifecycle.
 
 const std = @import("std");
+const agent = @import("../agent/main.zig");
 const disk = @import("../disk.zig");
 const global = @import("../global.zig");
 const AppConfig = @import("AppConfig.zig");
@@ -33,6 +34,11 @@ const c = struct {
     pub const GtkScrolledWindow = opaque {};
     pub const GtkWidget = opaque {};
     pub const GFile = opaque {};
+    pub const GAsyncResult = opaque {};
+    pub const GCancellable = opaque {};
+    pub const GError = opaque {};
+    pub const GdkClipboard = opaque {};
+    pub const GdkDisplay = opaque {};
     pub const cairo_t = opaque {};
     pub const cairo_surface_t = opaque {};
 
@@ -174,9 +180,24 @@ const c = struct {
         data: ?*anyopaque,
     ) c_uint;
     pub extern fn gdk_keyval_to_unicode(keyval: c_uint) c_uint;
+    pub extern fn gdk_display_get_default() ?*GdkDisplay;
+    pub extern fn gdk_display_get_clipboard(display: *GdkDisplay) *GdkClipboard;
+    pub extern fn gdk_clipboard_set_text(clipboard: *GdkClipboard, text: [*:0]const u8) void;
+    pub extern fn gdk_clipboard_read_text_async(
+        clipboard: *GdkClipboard,
+        cancellable: ?*GCancellable,
+        callback: *const fn (?*anyopaque, *GAsyncResult, ?*anyopaque) callconv(.c) void,
+        data: ?*anyopaque,
+    ) void;
+    pub extern fn gdk_clipboard_read_text_finish(
+        clipboard: *GdkClipboard,
+        result: *GAsyncResult,
+        err: *?*GError,
+    ) ?[*:0]u8;
     pub extern fn g_unichar_to_utf8(character: c_uint, output: [*]u8) c_int;
     pub extern fn g_file_get_path(file: *GFile) ?[*:0]u8;
     pub extern fn g_free(memory: ?*anyopaque) void;
+    pub extern fn g_error_free(err: *GError) void;
     pub extern fn cairo_image_surface_create_for_data(
         data: [*]u8,
         format: c_int,
@@ -246,7 +267,15 @@ const State = struct {
     reboot_button: ?*c.GtkWidget = null,
     trim_button: ?*c.GtkWidget = null,
     sync_time_button: ?*c.GtkWidget = null,
+    send_file_button: ?*c.GtkWidget = null,
     guest_tools: ?*c.GtkLabel = null,
+    clipboard: ?*c.GdkClipboard = null,
+    clipboard_lock: std.Io.Mutex = .init,
+    clipboard_text: []u8,
+    clipboard_text_len: usize = 0,
+    guest_clipboard_pending: bool = false,
+    host_clipboard_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ignore_clipboard_change: bool = false,
     output_lock: std.Io.Mutex = .init,
     output_pending: [output_pending_bytes]u8 = undefined,
     output_head: usize = 0,
@@ -297,6 +326,7 @@ const State = struct {
             return;
         };
         self.vm = vm;
+        vm.setClipboardHandlers(guestClipboard, requestHostClipboard, self);
         vm.start() catch |err| {
             vm.destroy();
             self.vm = null;
@@ -546,6 +576,12 @@ const State = struct {
             .protocol_error => "Guest tools: protocol error",
         });
         self.setManagementControls(vm.guestManagementReady());
+        const file_transfer = vm.guestToolsCapabilities() &
+            agent.native.HostCapability.file_transfer != 0;
+        c.gtk_widget_set_sensitive(
+            self.send_file_button.?,
+            if (file_transfer) c.TRUE else c.FALSE,
+        );
     }
 
     fn setManagementControls(self: *State, enabled: bool) void {
@@ -554,6 +590,7 @@ const State = struct {
         c.gtk_widget_set_sensitive(self.reboot_button.?, sensitive);
         c.gtk_widget_set_sensitive(self.trim_button.?, sensitive);
         c.gtk_widget_set_sensitive(self.sync_time_button.?, sensitive);
+        if (!enabled) c.gtk_widget_set_sensitive(self.send_file_button.?, c.FALSE);
     }
 
     fn finish(self: *State) void {
@@ -630,6 +667,26 @@ const State = struct {
         self.frame_height = scanout.height;
         self.frame_generation = scanout.generation;
         c.gtk_widget_queue_draw(self.display.?);
+    }
+
+    fn flushClipboard(self: *State) void {
+        if (self.host_clipboard_requested.swap(false, .acq_rel)) {
+            if (self.clipboard) |clipboard| {
+                c.gdk_clipboard_read_text_async(clipboard, null, hostClipboardRead, self);
+            }
+        }
+
+        self.clipboard_lock.lockUncancelable(global.io());
+        defer self.clipboard_lock.unlock(global.io());
+        if (!self.guest_clipboard_pending) return;
+        const clipboard = self.clipboard orelse return;
+        self.clipboard_text[self.clipboard_text_len] = 0;
+        self.ignore_clipboard_change = true;
+        c.gdk_clipboard_set_text(
+            clipboard,
+            self.clipboard_text[0..self.clipboard_text_len :0].ptr,
+        );
+        self.guest_clipboard_pending = false;
     }
 
     fn injectPointer(self: *State, x: f64, y: f64) void {
@@ -735,6 +792,14 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         std.process.exit(1);
     };
     defer std.heap.c_allocator.free(frame_pixels);
+    const clipboard_text = std.heap.c_allocator.alloc(
+        u8,
+        agent.native.clipboard_text_bytes_max + 1,
+    ) catch {
+        writeStderr("error: unable to allocate clipboard buffer\n");
+        std.process.exit(1);
+    };
+    defer std.heap.c_allocator.free(clipboard_text);
     var state = State{
         .allocator = std.heap.c_allocator,
         .memory_bytes = config.memory_bytes,
@@ -751,6 +816,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .forward_count = config.forward_count,
         .command_line = config.command_line,
         .frame_pixels = frame_pixels,
+        .clipboard_text = clipboard_text,
     };
     defer {
         if (state.loaded_firmware_path) |path| state.allocator.free(path);
@@ -776,6 +842,17 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const window_widget = c.gtk_application_window_new(app) orelse return;
     const window: *c.GtkWindow = @ptrCast(window_widget);
     state.window = window;
+    if (c.gdk_display_get_default()) |display| {
+        state.clipboard = c.gdk_display_get_clipboard(display);
+        _ = c.g_signal_connect_data(
+            state.clipboard.?,
+            "changed",
+            @ptrCast(&clipboardChanged),
+            state,
+            null,
+            0,
+        );
+    }
     c.gtk_window_set_title(window, "bobrvm");
     c.gtk_window_set_default_size(window, 1100, 900);
     const box_widget = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12) orelse return;
@@ -920,6 +997,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const reboot_button = c.gtk_button_new_with_label("Reboot Guest") orelse return;
     const trim_button = c.gtk_button_new_with_label("Trim") orelse return;
     const sync_time_button = c.gtk_button_new_with_label("Sync Time") orelse return;
+    const send_file_button = c.gtk_button_new_with_label("Send File…") orelse return;
     state.start_button = start_button;
     state.pause_button = pause_button;
     state.stop_button = stop_button;
@@ -927,6 +1005,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     state.reboot_button = reboot_button;
     state.trim_button = trim_button;
     state.sync_time_button = sync_time_button;
+    state.send_file_button = send_file_button;
     _ = c.g_signal_connect_data(start_button, "clicked", @ptrCast(&startClicked), state, null, 0);
     _ = c.g_signal_connect_data(pause_button, "clicked", @ptrCast(&pauseClicked), state, null, 0);
     _ = c.g_signal_connect_data(stop_button, "clicked", @ptrCast(&stopClicked), state, null, 0);
@@ -955,6 +1034,14 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         null,
         0,
     );
+    _ = c.g_signal_connect_data(
+        send_file_button,
+        "clicked",
+        @ptrCast(&sendFileClicked),
+        state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(controls), start_button);
     c.gtk_box_append(@ptrCast(controls), pause_button);
     c.gtk_box_append(@ptrCast(controls), stop_button);
@@ -962,6 +1049,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(controls), reboot_button);
     c.gtk_box_append(@ptrCast(controls), trim_button);
     c.gtk_box_append(@ptrCast(controls), sync_time_button);
+    c.gtk_box_append(@ptrCast(controls), send_file_button);
     const status_widget = c.gtk_label_new("Ready") orelse return;
     const status: *c.GtkLabel = @ptrCast(status_widget);
     state.status = status;
@@ -974,6 +1062,14 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_drawing_area_set_content_width(display, @intCast(display_width));
     c.gtk_drawing_area_set_content_height(display, @intCast(display_height));
     c.gtk_drawing_area_set_draw_func(display, drawDisplay, state, null);
+    _ = c.g_signal_connect_data(
+        display,
+        "resize",
+        @ptrCast(&displayResized),
+        state,
+        null,
+        0,
+    );
     c.gtk_widget_set_hexpand(display_widget, c.TRUE);
     c.gtk_widget_set_vexpand(display_widget, c.TRUE);
     const console_widget = c.gtk_label_new("") orelse return;
@@ -1119,6 +1215,88 @@ fn syncTimeClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     const vm = state.vm orelse return;
     vm.syncGuestTime();
     c.gtk_label_set_text(state.status.?, "Guest time synchronized");
+}
+
+fn sendFileClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (state.vm == null) return;
+    const dialog = c.gtk_file_chooser_native_new(
+        "Send file to guest",
+        state.window.?,
+        c.GTK_FILE_CHOOSER_ACTION_OPEN,
+        "Send",
+        "Cancel",
+    ) orelse return;
+    _ = c.g_signal_connect_data(
+        dialog,
+        "response",
+        @ptrCast(&sendFileChosen),
+        state,
+        null,
+        0,
+    );
+    c.gtk_native_dialog_show(dialog);
+}
+
+fn sendFileChosen(
+    dialog: *c.GtkNativeDialog,
+    response: c_int,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    defer c.g_object_unref(dialog);
+    defer c.gtk_native_dialog_destroy(dialog);
+    if (response != c.GTK_RESPONSE_ACCEPT) return;
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    const file = c.gtk_file_chooser_get_file(@ptrCast(dialog)) orelse return;
+    defer c.g_object_unref(file);
+    const path = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path);
+    vm.sendFileToGuest(std.mem.span(path)) catch |err| return state.setError(err);
+    c.gtk_label_set_text(state.status.?, "File offered to guest");
+}
+
+fn guestClipboard(text: []const u8, userdata: ?*anyopaque) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (text.len > agent.native.clipboard_text_bytes_max) return;
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+    state.clipboard_lock.lockUncancelable(global.io());
+    defer state.clipboard_lock.unlock(global.io());
+    @memcpy(state.clipboard_text[0..text.len], text);
+    state.clipboard_text_len = text.len;
+    state.guest_clipboard_pending = true;
+}
+
+fn requestHostClipboard(userdata: ?*anyopaque) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.host_clipboard_requested.store(true, .release);
+}
+
+fn clipboardChanged(_: *c.GdkClipboard, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (state.ignore_clipboard_change) {
+        state.ignore_clipboard_change = false;
+        return;
+    }
+    if (state.vm) |vm| vm.hostClipboardGrab();
+}
+
+fn hostClipboardRead(
+    _: ?*anyopaque,
+    result: *c.GAsyncResult,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const clipboard = state.clipboard orelse return;
+    var err: ?*c.GError = null;
+    const text = c.gdk_clipboard_read_text_finish(clipboard, result, &err) orelse {
+        if (err) |value| c.g_error_free(value);
+        return;
+    };
+    defer c.g_free(text);
+    const bytes = std.mem.span(text);
+    if (bytes.len > agent.native.clipboard_text_bytes_max) return;
+    if (state.vm) |vm| vm.sendHostClipboard(bytes);
 }
 
 fn loadClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
@@ -1273,6 +1451,7 @@ fn tick(userdata: ?*anyopaque) callconv(.c) c.gboolean {
     const vm = state.vm orelse return c.G_SOURCE_REMOVE;
     state.refreshDisplay();
     state.refreshGuestTools();
+    state.flushClipboard();
     if (vm.state() != .stopped) return c.G_SOURCE_CONTINUE;
     state.finish();
     return c.G_SOURCE_REMOVE;
@@ -1311,6 +1490,18 @@ fn drawDisplay(
     c.cairo_scale(context, scale, scale);
     c.cairo_set_source_surface(context, surface, 0, 0);
     c.cairo_paint(context);
+}
+
+fn displayResized(
+    _: *c.GtkDrawingArea,
+    width: c_int,
+    height: c_int,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    if (width <= 0 or height <= 0) return;
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    vm.requestDisplayResize(@intCast(width), @intCast(height));
 }
 
 fn keyPressed(

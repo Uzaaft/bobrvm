@@ -267,6 +267,10 @@ pub fn copyScanout(self: *VM, destination: []u8) ?x86.Machine.Scanout {
     return self.machine.copyScanout(destination);
 }
 
+pub fn requestDisplayResize(self: *VM, width: u32, height: u32) void {
+    self.machine.requestDisplayResize(width, height);
+}
+
 pub fn guestToolsStatus(self: *const VM) agent.native.Status {
     return self.machine.guestToolsStatus();
 }
@@ -277,6 +281,31 @@ pub fn guestToolsCapabilities(self: *const VM) u64 {
 
 pub fn guestManagementReady(self: *const VM) bool {
     return self.machine.guestManagementReady();
+}
+
+pub fn setClipboardHandlers(
+    self: *VM,
+    on_guest_clipboard: *const fn ([]const u8, ?*anyopaque) void,
+    request_host_clipboard: *const fn (?*anyopaque) void,
+    userdata: ?*anyopaque,
+) void {
+    self.machine.setClipboardHandlers(
+        on_guest_clipboard,
+        request_host_clipboard,
+        userdata,
+    );
+}
+
+pub fn hostClipboardGrab(self: *VM) void {
+    self.machine.hostClipboardGrab();
+}
+
+pub fn sendHostClipboard(self: *VM, text: []const u8) void {
+    self.machine.sendHostClipboard(text);
+}
+
+pub fn sendFileToGuest(self: *VM, path: []const u8) !void {
+    try self.machine.sendFileToGuest(path);
 }
 
 pub fn requestGuestShutdown(self: *VM) void {

@@ -224,7 +224,7 @@ pub const Console = struct {
         if (qc.num == 0 or qc.num > QUEUE_SIZE) return null;
         const pending = avail_idx -% last_avail;
         if (pending > qc.num) {
-            log.warn("rejecting avail jump {} larger than queue {}", .{ pending, qc.num });
+            log.debug("rejecting avail jump {} larger than queue {}", .{ pending, qc.num });
             return null;
         }
         return pending;

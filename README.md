@@ -7,7 +7,7 @@ platform applications stay thin while Zig owns virtualization and devices.
 
 The project is under active development. Linux guests can boot NixOS to a GUI
 or headless console with SMP, persistent virtio disks, input, built-in NAT, and
-2D Metal display output. The optional Venus stack supports Vulkan 1.4 and
+2D virtio-GPU display output. On Apple Silicon, the optional Venus stack supports Vulkan 1.4 and
 OpenGL 4.6 through Zink using the vendored GPU dependencies in `third_party/`.
 The legacy virgl translator is a GL 2.x fallback.
 
@@ -47,7 +47,8 @@ See [macos/README.md](macos/README.md) for Xcode and framework builds.
 The Linux package installs a dependency-light headless binary and a separate GTK
 application. Both use the same cancellable Zig VM lifecycle and KVM device model.
 The GTK application manages a persistent VM library, installer media, sparse raw
-disks, shared folders, port forwards, memory, CPUs, networking, and pause/resume:
+disks, shared folders, port forwards, memory, CPUs, networking, pause/resume,
+guest management, clipboard sharing, and host-to-guest file delivery:
 
 ```sh
 bobrvm run-kernel bzImage initrd writable-root.raw
@@ -62,13 +63,16 @@ creates a private writable variable store so UEFI boot entries survive restarts.
 
 The x86 host supports direct kernel boot and an OVMF firmware path with primary and
 secondary virtio-pci block devices, including read-only ISO installation media,
-plus virtio GPU, keyboard, tablet, entropy, networking, and 9p shared-folder devices.
+plus virtio GPU, keyboard, tablet, entropy, networking, 9p shared-folder, and
+multiport console devices.
 Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
 the vCPU thread. A virtio-net adapter uses the shared Zig user-mode NAT, with no TAP
 device or host privileges required. The GTK application presents the guest's
-virtio-GPU scanout with aspect-correct scaling, injects keyboard and absolute pointer
-events, and retains a bounded serial-console history. Closing its window requests an
-immediate vCPU exit and joins the VM before releasing resources.
+virtio-GPU scanout with live guest modesetting and aspect-correct scaling, injects
+keyboard and absolute pointer events, and retains a bounded serial-console history.
+Stock qemu-guest-agent and spice-vdagent channels provide graceful lifecycle actions
+and text clipboard sharing when their guest services are installed. Closing the window
+requests an immediate vCPU exit and joins the VM before releasing resources.
 
 Direct boot uses two KVM vCPUs by default and exposes their topology through an Intel
 MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable

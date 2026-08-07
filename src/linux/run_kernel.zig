@@ -91,11 +91,15 @@ pub fn executeFirmwareSmoke(
     defer allocator.free(pixels);
     var scanout: ?x86.Machine.Scanout = null;
     for (0..100) |attempt| {
-        scanout = vm.copyScanout(pixels);
-        if (scanout != null) {
-            std.log.info("firmware scanout ready after {} ms", .{attempt * 100});
-            break;
+        if (scanout == null) {
+            scanout = vm.copyScanout(pixels);
+            if (scanout != null) {
+                std.log.info("firmware scanout ready after {} ms", .{attempt * 100});
+            }
         }
+        const storage_ready = vm.fastBlockStats().kicks > 0 or
+            vm.secondaryBlockNotifications() > 0;
+        if (scanout != null and storage_ready) break;
         if (vm.state() != .running) return error.FirmwareStoppedEarly;
         std.Io.Clock.Duration.sleep(.{
             .raw = .{ .nanoseconds = 100 * std.time.ns_per_ms },
