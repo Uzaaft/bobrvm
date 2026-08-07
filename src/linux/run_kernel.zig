@@ -53,6 +53,7 @@ pub fn execute(
     if (disk_path) |path| try machine.attachDisk(allocator, path, false);
     var output = Stdout{};
     try machine.run(x86.SerialSink.bind(Stdout, &output, Stdout.write), exits_max);
+    if (disk_path != null) output.writeFastBlockStats(machine.fastBlockStats());
 }
 
 fn readFile(
@@ -86,5 +87,21 @@ const Stdout = struct {
             if (count <= 0) return;
             remaining = remaining[@intCast(count)..];
         }
+    }
+
+    fn writeFastBlockStats(self: *Stdout, stats: x86.Machine.FastBlockStats) void {
+        const healthy = stats.enabled and !stats.worker_failed and stats.kicks > 0 and
+            stats.interrupts > 0 and stats.notify_mmio_exits == 0;
+        const marker = if (healthy)
+            "BOBRVM_KVM_FAST_BLOCK_OK"
+        else
+            "BOBRVM_KVM_FAST_BLOCK_FAILED";
+        var buffer: [192]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buffer,
+            "{s} kicks={d} interrupts={d} notify_mmio_exits={d}\n",
+            .{ marker, stats.kicks, stats.interrupts, stats.notify_mmio_exits },
+        ) catch unreachable;
+        self.write(line);
     }
 };

@@ -9,12 +9,13 @@ const assert = @import("../../quirks.zig").inlineAssert;
 pub const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("linux/kvm.h");
+    @cInclude("sys/eventfd.h");
     @cInclude("sys/ioctl.h");
 });
 
 pub const API_VERSION: c_int = 12;
 
-pub const Error = OpenError || CreateError || InterruptError || RunError;
+pub const Error = OpenError || CreateError || FastPathError || InterruptError || RunError;
 
 pub const OpenError = error{
     AccessDenied,
@@ -55,9 +56,16 @@ pub const RunError = error{
 
 pub const InterruptError = error{SetIrqFailed};
 
+pub const FastPathError = error{
+    CreateEventFdFailed,
+    RegisterIoEventFailed,
+    RegisterIrqFdFailed,
+};
+
 pub const Capability = enum(c_int) {
     user_memory = c.KVM_CAP_USER_MEMORY,
     irqfd = c.KVM_CAP_IRQFD,
+    irqfd_resample = c.KVM_CAP_IRQFD_RESAMPLE,
     ioeventfd = c.KVM_CAP_IOEVENTFD,
     immediate_exit = c.KVM_CAP_IMMEDIATE_EXIT,
     x86_user_space_msr = c.KVM_CAP_X86_USER_SPACE_MSR,
@@ -66,12 +74,13 @@ pub const Capability = enum(c_int) {
 pub const Capabilities = struct {
     user_memory: bool,
     irqfd: bool,
+    irqfd_resample: bool,
     ioeventfd: bool,
     immediate_exit: bool,
     x86_user_space_msr: bool,
 
     pub fn supportsFastDevicePath(self: Capabilities) bool {
-        return self.irqfd and self.ioeventfd;
+        return self.irqfd and self.irqfd_resample and self.ioeventfd;
     }
 
     pub fn validate(self: Capabilities) OpenError!void {
@@ -99,6 +108,7 @@ pub const Kvm = struct {
         const capabilities = Capabilities{
             .user_memory = checkExtension(fd, .user_memory),
             .irqfd = checkExtension(fd, .irqfd),
+            .irqfd_resample = checkExtension(fd, .irqfd_resample),
             .ioeventfd = checkExtension(fd, .ioeventfd),
             .immediate_exit = checkExtension(fd, .immediate_exit),
             .x86_user_space_msr = checkExtension(fd, .x86_user_space_msr),
@@ -253,7 +263,108 @@ pub const VM = struct {
             return error.SetIrqFailed;
         }
     }
+
+    /// Register an MMIO address whose guest writes signal `event` without a VM exit.
+    pub fn registerIoEvent(
+        self: *VM,
+        event: EventFd,
+        guest_address: u64,
+    ) FastPathError!void {
+        var descriptor = ioEventDescriptor(event, guest_address, false);
+        if (c.ioctl(self.fd, c.KVM_IOEVENTFD, &descriptor) < 0) {
+            return error.RegisterIoEventFailed;
+        }
+    }
+
+    pub fn unregisterIoEvent(self: *VM, event: EventFd, guest_address: u64) void {
+        var descriptor = ioEventDescriptor(event, guest_address, true);
+        _ = c.ioctl(self.fd, c.KVM_IOEVENTFD, &descriptor);
+    }
+
+    /// Route eventfd assertions to a level-triggered guest interrupt.
+    pub fn registerIrqFd(
+        self: *VM,
+        event: EventFd,
+        resample_event: EventFd,
+        irq: u32,
+    ) FastPathError!void {
+        var descriptor = irqFdDescriptor(event, resample_event, irq, false);
+        if (c.ioctl(self.fd, c.KVM_IRQFD, &descriptor) < 0) {
+            return error.RegisterIrqFdFailed;
+        }
+    }
+
+    pub fn unregisterIrqFd(
+        self: *VM,
+        event: EventFd,
+        resample_event: EventFd,
+        irq: u32,
+    ) void {
+        var descriptor = irqFdDescriptor(event, resample_event, irq, true);
+        _ = c.ioctl(self.fd, c.KVM_IRQFD, &descriptor);
+    }
 };
+
+/// A nonblocking eventfd used for KVM device notifications and interrupt routing.
+pub const EventFd = struct {
+    fd: std.posix.fd_t,
+
+    pub fn init() FastPathError!EventFd {
+        const fd = c.eventfd(0, c.EFD_CLOEXEC | c.EFD_NONBLOCK);
+        if (fd < 0) return error.CreateEventFdFailed;
+        return .{ .fd = fd };
+    }
+
+    pub fn deinit(self: *EventFd) void {
+        assert(self.fd >= 0);
+        _ = std.c.close(self.fd);
+        self.fd = -1;
+    }
+
+    pub fn signal(self: EventFd) bool {
+        var value: u64 = 1;
+        return std.c.write(self.fd, std.mem.asBytes(&value).ptr, @sizeOf(u64)) ==
+            @sizeOf(u64);
+    }
+
+    pub fn consume(self: EventFd) ?u64 {
+        var value: u64 = 0;
+        if (std.c.read(self.fd, std.mem.asBytes(&value).ptr, @sizeOf(u64)) != @sizeOf(u64)) {
+            return null;
+        }
+        return value;
+    }
+};
+
+fn ioEventDescriptor(
+    event: EventFd,
+    guest_address: u64,
+    deassign: bool,
+) c.struct_kvm_ioeventfd {
+    return .{
+        .datamatch = 0,
+        .addr = guest_address,
+        .len = 0,
+        .fd = event.fd,
+        .flags = if (deassign) c.KVM_IOEVENTFD_FLAG_DEASSIGN else 0,
+        .pad = std.mem.zeroes([36]u8),
+    };
+}
+
+fn irqFdDescriptor(
+    event: EventFd,
+    resample_event: EventFd,
+    irq: u32,
+    deassign: bool,
+) c.struct_kvm_irqfd {
+    return .{
+        .fd = @intCast(event.fd),
+        .gsi = irq,
+        .flags = if (deassign) c.KVM_IRQFD_FLAG_DEASSIGN else c.KVM_IRQFD_FLAG_RESAMPLE,
+        .resamplefd = @intCast(resample_event.fd),
+        .pad = std.mem.zeroes([16]u8),
+    };
+}
 
 pub const ExitReason = enum {
     halted,
@@ -482,6 +593,7 @@ test "KVM requires userspace guest memory" {
     const caps = Capabilities{
         .user_memory = false,
         .irqfd = true,
+        .irqfd_resample = true,
         .ioeventfd = true,
         .immediate_exit = true,
         .x86_user_space_msr = true,
@@ -493,6 +605,7 @@ test "KVM fast device path needs ioeventfd and irqfd" {
     var caps = Capabilities{
         .user_memory = true,
         .irqfd = true,
+        .irqfd_resample = true,
         .ioeventfd = false,
         .immediate_exit = true,
         .x86_user_space_msr = true,
@@ -500,6 +613,36 @@ test "KVM fast device path needs ioeventfd and irqfd" {
     try std.testing.expect(!caps.supportsFastDevicePath());
     caps.ioeventfd = true;
     try std.testing.expect(caps.supportsFastDevicePath());
+    caps.irqfd_resample = false;
+    try std.testing.expect(!caps.supportsFastDevicePath());
+}
+
+test "KVM fast path descriptors preserve registration identity" {
+    const event = EventFd{ .fd = 7 };
+    const resample = EventFd{ .fd = 8 };
+    const address: u64 = 0xd000_0044;
+
+    const ioevent = ioEventDescriptor(event, address, false);
+    try std.testing.expectEqual(address, ioevent.addr);
+    try std.testing.expectEqual(@as(u32, 0), ioevent.len);
+    try std.testing.expectEqual(@as(i32, 7), ioevent.fd);
+    try std.testing.expectEqual(@as(u32, 0), ioevent.flags);
+
+    const irqfd = irqFdDescriptor(event, resample, 11, false);
+    try std.testing.expectEqual(@as(u32, 7), irqfd.fd);
+    try std.testing.expectEqual(@as(u32, 8), irqfd.resamplefd);
+    try std.testing.expectEqual(@as(u32, 11), irqfd.gsi);
+    try std.testing.expectEqual(@as(u32, c.KVM_IRQFD_FLAG_RESAMPLE), irqfd.flags);
+}
+
+test "eventfd coalesces notifications without blocking" {
+    var event = try EventFd.init();
+    defer event.deinit();
+
+    try std.testing.expect(event.signal());
+    try std.testing.expect(event.signal());
+    try std.testing.expectEqual(@as(u64, 2), event.consume().?);
+    try std.testing.expectEqual(@as(?u64, null), event.consume());
 }
 
 test "KVM guest memory regions are page aligned and nonempty" {

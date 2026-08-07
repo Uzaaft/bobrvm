@@ -74,6 +74,7 @@ fn printKvmInfo() kvm.OpenError!void {
         \\vCPU run mapping: {d} bytes
         \\user memory: {}
         \\irqfd: {}
+        \\irqfd resample: {}
         \\ioeventfd: {}
         \\immediate exit: {}
         \\userspace MSRs: {}
@@ -84,6 +85,7 @@ fn printKvmInfo() kvm.OpenError!void {
         host.vcpu_run_size,
         host.capabilities.user_memory,
         host.capabilities.irqfd,
+        host.capabilities.irqfd_resample,
         host.capabilities.ioeventfd,
         host.capabilities.immediate_exit,
         host.capabilities.x86_user_space_msr,

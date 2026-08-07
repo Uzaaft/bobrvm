@@ -33,6 +33,12 @@ if ! grep -q "^$expected_marker$" "$output_file"; then
     echo "error: $expected_marker was not observed (status $status)" >&2
     exit 1
 fi
+fast_path_marker="BOBRVM_KVM_FAST_BLOCK_OK"
+fast_path_pattern="^$fast_path_marker kicks=[1-9][0-9]* interrupts=[1-9][0-9]* notify_mmio_exits=0$"
+if ! grep -Eq "$fast_path_pattern" "$output_file"; then
+    echo "error: $fast_path_marker was not observed (status $status)" >&2
+    exit 1
+fi
 fixture_dir="$(dirname "$4")"
 debugfs="$fixture_dir/debugfs"
 e2fsck="$fixture_dir/e2fsck"
@@ -50,4 +56,4 @@ if [[ "$persisted" != "bobrvm-root-write-ok" ]]; then
     exit 1
 fi
 
-echo "Linux KVM E2E: $expected_marker"
+echo "Linux KVM E2E: $expected_marker $fast_path_marker"
