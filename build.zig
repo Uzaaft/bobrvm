@@ -116,6 +116,10 @@ pub fn build(b: *std.Build) !void {
         "test-fuzz-pci",
         "Run PCI configuration and transport property tests",
     );
+    const gic_fuzz_step = b.step(
+        "test-fuzz-gic",
+        "Run GIC distributor and redistributor property tests",
+    );
     const tgsi_fuzz_step = b.step(
         "test-fuzz-tgsi",
         "Run TGSI parser and emitter property tests",
@@ -575,6 +579,20 @@ pub fn build(b: *std.Build) !void {
     const run_pci_fuzz_tests = b.addRunArtifact(pci_fuzz_tests);
     test_step.dependOn(&run_pci_fuzz_tests.step);
     pci_fuzz_step.dependOn(&run_pci_fuzz_tests.step);
+
+    const gic_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/gic_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .error_tracing = false,
+    });
+    const gic_fuzz_tests = b.addTest(.{
+        .root_module = gic_fuzz_module,
+        .filters = test_filters,
+    });
+    const run_gic_fuzz_tests = b.addRunArtifact(gic_fuzz_tests);
+    test_step.dependOn(&run_gic_fuzz_tests.step);
+    gic_fuzz_step.dependOn(&run_gic_fuzz_tests.step);
 
     const tgsi_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/tgsi_fuzz.zig"),
