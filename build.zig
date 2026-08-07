@@ -404,6 +404,36 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    const c_api_smoke_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_api_smoke_module.addCSourceFile(.{
+        .file = b.path("tests/c_api_smoke.c"),
+        .flags = &.{"-std=c11"},
+    });
+    c_api_smoke_module.addIncludePath(b.path("include"));
+    c_api_smoke_module.linkLibrary(lib);
+    if (target.result.os.tag == .macos) {
+        const sdk = environmentVariable(b, "SDKROOT") orelse std.mem.trim(
+            u8,
+            b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }),
+            &std.ascii.whitespace,
+        );
+        const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+        c_api_smoke_module.addFrameworkPath(.{ .cwd_relative = framework_path });
+        c_api_smoke_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+        c_api_smoke_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+    }
+
+    const c_api_smoke = b.addExecutable(.{
+        .name = "c_api_smoke",
+        .root_module = c_api_smoke_module,
+    });
+    const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
+    test_step.dependOn(&run_c_api_smoke.step);
+
     const virtqueue_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/virtqueue_fuzz.zig"),
         .target = target,
