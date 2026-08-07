@@ -32,9 +32,11 @@ pub fn main(minimal: std.process.Init.Minimal) void {
             writeAll("error: run-kernel requires a bzImage path\n");
             std.process.exit(1);
         };
+        const initrd_path = args.next();
         run_kernel.execute(
             std.heap.c_allocator,
             kernel_path,
+            initrd_path,
             args.next(),
         ) catch |err| {
             printNamedError("direct kernel boot", err);
@@ -126,7 +128,7 @@ fn printUsage() void {
         \\Commands:
         \\  kvm-info    Validate KVM and show acceleration capabilities
         \\  kvm-smoke   Run a tiny x86 payload through KVM
-        \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd]
+        \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [read-only-disk]
         \\  version     Show version information
         \\  help        Show this help message
         \\

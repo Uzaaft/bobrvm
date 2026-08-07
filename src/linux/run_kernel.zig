@@ -12,9 +12,10 @@ const initrd_bytes_max: usize = 1024 * 1024 * 1024;
 const exits_max: u64 = 100_000_000;
 const command_line =
     "console=ttyS0,115200 earlycon=uart,io,0x3f8,115200n8 " ++
-    "nokaslr acpi=off panic=-1 reboot=t";
+    "nokaslr acpi=off pci=conf1 panic=-1 reboot=t";
 
-pub const Error = boot.ParseError || x86.Machine.InitError || x86.Machine.RunError || error{
+pub const Error = boot.ParseError || x86.Machine.InitError || x86.Machine.AttachDiskError ||
+    x86.Machine.RunError || error{
     OpenKernelFailed,
     ReadKernelFailed,
     OpenInitrdFailed,
@@ -25,6 +26,7 @@ pub fn execute(
     allocator: std.mem.Allocator,
     kernel_path: []const u8,
     initrd_path: ?[]const u8,
+    disk_path: ?[]const u8,
 ) Error!void {
     const kernel = try readFile(
         allocator,
@@ -48,6 +50,7 @@ pub fn execute(
 
     var machine = try x86.Machine.init(memory_bytes, image, command_line, initrd);
     defer machine.deinit();
+    if (disk_path) |path| try machine.attachDisk(allocator, path, true);
     var output = Stdout{};
     try machine.run(x86.SerialSink.bind(Stdout, &output, Stdout.write), exits_max);
 }

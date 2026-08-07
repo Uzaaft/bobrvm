@@ -26,6 +26,19 @@ pub const GuestMemory = struct {
         return .{ .userdata = context, .get_fn = Adapter.get };
     }
 
+    pub fn bindGlobal(
+        comptime get_fn: *const fn (u64, usize) ?[]u8,
+    ) GuestMemory {
+        const Adapter = struct {
+            var token: u8 = 0;
+
+            fn get(_: *anyopaque, address: u64, length: usize) ?[]u8 {
+                return get_fn(address, length);
+            }
+        };
+        return .{ .userdata = &Adapter.token, .get_fn = Adapter.get };
+    }
+
     pub fn get(self: GuestMemory, address: u64, length: usize) ?[]u8 {
         _ = std.math.add(u64, address, length) catch return null;
         return self.get_fn(self.userdata, address, length);

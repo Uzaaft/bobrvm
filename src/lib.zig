@@ -33,6 +33,8 @@ test {
         _ = std.testing.refAllDecls(hypervisor);
         _ = std.testing.refAllDecls(@import("machine/x86/boot.zig"));
         _ = std.testing.refAllDecls(@import("machine/x86/main.zig"));
+        _ = std.testing.refAllDecls(@import("pci/virtio_pci.zig"));
+        _ = std.testing.refAllDecls(@import("pci/x86_config.zig"));
         _ = std.testing.refAllDecls(worker);
         _ = std.testing.refAllDecls(@import("virtio/queue.zig"));
         _ = std.testing.refAllDecls(@import("virtio/mmio.zig"));

@@ -4,6 +4,7 @@
 
 pub const ecam = @import("ecam.zig");
 pub const virtio_pci = @import("virtio_pci.zig");
+pub const x86_config = @import("x86_config.zig");
 
 pub const EcamHost = ecam.EcamHost;
 pub const PciDevice = ecam.PciDevice;

@@ -16,6 +16,7 @@ const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
 const console_session = @import("../console/Session.zig");
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const thread_compat = @import("../compat/thread.zig");
 
 const hypervisor = @import("../hypervisor/main.zig");
@@ -227,6 +228,7 @@ const VirtioMmioDevice = union(enum) {
 
     fn setGuestMemory(self: VirtioMmioDevice, accessor: *const fn (u64, usize) ?[]u8) void {
         switch (self) {
+            .block => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
             inline else => |device| device.setGuestMemory(accessor),
         }
     }

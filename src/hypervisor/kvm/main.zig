@@ -14,7 +14,7 @@ pub const c = @cImport({
 
 pub const API_VERSION: c_int = 12;
 
-pub const Error = OpenError || CreateError || RunError;
+pub const Error = OpenError || CreateError || InterruptError || RunError;
 
 pub const OpenError = error{
     AccessDenied,
@@ -52,6 +52,8 @@ pub const RunError = error{
     Interrupted,
     RunFailed,
 };
+
+pub const InterruptError = error{SetIrqFailed};
 
 pub const Capability = enum(c_int) {
     user_memory = c.KVM_CAP_USER_MEMORY,
@@ -239,6 +241,16 @@ pub const VM = struct {
         var pit = std.mem.zeroes(c.struct_kvm_pit_config);
         if (c.ioctl(self.fd, c.KVM_CREATE_PIT2, &pit) < 0) {
             return error.CreatePitFailed;
+        }
+    }
+
+    pub fn setIrqLine(self: *VM, irq: u32, level: bool) InterruptError!void {
+        var irq_level = c.struct_kvm_irq_level{
+            .unnamed_0 = .{ .irq = irq },
+            .level = @intFromBool(level),
+        };
+        if (c.ioctl(self.fd, c.KVM_IRQ_LINE, &irq_level) < 0) {
+            return error.SetIrqFailed;
         }
     }
 };
