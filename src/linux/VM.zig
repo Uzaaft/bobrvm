@@ -9,6 +9,7 @@ const std = @import("std");
 const file_compat = @import("../compat/file.zig");
 const global = @import("../global.zig");
 const boot = @import("../machine/x86/boot.zig");
+const mininat = @import("../net/mininat.zig");
 const x86 = @import("../machine/x86/main.zig");
 
 const kernel_bytes_max: usize = 512 * 1024 * 1024;
@@ -26,6 +27,7 @@ exits_max: u64,
 pub const State = enum(u8) {
     ready,
     running,
+    paused,
     stopping,
     stopped,
 };
@@ -41,16 +43,19 @@ pub const Config = struct {
     disk2_path: ?[]const u8 = null,
     disk2_read_only: bool = true,
     network_enabled: bool = false,
+    forwards: []const mininat.Forward = &.{},
     display_enabled: bool = false,
     display_width: u32 = 1280,
     display_height: u32 = 800,
+    shared_dir: ?[]const u8 = null,
     command_line: []const u8,
     exits_max: u64,
 };
 
 pub const CreateError = boot.ParseError || x86.Machine.InitError ||
     x86.Machine.AttachDiskError || x86.Machine.AttachNetworkError ||
-    x86.Machine.AttachDisplayError || x86.Machine.AttachInputError || error{
+    x86.Machine.AttachDisplayError || x86.Machine.AttachInputError ||
+    x86.Machine.AttachRngError || error{
     OpenKernelFailed,
     ReadKernelFailed,
     OpenInitrdFailed,
@@ -118,11 +123,13 @@ pub fn create(
     if (config.disk2_path) |path| {
         try self.machine.attachDisk2(allocator, path, config.disk2_read_only);
     }
-    if (config.network_enabled) try self.machine.attachNetwork(allocator);
+    if (config.network_enabled) try self.machine.attachNetwork(allocator, config.forwards);
     if (config.display_enabled) {
         try self.machine.attachDisplay(allocator, config.display_width, config.display_height);
         try self.machine.attachInputDevices(allocator);
     }
+    if (config.shared_dir) |path| try self.machine.attachSharedFolder(allocator, path);
+    try self.machine.attachRng(allocator);
     return self;
 }
 
@@ -149,12 +156,42 @@ pub fn start(self: *VM) StartError!void {
 }
 
 pub fn requestStop(self: *VM) void {
+    var current = self.state_value.load(.acquire);
+    while (current == .running or current == .paused) {
+        current = self.state_value.cmpxchgWeak(
+            current,
+            .stopping,
+            .acq_rel,
+            .acquire,
+        ) orelse {
+            self.machine.requestStop();
+            return;
+        };
+    }
+}
+
+pub fn requestPause(self: *VM) bool {
     if (self.state_value.cmpxchgStrong(
         .running,
-        .stopping,
+        .paused,
         .acq_rel,
         .acquire,
-    ) == null) self.machine.requestStop();
+    ) != null) return false;
+    if (self.machine.requestPause()) return true;
+    self.state_value.store(.running, .release);
+    return false;
+}
+
+pub fn requestResume(self: *VM) bool {
+    if (self.state_value.cmpxchgStrong(
+        .paused,
+        .running,
+        .acq_rel,
+        .acquire,
+    ) != null) return false;
+    if (self.machine.requestResume()) return true;
+    self.state_value.store(.paused, .release);
+    return false;
 }
 
 pub fn join(self: *VM) JoinError!x86.Machine.RunOutcome {
@@ -250,5 +287,5 @@ fn readFile(
 
 test "Linux VM lifecycle states have a stable order" {
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(State.ready));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(State.stopped));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(State.stopped));
 }

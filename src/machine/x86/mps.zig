@@ -16,7 +16,7 @@ const bus_entry_bytes: usize = 8;
 const io_apic_entry_bytes: usize = 8;
 const interrupt_entry_bytes: usize = 8;
 const isa_irq_count: usize = 16;
-const pci_device_count: usize = 6;
+const pci_device_count: usize = 8;
 
 pub const WriteError = error{
     BufferTooSmall,
@@ -97,6 +97,10 @@ fn writeConfigTable(bytes: []u8, cpu_count: u8) void {
     offset += interrupt_entry_bytes;
     writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 7 << 2, io_apic_id, 7);
     offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 8 << 2, io_apic_id, 12);
+    offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 9 << 2, io_apic_id, 13);
+    offset += interrupt_entry_bytes;
     std.debug.assert(offset == bytes.len);
     bytes[7] = checksum(bytes);
 }
@@ -150,7 +154,7 @@ test "MP tables publish each CPU and have valid checksums" {
 
     try std.testing.expectEqual(@as(u8, 0), 0 -% checksum(memory[0..floating_bytes]));
     try std.testing.expectEqual(@as(u8, 0), 0 -% checksum(table));
-    try std.testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, table[34..36], .little));
+    try std.testing.expectEqual(@as(u16, 30), std.mem.readInt(u16, table[34..36], .little));
     for (0..4) |index| {
         const offset = config_header_bytes + index * processor_entry_bytes;
         try std.testing.expectEqual(@as(u8, 0), table[offset]);

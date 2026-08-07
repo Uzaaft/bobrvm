@@ -230,6 +230,7 @@ const VirtioMmioDevice = union(enum) {
         switch (self) {
             .block => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
             .net => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
+            .rng => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
             inline else => |device| device.setGuestMemory(accessor),
         }
     }

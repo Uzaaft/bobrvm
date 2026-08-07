@@ -4,8 +4,10 @@ const std = @import("std");
 const disk = @import("../disk.zig");
 const global = @import("../global.zig");
 const AppConfig = @import("AppConfig.zig");
+const SavedConfig = @import("../cli/Config.zig");
 const VM = @import("VM.zig");
 const x86 = @import("../machine/x86/main.zig");
+const mininat = @import("../net/mininat.zig");
 
 const c = struct {
     pub const GtkApplication = opaque {};
@@ -13,6 +15,8 @@ const c = struct {
     pub const GtkWindow = opaque {};
     pub const GtkBox = opaque {};
     pub const GtkCheckButton = opaque {};
+    pub const GtkComboBox = opaque {};
+    pub const GtkComboBoxText = opaque {};
     pub const GtkEditable = opaque {};
     pub const GtkDrawingArea = opaque {};
     pub const GtkEntry = opaque {};
@@ -42,6 +46,7 @@ const c = struct {
     pub const GTK_ORIENTATION_HORIZONTAL: c_int = 0;
     pub const GTK_FILE_CHOOSER_ACTION_OPEN: c_int = 0;
     pub const GTK_FILE_CHOOSER_ACTION_SAVE: c_int = 1;
+    pub const GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER: c_int = 2;
     pub const GTK_RESPONSE_ACCEPT: c_int = -3;
     pub const GDK_CONTROL_MASK: c_uint = 1 << 2;
     pub const GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES: c_uint = 3;
@@ -60,9 +65,20 @@ const c = struct {
     pub extern fn gtk_box_new(orientation: c_int, spacing: c_int) ?*GtkWidget;
     pub extern fn gtk_box_append(box: *GtkBox, child: *GtkWidget) void;
     pub extern fn gtk_button_new_with_label(text: [*:0]const u8) ?*GtkWidget;
+    pub extern fn gtk_button_set_label(button: *GtkButton, text: [*:0]const u8) void;
     pub extern fn gtk_check_button_new_with_label(text: [*:0]const u8) ?*GtkWidget;
     pub extern fn gtk_check_button_get_active(button: *GtkCheckButton) gboolean;
     pub extern fn gtk_check_button_set_active(button: *GtkCheckButton, active: gboolean) void;
+    pub extern fn gtk_combo_box_text_new() ?*GtkWidget;
+    pub extern fn gtk_combo_box_text_append_text(
+        combo_box: *GtkComboBoxText,
+        text: [*:0]const u8,
+    ) void;
+    pub extern fn gtk_combo_box_text_remove_all(combo_box: *GtkComboBoxText) void;
+    pub extern fn gtk_combo_box_text_get_active_text(
+        combo_box: *GtkComboBoxText,
+    ) ?[*:0]u8;
+    pub extern fn gtk_combo_box_set_active(combo_box: *GtkComboBox, index: c_int) void;
     pub extern fn gtk_entry_new() ?*GtkWidget;
     pub extern fn gtk_drawing_area_new() ?*GtkWidget;
     pub extern fn gtk_drawing_area_set_content_width(area: *GtkDrawingArea, width: c_int) void;
@@ -197,22 +213,32 @@ const State = struct {
     initrd_path: ?[]const u8,
     disk_path: ?[]const u8,
     iso_path: ?[]const u8,
+    shared_dir: ?[]const u8,
     network_enabled: bool,
+    forwards: [AppConfig.MAX_FORWARDS]mininat.Forward,
+    forward_count: u8,
     command_line: []const u8,
+    loaded_firmware_path: ?[]u8 = null,
+    loaded_command_line: ?[]u8 = null,
     vm: ?*VM = null,
     window: ?*c.GtkWindow = null,
     status: ?*c.GtkLabel = null,
     console: ?*c.GtkLabel = null,
     display: ?*c.GtkWidget = null,
+    vm_name_entry: ?*c.GtkEntry = null,
+    vm_selector: ?*c.GtkComboBoxText = null,
     iso_entry: ?*c.GtkEntry = null,
     disk_entry: ?*c.GtkEntry = null,
     kernel_entry: ?*c.GtkEntry = null,
     initrd_entry: ?*c.GtkEntry = null,
+    shared_entry: ?*c.GtkEntry = null,
+    forward_entry: ?*c.GtkEntry = null,
     memory_spin: ?*c.GtkSpinButton = null,
     vcpu_spin: ?*c.GtkSpinButton = null,
     disk_size_spin: ?*c.GtkSpinButton = null,
     network_check: ?*c.GtkCheckButton = null,
     start_button: ?*c.GtkWidget = null,
+    pause_button: ?*c.GtkWidget = null,
     stop_button: ?*c.GtkWidget = null,
     output_lock: std.Io.Mutex = .init,
     output_pending: [output_pending_bytes]u8 = undefined,
@@ -250,7 +276,9 @@ const State = struct {
             .disk_path = self.disk_path,
             .disk2_path = self.iso_path,
             .disk2_read_only = true,
+            .shared_dir = self.shared_dir,
             .network_enabled = self.network_enabled,
+            .forwards = self.forwards[0..self.forward_count],
             .display_enabled = true,
             .display_width = display_width,
             .display_height = display_height,
@@ -273,22 +301,189 @@ const State = struct {
     }
 
     fn startFromForm(self: *State) void {
+        if (!self.readForm()) return;
+        self.start();
+    }
+
+    fn readForm(self: *State) bool {
         self.iso_path = entryValue(self.iso_entry.?);
         self.disk_path = entryValue(self.disk_entry.?);
         self.kernel_path = entryValue(self.kernel_entry.?);
         self.initrd_path = entryValue(self.initrd_entry.?);
+        self.shared_dir = entryValue(self.shared_entry.?);
         const memory_mib = c.gtk_spin_button_get_value_as_int(self.memory_spin.?);
         const vcpu_count = c.gtk_spin_button_get_value_as_int(self.vcpu_spin.?);
-        if (memory_mib <= 0 or vcpu_count <= 0) return self.setError(error.InvalidConfig);
+        if (memory_mib <= 0 or vcpu_count <= 0) {
+            self.setError(error.InvalidConfig);
+            return false;
+        }
         self.memory_bytes = @as(usize, @intCast(memory_mib)) * 1024 * 1024;
         self.vcpu_count = @intCast(vcpu_count);
         self.network_enabled = c.gtk_check_button_get_active(self.network_check.?) != c.FALSE;
-        self.start();
+        if (!self.readForwards()) return false;
+        return true;
+    }
+
+    fn readForwards(self: *State) bool {
+        self.forward_count = 0;
+        const value = entryValue(self.forward_entry.?) orelse return true;
+        var parts = std.mem.splitScalar(u8, value, ',');
+        while (parts.next()) |part_untrimmed| {
+            const part = std.mem.trim(u8, part_untrimmed, " \t");
+            if (part.len == 0 or self.forward_count == self.forwards.len) {
+                self.setError(error.InvalidPortForward);
+                return false;
+            }
+            const forward = AppConfig.parseForward(part) catch {
+                self.setError(error.InvalidPortForward);
+                return false;
+            };
+            for (self.forwards[0..self.forward_count]) |earlier| {
+                if (earlier.host_port == forward.host_port) {
+                    self.setError(error.InvalidPortForward);
+                    return false;
+                }
+            }
+            self.forwards[self.forward_count] = forward;
+            self.forward_count += 1;
+        }
+        if (self.forward_count > 0) {
+            self.network_enabled = true;
+            c.gtk_check_button_set_active(self.network_check.?, c.TRUE);
+        }
+        return true;
+    }
+
+    fn saveConfiguration(self: *State) void {
+        if (!self.readForm()) return;
+        const name = entryValue(self.vm_name_entry.?) orelse return self.setError(error.InvalidName);
+        const firmware = self.firmware_path orelse if (self.iso_path != null or
+            self.disk_path != null and self.kernel_path == null)
+            defaultFirmwarePath()
+        else
+            null;
+        var config = SavedConfig{
+            .name = name,
+            .memory_mb = self.memory_bytes / (1024 * 1024),
+            .vcpu_count = self.vcpu_count,
+            .firmware_path = firmware,
+            .disk_path = self.disk_path,
+            .disk2_path = self.iso_path,
+            .disk2_read_only = true,
+            .kernel_path = self.kernel_path,
+            .initrd_path = self.initrd_path,
+            .cmdline = self.command_line,
+            .enable_gpu = true,
+            .enable_net = self.network_enabled,
+            .shared_dir = self.shared_dir,
+            .display_width = display_width,
+            .display_height = display_height,
+        };
+        config.forward_count = self.forward_count;
+        for (self.forwards[0..self.forward_count], 0..) |forward, index| {
+            config.forwards[index] = .{
+                .host_port = forward.host_port,
+                .guest_port = forward.guest_port,
+            };
+        }
+        config.save(self.allocator) catch |err| return self.setError(err);
+        self.refreshLibrary(name);
+        c.gtk_label_set_text(self.status.?, "Configuration saved");
+    }
+
+    fn loadConfiguration(self: *State) void {
+        const name_owned = c.gtk_combo_box_text_get_active_text(self.vm_selector.?) orelse return;
+        defer c.g_free(name_owned);
+        var loaded = SavedConfig.load(self.allocator, std.mem.span(name_owned)) catch |err| {
+            return self.setError(err);
+        };
+        defer loaded.deinit();
+        const config = loaded.config;
+        setEntryValue(self, self.vm_name_entry.?, config.name);
+        setEntryValue(self, self.disk_entry.?, config.disk_path);
+        setEntryValue(self, self.iso_entry.?, config.disk2_path);
+        setEntryValue(self, self.kernel_entry.?, config.kernel_path);
+        setEntryValue(self, self.initrd_entry.?, config.initrd_path);
+        setEntryValue(self, self.shared_entry.?, config.shared_dir);
+        c.gtk_spin_button_set_value(self.memory_spin.?, @floatFromInt(config.memory_mb));
+        c.gtk_spin_button_set_value(self.vcpu_spin.?, @floatFromInt(config.vcpu_count));
+        c.gtk_check_button_set_active(
+            self.network_check.?,
+            if (config.enable_net) c.TRUE else c.FALSE,
+        );
+        self.forward_count = config.forward_count;
+        for (config.forwards[0..config.forward_count], 0..) |forward, index| {
+            self.forwards[index] = .{
+                .host_port = forward.host_port,
+                .guest_port = forward.guest_port,
+            };
+        }
+        self.writeForwards();
+        const firmware_copy = if (config.firmware_path) |path|
+            self.allocator.dupe(u8, path) catch return self.setError(error.OutOfMemory)
+        else
+            null;
+        const command_copy = self.allocator.dupe(u8, config.cmdline) catch {
+            if (firmware_copy) |path| self.allocator.free(path);
+            return self.setError(error.OutOfMemory);
+        };
+        if (self.loaded_firmware_path) |path| self.allocator.free(path);
+        if (self.loaded_command_line) |command| self.allocator.free(command);
+        self.loaded_firmware_path = firmware_copy;
+        self.loaded_command_line = command_copy;
+        self.firmware_path = firmware_copy;
+        self.command_line = command_copy;
+        c.gtk_label_set_text(self.status.?, "Configuration loaded");
+    }
+
+    fn writeForwards(self: *State) void {
+        var buffer: [AppConfig.MAX_FORWARDS * 12]u8 = undefined;
+        var length: usize = 0;
+        for (self.forwards[0..self.forward_count], 0..) |forward, index| {
+            const formatted = std.fmt.bufPrint(buffer[length..], "{s}{}:{}", .{
+                if (index == 0) "" else ", ",
+                forward.host_port,
+                forward.guest_port,
+            }) catch return self.setError(error.InvalidPortForward);
+            length += formatted.len;
+        }
+        setEntryValue(self, self.forward_entry.?, buffer[0..length]);
+    }
+
+    fn deleteConfiguration(self: *State) void {
+        const name_owned = c.gtk_combo_box_text_get_active_text(self.vm_selector.?) orelse return;
+        defer c.g_free(name_owned);
+        SavedConfig.delete(self.allocator, std.mem.span(name_owned)) catch |err| {
+            return self.setError(err);
+        };
+        self.refreshLibrary(null);
+        c.gtk_label_set_text(self.status.?, "Configuration removed");
+    }
+
+    fn refreshLibrary(self: *State, selected: ?[]const u8) void {
+        const selector = self.vm_selector orelse return;
+        c.gtk_combo_box_text_remove_all(selector);
+        const names = SavedConfig.listAll(self.allocator) catch |err| return self.setError(err);
+        defer {
+            for (names) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+        var selected_index: c_int = -1;
+        for (names, 0..) |name, index| {
+            const terminated = self.allocator.dupeZ(u8, name) catch continue;
+            defer self.allocator.free(terminated);
+            c.gtk_combo_box_text_append_text(selector, terminated.ptr);
+            if (selected) |wanted| {
+                if (std.mem.eql(u8, wanted, name)) selected_index = @intCast(index);
+            }
+        }
+        if (selected_index < 0 and names.len > 0) selected_index = 0;
+        c.gtk_combo_box_set_active(@ptrCast(selector), selected_index);
     }
 
     fn stop(self: *State) void {
         const vm = self.vm orelse return;
-        if (vm.state() != .running) return;
+        if (vm.state() != .running and vm.state() != .paused) return;
         vm.requestStop();
         c.gtk_label_set_text(self.status.?, "Stopping…");
         c.gtk_widget_set_sensitive(self.stop_button.?, c.FALSE);
@@ -296,7 +491,9 @@ const State = struct {
 
     fn setRunningControls(self: *State, running: bool) void {
         c.gtk_widget_set_sensitive(self.start_button.?, if (running) c.FALSE else c.TRUE);
+        c.gtk_widget_set_sensitive(self.pause_button.?, if (running) c.TRUE else c.FALSE);
         c.gtk_widget_set_sensitive(self.stop_button.?, if (running) c.TRUE else c.FALSE);
+        if (!running) c.gtk_button_set_label(@ptrCast(self.pause_button.?), "Pause");
     }
 
     fn finish(self: *State) void {
@@ -487,10 +684,17 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .initrd_path = config.initrd_path,
         .disk_path = config.disk_path,
         .iso_path = config.iso_path,
+        .shared_dir = config.shared_dir,
         .network_enabled = config.network_enabled,
+        .forwards = config.forwards,
+        .forward_count = config.forward_count,
         .command_line = config.command_line,
         .frame_pixels = frame_pixels,
     };
+    defer {
+        if (state.loaded_firmware_path) |path| state.allocator.free(path);
+        if (state.loaded_command_line) |command| state.allocator.free(command);
+    }
     const app = c.gtk_application_new("com.bobrvm.Bobrvm", c.G_APPLICATION_DEFAULT_FLAGS) orelse {
         writeStderr("error: unable to create GTK application\n");
         std.process.exit(1);
@@ -521,6 +725,33 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const title = c.gtk_label_new("bobrvm Linux virtual machine") orelse return;
     c.gtk_widget_add_css_class(title, "title-2");
     c.gtk_box_append(box, title);
+    const library = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
+    const selector_widget = c.gtk_combo_box_text_new() orelse return;
+    state.vm_selector = @ptrCast(selector_widget);
+    const name_widget = c.gtk_entry_new() orelse return;
+    const name_entry: *c.GtkEntry = @ptrCast(name_widget);
+    state.vm_name_entry = name_entry;
+    c.gtk_entry_set_placeholder_text(name_entry, "VM name");
+    const load_button = c.gtk_button_new_with_label("Load") orelse return;
+    const save_button = c.gtk_button_new_with_label("Save") orelse return;
+    const delete_button = c.gtk_button_new_with_label("Remove") orelse return;
+    _ = c.g_signal_connect_data(load_button, "clicked", @ptrCast(&loadClicked), state, null, 0);
+    _ = c.g_signal_connect_data(save_button, "clicked", @ptrCast(&saveClicked), state, null, 0);
+    _ = c.g_signal_connect_data(
+        delete_button,
+        "clicked",
+        @ptrCast(&deleteClicked),
+        state,
+        null,
+        0,
+    );
+    c.gtk_widget_set_hexpand(name_widget, c.TRUE);
+    c.gtk_box_append(@ptrCast(library), selector_widget);
+    c.gtk_box_append(@ptrCast(library), name_widget);
+    c.gtk_box_append(@ptrCast(library), load_button);
+    c.gtk_box_append(@ptrCast(library), save_button);
+    c.gtk_box_append(@ptrCast(library), delete_button);
+    c.gtk_box_append(box, library);
     const iso_entry = addPathRow(
         box,
         state,
@@ -557,6 +788,27 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         &chooseInitrdClicked,
     ) orelse return;
     state.initrd_entry = initrd_entry;
+    const shared_entry = addPathRow(
+        box,
+        state,
+        "Shared Folder",
+        "Optional host directory mounted with tag ‘host’",
+        state.shared_dir,
+        &chooseSharedClicked,
+    ) orelse return;
+    state.shared_entry = shared_entry;
+    const forward_row_widget = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
+    const forward_row: *c.GtkBox = @ptrCast(forward_row_widget);
+    const forward_label = c.gtk_label_new("Port Forwards") orelse return;
+    const forward_widget = c.gtk_entry_new() orelse return;
+    const forward_entry: *c.GtkEntry = @ptrCast(forward_widget);
+    state.forward_entry = forward_entry;
+    c.gtk_entry_set_placeholder_text(forward_entry, "2222:22, 8080:80");
+    c.gtk_widget_set_hexpand(forward_widget, c.TRUE);
+    c.gtk_box_append(forward_row, forward_label);
+    c.gtk_box_append(forward_row, forward_widget);
+    c.gtk_box_append(box, forward_row_widget);
+    state.writeForwards();
     const hardware = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12) orelse return;
     const memory_label = c.gtk_label_new("Memory (MiB)") orelse return;
     const memory_spin_widget = c.gtk_spin_button_new_with_range(128, 65_536, 128) orelse return;
@@ -579,6 +831,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_spin_button_set_value(disk_size, 64);
     state.disk_size_spin = disk_size;
     const create_disk = c.gtk_button_new_with_label("Create Disk…") orelse return;
+    const grow_disk = c.gtk_button_new_with_label("Grow Disk") orelse return;
     _ = c.g_signal_connect_data(
         create_disk,
         "clicked",
@@ -587,6 +840,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         null,
         0,
     );
+    _ = c.g_signal_connect_data(grow_disk, "clicked", @ptrCast(&growDiskClicked), state, null, 0);
     c.gtk_box_append(@ptrCast(hardware), memory_label);
     c.gtk_box_append(@ptrCast(hardware), memory_spin_widget);
     c.gtk_box_append(@ptrCast(hardware), vcpu_label);
@@ -595,14 +849,19 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(storage), disk_size_label);
     c.gtk_box_append(@ptrCast(storage), disk_size_widget);
     c.gtk_box_append(@ptrCast(storage), create_disk);
+    c.gtk_box_append(@ptrCast(storage), grow_disk);
     const controls = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
     const start_button = c.gtk_button_new_with_label("Start") orelse return;
+    const pause_button = c.gtk_button_new_with_label("Pause") orelse return;
     const stop_button = c.gtk_button_new_with_label("Stop") orelse return;
     state.start_button = start_button;
+    state.pause_button = pause_button;
     state.stop_button = stop_button;
     _ = c.g_signal_connect_data(start_button, "clicked", @ptrCast(&startClicked), state, null, 0);
+    _ = c.g_signal_connect_data(pause_button, "clicked", @ptrCast(&pauseClicked), state, null, 0);
     _ = c.g_signal_connect_data(stop_button, "clicked", @ptrCast(&stopClicked), state, null, 0);
     c.gtk_box_append(@ptrCast(controls), start_button);
+    c.gtk_box_append(@ptrCast(controls), pause_button);
     c.gtk_box_append(@ptrCast(controls), stop_button);
     const status_widget = c.gtk_label_new("Ready") orelse return;
     const status: *c.GtkLabel = @ptrCast(status_widget);
@@ -656,6 +915,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_add_controller(display_widget, scroll);
     _ = c.g_signal_connect_data(window, "close-request", @ptrCast(&closeRequest), state, null, 0);
     state.setRunningControls(false);
+    state.refreshLibrary(null);
     c.gtk_window_present(window);
     if (state.kernel_path != null or state.firmware_path != null or
         state.iso_path != null or state.disk_path != null)
@@ -690,7 +950,10 @@ fn addPathRow(
 }
 
 fn setEntryValue(state: *State, entry: *c.GtkEntry, value: ?[]const u8) void {
-    const bytes = value orelse return;
+    const bytes = value orelse {
+        c.gtk_editable_set_text(@ptrCast(entry), "");
+        return;
+    };
     const terminated = state.allocator.dupeZ(u8, bytes) catch return;
     defer state.allocator.free(terminated);
     c.gtk_editable_set_text(@ptrCast(entry), terminated.ptr);
@@ -711,6 +974,37 @@ fn stopClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     state.stop();
 }
 
+fn pauseClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const vm = state.vm orelse return;
+    switch (vm.state()) {
+        .running => if (vm.requestPause()) {
+            c.gtk_button_set_label(@ptrCast(state.pause_button.?), "Resume");
+            c.gtk_label_set_text(state.status.?, "Paused");
+        },
+        .paused => if (vm.requestResume()) {
+            c.gtk_button_set_label(@ptrCast(state.pause_button.?), "Pause");
+            c.gtk_label_set_text(state.status.?, "Running");
+        },
+        else => {},
+    }
+}
+
+fn loadClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.loadConfiguration();
+}
+
+fn saveClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.saveConfiguration();
+}
+
+fn deleteClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.deleteConfiguration();
+}
+
 fn chooseIsoClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
     chooseFile(state, state.iso_entry.?, "Choose installer ISO");
@@ -729,6 +1023,11 @@ fn chooseKernelClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void
 fn chooseInitrdClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
     chooseFile(state, state.initrd_entry.?, "Choose initial ramdisk");
+}
+
+fn chooseSharedClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    chooseFolder(state, state.shared_entry.?, "Choose shared host folder");
 }
 
 fn createDiskClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
@@ -752,11 +1051,36 @@ fn createDiskClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_native_dialog_show(dialog);
 }
 
+fn growDiskClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (state.vm != null) return state.setError(error.VmMustBeStopped);
+    const path = entryValue(state.disk_entry.?) orelse return state.setError(error.InvalidPath);
+    const size_gib = c.gtk_spin_button_get_value_as_int(state.disk_size_spin.?);
+    if (size_gib <= 0) return state.setError(error.InvalidDiskSize);
+    const size_bytes = std.math.mul(u64, @intCast(size_gib), 1024 * 1024 * 1024) catch {
+        return state.setError(error.InvalidDiskSize);
+    };
+    disk.growRaw(path, size_bytes) catch |err| return state.setError(err);
+    c.gtk_label_set_text(state.status.?, "Virtual disk grown");
+}
+
 fn chooseFile(state: *State, entry: *c.GtkEntry, title: [*:0]const u8) void {
     const dialog = c.gtk_file_chooser_native_new(
         title,
         state.window.?,
         c.GTK_FILE_CHOOSER_ACTION_OPEN,
+        "Open",
+        "Cancel",
+    ) orelse return;
+    _ = c.g_signal_connect_data(dialog, "response", @ptrCast(&fileChosen), entry, null, 0);
+    c.gtk_native_dialog_show(dialog);
+}
+
+fn chooseFolder(state: *State, entry: *c.GtkEntry, title: [*:0]const u8) void {
+    const dialog = c.gtk_file_chooser_native_new(
+        title,
+        state.window.?,
+        c.GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
         "Open",
         "Cancel",
     ) orelse return;

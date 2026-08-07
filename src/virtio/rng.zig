@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
@@ -40,7 +41,7 @@ pub const Rng = struct {
     last_avail: u16,
 
     /// Guest memory accessor.
-    guest_memory: ?ring.GetMemFn,
+    guest_memory: ?GuestMemory,
 
     pub const Error = Allocator.Error;
 
@@ -69,8 +70,12 @@ pub const Rng = struct {
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(self: *Rng, accessor: ring.GetMemFn) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *Rng, accessor: anytype) void {
+        self.guest_memory = switch (@typeInfo(@TypeOf(accessor))) {
+            .@"fn", .pointer => GuestMemory.bindGlobal(accessor),
+            .@"struct" => accessor,
+            else => @compileError("unsupported guest-memory accessor"),
+        };
     }
 
     pub fn setIrqCallback(self: *Rng, irq: mmio.Irq) void {
@@ -110,7 +115,7 @@ pub const Rng = struct {
             var written: u32 = 0;
             for (chain.slice()) |desc| {
                 if (!desc.isWrite()) continue;
-                const buf = get_mem(desc.addr, desc.len) orelse continue;
+                const buf = get_mem.get(desc.addr, desc.len) orelse continue;
                 fillEntropy(buf);
                 written += @intCast(buf.len);
             }

@@ -7,6 +7,7 @@
   gsettings-desktop-schemas,
   libiconv,
   gtk4,
+  patchelf,
   pkg-config,
   wrapGAppsHook4,
   zig,
@@ -47,6 +48,7 @@ stdenv.mkDerivation (finalAttrs: {
   nativeBuildInputs =
     [
       pkg-config
+      patchelf
       zig
     ]
     ++ lib.optionals stdenv.hostPlatform.isLinux [
@@ -79,6 +81,8 @@ stdenv.mkDerivation (finalAttrs: {
     runHook preInstall
     cp -R zig-out/. "$out"
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
+      patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm"
+      patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm-gtk"
       mkdir -p "$out/share/bobrvm"
       cp ${OVMF.fd}/FV/OVMF.fd "$out/share/bobrvm/OVMF.fd"
     ''}

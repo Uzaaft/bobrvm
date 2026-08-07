@@ -11,6 +11,8 @@ const virtio = @import("../../virtio/main.zig");
 const boot = @import("boot.zig");
 const mps = @import("mps.zig");
 
+const log = std.log.scoped(.x86_machine);
+
 const gdt_address: u64 = 0x500;
 const pci_block_slot: u5 = 2;
 const pci_block_irq: u32 = 11;
@@ -30,6 +32,12 @@ const pci_keyboard_bar_initial: u32 = 0xd004_0000;
 const pci_tablet_slot: u5 = 7;
 const pci_tablet_irq: u32 = 7;
 const pci_tablet_bar_initial: u32 = 0xd005_0000;
+const pci_share_slot: u5 = 8;
+const pci_share_irq: u32 = 12;
+const pci_share_bar_initial: u32 = 0xd006_0000;
+const pci_rng_slot: u5 = 9;
+const pci_rng_irq: u32 = 13;
+const pci_rng_bar_initial: u32 = 0xd007_0000;
 const serial_irq: u32 = 4;
 const ovmf_debug_port: u16 = 0x402;
 const piix4_pm_function: u3 = 3;
@@ -158,8 +166,18 @@ pub const Machine = struct {
     tablet_irq_desired: bool = false,
     tablet_irq_injected: bool = false,
     input_wakeup: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    share: ?*virtio.P9 = null,
+    pci_share: ?*pci.VirtioPciDevice = null,
+    share_irq_desired: bool = false,
+    share_irq_injected: bool = false,
+    rng: ?*virtio.Rng = null,
+    pci_rng: ?*pci.VirtioPciDevice = null,
+    rng_irq_desired: bool = false,
+    rng_irq_injected: bool = false,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     run_state: std.atomic.Value(RunState) = std.atomic.Value(RunState).init(.idle),
+    state_mutex: std.Io.Mutex = .init,
+    state_condition: std.Io.Condition = .init,
     exits_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     mmio_exits_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_mmio_address: ?u64 = null,
@@ -181,6 +199,7 @@ pub const Machine = struct {
     const RunState = enum(u8) {
         idle,
         running,
+        paused,
         guest_shutdown,
         stopped,
         failed,
@@ -196,6 +215,8 @@ pub const Machine = struct {
     pub const AttachNetworkError = virtio.Net.Error || std.Thread.SpawnError;
     pub const AttachDisplayError = virtio.Gpu.Error;
     pub const AttachInputError = virtio.Input.Error;
+    pub const AttachShareError = std.mem.Allocator.Error;
+    pub const AttachRngError = virtio.Rng.Error;
     pub const InputError = error{InputUnavailable};
     pub const SerialInputError = kvm.InterruptError;
     pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError ||
@@ -332,6 +353,10 @@ pub const Machine = struct {
     pub fn deinit(self: *Machine) void {
         self.stopBlockFastPath();
         if (self.net_enabled) self.nat.stop();
+        if (self.pci_rng) |device| device.deinit();
+        if (self.rng) |rng| rng.deinit();
+        if (self.pci_share) |device| device.deinit();
+        if (self.share) |share| share.deinit();
         if (self.pci_tablet) |device| device.deinit();
         if (self.tablet) |input| input.deinit();
         if (self.pci_keyboard) |device| device.deinit();
@@ -427,7 +452,11 @@ pub const Machine = struct {
     }
 
     /// The machine address must remain stable until deinit because callbacks retain it.
-    pub fn attachNetwork(self: *Machine, allocator: std.mem.Allocator) AttachNetworkError!void {
+    pub fn attachNetwork(
+        self: *Machine,
+        allocator: std.mem.Allocator,
+        forwards: []const mininat.Forward,
+    ) AttachNetworkError!void {
         std.debug.assert(self.net == null);
         std.debug.assert(self.pci_net == null);
         std.debug.assert(!self.net_enabled);
@@ -477,6 +506,15 @@ pub const Machine = struct {
         self.nat.setRxReady(
             callback_binding.Handler0(Machine, bool, natRxReady).bind(self),
         );
+        for (forwards) |forward| {
+            self.nat.addForward(forward) catch |err| {
+                log.err("port forward {}->{} failed: {}", .{
+                    forward.host_port,
+                    forward.guest_port,
+                    err,
+                });
+            };
+        }
         self.nat.start() catch |err| {
             self.nat.stop();
             return err;
@@ -548,6 +586,58 @@ pub const Machine = struct {
         self.pci_keyboard = keyboard.device;
         self.tablet = tablet.input;
         self.pci_tablet = tablet.device;
+    }
+
+    pub fn attachSharedFolder(
+        self: *Machine,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) AttachShareError!void {
+        std.debug.assert(self.share == null);
+        std.debug.assert(self.pci_share == null);
+        const share = try virtio.P9.init(allocator, "host", path);
+        errdefer share.deinit();
+        share.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
+        share.setIrqCallback(virtio.mmio.Irq.initRaw(shareIrq, self));
+        const device = try pci.VirtioPciDevice.init(
+            allocator,
+            9,
+            share.transport.device_features,
+            1,
+            2 + share.tag.len,
+        );
+        errdefer device.deinit();
+        device.writeConfig(0x10, 4, pci_share_bar_initial);
+        device.config[0x3c] = pci_share_irq;
+        device.config[0x3d] = 1;
+        syncShareConfig(device, share);
+        device.transport.setNotifyCallback(shareNotify, self);
+        self.share = share;
+        self.pci_share = device;
+    }
+
+    /// Attach host-backed entropy so guest boot never waits on an empty random pool.
+    pub fn attachRng(self: *Machine, allocator: std.mem.Allocator) AttachRngError!void {
+        std.debug.assert(self.rng == null);
+        std.debug.assert(self.pci_rng == null);
+        const rng = try virtio.Rng.init(allocator);
+        errdefer rng.deinit();
+        rng.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
+        rng.setIrqCallback(virtio.mmio.Irq.initRaw(rngIrq, self));
+        const device = try pci.VirtioPciDevice.init(
+            allocator,
+            4,
+            rng.transport.device_features,
+            1,
+            0,
+        );
+        errdefer device.deinit();
+        device.writeConfig(0x10, 4, pci_rng_bar_initial);
+        device.config[0x3c] = pci_rng_irq;
+        device.config[0x3d] = 1;
+        device.transport.setNotifyCallback(rngNotify, self);
+        self.rng = rng;
+        self.pci_rng = device;
     }
 
     fn createInputDevice(
@@ -672,6 +762,28 @@ pub const Machine = struct {
         self.finishRun(.stopped);
     }
 
+    pub fn requestPause(self: *Machine) bool {
+        if (self.run_state.cmpxchgStrong(
+            .running,
+            .paused,
+            .acq_rel,
+            .acquire,
+        ) != null) return false;
+        self.interruptVcpus();
+        return true;
+    }
+
+    pub fn requestResume(self: *Machine) bool {
+        if (self.run_state.cmpxchgStrong(
+            .paused,
+            .running,
+            .acq_rel,
+            .acquire,
+        ) != null) return false;
+        self.signalStateWaiters();
+        return true;
+    }
+
     fn vcpuThreadMain(
         self: *Machine,
         index: usize,
@@ -701,6 +813,10 @@ pub const Machine = struct {
             slot.vcpu.clearExitRequest();
             switch (self.run_state.load(.acquire)) {
                 .running => {},
+                .paused => {
+                    self.waitWhilePaused();
+                    continue;
+                },
                 .guest_shutdown => return .guest_shutdown,
                 .stopped, .failed => return .stopped,
                 .idle => return error.InternalError,
@@ -739,6 +855,8 @@ pub const Machine = struct {
             try self.syncGpuIrq();
             if (self.input_wakeup.swap(false, .acq_rel)) self.processInput();
             try self.syncInputIrqs();
+            try self.syncShareIrq();
+            try self.syncRngIrq();
         }
     }
 
@@ -759,13 +877,42 @@ pub const Machine = struct {
     }
 
     fn finishRun(self: *Machine, state: RunState) void {
-        if (self.run_state.cmpxchgStrong(.running, state, .acq_rel, .acquire) != null) return;
+        var current = self.run_state.load(.acquire);
+        while (current == .running or current == .paused) {
+            current = self.run_state.cmpxchgWeak(
+                current,
+                state,
+                .acq_rel,
+                .acquire,
+            ) orelse {
+                self.signalStateWaiters();
+                self.interruptVcpus();
+                return;
+            };
+        }
+    }
+
+    fn interruptVcpus(self: *Machine) void {
         const current_id: u32 = @intCast(std.Thread.getCurrentId());
         for (self.vcpus) |*slot| {
             slot.vcpu.requestExit();
             const thread_id = slot.thread_id.load(.acquire);
             if (thread_id != 0 and thread_id != current_id) kvm.interruptThread(thread_id);
         }
+    }
+
+    fn waitWhilePaused(self: *Machine) void {
+        self.state_mutex.lockUncancelable(global.io());
+        defer self.state_mutex.unlock(global.io());
+        while (self.run_state.load(.acquire) == .paused) {
+            self.state_condition.waitUncancelable(global.io(), &self.state_mutex);
+        }
+    }
+
+    fn signalStateWaiters(self: *Machine) void {
+        self.state_mutex.lockUncancelable(global.io());
+        defer self.state_mutex.unlock(global.io());
+        for (self.vcpus) |_| self.state_condition.signal(global.io());
     }
 
     fn joinVcpuThreads(self: *Machine) void {
@@ -1024,6 +1171,12 @@ pub const Machine = struct {
         if (self.pci_tablet) |device| {
             if (self.tablet) |input| return self.handleInputPciBar(device, input, access);
         }
+        if (self.pci_share) |device| {
+            if (self.share) |share| return self.handleSharePciBar(device, share, access);
+        }
+        if (self.pci_rng) |device| {
+            if (self.rng) |rng| return self.handleRngPciBar(device, rng, access);
+        }
         return false;
     }
 
@@ -1171,6 +1324,61 @@ pub const Machine = struct {
         return true;
     }
 
+    fn handleSharePciBar(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        share: *virtio.P9,
+        access: kvm.MmioExit,
+    ) bool {
+        _ = self;
+        const bar_address: u64 = device.getBar0Addr();
+        if (bar_address == 0 or access.address < bar_address) return false;
+        const offset_u64 = access.address - bar_address;
+        if (offset_u64 >= pci.virtio_pci.BAR0_SIZE) return false;
+        const value = readIoValue(access.data) orelse return false;
+        const offset: u32 = @intCast(offset_u64);
+        if (access.direction == .read) {
+            if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) syncShareConfig(device, share);
+            const result = device.readBar0(offset, @intCast(access.data.len));
+            writeIoValue(access.data, result);
+            if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+                offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+            {
+                share.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), result);
+            }
+        } else {
+            device.writeBar0(offset, @intCast(access.data.len), value);
+        }
+        return true;
+    }
+
+    fn handleRngPciBar(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        rng: *virtio.Rng,
+        access: kvm.MmioExit,
+    ) bool {
+        _ = self;
+        const bar_address: u64 = device.getBar0Addr();
+        if (bar_address == 0 or access.address < bar_address) return false;
+        const offset_u64 = access.address - bar_address;
+        if (offset_u64 >= pci.virtio_pci.BAR0_SIZE) return false;
+        const value = readIoValue(access.data) orelse return false;
+        const offset: u32 = @intCast(offset_u64);
+        if (access.direction == .read) {
+            const result = device.readBar0(offset, @intCast(access.data.len));
+            writeIoValue(access.data, result);
+            if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+                offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+            {
+                rng.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), result);
+            }
+        } else {
+            device.writeBar0(offset, @intCast(access.data.len), value);
+        }
+        return true;
+    }
+
     fn pciDevice(
         self: *Machine,
         address: pci.x86_config.ConfigAddress,
@@ -1183,6 +1391,8 @@ pub const Machine = struct {
             pci_gpu_slot => self.pci_gpu,
             pci_keyboard_slot => self.pci_keyboard,
             pci_tablet_slot => self.pci_tablet,
+            pci_share_slot => self.pci_share,
+            pci_rng_slot => self.pci_rng,
             else => null,
         };
     }
@@ -1501,6 +1711,78 @@ pub const Machine = struct {
         if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
         primary.vcpu.requestExit();
         kvm.interruptThread(thread_id);
+    }
+
+    fn syncShareConfig(device: *pci.VirtioPciDevice, share: *virtio.P9) void {
+        const config = device.transport.device_config;
+        const tag_len: u16 = @intCast(share.tag.len);
+        config[0] = @truncate(tag_len);
+        config[1] = @truncate(tag_len >> 8);
+        @memcpy(config[2..][0..share.tag.len], share.tag);
+    }
+
+    fn shareNotify(queue_index: u32, userdata: ?*anyopaque) void {
+        if (queue_index != 0) return;
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_share orelse return;
+        const share = self.share orelse return;
+        const source = device.transport.queues[0];
+        const target = &share.transport.queues[0];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        share.write(@intFromEnum(virtio.mmio.Reg.queue_notify), 0);
+    }
+
+    fn shareIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_share orelse return;
+        const share = self.share orelse return;
+        device.transport.isr_status.queue_interrupt =
+            share.transport.interrupt_status.used_buffer;
+        device.transport.isr_status.config_change =
+            share.transport.interrupt_status.config_change;
+        self.share_irq_desired = level;
+    }
+
+    fn syncShareIrq(self: *Machine) kvm.InterruptError!void {
+        if (self.share_irq_desired == self.share_irq_injected) return;
+        try self.vm.setIrqLine(pci_share_irq, self.share_irq_desired);
+        self.share_irq_injected = self.share_irq_desired;
+    }
+
+    fn rngNotify(queue_index: u32, userdata: ?*anyopaque) void {
+        if (queue_index != 0) return;
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_rng orelse return;
+        const rng = self.rng orelse return;
+        const source = device.transport.queues[0];
+        const target = &rng.transport.queues[0];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        rng.write(@intFromEnum(virtio.mmio.Reg.queue_notify), 0);
+    }
+
+    fn rngIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_rng orelse return;
+        const rng = self.rng orelse return;
+        device.transport.isr_status.queue_interrupt =
+            rng.transport.interrupt_status.used_buffer;
+        device.transport.isr_status.config_change =
+            rng.transport.interrupt_status.config_change;
+        self.rng_irq_desired = level;
+    }
+
+    fn syncRngIrq(self: *Machine) kvm.InterruptError!void {
+        if (self.rng_irq_desired == self.rng_irq_injected) return;
+        try self.vm.setIrqLine(pci_rng_irq, self.rng_irq_desired);
+        self.rng_irq_injected = self.rng_irq_desired;
     }
 
     fn syncNetIrq(self: *Machine) kvm.InterruptError!void {

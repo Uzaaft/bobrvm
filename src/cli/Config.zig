@@ -49,6 +49,7 @@ pub const PortForward = struct {
 
 pub const ParseError = error{
     InvalidArgument,
+    InvalidName,
     HelpRequested,
     MissingName,
 };
@@ -196,6 +197,15 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
 }
 
 pub fn validate(self: *const Config) ParseError!void {
+    if (self.forward_count > MAX_FORWARDS) return ParseError.InvalidArgument;
+    for (self.forwards[0..self.forward_count], 0..) |forward, index| {
+        if (forward.host_port == 0 or forward.guest_port == 0) {
+            return ParseError.InvalidArgument;
+        }
+        for (self.forwards[0..index]) |earlier| {
+            if (earlier.host_port == forward.host_port) return ParseError.InvalidArgument;
+        }
+    }
     const memory_bytes = std.math.mul(u64, self.memory_mb, 1024 * 1024) catch {
         return ParseError.InvalidArgument;
     };
@@ -241,6 +251,7 @@ pub fn ensureConfigDir(alloc: Allocator) ![]const u8 {
 }
 
 pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
+    try validateName(name);
     const dir = try getConfigDir(alloc);
     defer alloc.free(dir);
     const filename = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
@@ -250,6 +261,7 @@ pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
 
 pub fn save(self: *const Config, alloc: Allocator) !void {
     if (self.name.len == 0) return ParseError.MissingName;
+    try validateName(self.name);
 
     const dir_path = try ensureConfigDir(alloc);
     defer alloc.free(dir_path);
@@ -277,6 +289,7 @@ pub const LoadedConfig = struct {
 };
 
 pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
+    try validateName(name);
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
@@ -309,6 +322,7 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
 }
 
 pub fn delete(alloc: Allocator, name: []const u8) !void {
+    try validateName(name);
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
@@ -326,7 +340,7 @@ pub fn listAll(alloc: Allocator) ![][]const u8 {
 
     var dir = std.Io.Dir.openDirAbsolute(global.io(), dir_path, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
-            return &.{};
+            return try alloc.alloc([]const u8, 0);
         }
         return err;
     };
@@ -348,6 +362,19 @@ pub fn listAll(alloc: Allocator) ![][]const u8 {
     }
 
     return names.toOwnedSlice(alloc);
+}
+
+pub fn validateName(name: []const u8) ParseError!void {
+    if (name.len == 0 or name.len > 64) return error.InvalidName;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.') {
+            continue;
+        }
+        return error.InvalidName;
+    }
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.InvalidName;
+    }
 }
 
 pub fn printOptions() void {
@@ -378,4 +405,10 @@ test "persisted config uses shared GPU memory validation" {
 
     const valid = Config{ .gpu_memory_mb = 2048 };
     try valid.validate();
+}
+
+test "VM names cannot escape the config directory" {
+    try std.testing.expectError(error.InvalidName, validateName("../escape"));
+    try std.testing.expectError(error.InvalidName, validateName("nested/vm"));
+    try validateName("fedora-workstation_41");
 }
