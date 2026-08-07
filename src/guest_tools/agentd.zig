@@ -199,3 +199,90 @@ const Transfer = struct {
     final_path: [std.fs.max_path_bytes]u8 = undefined,
     final_path_len: usize = 0,
 };
+
+fn expectFileAcknowledgement(fd: std.posix.fd_t, request_id: u64, offset: u64) !void {
+    var encoded: [protocol.Header.bytes + 8]u8 = undefined;
+    var read_len: usize = 0;
+    while (read_len < encoded.len) {
+        const count = try std.posix.read(fd, encoded[read_len..]);
+        if (count == 0) return error.EndOfStream;
+        read_len += count;
+    }
+
+    try std.testing.expectEqual(
+        protocol.Header.magic,
+        std.mem.readInt(u32, encoded[0..4], .little),
+    );
+    try std.testing.expectEqual(
+        @intFromEnum(protocol.MessageKind.file_accept),
+        std.mem.readInt(u16, encoded[6..8], .little),
+    );
+    try std.testing.expectEqual(request_id, std.mem.readInt(u64, encoded[12..20], .little));
+    try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, encoded[20..24], .little));
+    try std.testing.expectEqual(offset, std.mem.readInt(u64, encoded[24..32], .little));
+}
+
+test "guest file transfer commits complete ordered payloads atomically" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(io, &directory_buffer);
+    const directory = directory_buffer[0..directory_len];
+
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const port = std.Io.File{
+        .handle = pipe_fds[1],
+        .flags = .{ .nonblocking = false },
+    };
+
+    var transfer: ?Transfer = null;
+    defer abortTransfer(io, &transfer);
+    var offer_buffer: [protocol.FileOffer.header_bytes + "hello.txt".len]u8 = undefined;
+    const offer = try protocol.FileOffer.encode(&offer_buffer, 5, "hello.txt");
+    const offer_frame = protocol.Frame{ .kind = .file_offer, .request_id = 42, .payload = offer };
+    try acceptFile(port, io, directory, &transfer, offer_frame);
+    try expectFileAcknowledgement(pipe_fds[0], 42, 0);
+
+    var chunk_buffer: [protocol.FileChunk.header_bytes + 3]u8 = undefined;
+    const first = try protocol.FileChunk.encode(&chunk_buffer, 0, "hel");
+    try receiveFileChunk(port, io, &transfer, .{
+        .kind = .file_chunk,
+        .request_id = 42,
+        .payload = first,
+    });
+    try expectFileAcknowledgement(pipe_fds[0], 42, 3);
+    try std.testing.expectError(error.IncompleteTransfer, completeFile(io, &transfer, .{
+        .kind = .file_complete,
+        .request_id = 42,
+        .payload = &.{},
+    }));
+
+    const second = try protocol.FileChunk.encode(&chunk_buffer, 3, "lo");
+    try receiveFileChunk(port, io, &transfer, .{
+        .kind = .file_chunk,
+        .request_id = 42,
+        .payload = second,
+    });
+    try expectFileAcknowledgement(pipe_fds[0], 42, 5);
+    try completeFile(io, &transfer, .{
+        .kind = .file_complete,
+        .request_id = 42,
+        .payload = &.{},
+    });
+
+    var final_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const final_path = try std.fmt.bufPrint(&final_path_buffer, "{s}/hello.txt", .{directory});
+    const file = try std.Io.Dir.openFileAbsolute(io, final_path, .{});
+    defer file.close(io);
+    var contents: [5]u8 = undefined;
+    try std.testing.expectEqual(contents.len, try file.readPositionalAll(io, &contents, 0));
+    try std.testing.expectEqualStrings("hello", &contents);
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        acceptFile(port, io, directory, &transfer, offer_frame),
+    );
+}

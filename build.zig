@@ -423,7 +423,9 @@ pub fn build(b: *std.Build) !void {
         );
         const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
         c_api_smoke_module.addFrameworkPath(.{ .cwd_relative = framework_path });
-        c_api_smoke_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+        c_api_smoke_module.addSystemIncludePath(.{
+            .cwd_relative = b.fmt("{s}/usr/include", .{sdk}),
+        });
         c_api_smoke_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
     }
 
@@ -549,6 +551,25 @@ pub fn build(b: *std.Build) !void {
     });
     const run_wayland_tests = b.addRunArtifact(wayland_tests);
     test_step.dependOn(&run_wayland_tests.step);
+
+    const guest_protocol_test_module = b.createModule(.{
+        .root_source_file = b.path("src/agent/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const guest_agent_test_module = b.createModule(.{
+        .root_source_file = b.path("src/guest_tools/agentd.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    guest_agent_test_module.addImport("guest_protocol", guest_protocol_test_module);
+    const guest_agent_tests = b.addTest(.{
+        .root_module = guest_agent_test_module,
+        .filters = test_filters,
+    });
+    const run_guest_agent_tests = b.addRunArtifact(guest_agent_tests);
+    test_step.dependOn(&run_guest_agent_tests.step);
 
     // ==========================================================================
     // Integration test: bare-metal ARM64 test binary (pure assembly)
