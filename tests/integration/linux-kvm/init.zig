@@ -29,6 +29,12 @@ pub fn main() noreturn {
         if (debug_port_available) emit("BOBRVM_ROOTFS_MOUNT_FAILED\n");
         restart();
     }
+    if (linux.errno(linux.mount("devtmpfs", "/newroot/dev", "devtmpfs", 0, 0)) != .SUCCESS or
+        linux.errno(linux.mount("proc", "/newroot/proc", "proc", 0, 0)) != .SUCCESS)
+    {
+        if (debug_port_available) emit("BOBRVM_PSEUDOFS_MOUNT_FAILED\n");
+        restart();
+    }
     if (linux.errno(linux.chroot("/newroot")) != .SUCCESS or
         linux.errno(linux.chdir("/")) != .SUCCESS)
     {

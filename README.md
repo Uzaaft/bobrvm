@@ -54,7 +54,9 @@ bobrvm-gtk bzImage initrd writable-root.raw
 
 The current x86 direct-boot path provides writable virtio-pci block storage.
 Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
-the vCPU thread. The GTK window stops and joins the VM before closing.
+the vCPU thread. The GTK application displays a bounded serial-console history and
+forwards text and navigation keys through the shared Zig 16550 UART. Closing its
+window requests an immediate vCPU exit and joins the VM before releasing resources.
 
 ## Run a Linux guest
 

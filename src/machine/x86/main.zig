@@ -12,6 +12,7 @@ const gdt_address: u64 = 0x500;
 const pci_block_slot: u5 = 1;
 const pci_block_irq: u32 = 11;
 const pci_bar_initial: u32 = 0xd000_0000;
+const serial_irq: u32 = 4;
 
 pub const SerialSink = struct {
     userdata: *anyopaque,
@@ -36,6 +37,41 @@ pub const SerialSink = struct {
     }
 };
 
+const Serial = struct {
+    const capacity: usize = 4096;
+
+    rx: [capacity]u8 = undefined,
+    rx_head: usize = 0,
+    rx_len: usize = 0,
+    interrupt_enable: u8 = 0,
+    line_control: u8 = 0,
+    modem_control: u8 = 0,
+    scratch: u8 = 0,
+    divisor_low: u8 = 1,
+    divisor_high: u8 = 0,
+
+    fn queue(self: *Serial, bytes: []const u8) usize {
+        if (bytes.len > capacity - self.rx_len) return 0;
+        for (bytes, 0..) |byte, index| {
+            self.rx[(self.rx_head + self.rx_len + index) % capacity] = byte;
+        }
+        self.rx_len += bytes.len;
+        return bytes.len;
+    }
+
+    fn pop(self: *Serial) ?u8 {
+        if (self.rx_len == 0) return null;
+        const byte = self.rx[self.rx_head];
+        self.rx_head = (self.rx_head + 1) % capacity;
+        self.rx_len -= 1;
+        return byte;
+    }
+
+    fn receiveInterruptPending(self: *const Serial) bool {
+        return self.rx_len > 0 and self.interrupt_enable & 0x01 != 0;
+    }
+};
+
 pub const Machine = struct {
     host: kvm.Kvm,
     vm: kvm.VM,
@@ -43,6 +79,9 @@ pub const Machine = struct {
     memory: []align(std.heap.page_size_min) u8,
     layout: boot.Layout,
     pci_config: pci.x86_config.LegacyConfig = .{},
+    serial: Serial = .{},
+    serial_lock: std.Io.Mutex = .init,
+    serial_irq_injected: bool = false,
     block: ?*virtio.Block = null,
     pci_block: ?*pci.VirtioPciDevice = null,
     block_lock: std.Io.Mutex = .init,
@@ -68,6 +107,7 @@ pub const Machine = struct {
     pub const InitError = kvm.OpenError || kvm.CreateError || boot.LoadError;
     pub const AttachDiskError = virtio.Block.Error || std.Io.File.StatError ||
         kvm.FastPathError || std.Thread.SpawnError;
+    pub const SerialInputError = kvm.InterruptError;
     pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError || error{
         ExitLimitReached,
         InternalError,
@@ -215,6 +255,15 @@ pub const Machine = struct {
         if (thread_id != 0) kvm.interruptThread(thread_id);
     }
 
+    /// Queue host input for the guest's 16550 receive register.
+    pub fn queueSerialInput(self: *Machine, bytes: []const u8) SerialInputError!usize {
+        self.serial_lock.lockUncancelable(global.io());
+        defer self.serial_lock.unlock(global.io());
+        const written = self.serial.queue(bytes);
+        try self.updateSerialIrqLocked();
+        return written;
+    }
+
     pub fn fastBlockStats(self: *const Machine) FastBlockStats {
         return .{
             .enabled = self.block_fast_enabled,
@@ -229,7 +278,7 @@ pub const Machine = struct {
         const access = self.vcpu.ioExit() orelse return error.InvalidIoExit;
         switch (access.direction) {
             .write => try self.handleIoWrite(access, serial),
-            .read => self.handleIoRead(access),
+            .read => try self.handleIoRead(access),
         }
     }
 
@@ -237,13 +286,17 @@ pub const Machine = struct {
         self: *Machine,
         access: kvm.IoExit,
         serial: SerialSink,
-    ) kvm.FastPathError!void {
-        if (access.size == 1 and (access.port == 0x3f8 or access.port == 0xe9)) {
+    ) (kvm.FastPathError || kvm.InterruptError)!void {
+        if (access.size == 1 and access.port == 0xe9) {
             serial.write(access.data);
         }
 
         if (access.count != 1) return;
         const value = readIoValue(access.data) orelse return;
+        if (access.size == 1 and access.port >= 0x3f8 and access.port <= 0x3ff) {
+            try self.writeSerialRegister(access.port, @truncate(value), serial);
+            return;
+        }
         if (self.pci_config.writeAddress(access.port, access.size, value)) return;
         const address = self.pci_config.dataAddress(access.port, access.size) orelse return;
         const device = self.pciDevice(address) orelse return;
@@ -256,11 +309,17 @@ pub const Machine = struct {
         };
     }
 
-    fn handleIoRead(self: *Machine, access: kvm.IoExit) void {
+    fn handleIoRead(self: *Machine, access: kvm.IoExit) kvm.InterruptError!void {
         @memset(access.data, 0xff);
         if (access.count != 1) return;
         if (self.pci_config.readAddress(access.port, access.size)) |value| {
             writeIoValue(access.data, value);
+            return;
+        }
+        if (access.count == 1 and access.size == 1 and
+            access.port >= 0x3f8 and access.port <= 0x3ff)
+        {
+            @memset(access.data, try self.readSerialRegister(access.port));
             return;
         }
         if (self.pci_config.dataAddress(access.port, access.size)) |address| {
@@ -269,14 +328,64 @@ pub const Machine = struct {
             return;
         }
         if (access.size != 1) return;
-        const value: u8 = switch (access.port) {
-            0x3f8 => 0x00,
-            0x3fa => 0x01,
-            0x3fd => 0x60,
-            0x3fe => 0xb0,
-            else => return,
+    }
+
+    fn writeSerialRegister(
+        self: *Machine,
+        port: u16,
+        value: u8,
+        sink: SerialSink,
+    ) kvm.InterruptError!void {
+        self.serial_lock.lockUncancelable(global.io());
+        defer self.serial_lock.unlock(global.io());
+        switch (port - 0x3f8) {
+            0 => if (self.serial.line_control & 0x80 != 0) {
+                self.serial.divisor_low = value;
+            } else {
+                sink.write(&.{value});
+            },
+            1 => if (self.serial.line_control & 0x80 != 0) {
+                self.serial.divisor_high = value;
+            } else {
+                self.serial.interrupt_enable = value & 0x0f;
+            },
+            3 => self.serial.line_control = value,
+            4 => self.serial.modem_control = value & 0x1f,
+            7 => self.serial.scratch = value,
+            else => {},
+        }
+        try self.updateSerialIrqLocked();
+    }
+
+    fn readSerialRegister(self: *Machine, port: u16) kvm.InterruptError!u8 {
+        self.serial_lock.lockUncancelable(global.io());
+        defer self.serial_lock.unlock(global.io());
+        const value: u8 = switch (port - 0x3f8) {
+            0 => if (self.serial.line_control & 0x80 != 0)
+                self.serial.divisor_low
+            else
+                self.serial.pop() orelse 0,
+            1 => if (self.serial.line_control & 0x80 != 0)
+                self.serial.divisor_high
+            else
+                self.serial.interrupt_enable,
+            2 => if (self.serial.receiveInterruptPending()) 0x04 else 0x01,
+            3 => self.serial.line_control,
+            4 => self.serial.modem_control,
+            5 => 0x60 | @as(u8, @intFromBool(self.serial.rx_len > 0)),
+            6 => 0xb0,
+            7 => self.serial.scratch,
+            else => 0,
         };
-        @memset(access.data, value);
+        try self.updateSerialIrqLocked();
+        return value;
+    }
+
+    fn updateSerialIrqLocked(self: *Machine) kvm.InterruptError!void {
+        const desired = self.serial.receiveInterruptPending();
+        if (desired == self.serial_irq_injected) return;
+        try self.vm.setIrqLine(serial_irq, desired);
+        self.serial_irq_injected = desired;
     }
 
     fn handleMmio(self: *Machine) RunError!void {
@@ -576,6 +685,37 @@ test "x86 machine GDT contains flat code and data segments" {
         @as(u64, 0x00cf_9300_0000_ffff),
         std.mem.readInt(u64, memory[gdt_address + 16 ..][0..8], .little),
     );
+}
+
+test "serial receive queue is bounded and preserves FIFO order" {
+    var serial = Serial{};
+    var input: [Serial.capacity]u8 = undefined;
+    for (&input, 0..) |*byte, index| byte.* = @truncate(index);
+
+    try std.testing.expectEqual(Serial.capacity, serial.queue(&input));
+    try std.testing.expectEqual(@as(usize, 0), serial.queue("overflow"));
+    for (input[0..100]) |expected| {
+        try std.testing.expectEqual(expected, serial.pop().?);
+    }
+    try std.testing.expectEqual(@as(usize, 100), serial.queue(input[0..100]));
+    for (input[100..Serial.capacity]) |expected| {
+        try std.testing.expectEqual(expected, serial.pop().?);
+    }
+    for (input[0..100]) |expected| {
+        try std.testing.expectEqual(expected, serial.pop().?);
+    }
+    try std.testing.expectEqual(@as(?u8, null), serial.pop());
+}
+
+test "serial receive interrupt follows buffered input and IER" {
+    var serial = Serial{};
+    try std.testing.expectEqual(@as(usize, 1), serial.queue("a"));
+    try std.testing.expect(!serial.receiveInterruptPending());
+
+    serial.interrupt_enable = 1;
+    try std.testing.expect(serial.receiveInterruptPending());
+    try std.testing.expectEqual(@as(?u8, 'a'), serial.pop());
+    try std.testing.expect(!serial.receiveInterruptPending());
 }
 
 test "absent MMIO reads return all bits set" {

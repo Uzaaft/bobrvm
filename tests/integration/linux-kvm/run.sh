@@ -13,9 +13,12 @@ fi
 test_dir="$(mktemp -d -p /tmp bobrvm-linux-kvm.XXXXXXXX)"
 output_file="$test_dir/output"
 disk_copy="$test_dir/disk"
+console_disk_copy="$test_dir/console-disk"
 trap 'rm -rf "$test_dir"' EXIT
 cp "$4" "$disk_copy"
+cp "$4" "$console_disk_copy"
 chmod u+w "$disk_copy"
+chmod u+w "$console_disk_copy"
 command=("$1" run-kernel "$2" "$3" "$disk_copy")
 
 set +e
@@ -72,4 +75,22 @@ if ! grep -q "^$lifecycle_marker$" "$lifecycle_output"; then
     exit 1
 fi
 
-echo "Linux KVM E2E: $expected_marker $fast_path_marker lifecycle-stop"
+console_output="$test_dir/console-output"
+set +e
+timeout 10s \
+    "$1" kvm-console-smoke "$2" "$3" "$console_disk_copy" \
+    >"$console_output" 2>&1
+console_status="$?"
+set -e
+cat "$console_output"
+if [[ "$console_status" -ne 0 ]]; then
+    echo "error: KVM console smoke exited with status $console_status" >&2
+    exit 1
+fi
+console_marker="KVM console: guest accepted serial input"
+if ! grep -q "^$console_marker$" "$console_output"; then
+    echo "error: $console_marker was not observed" >&2
+    exit 1
+fi
+
+echo "Linux KVM E2E: $expected_marker $fast_path_marker lifecycle-stop console-input"

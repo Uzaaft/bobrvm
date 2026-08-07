@@ -39,6 +39,22 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeAll("KVM lifecycle: host stop joined cleanly\n");
         return;
     }
+    if (std.mem.eql(u8, command, "kvm-console-smoke")) {
+        const kernel_path = args.next() orelse return missingConsoleSmokeArgument();
+        const initrd_path = args.next() orelse return missingConsoleSmokeArgument();
+        const disk_path = args.next() orelse return missingConsoleSmokeArgument();
+        run_kernel.executeConsoleSmoke(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            disk_path,
+        ) catch |err| {
+            printNamedError("KVM console smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM console: guest accepted serial input\n");
+        return;
+    }
     if (std.mem.eql(u8, command, "run-kernel")) {
         const kernel_path = args.next() orelse {
             writeAll("error: run-kernel requires a bzImage path\n");
@@ -133,6 +149,11 @@ fn printNamedError(operation: []const u8, err: anyerror) void {
     writeAll(output);
 }
 
+fn missingConsoleSmokeArgument() noreturn {
+    writeAll("error: kvm-console-smoke requires bzImage, initrd, and disk paths\n");
+    std.process.exit(1);
+}
+
 fn printUsage() void {
     writeAll(
         \\bobrvm - fast Linux virtualization
@@ -143,6 +164,7 @@ fn printUsage() void {
         \\  kvm-info    Validate KVM and show acceleration capabilities
         \\  kvm-smoke   Run a tiny x86 payload through KVM
         \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
+        \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
         \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
         \\  version     Show version information
         \\  help        Show this help message

@@ -14,7 +14,12 @@ runCommand "bobrvm-linux-kvm-fixture" {
   export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
   export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
   export E2FSPROGS_FAKE_TIME=1
-  mkdir -p "$out/root/dev" "$out/root/modules" "$out/root/newroot" "$out/rootfs"
+  mkdir -p \
+    "$out/root/dev" \
+    "$out/root/modules" \
+    "$out/root/newroot" \
+    "$out/rootfs/dev" \
+    "$out/rootfs/proc"
   zig build-exe "$init" \
     -target x86_64-linux-musl \
     -O ReleaseSmall \

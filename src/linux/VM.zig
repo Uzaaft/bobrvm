@@ -49,6 +49,7 @@ pub const CreateError = boot.ParseError || x86.Machine.InitError ||
 
 pub const StartError = std.Thread.SpawnError || error{InvalidState};
 pub const JoinError = x86.Machine.RunError || error{InvalidState};
+pub const ConsoleWriteError = x86.Machine.SerialInputError || error{InvalidState};
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -127,6 +128,12 @@ pub fn join(self: *VM) JoinError!x86.Machine.RunOutcome {
 
 pub fn state(self: *const VM) State {
     return self.state_value.load(.acquire);
+}
+
+/// Queue terminal input for the guest while its vCPU is running.
+pub fn writeConsole(self: *VM, bytes: []const u8) ConsoleWriteError!usize {
+    if (self.state() != .running) return error.InvalidState;
+    return self.machine.queueSerialInput(bytes);
 }
 
 pub fn fastBlockStats(self: *const VM) x86.Machine.FastBlockStats {
