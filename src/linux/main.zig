@@ -87,6 +87,22 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         printBootBenchmark(result);
         return;
     }
+    if (std.mem.eql(u8, command, "kvm-firmware-smoke")) {
+        const firmware_path = args.next() orelse return missingFirmwareSmokeArgument();
+        const disk_path = args.next() orelse return missingFirmwareSmokeArgument();
+        const iso_path = args.next() orelse return missingFirmwareSmokeArgument();
+        run_kernel.executeFirmwareSmoke(
+            std.heap.c_allocator,
+            firmware_path,
+            disk_path,
+            iso_path,
+        ) catch |err| {
+            printNamedError("KVM firmware smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM firmware: OVMF probed virtio installation storage\n");
+        return;
+    }
     if (std.mem.eql(u8, command, "run-kernel")) {
         const kernel_path = args.next() orelse {
             writeAll("error: run-kernel requires a bzImage path\n");
@@ -100,6 +116,22 @@ pub fn main(minimal: std.process.Init.Minimal) void {
             args.next(),
         ) catch |err| {
             printNamedError("direct kernel boot", err);
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, command, "run-firmware")) {
+        const firmware_path = args.next() orelse {
+            writeAll("error: run-firmware requires an OVMF firmware path\n");
+            std.process.exit(1);
+        };
+        run_kernel.executeFirmware(
+            std.heap.c_allocator,
+            firmware_path,
+            args.next(),
+            args.next(),
+        ) catch |err| {
+            printNamedError("firmware boot", err);
             std.process.exit(1);
         };
         return;
@@ -196,6 +228,11 @@ fn missingBootBenchmarkArgument() noreturn {
     std.process.exit(1);
 }
 
+fn missingFirmwareSmokeArgument() noreturn {
+    writeAll("error: kvm-firmware-smoke requires OVMF, disk, and ISO paths\n");
+    std.process.exit(1);
+}
+
 fn printBootBenchmark(result: run_kernel.BootBenchmark) void {
     var buffer: [256]u8 = undefined;
     const output = std.fmt.bufPrint(
@@ -227,7 +264,9 @@ fn printUsage() void {
         \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
         \\  kvm-network-smoke <bzImage> <initrd> <disk>  Verify built-in NAT
         \\  kvm-boot-benchmark <bzImage> <initrd> <disk>  Measure boot readiness
+        \\  kvm-firmware-smoke <OVMF> <disk> <ISO>  Verify UEFI installation storage
         \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
+        \\  run-firmware  UEFI boot: run-firmware <OVMF.fd> [disk] [installer.iso]
         \\  version     Show version information
         \\  help        Show this help message
         \\

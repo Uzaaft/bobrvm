@@ -242,6 +242,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .link_libc = true,
         });
+        wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
         gtk_module.linkSystemLibrary("gtk4", dynamic_link_options);
         const gtk_exe = b.addExecutable(.{
             .name = "bobrvm-gtk",

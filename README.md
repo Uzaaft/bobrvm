@@ -45,14 +45,21 @@ See [macos/README.md](macos/README.md) for Xcode and framework builds.
 ### Linux host preview
 
 The Linux package installs a dependency-light headless binary and a separate GTK
-application. Both use the same cancellable Zig VM lifecycle and KVM device model:
+application. Both use the same cancellable Zig VM lifecycle and KVM device model.
+The GTK application can select installer media, attach or create a sparse raw disk,
+configure memory, CPUs, and networking, and start or stop the VM:
 
 ```sh
 bobrvm run-kernel bzImage initrd writable-root.raw
-bobrvm-gtk bzImage initrd writable-root.raw
+bobrvm-gtk
 ```
 
-The current x86 direct-boot path provides writable virtio-pci block storage.
+For automation, the GTK executable also accepts `--iso`, `--disk`, `--kernel`,
+`--initrd`, `--memory`, and `--cpus`. The Nix development shell and package provide
+OVMF automatically; `BOBRVM_OVMF_FD` can override the firmware path.
+
+The x86 host supports direct kernel boot and an OVMF firmware path with primary and
+secondary virtio-pci block devices, including read-only ISO installation media.
 Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
 the vCPU thread. A virtio-net adapter uses the shared Zig user-mode NAT, with no TAP
 device or host privileges required. The GTK application displays a bounded

@@ -167,7 +167,7 @@ pub const Kvm = struct {
         return .{
             .fd = fd,
             .vcpu_run_size = self.vcpu_run_size,
-            .memory_region = null,
+            .memory_regions = @splat(null),
         };
     }
 
@@ -229,19 +229,24 @@ fn kickSignalHandler(_: std.posix.SIG) callconv(.c) void {}
 pub const VM = struct {
     fd: std.posix.fd_t,
     vcpu_run_size: usize,
-    memory_region: ?MemoryRegion,
+    memory_regions: [memory_regions_max]?MemoryRegion,
 
     const page_size: u64 = 4096;
+    const memory_regions_max: usize = 8;
 
     const MemoryRegion = struct {
+        slot: u32,
+        guest_address: u64,
         memory: []align(std.heap.page_size_min) u8,
     };
 
     pub fn deinit(self: *VM) void {
         assert(self.fd >= 0);
-        if (self.memory_region) |region| std.posix.munmap(region.memory);
+        for (&self.memory_regions) |*entry| {
+            if (entry.*) |region| std.posix.munmap(region.memory);
+            entry.* = null;
+        }
         _ = std.c.close(self.fd);
-        self.memory_region = null;
         self.fd = -1;
     }
 
@@ -252,7 +257,8 @@ pub const VM = struct {
         size: usize,
     ) CreateError![]align(std.heap.page_size_min) u8 {
         try validateMemoryRegion(guest_address, size);
-        if (self.memory_region != null) return error.MemoryAlreadyMapped;
+        const entry = self.freeMemoryRegion(slot, guest_address, size) orelse
+            return error.MemoryAlreadyMapped;
 
         const memory = std.posix.mmap(
             null,
@@ -275,8 +281,32 @@ pub const VM = struct {
             return error.RegisterMemoryFailed;
         }
 
-        self.memory_region = .{ .memory = memory };
+        entry.* = .{
+            .slot = slot,
+            .guest_address = guest_address,
+            .memory = memory,
+        };
         return memory;
+    }
+
+    fn freeMemoryRegion(
+        self: *VM,
+        slot: u32,
+        guest_address: u64,
+        size: usize,
+    ) ?*?MemoryRegion {
+        const guest_end = guest_address + @as(u64, @intCast(size));
+        var free: ?*?MemoryRegion = null;
+        for (&self.memory_regions) |*entry| {
+            const region = entry.* orelse {
+                if (free == null) free = entry;
+                continue;
+            };
+            if (region.slot == slot) return null;
+            const region_end = region.guest_address + @as(u64, @intCast(region.memory.len));
+            if (guest_address < region_end and region.guest_address < guest_end) return null;
+        }
+        return free;
     }
 
     pub fn validateMemoryRegion(
@@ -500,6 +530,30 @@ pub const Vcpu = struct {
         registers.rip = instruction_pointer;
         registers.rsp = stack_pointer;
         registers.rflags = 2;
+        if (c.ioctl(self.fd, c.KVM_SET_REGS, &registers) < 0) {
+            return error.ConfigureVcpuFailed;
+        }
+    }
+
+    /// Configure the architectural x86 reset vector used by PC firmware.
+    pub fn setFirmwareReset(self: *Vcpu) CreateError!void {
+        var special: c.struct_kvm_sregs = undefined;
+        if (c.ioctl(self.fd, c.KVM_GET_SREGS, &special) < 0) {
+            return error.ConfigureVcpuFailed;
+        }
+        special.cs.base = 0xffff_0000;
+        special.cs.selector = 0xf000;
+        special.cr0 = 0x6000_0010;
+        special.cr4 = 0;
+        special.efer = 0;
+        if (c.ioctl(self.fd, c.KVM_SET_SREGS, &special) < 0) {
+            return error.ConfigureVcpuFailed;
+        }
+
+        var registers = std.mem.zeroes(c.struct_kvm_regs);
+        registers.rip = 0xfff0;
+        registers.rflags = 2;
+        registers.rdx = 0x600;
         if (c.ioctl(self.fd, c.KVM_SET_REGS, &registers) < 0) {
             return error.ConfigureVcpuFailed;
         }

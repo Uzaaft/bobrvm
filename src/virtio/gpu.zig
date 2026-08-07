@@ -9,15 +9,20 @@
 //!   1: cursorq (cursor updates)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 const virgl = @import("../gpu/virgl/main.zig");
-const gpu_module = @import("../gpu/main.zig");
+const gpu_module = if (builtin.os.tag == .macos)
+    @import("../gpu/main.zig")
+else
+    @import("../gpu/stub.zig");
 const iosurface = @import("../gpu/iosurface.zig");
 
 pub const FrameReady = callback_binding.Binding0(void);
@@ -609,7 +614,7 @@ pub const Gpu = struct {
     boot_display_height: u32 = 800,
 
     /// Guest memory accessor.
-    guest_memory: ?ring.GetMemFn,
+    guest_memory: ?GuestMemory,
 
     /// Frame ready callback (scanout resource was flushed).
     frame_ready: ?FrameReady,
@@ -891,8 +896,12 @@ pub const Gpu = struct {
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(self: *Gpu, accessor: ring.GetMemFn) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *Gpu, accessor: anytype) void {
+        self.guest_memory = switch (@typeInfo(@TypeOf(accessor))) {
+            .@"fn", .pointer => GuestMemory.bindGlobal(accessor),
+            .@"struct" => accessor,
+            else => @compileError("unsupported guest-memory accessor"),
+        };
     }
 
     pub fn setIrqCallback(self: *Gpu, irq: mmio.Irq) void {
@@ -1142,7 +1151,7 @@ pub const Gpu = struct {
         }
     }
 
-    fn processCursorCommand(self: *Gpu, qc: mmio.QueueConfig, head: u16, get_mem: ring.GetMemFn) void {
+    fn processCursorCommand(self: *Gpu, qc: mmio.QueueConfig, head: u16, get_mem: anytype) void {
         const chain = ring.Chain.collect(qc, head, get_mem);
         const req = chain.request(get_mem) orelse return;
         self.handleCursorCommand(req);
@@ -1184,7 +1193,7 @@ pub const Gpu = struct {
     }
 
     /// Execute one command chain; returns bytes written to the response.
-    fn processCommand(self: *Gpu, qc: mmio.QueueConfig, head: u16, get_mem: ring.GetMemFn) u32 {
+    fn processCommand(self: *Gpu, qc: mmio.QueueConfig, head: u16, get_mem: anytype) u32 {
         const chain = ring.Chain.collect(qc, head, get_mem);
         const req = chain.request(get_mem) orelse return 0;
         const resp = chain.response(get_mem) orelse return 0;
@@ -1574,7 +1583,7 @@ pub const Gpu = struct {
         return true;
     }
 
-    fn cmdTransferToHost2D(self: *Gpu, req: []const u8, get_mem: ring.GetMemFn) CmdType {
+    fn cmdTransferToHost2D(self: *Gpu, req: []const u8, get_mem: anytype) CmdType {
         if (req.len < @sizeOf(TransferToHost2D)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(TransferToHost2D, req[0..@sizeOf(TransferToHost2D)]);
 
@@ -1624,7 +1633,7 @@ pub const Gpu = struct {
     /// are handled here — vertex/index/constant uploads — which is what
     /// draw_vbo needs. The scattered guest backing is copied straight into
     /// the resource's shared-storage MTLBuffer (zero staging copy).
-    fn cmdTransferToHost3D(self: *Gpu, req: []const u8, get_mem: ring.GetMemFn) CmdType {
+    fn cmdTransferToHost3D(self: *Gpu, req: []const u8, get_mem: anytype) CmdType {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (req.len < @sizeOf(TransferHost3D)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(TransferHost3D, req[0..@sizeOf(TransferHost3D)]);
@@ -1734,7 +1743,7 @@ pub const Gpu = struct {
         row_bytes: u64,
         height: u32,
         total: usize,
-        get_mem: ring.GetMemFn,
+        get_mem: anytype,
     ) TextureUploadError!TextureUpload {
         assert(entries.len > 0);
         assert(row_bytes > 0 and height > 0);
@@ -1774,7 +1783,7 @@ pub const Gpu = struct {
         entries: []const MemEntry,
         offset: u64,
         len: usize,
-        get_mem: ring.GetMemFn,
+        get_mem: anytype,
     ) ?[]u8 {
         assert(entries.len > 0);
         assert(len > 0);
@@ -1787,7 +1796,7 @@ pub const Gpu = struct {
             const available = @as(u64, entry.length) - skip;
             if (len > available) return null;
             const address = std.math.add(u64, entry.addr, skip) catch return null;
-            return get_mem(address, len);
+            return ring.get(get_mem, address, len);
         }
         return null;
     }
@@ -1798,7 +1807,7 @@ pub const Gpu = struct {
         entries: []const MemEntry,
         offset: u64,
         dst: []u8,
-        get_mem: ring.GetMemFn,
+        get_mem: anytype,
     ) bool {
         var remaining = dst;
         var skip = offset;
@@ -1810,7 +1819,7 @@ pub const Gpu = struct {
             }
             const avail = entry.length - @as(u32, @intCast(skip));
             const n: usize = @min(remaining.len, avail);
-            const src = get_mem(entry.addr + skip, n) orelse return false;
+            const src = ring.get(get_mem, entry.addr + skip, n) orelse return false;
             @memcpy(remaining[0..n], src[0..n]);
             remaining = remaining[n..];
             skip = 0;
@@ -1822,7 +1831,7 @@ pub const Gpu = struct {
         self: *Gpu,
         req: []const u8,
         chain: *const ring.Chain,
-        get_mem: ring.GetMemFn,
+        get_mem: anytype,
     ) CmdType {
         if (req.len < @sizeOf(ResourceAttachBacking)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(
@@ -1860,7 +1869,7 @@ pub const Gpu = struct {
                 if (d.isWrite()) continue;
                 readable_idx += 1;
                 if (readable_idx == 2) {
-                    const mem = get_mem(d.addr, d.len) orelse
+                    const mem = ring.get(get_mem, d.addr, d.len) orelse
                         return .resp_err_invalid_parameter;
                     break :blk mem;
                 }
@@ -1962,7 +1971,7 @@ pub const Gpu = struct {
         header: CtrlHeader,
         req: []const u8,
         chain: *const ring.Chain,
-        get_mem: ring.GetMemFn,
+        get_mem: anytype,
     ) CmdType {
         if (comptime gpu_venus) {
             const vh = if (self.venus_host) |*h| h else return .resp_err_unspec;
@@ -1984,7 +1993,7 @@ pub const Gpu = struct {
                     for (chain.slice()) |d| {
                         if (d.isWrite()) continue;
                         readable_idx += 1;
-                        if (readable_idx == 2) break :blk get_mem(d.addr, d.len) orelse
+                        if (readable_idx == 2) break :blk ring.get(get_mem, d.addr, d.len) orelse
                             return .resp_err_invalid_parameter;
                     }
                     return .resp_err_invalid_parameter;
@@ -1995,7 +2004,7 @@ pub const Gpu = struct {
                 var i: u32 = 0;
                 while (i < cmd.nr_entries) : (i += 1) {
                     const e = std.mem.bytesToValue(MemEntry, entries_mem[i * @sizeOf(MemEntry) ..][0..@sizeOf(MemEntry)]);
-                    const host = get_mem(e.addr, e.length) orelse {
+                    const host = ring.get(get_mem, e.addr, e.length) orelse {
                         self.alloc.free(iovs);
                         return .resp_err_invalid_parameter;
                     };
@@ -2138,7 +2147,7 @@ pub const Gpu = struct {
         header: CtrlHeader,
         req: []const u8,
         chain: *const ring.Chain,
-        get_mem: ring.GetMemFn,
+        get_mem: anytype,
     ) CmdType {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (req.len < @sizeOf(Submit3D)) return .resp_err_invalid_parameter;
@@ -2155,7 +2164,7 @@ pub const Gpu = struct {
                 if (d.isWrite()) continue;
                 readable_idx += 1;
                 if (readable_idx == 2) {
-                    const mem = get_mem(d.addr, d.len) orelse
+                    const mem = ring.get(get_mem, d.addr, d.len) orelse
                         return .resp_err_invalid_parameter;
                     if (mem.len < cmd.size) return .resp_err_invalid_parameter;
                     break :blk mem[0..cmd.size];

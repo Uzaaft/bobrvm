@@ -16,7 +16,7 @@ const bus_entry_bytes: usize = 8;
 const io_apic_entry_bytes: usize = 8;
 const interrupt_entry_bytes: usize = 8;
 const isa_irq_count: usize = 16;
-const pci_device_count: usize = 2;
+const pci_device_count: usize = 6;
 
 pub const WriteError = error{
     BufferTooSmall,
@@ -59,7 +59,7 @@ fn writeConfigTable(bytes: []u8, cpu_count: u8) void {
     bytes[6] = 4;
     @memcpy(bytes[8..16], "BOBRVM  ");
     @memcpy(bytes[16..28], "BOBRVM KVM  ");
-    writeInt(u16, bytes, 34, @intCast(cpu_count + 2 + 1 + isa_irq_count + 2));
+    writeInt(u16, bytes, 34, @intCast(cpu_count + 2 + 1 + isa_irq_count + pci_device_count));
     writeInt(u32, bytes, 36, 0xfee0_0000);
 
     var offset: usize = config_header_bytes;
@@ -85,9 +85,17 @@ fn writeConfigTable(bytes: []u8, cpu_count: u8) void {
         );
         offset += interrupt_entry_bytes;
     }
-    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 1 << 2, io_apic_id, 11);
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 2 << 2, io_apic_id, 11);
     offset += interrupt_entry_bytes;
-    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 2 << 2, io_apic_id, 10);
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 3 << 2, io_apic_id, 10);
+    offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 4 << 2, io_apic_id, 9);
+    offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 5 << 2, io_apic_id, 5);
+    offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 6 << 2, io_apic_id, 6);
+    offset += interrupt_entry_bytes;
+    writeInterrupt(bytes[offset..][0..interrupt_entry_bytes], 0, 7 << 2, io_apic_id, 7);
     offset += interrupt_entry_bytes;
     std.debug.assert(offset == bytes.len);
     bytes[7] = checksum(bytes);
@@ -142,7 +150,7 @@ test "MP tables publish each CPU and have valid checksums" {
 
     try std.testing.expectEqual(@as(u8, 0), 0 -% checksum(memory[0..floating_bytes]));
     try std.testing.expectEqual(@as(u8, 0), 0 -% checksum(table));
-    try std.testing.expectEqual(@as(u16, 25), std.mem.readInt(u16, table[34..36], .little));
+    try std.testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, table[34..36], .little));
     for (0..4) |index| {
         const offset = config_header_bytes + index * processor_entry_bytes;
         try std.testing.expectEqual(@as(u8, 0), table[offset]);

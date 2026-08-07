@@ -11,6 +11,14 @@ const mmio = @import("mmio.zig");
 
 pub const GetMemFn = *const fn (addr: u64, len: usize) ?[]u8;
 
+pub fn get(accessor: anytype, address: u64, length: usize) ?[]u8 {
+    return switch (@typeInfo(@TypeOf(accessor))) {
+        .@"fn", .pointer => accessor(address, length),
+        .@"struct" => accessor.get(address, length),
+        else => @compileError("unsupported guest-memory accessor"),
+    };
+}
+
 /// A descriptor read out of guest memory.
 pub const Desc = struct {
     addr: u64,
@@ -31,8 +39,8 @@ pub const Desc = struct {
 };
 
 /// Read one descriptor from the descriptor table.
-pub fn readDesc(qc: mmio.QueueConfig, idx: u16, get_mem: GetMemFn) ?Desc {
-    const mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
+pub fn readDesc(qc: mmio.QueueConfig, idx: u16, get_mem: anytype) ?Desc {
+    const mem = get(get_mem, qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
     return decodeDesc(mem);
 }
 
@@ -52,8 +60,8 @@ fn decodeDesc(mem: []const u8) Desc {
 }
 
 /// Read the avail ring index.
-pub fn availIdx(qc: mmio.QueueConfig, get_mem: GetMemFn) ?u16 {
-    const mem = get_mem(qc.driver_addr, 6) orelse return null;
+pub fn availIdx(qc: mmio.QueueConfig, get_mem: anytype) ?u16 {
+    const mem = get(get_mem, qc.driver_addr, 6) orelse return null;
     return std.mem.readInt(u16, mem[2..4], .little);
 }
 
@@ -63,9 +71,10 @@ pub fn availIdxMemory(qc: mmio.QueueConfig, memory: GuestMemory) ?u16 {
 }
 
 /// Read the descriptor index at an avail ring position.
-pub fn availEntry(qc: mmio.QueueConfig, pos: u16, get_mem: GetMemFn) ?u16 {
+pub fn availEntry(qc: mmio.QueueConfig, pos: u16, get_mem: anytype) ?u16 {
     const ring_idx = pos % qc.num;
-    const mem = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse return null;
+    const mem = get(get_mem, qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse
+        return null;
     return std.mem.readInt(u16, mem[0..2], .little);
 }
 
@@ -76,11 +85,11 @@ pub fn availEntryMemory(qc: mmio.QueueConfig, pos: u16, memory: GuestMemory) ?u1
 }
 
 /// Append an entry to the used ring and bump its index.
-pub fn pushUsed(qc: mmio.QueueConfig, desc_idx: u16, len: u32, get_mem: GetMemFn) void {
-    const used_ring = get_mem(qc.device_addr, 6) orelse return;
+pub fn pushUsed(qc: mmio.QueueConfig, desc_idx: u16, len: u32, get_mem: anytype) void {
+    const used_ring = get(get_mem, qc.device_addr, 6) orelse return;
     const used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
     const pos = used_idx % qc.num;
-    const entry = get_mem(qc.device_addr + 4 + @as(u64, pos) * 8, 8) orelse return;
+    const entry = get(get_mem, qc.device_addr + 4 + @as(u64, pos) * 8, 8) orelse return;
     writeUsedEntry(used_ring, entry, desc_idx, len, used_idx);
 }
 
@@ -112,7 +121,7 @@ pub const Chain = struct {
     pub const MAX_CHAIN: usize = 64;
 
     /// Collect the chain starting at head. Bounded by MAX_CHAIN.
-    pub fn collect(qc: mmio.QueueConfig, head: u16, get_mem: GetMemFn) Chain {
+    pub fn collect(qc: mmio.QueueConfig, head: u16, get_mem: anytype) Chain {
         var chain: Chain = .{};
         var idx = head;
         while (chain.count < MAX_CHAIN) {
@@ -143,17 +152,17 @@ pub const Chain = struct {
     }
 
     /// First device-readable descriptor's guest memory (the request).
-    pub fn request(self: *const Chain, get_mem: GetMemFn) ?[]u8 {
+    pub fn request(self: *const Chain, get_mem: anytype) ?[]u8 {
         for (self.slice()) |d| {
-            if (!d.isWrite()) return get_mem(d.addr, d.len);
+            if (!d.isWrite()) return get(get_mem, d.addr, d.len);
         }
         return null;
     }
 
     /// First device-writable descriptor's guest memory (the response).
-    pub fn response(self: *const Chain, get_mem: GetMemFn) ?[]u8 {
+    pub fn response(self: *const Chain, get_mem: anytype) ?[]u8 {
         for (self.slice()) |d| {
-            if (d.isWrite()) return get_mem(d.addr, d.len);
+            if (d.isWrite()) return get(get_mem, d.addr, d.len);
         }
         return null;
     }

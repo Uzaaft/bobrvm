@@ -1,6 +1,7 @@
 {
   lib,
   stdenv,
+  OVMF,
   glib,
   gobject-introspection,
   gsettings-desktop-schemas,
@@ -77,7 +78,15 @@ stdenv.mkDerivation (finalAttrs: {
   installPhase = ''
     runHook preInstall
     cp -R zig-out/. "$out"
+    ${lib.optionalString stdenv.hostPlatform.isLinux ''
+      mkdir -p "$out/share/bobrvm"
+      cp ${OVMF.fd}/FV/OVMF.fd "$out/share/bobrvm/OVMF.fd"
+    ''}
     runHook postInstall
+  '';
+
+  preFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
+    gappsWrapperArgs+=(--set BOBRVM_OVMF_FD "$out/share/bobrvm/OVMF.fd")
   '';
 
   meta = {

@@ -45,6 +45,71 @@ pub fn execute(
     if (disk_path != null) output.writeFastBlockStats(vm.fastBlockStats());
 }
 
+pub fn executeFirmware(
+    allocator: std.mem.Allocator,
+    firmware_path: []const u8,
+    disk_path: ?[]const u8,
+    iso_path: ?[]const u8,
+) Error!void {
+    var output = Stdout{};
+    const vm = try VM.create(allocator, .{
+        .memory_bytes = memory_bytes,
+        .firmware_path = firmware_path,
+        .disk_path = disk_path,
+        .disk2_path = iso_path,
+        .disk2_read_only = true,
+        .network_enabled = true,
+        .command_line = command_line,
+        .exits_max = exits_max,
+    }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
+    defer vm.destroy();
+    try vm.start();
+    _ = try vm.join();
+}
+
+pub fn executeFirmwareSmoke(
+    allocator: std.mem.Allocator,
+    firmware_path: []const u8,
+    disk_path: []const u8,
+    iso_path: []const u8,
+) !void {
+    var output = Stdout{};
+    const vm = try VM.create(allocator, .{
+        .memory_bytes = memory_bytes,
+        .firmware_path = firmware_path,
+        .disk_path = disk_path,
+        .disk2_path = iso_path,
+        .disk2_read_only = true,
+        .display_enabled = true,
+        .command_line = command_line,
+        .exits_max = exits_max,
+    }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
+    defer vm.destroy();
+    try vm.start();
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
+        .clock = .awake,
+    }, global.io()) catch {};
+    if (vm.state() != .running) return error.FirmwareStoppedEarly;
+    const pixels = try allocator.alloc(u8, 1280 * 800 * 4);
+    defer allocator.free(pixels);
+    const scanout = vm.copyScanout(pixels) orelse return error.FirmwareDidNotProduceScanout;
+    if (scanout.width == 0 or scanout.height == 0) return error.FirmwareDidNotProduceScanout;
+    vm.requestStop();
+    if (try vm.join() != .stopped) return error.UnexpectedRunOutcome;
+    const primary = vm.fastBlockStats();
+    output.writeFirmwareStats(
+        vm.pciConfigReads(),
+        vm.pciDeviceReads(),
+        vm.mmioExitStats(),
+        primary.kicks,
+        vm.secondaryBlockNotifications(),
+    );
+    if (primary.kicks == 0 and vm.secondaryBlockNotifications() == 0) {
+        return error.FirmwareDidNotProbeStorage;
+    }
+}
+
 pub fn executeStopSmoke(allocator: std.mem.Allocator, kernel_path: []const u8) !void {
     var output = DiscardOutput{};
     const vm = try VM.create(allocator, .{
@@ -283,6 +348,35 @@ const Stdout = struct {
             &buffer,
             "{s} kicks={d} interrupts={d} notify_mmio_exits={d}\n",
             .{ marker, stats.kicks, stats.interrupts, stats.notify_mmio_exits },
+        ) catch unreachable;
+        self.write(line);
+    }
+
+    fn writeFirmwareStats(
+        self: *Stdout,
+        pci_reads: u64,
+        device_reads: [32]u64,
+        mmio: x86.Machine.MmioExitStats,
+        primary_kicks: u64,
+        secondary_notifications: u64,
+    ) void {
+        var buffer: [224]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buffer,
+            "BOBRVM_KVM_FIRMWARE pci_reads={d} devices={d},{d},{d},{d},{d} " ++
+                "mmio={d} last_mmio=0x{x} primary_kicks={d} secondary_kicks={d}\n",
+            .{
+                pci_reads,
+                device_reads[0],
+                device_reads[1],
+                device_reads[2],
+                device_reads[3],
+                device_reads[4],
+                mmio.total,
+                mmio.last orelse 0,
+                primary_kicks,
+                secondary_notifications,
+            },
         ) catch unreachable;
         self.write(line);
     }

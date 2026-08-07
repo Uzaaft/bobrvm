@@ -2,6 +2,7 @@
   mkShell,
   lib,
   stdenv,
+  OVMF,
   adwaita-icon-theme,
   glib,
   gobject-introspection,
@@ -19,6 +20,8 @@
 }:
 mkShell {
   name = "bobrvm";
+
+  BOBRVM_OVMF_FD = lib.optionalString stdenv.hostPlatform.isLinux "${OVMF.fd}/FV/OVMF.fd";
 
   packages =
     [
@@ -38,6 +41,7 @@ mkShell {
       gsettings-desktop-schemas
       gtk4
       hicolor-icon-theme
+      OVMF.fd
     ];
 
   shellHook =

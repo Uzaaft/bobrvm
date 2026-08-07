@@ -547,9 +547,6 @@ pub const VirtioPciDevice = struct {
     /// BAR0 address (assigned by OS/firmware).
     bar0_addr: u32,
 
-    /// Device-specific info.
-    subsystem_id: u16,
-
     const AllocationLayout = struct {
         transport_offset: usize,
         transport: VirtioPciTransport.AllocationLayout,
@@ -579,7 +576,6 @@ pub const VirtioPciDevice = struct {
     pub fn init(
         alloc: Allocator,
         device_id: u32,
-        subsystem_id: u16,
         device_features: u64,
         num_queues: u16,
         device_config_size: usize,
@@ -605,7 +601,6 @@ pub const VirtioPciDevice = struct {
             .transport = transport,
             .config = [_]u8{0} ** 4096,
             .bar0_addr = 0,
-            .subsystem_id = subsystem_id,
         };
 
         dev.initConfigSpace();
@@ -628,13 +623,9 @@ pub const VirtioPciDevice = struct {
     fn initConfigSpace(self: *VirtioPciDevice) void {
         // Vendor ID: Virtio (0x1AF4)
         self.setConfigU16(0x00, 0x1AF4);
-        // Device ID: Use transitional IDs for UEFI compatibility
-        // Block = 0x1001, Console = 0x1003, etc. (not modern-only 0x1040+)
-        const device_id: u16 = switch (self.transport.device_id) {
-            2 => 0x1001, // virtio-blk transitional
-            3 => 0x1003, // virtio-console transitional
-            else => 0x1040 + @as(u16, @truncate(self.transport.device_id)),
-        };
+        // This transport exposes only the modern capability layout, so advertising a
+        // transitional ID would make firmware look for the absent legacy I/O BAR.
+        const device_id = 0x1040 + @as(u16, @truncate(self.transport.device_id));
         self.setConfigU16(0x02, device_id);
         // Command: All disabled initially (UEFI enables after BAR assignment)
         self.setConfigU16(0x04, 0x0000);
@@ -644,7 +635,10 @@ pub const VirtioPciDevice = struct {
         self.config[0x08] = 0x01;
         // PCI class code helps firmware and the guest choose the right driver.
         self.config[0x09] = 0x00; // Prog IF
-        self.config[0x0A] = 0x00; // Subclass
+        self.config[0x0A] = switch (self.transport.device_id) {
+            16 => 0x80, // Other display controller; this device has no legacy VGA BAR.
+            else => 0x00,
+        };
         self.config[0x0B] = switch (self.transport.device_id) {
             1 => 0x02, // Network controller
             2 => 0x01, // Mass storage
@@ -657,8 +651,8 @@ pub const VirtioPciDevice = struct {
         self.setConfigU32(0x10, 0x00000000);
         // Subsystem Vendor ID
         self.setConfigU16(0x2C, 0x1AF4);
-        // Subsystem ID
-        self.setConfigU16(0x2E, self.subsystem_id);
+        // EDK2 uses this value to distinguish modern-only from transitional devices.
+        self.setConfigU16(0x2E, 0x0040);
         // Capabilities pointer
         self.config[0x34] = 0x40;
         // Interrupt pin: INTA#
@@ -796,6 +790,7 @@ pub const VirtioPciDevice = struct {
                     log.info("BAR0 assigned to 0x{x}", .{self.bar0_addr});
                 }
             },
+            0x14...0x27 => {},
             0x30...0x33 => {
                 // This device has no expansion ROM. Probing must keep the register zero.
                 self.setConfigU32(0x30, 0);
@@ -851,16 +846,17 @@ test "VirtioPciTransport init" {
 }
 
 test "virtio GPU uses the modern device id and display class" {
-    const device = try VirtioPciDevice.init(std.testing.allocator, 16, 16, 0, 2, 16);
+    const device = try VirtioPciDevice.init(std.testing.allocator, 16, 0, 2, 16);
     defer device.deinit();
 
     try std.testing.expectEqual(@as(u8, 0x50), device.config[0x02]);
     try std.testing.expectEqual(@as(u8, 0x10), device.config[0x03]);
     try std.testing.expectEqual(@as(u8, 0x03), device.config[0x0B]);
+    try std.testing.expectEqual(@as(u8, 0x80), device.config[0x0A]);
 }
 
 test "virtio network uses the modern device id and network class" {
-    const dev = try VirtioPciDevice.init(std.testing.allocator, 1, 1, 0, 2, 12);
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 1, 0, 2, 12);
     defer dev.deinit();
 
     try std.testing.expectEqual(@as(u64, 0x1041), dev.readConfig(0x02, 2));
@@ -922,20 +918,21 @@ test "VirtioPciTransport rejects malformed BAR accesses" {
 }
 
 test "VirtioPciDevice init and config" {
-    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0x0002, 0, 1, 64);
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
     defer dev.deinit();
 
     // Check vendor ID
     const vendor = dev.readConfig(0x00, 2);
     try std.testing.expectEqual(@as(u64, 0x1AF4), vendor);
 
-    // Check device ID (0x1001 for transitional block device)
+    // Check device ID (0x1042 for modern block device)
     const device_id = dev.readConfig(0x02, 2);
-    try std.testing.expectEqual(@as(u64, 0x1001), device_id);
+    try std.testing.expectEqual(@as(u64, 0x1042), device_id);
 
     // Check capabilities pointer
     const cap_ptr = dev.readConfig(0x34, 1);
     try std.testing.expectEqual(@as(u64, 0x40), cap_ptr);
+    try std.testing.expectEqual(@as(u64, 0x40), dev.readConfig(0x2e, 2));
 }
 
 test "VirtioPciDevice allocation profile" {
@@ -945,7 +942,6 @@ test "VirtioPciDevice allocation profile" {
     const dev = try VirtioPciDevice.init(
         counted.allocator(),
         2,
-        0x0002,
         0,
         num_queues,
         device_config_size,
@@ -961,7 +957,7 @@ test "VirtioPciDevice allocation profile" {
 }
 
 test "VirtioPciDevice BAR sizing" {
-    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0x0002, 0, 1, 64);
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
     defer dev.deinit();
 
     // Write all 1s to BAR0
@@ -972,8 +968,17 @@ test "VirtioPciDevice BAR sizing" {
     try std.testing.expectEqual(@as(u64, 0xFFFFF000), bar0);
 }
 
+test "VirtioPciDevice reports only BAR0" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
+    defer dev.deinit();
+
+    dev.writeConfig(0x14, 4, 0xFFFFFFFF);
+
+    try std.testing.expectEqual(@as(u64, 0), dev.readConfig(0x14, 4));
+}
+
 test "VirtioPciDevice reports no expansion ROM" {
-    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0x0002, 0, 1, 64);
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
     defer dev.deinit();
 
     dev.writeConfig(0x30, 4, 0xFFFFFFFF);

@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
@@ -210,7 +211,7 @@ pub const Input = struct {
     name: []const u8,
 
     /// Guest memory accessor.
-    guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
+    guest_memory: ?GuestMemory,
 
     /// Interrupt callback.
     interrupt_callback: ?*const fn (userdata: ?*anyopaque) void,
@@ -265,11 +266,12 @@ pub const Input = struct {
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(
-        self: *Input,
-        accessor: *const fn (u64, usize) ?[]u8,
-    ) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *Input, accessor: anytype) void {
+        self.guest_memory = switch (@typeInfo(@TypeOf(accessor))) {
+            .@"fn", .pointer => GuestMemory.bindGlobal(accessor),
+            .@"struct" => accessor,
+            else => @compileError("unsupported guest-memory accessor"),
+        };
     }
 
     pub fn setIrqCallback(self: *Input, irq: mmio.Irq) void {
@@ -576,7 +578,7 @@ pub const Input = struct {
                 continue;
             }
 
-            const mem = get_mem(desc.addr, @sizeOf(InputEvent)) orelse break;
+            const mem = ring.get(get_mem, desc.addr, @sizeOf(InputEvent)) orelse break;
             const event_index = (self.pending_head + delivered) % self.pending_events.len;
             const event = self.pending_events[event_index];
             @memcpy(mem[0..@sizeOf(InputEvent)], std.mem.asBytes(&event));
