@@ -26,13 +26,26 @@ pub const OpenError = error{
 
 pub const CreateError = error{
     ConfigureVcpuFailed,
+    CreateIrqChipFailed,
+    CreatePitFailed,
     CreateVmFailed,
     CreateVcpuFailed,
+    GetCpuidFailed,
     InvalidMemoryRegion,
     MapRunFailed,
     MapMemoryFailed,
     MemoryAlreadyMapped,
     RegisterMemoryFailed,
+    SetCpuidFailed,
+};
+
+pub const Cpuid = extern struct {
+    nent: u32 = entries_max,
+    padding: u32 = 0,
+    entries: [entries_max]c.struct_kvm_cpuid_entry2 =
+        std.mem.zeroes([entries_max]c.struct_kvm_cpuid_entry2),
+
+    const entries_max = 256;
 };
 
 pub const RunError = error{
@@ -74,11 +87,11 @@ pub const Kvm = struct {
         if (fd < 0) return openError();
         errdefer _ = std.c.close(fd);
 
-        const api_version = c.ioctl(fd, c.KVM_GET_API_VERSION);
+        const api_version = c.ioctl(fd, c.KVM_GET_API_VERSION, @as(c_ulong, 0));
         if (api_version < 0) return error.IoctlFailed;
         if (api_version != API_VERSION) return error.UnsupportedApiVersion;
 
-        const run_size = c.ioctl(fd, c.KVM_GET_VCPU_MMAP_SIZE);
+        const run_size = c.ioctl(fd, c.KVM_GET_VCPU_MMAP_SIZE, @as(c_ulong, 0));
         if (run_size <= 0) return error.IoctlFailed;
 
         const capabilities = Capabilities{
@@ -111,6 +124,15 @@ pub const Kvm = struct {
             .vcpu_run_size = self.vcpu_run_size,
             .memory_region = null,
         };
+    }
+
+    pub fn supportedCpuid(self: *const Kvm) CreateError!Cpuid {
+        var cpuid = Cpuid{};
+        const header: *c.struct_kvm_cpuid2 = @ptrCast(&cpuid);
+        if (c.ioctl(self.fd, c.KVM_GET_SUPPORTED_CPUID, header) < 0) {
+            return error.GetCpuidFailed;
+        }
+        return cpuid;
     }
 
     fn checkExtension(fd: std.posix.fd_t, capability: Capability) bool {
@@ -209,6 +231,16 @@ pub const VM = struct {
             .run = @ptrCast(run_memory.ptr),
         };
     }
+
+    pub fn createPcInterrupts(self: *VM) CreateError!void {
+        if (c.ioctl(self.fd, c.KVM_CREATE_IRQCHIP, @as(c_ulong, 0)) < 0) {
+            return error.CreateIrqChipFailed;
+        }
+        var pit = std.mem.zeroes(c.struct_kvm_pit_config);
+        if (c.ioctl(self.fd, c.KVM_CREATE_PIT2, &pit) < 0) {
+            return error.CreatePitFailed;
+        }
+    }
 };
 
 pub const ExitReason = enum {
@@ -219,6 +251,25 @@ pub const ExitReason = enum {
     interrupted,
     internal_error,
     unknown,
+};
+
+pub const IoDirection = enum {
+    read,
+    write,
+};
+
+pub const IoExit = struct {
+    direction: IoDirection,
+    port: u16,
+    size: u8,
+    count: u32,
+    data: []u8,
+};
+
+pub const MmioExit = struct {
+    direction: IoDirection,
+    address: u64,
+    data: []u8,
 };
 
 pub const Vcpu = struct {
@@ -261,6 +312,47 @@ pub const Vcpu = struct {
         }
     }
 
+    pub fn setProtectedModeEntry(
+        self: *Vcpu,
+        instruction_pointer: u64,
+        boot_params_address: u64,
+        gdt_address: u64,
+    ) CreateError!void {
+        var special: c.struct_kvm_sregs = undefined;
+        if (c.ioctl(self.fd, c.KVM_GET_SREGS, &special) < 0) {
+            return error.ConfigureVcpuFailed;
+        }
+        special.cs = protectedSegment(0x8, true);
+        const data = protectedSegment(0x10, false);
+        special.ds = data;
+        special.es = data;
+        special.fs = data;
+        special.gs = data;
+        special.ss = data;
+        special.gdt.base = gdt_address;
+        special.gdt.limit = 3 * 8 - 1;
+        special.cr0 |= 1;
+        special.efer = 0;
+        if (c.ioctl(self.fd, c.KVM_SET_SREGS, &special) < 0) {
+            return error.ConfigureVcpuFailed;
+        }
+
+        var registers = std.mem.zeroes(c.struct_kvm_regs);
+        registers.rip = instruction_pointer;
+        registers.rsi = boot_params_address;
+        registers.rflags = 2;
+        if (c.ioctl(self.fd, c.KVM_SET_REGS, &registers) < 0) {
+            return error.ConfigureVcpuFailed;
+        }
+    }
+
+    pub fn setCpuid(self: *Vcpu, cpuid: *Cpuid) CreateError!void {
+        const header: *c.struct_kvm_cpuid2 = @ptrCast(cpuid);
+        if (c.ioctl(self.fd, c.KVM_SET_CPUID2, header) < 0) {
+            return error.SetCpuidFailed;
+        }
+    }
+
     pub fn runOnce(self: *Vcpu) RunError!ExitReason {
         self.run.immediate_exit = 0;
         if (c.ioctl(self.fd, c.KVM_RUN, @as(c_ulong, 0)) < 0) {
@@ -270,6 +362,43 @@ pub const Vcpu = struct {
             };
         }
         return exitReason(self.run.exit_reason);
+    }
+
+    pub fn ioExit(self: *Vcpu) ?IoExit {
+        if (self.run.exit_reason != c.KVM_EXIT_IO) return null;
+        const io = self.run.unnamed_0.io;
+        const length = std.math.mul(usize, io.size, io.count) catch return null;
+        if (io.data_offset > self.run_memory.len) return null;
+        const offset: usize = @intCast(io.data_offset);
+        if (length > self.run_memory.len - offset) return null;
+        const direction: IoDirection = switch (io.direction) {
+            c.KVM_EXIT_IO_IN => .read,
+            c.KVM_EXIT_IO_OUT => .write,
+            else => return null,
+        };
+        return .{
+            .direction = direction,
+            .port = io.port,
+            .size = io.size,
+            .count = io.count,
+            .data = self.run_memory[offset..][0..length],
+        };
+    }
+
+    pub fn mmioExit(self: *Vcpu) ?MmioExit {
+        if (self.run.exit_reason != c.KVM_EXIT_MMIO) return null;
+        const mmio = &self.run.unnamed_0.mmio;
+        if (mmio.len == 0 or mmio.len > mmio.data.len) return null;
+        const direction: IoDirection = switch (mmio.is_write) {
+            0 => .read,
+            1 => .write,
+            else => return null,
+        };
+        return .{
+            .direction = direction,
+            .address = mmio.phys_addr,
+            .data = mmio.data[0..mmio.len],
+        };
     }
 
     fn exitReason(reason: u32) ExitReason {
@@ -283,6 +412,24 @@ pub const Vcpu = struct {
             else => .unknown,
         };
     }
+
+    fn protectedSegment(selector: u16, executable: bool) c.struct_kvm_segment {
+        return .{
+            .base = 0,
+            .limit = std.math.maxInt(u32),
+            .selector = selector,
+            .type = if (executable) 11 else 3,
+            .present = 1,
+            .dpl = 0,
+            .db = 1,
+            .s = 1,
+            .l = 0,
+            .g = 1,
+            .avl = 0,
+            .unusable = 0,
+            .padding = 0,
+        };
+    }
 };
 
 pub const smoke_payload = [_]u8{
@@ -292,7 +439,7 @@ pub const smoke_payload = [_]u8{
     0xf4, // hlt
 };
 
-pub fn runSmoke() (Error || error{UnexpectedExit})!void {
+pub fn runSmoke() (Error || error{ UnexpectedExit, UnexpectedIo })!void {
     var host = try Kvm.open();
     defer host.deinit();
 
@@ -306,6 +453,12 @@ pub fn runSmoke() (Error || error{UnexpectedExit})!void {
     try vcpu.setRealModeEntry(0x1000, 0x8000);
 
     if (try vcpu.runOnce() != .io) return error.UnexpectedExit;
+    const io = vcpu.ioExit() orelse return error.UnexpectedIo;
+    if (io.direction != .write or io.port != 0x3f8 or io.size != 1 or
+        io.count != 1 or io.data[0] != 'B')
+    {
+        return error.UnexpectedIo;
+    }
     if (try vcpu.runOnce() != .halted) return error.UnexpectedExit;
 }
 

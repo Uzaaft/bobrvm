@@ -49,18 +49,22 @@
           pkgs.callPackage ./nix/package.nix {
             inherit optimize zig;
           };
-      in rec {
-        bobrvm-debug = package "Debug";
-        bobrvm-releasefast = package "ReleaseFast";
-        bobrvm = bobrvm-releasefast;
-        debug = bobrvm-debug;
-        default = bobrvm;
+      in
+        rec {
+          bobrvm-debug = package "Debug";
+          bobrvm-releasefast = package "ReleaseFast";
+          bobrvm = bobrvm-releasefast;
+          debug = bobrvm-debug;
+          default = bobrvm;
 
-        deps = zigDeps;
-        framework-deps = bobrvm.zigDeps;
+          deps = zigDeps;
+          framework-deps = bobrvm.zigDeps;
 
-        test = pkgs.callPackage ./nix/test.nix {inherit zig;};
-      }))
+          test = pkgs.callPackage ./nix/test.nix {inherit zig;};
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          linux-kvm-fixture = pkgs.callPackage ./nix/linux-kvm-fixture.nix {inherit zig;};
+        }))
       // (forPlatforms guestPlatforms (pkgs: {
         bobrvm-tools = pkgs.callPackage ./nix/guest-tools.nix {};
       }));

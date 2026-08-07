@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const kvm = @import("../hypervisor/kvm/main.zig");
+const run_kernel = @import("run_kernel.zig");
 
 pub fn main(minimal: std.process.Init.Minimal) void {
     var args = minimal.args.iterate();
@@ -24,6 +25,21 @@ pub fn main(minimal: std.process.Init.Minimal) void {
             std.process.exit(1);
         };
         writeAll("KVM smoke: marker I/O exit followed by halt\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "run-kernel")) {
+        const kernel_path = args.next() orelse {
+            writeAll("error: run-kernel requires a bzImage path\n");
+            std.process.exit(1);
+        };
+        run_kernel.execute(
+            std.heap.c_allocator,
+            kernel_path,
+            args.next(),
+        ) catch |err| {
+            printNamedError("direct kernel boot", err);
+            std.process.exit(1);
+        };
         return;
     }
     if (std.mem.eql(u8, command, "version") or
@@ -88,11 +104,15 @@ fn printError(err: kvm.OpenError) void {
 }
 
 fn printSmokeError(err: anyerror) void {
+    printNamedError("KVM smoke", err);
+}
+
+fn printNamedError(operation: []const u8, err: anyerror) void {
     var buffer: [256]u8 = undefined;
     const output = std.fmt.bufPrint(
         &buffer,
-        "error: KVM smoke failed: {s}\n",
-        .{@errorName(err)},
+        "error: {s} failed: {s}\n",
+        .{ operation, @errorName(err) },
     ) catch unreachable;
     writeAll(output);
 }
@@ -106,6 +126,7 @@ fn printUsage() void {
         \\Commands:
         \\  kvm-info    Validate KVM and show acceleration capabilities
         \\  kvm-smoke   Run a tiny x86 payload through KVM
+        \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd]
         \\  version     Show version information
         \\  help        Show this help message
         \\
