@@ -41,4 +41,5 @@ test {
     _ = @import("cli/runner.zig");
     _ = @import("compat/file.zig");
     _ = @import("compat/thread.zig");
+    _ = @import("c_abi_test.zig");
 }

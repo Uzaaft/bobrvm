@@ -366,6 +366,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_module.addIncludePath(b.path("include"));
 
     // Link frameworks for tests on macOS. Mirror the lib/cli modules so
     // Metal-backed tests (virgl renderer) can create a real device: the
