@@ -139,8 +139,10 @@ fn completeFile(io: std.Io, transfer: *?Transfer, frame: protocol.Frame) !void {
     if (active.offset != active.size) return error.IncompleteTransfer;
     active.file.close(io);
     transfer.* = null;
-    std.Io.Dir.renameAbsolute(
+    const cwd = std.Io.Dir.cwd();
+    cwd.renamePreserve(
         active.temporary_path[0..active.temporary_path_len],
+        cwd,
         active.final_path[0..active.final_path_len],
         io,
     ) catch |err| {
@@ -285,4 +287,50 @@ test "guest file transfer commits complete ordered payloads atomically" {
         error.PathAlreadyExists,
         acceptFile(port, io, directory, &transfer, offer_frame),
     );
+}
+
+test "guest file transfer never replaces a destination created in flight" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(io, &directory_buffer);
+    const directory = directory_buffer[0..directory_len];
+
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const port = std.Io.File{
+        .handle = pipe_fds[1],
+        .flags = .{ .nonblocking = false },
+    };
+
+    var transfer: ?Transfer = null;
+    defer abortTransfer(io, &transfer);
+    var offer_buffer: [protocol.FileOffer.header_bytes + "race.txt".len]u8 = undefined;
+    const offer = try protocol.FileOffer.encode(&offer_buffer, 0, "race.txt");
+    try acceptFile(port, io, directory, &transfer, .{
+        .kind = .file_offer,
+        .request_id = 43,
+        .payload = offer,
+    });
+    try expectFileAcknowledgement(pipe_fds[0], 43, 0);
+
+    var final_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const final_path = try std.fmt.bufPrint(&final_path_buffer, "{s}/race.txt", .{directory});
+    const existing = try std.Io.Dir.createFileAbsolute(io, final_path, .{ .exclusive = true });
+    try existing.writeStreamingAll(io, "keep");
+    existing.close(io);
+
+    try std.testing.expectError(error.PathAlreadyExists, completeFile(io, &transfer, .{
+        .kind = .file_complete,
+        .request_id = 43,
+        .payload = &.{},
+    }));
+    const preserved = try std.Io.Dir.openFileAbsolute(io, final_path, .{});
+    defer preserved.close(io);
+    var contents: [4]u8 = undefined;
+    try std.testing.expectEqual(contents.len, try preserved.readPositionalAll(io, &contents, 0));
+    try std.testing.expectEqualStrings("keep", &contents);
 }
