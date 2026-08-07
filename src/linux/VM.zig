@@ -465,9 +465,34 @@ fn threadMain(self: *VM) void {
 fn persistVariables(self: *VM) !void {
     const path = self.vars_path orelse return;
     const bytes = self.machine.firmwareVariables() orelse return;
-    const file = try std.Io.Dir.cwd().createFile(global.io(), path, .{});
-    defer file.close(global.io());
-    try file.writePositionalAll(global.io(), bytes, 0);
+    try persistVariablesFile(self.allocator, path, bytes);
+}
+
+fn persistVariablesFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: []const u8,
+) !void {
+    const io = global.io();
+    const temporary_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{}", .{
+        path,
+        std.c.getpid(),
+    });
+    defer allocator.free(temporary_path);
+
+    const file = try std.Io.Dir.cwd().createFile(io, temporary_path, .{
+        .exclusive = true,
+        .permissions = @enumFromInt(0o600),
+    });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, temporary_path) catch {};
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+
+    try std.Io.Dir.rename(.cwd(), temporary_path, .cwd(), path, io);
 }
 
 fn readFile(
@@ -505,4 +530,31 @@ fn readFile(
 test "Linux VM lifecycle states have a stable order" {
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(State.ready));
     try std.testing.expectEqual(@as(u8, 4), @intFromEnum(State.stopped));
+}
+
+test "UEFI variables atomically replace a read-only template copy" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory_length = try temporary.dir.realPath(global.io(), &directory_buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/vars.fd", .{
+        directory_buffer[0..directory_length],
+    });
+
+    const original = try std.Io.Dir.createFileAbsolute(global.io(), path, .{
+        .permissions = @enumFromInt(0o400),
+    });
+    try original.writePositionalAll(global.io(), "old", 0);
+    original.close(global.io());
+
+    try persistVariablesFile(std.testing.allocator, path, "new variables");
+    const persisted = try readFile(
+        std.testing.allocator,
+        path,
+        variables_bytes_max,
+        .variables,
+    );
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expectEqualStrings("new variables", persisted);
 }
