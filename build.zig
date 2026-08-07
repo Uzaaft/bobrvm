@@ -112,6 +112,10 @@ pub fn build(b: *std.Build) !void {
         "test-fuzz-virtio-mmio",
         "Run virtio MMIO transport property tests",
     );
+    const pci_fuzz_step = b.step(
+        "test-fuzz-pci",
+        "Run PCI configuration and transport property tests",
+    );
     const tgsi_fuzz_step = b.step(
         "test-fuzz-tgsi",
         "Run TGSI parser and emitter property tests",
@@ -524,6 +528,20 @@ pub fn build(b: *std.Build) !void {
     const run_virtio_mmio_fuzz_tests = b.addRunArtifact(virtio_mmio_fuzz_tests);
     test_step.dependOn(&run_virtio_mmio_fuzz_tests.step);
     virtio_mmio_fuzz_step.dependOn(&run_virtio_mmio_fuzz_tests.step);
+
+    const pci_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/pci_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .error_tracing = false,
+    });
+    const pci_fuzz_tests = b.addTest(.{
+        .root_module = pci_fuzz_module,
+        .filters = test_filters,
+    });
+    const run_pci_fuzz_tests = b.addRunArtifact(pci_fuzz_tests);
+    test_step.dependOn(&run_pci_fuzz_tests.step);
+    pci_fuzz_step.dependOn(&run_pci_fuzz_tests.step);
 
     const tgsi_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/tgsi_fuzz.zig"),
