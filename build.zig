@@ -230,6 +230,22 @@ pub fn build(b: *std.Build) !void {
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
 
+    if (target.result.os.tag == .linux) {
+        const gtk_module = b.createModule(.{
+            .root_source_file = b.path("src/main_gtk.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        gtk_module.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
+        const gtk_exe = b.addExecutable(.{
+            .name = "bobrvm-gtk",
+            .root_module = gtk_module,
+        });
+        const install_gtk = b.addInstallArtifact(gtk_exe, .{});
+        b.getInstallStep().dependOn(&install_gtk.step);
+    }
+
     // Code-sign the installed CLI with hypervisor entitlement (macOS only)
     if (target.result.os.tag == .macos and !is_nix_build) {
         // Venus loads ad-hoc-signed third-party dylibs (virglrenderer/KosmicKrisp),

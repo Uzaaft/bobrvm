@@ -2,6 +2,7 @@
   lib,
   stdenv,
   libiconv,
+  gtk4,
   pkg-config,
   zig,
   optimize ? "ReleaseFast",
@@ -42,7 +43,9 @@ stdenv.mkDerivation (finalAttrs: {
     pkg-config
     zig
   ];
-  buildInputs = lib.optional stdenv.hostPlatform.isDarwin libiconv;
+  buildInputs =
+    lib.optional stdenv.hostPlatform.isDarwin libiconv
+    ++ lib.optional stdenv.hostPlatform.isLinux gtk4;
 
   dontConfigure = true;
   dontUseZigBuild = true;
@@ -54,8 +57,7 @@ stdenv.mkDerivation (finalAttrs: {
     ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
     zig build \
       -Dcpu=baseline \
-      -Doptimize=${optimize} \
-      ${lib.optionalString stdenv.hostPlatform.isLinux "-Dtarget=x86_64-linux-gnu"}
+      -Doptimize=${optimize}
     runHook postBuild
   '';
 

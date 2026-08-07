@@ -2,6 +2,7 @@
   mkShell,
   lib,
   stdenv,
+  gtk4,
   alejandra,
   jujutsu,
   nushell,
@@ -14,16 +15,18 @@
 mkShell {
   name = "bobrvm";
 
-  packages = [
-    alejandra
-    jujutsu
-    nushell
-    pandoc
-    pkg-config
-    zig
-    ziglint
-    zon2nix.packages.${stdenv.hostPlatform.system}.zon2nix
-  ];
+  packages =
+    [
+      alejandra
+      jujutsu
+      nushell
+      pandoc
+      pkg-config
+      zig
+      ziglint
+      zon2nix.packages.${stdenv.hostPlatform.system}.zon2nix
+    ]
+    ++ lib.optional stdenv.hostPlatform.isLinux gtk4;
 
   shellHook = lib.optionalString stdenv.hostPlatform.isDarwin ''
     # Framework builds need the system Xcode macOS and iOS SDKs. Nix's

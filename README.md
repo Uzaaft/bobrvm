@@ -1,9 +1,9 @@
 # bobrvm
 
-bobrvm runs Linux and macOS virtual machines on Apple Silicon. The Linux VM is
-implemented in Zig on Hypervisor.framework; macOS guests use Apple's
-Virtualization framework. A native Swift app provides the window and Metal
-context while Zig owns Linux guest rendering.
+bobrvm runs virtual machines on macOS and Linux. On Apple Silicon, the Linux VM
+uses Hypervisor.framework and macOS guests use Apple's Virtualization framework.
+On x86-64 Linux, the direct-boot VM uses KVM with a GTK host application. The
+platform applications stay thin while Zig owns virtualization and devices.
 
 The project is under active development. Linux guests can boot NixOS to a GUI
 or headless console with SMP, persistent virtio disks, input, built-in NAT, and
@@ -20,6 +20,7 @@ the prerelease tagged [`tip`](https://github.com/polymath-as/bobrvm/releases/tag
 ## Requirements
 
 - Apple Silicon Mac running macOS 13 or later
+- Or x86-64 Linux with KVM and GTK 4
 - Nix for the Zig core
 - Xcode and the Swift toolchain for the macOS app
 
@@ -40,6 +41,20 @@ zig build test -Dtest-filter=<name>
 ```
 
 See [macos/README.md](macos/README.md) for Xcode and framework builds.
+
+### Linux host preview
+
+The Linux package installs a dependency-light headless binary and a separate GTK
+application. Both use the same cancellable Zig VM lifecycle and KVM device model:
+
+```sh
+bobrvm run-kernel bzImage initrd writable-root.raw
+bobrvm-gtk bzImage initrd writable-root.raw
+```
+
+The current x86 direct-boot path provides writable virtio-pci block storage.
+Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
+the vCPU thread. The GTK window stops and joins the VM before closing.
 
 ## Run a Linux guest
 
