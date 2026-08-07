@@ -47,12 +47,6 @@ fn installHandlers() void {
 }
 
 fn handleSignal(sig: posix.SIG) callconv(.c) void {
-    const sig_name: []const u8 = switch (sig) {
-        .INT => "SIGINT",
-        .TERM => "SIGTERM",
-        else => "unknown",
-    };
-
     // Async-signal-safe: only call cleanup, don't log (logging isn't signal-safe)
     if (cleanup_fn) |cb| {
         cb();
@@ -66,9 +60,7 @@ fn handleSignal(sig: posix.SIG) callconv(.c) void {
     };
 
     posix.sigaction(sig, &default_handler, null);
-    posix.raise(sig) catch {};
-
-    // If we get here, just exit
-    _ = sig_name;
-    std.process.exit(128 + @as(u8, @intCast(@intFromEnum(sig))));
+    posix.raise(sig) catch {
+        std.process.exit(128 + @as(u8, @intCast(@intFromEnum(sig))));
+    };
 }

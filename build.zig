@@ -453,6 +453,26 @@ pub fn build(b: *std.Build) !void {
     run_cli_smoke.addArtifactArg(cli_exe);
     test_step.dependOn(&run_cli_smoke.step);
 
+    const signal_smoke_signal_module = b.createModule(.{
+        .root_source_file = b.path("src/os/signal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const signal_smoke_module = b.createModule(.{
+        .root_source_file = b.path("tests/signal_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    signal_smoke_module.addImport("signal", signal_smoke_signal_module);
+    const signal_smoke = b.addExecutable(.{
+        .name = "signal_smoke",
+        .root_module = signal_smoke_module,
+    });
+    const run_signal_smoke = b.addRunArtifact(signal_smoke);
+    test_step.dependOn(&run_signal_smoke.step);
+
     const virtqueue_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/virtqueue_fuzz.zig"),
         .target = target,
