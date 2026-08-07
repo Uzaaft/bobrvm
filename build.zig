@@ -440,6 +440,19 @@ pub fn build(b: *std.Build) !void {
     const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
     test_step.dependOn(&run_c_api_smoke.step);
 
+    const cli_smoke_module = b.createModule(.{
+        .root_source_file = b.path("tests/cli_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_smoke = b.addExecutable(.{
+        .name = "cli_smoke",
+        .root_module = cli_smoke_module,
+    });
+    const run_cli_smoke = b.addRunArtifact(cli_smoke);
+    run_cli_smoke.addArtifactArg(cli_exe);
+    test_step.dependOn(&run_cli_smoke.step);
+
     const virtqueue_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/virtqueue_fuzz.zig"),
         .target = target,

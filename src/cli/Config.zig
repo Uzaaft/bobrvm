@@ -225,20 +225,8 @@ pub fn getConfigDir(alloc: Allocator) ![]const u8 {
 
 pub fn ensureConfigDir(alloc: Allocator) ![]const u8 {
     const dir_path = try getConfigDir(alloc);
-    std.Io.Dir.createDirAbsolute(global.io(), dir_path, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            const parent = std.fs.path.dirname(dir_path) orelse return err;
-            std.Io.Dir.createDirAbsolute(global.io(), parent, .default_dir) catch |e| switch (e) {
-                error.PathAlreadyExists => {},
-                else => return e,
-            };
-            std.Io.Dir.createDirAbsolute(global.io(), dir_path, .default_dir) catch |e| switch (e) {
-                error.PathAlreadyExists => {},
-                else => return e,
-            };
-        },
-    };
+    errdefer alloc.free(dir_path);
+    try std.Io.Dir.cwd().createDirPath(global.io(), dir_path);
     return dir_path;
 }
 
@@ -261,10 +249,16 @@ pub fn save(self: *const Config, alloc: Allocator) !void {
     const config_path = try getConfigPath(alloc, self.name);
     defer alloc.free(config_path);
 
-    const json_bytes = try std.json.Stringify.valueAlloc(alloc, self.*, .{ .whitespace = .indent_2 });
+    const json_bytes = try std.json.Stringify.valueAlloc(
+        alloc,
+        self.*,
+        .{ .whitespace = .indent_2 },
+    );
     defer alloc.free(json_bytes);
 
-    const file = try std.Io.Dir.createFileAbsolute(global.io(), config_path, .{});
+    const file = try std.Io.Dir.createFileAbsolute(global.io(), config_path, .{
+        .exclusive = true,
+    });
     defer file.close(global.io());
 
     try file.writePositionalAll(global.io(), json_bytes, 0);
@@ -307,6 +301,7 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
     errdefer arena.deinit();
 
     const parsed = try std.json.parseFromSlice(Config, arena.allocator(), content, .{
+        .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
 
