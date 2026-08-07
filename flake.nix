@@ -26,7 +26,10 @@
   }: let
     inherit (nixpkgs) lib;
 
-    hostPlatforms = ["aarch64-darwin"];
+    hostPlatforms = [
+      "aarch64-darwin"
+      "x86_64-linux"
+    ];
     guestPlatforms = ["aarch64-linux"];
     forPlatforms = platforms: function:
       lib.genAttrs platforms (system:

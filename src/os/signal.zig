@@ -36,7 +36,7 @@ pub fn unregisterCleanup() void {
 fn installHandlers() void {
     const handler = posix.Sigaction{
         .handler = .{ .handler = handleSignal },
-        .mask = 0,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
 
@@ -61,7 +61,7 @@ fn handleSignal(sig: posix.SIG) callconv(.c) void {
     // Re-raise the signal with default handler to get proper exit code
     const default_handler = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.DFL },
-        .mask = 0,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
 

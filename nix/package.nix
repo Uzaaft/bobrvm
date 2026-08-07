@@ -42,7 +42,7 @@ stdenv.mkDerivation (finalAttrs: {
     pkg-config
     zig
   ];
-  buildInputs = [libiconv];
+  buildInputs = lib.optional stdenv.hostPlatform.isDarwin libiconv;
 
   dontConfigure = true;
   dontUseZigBuild = true;
@@ -52,7 +52,10 @@ stdenv.mkDerivation (finalAttrs: {
     export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
-    zig build -Dcpu=baseline -Doptimize=${optimize}
+    zig build \
+      -Dcpu=baseline \
+      -Doptimize=${optimize} \
+      ${lib.optionalString stdenv.hostPlatform.isLinux "-Dtarget=x86_64-linux-gnu"}
     runHook postBuild
   '';
 
@@ -63,12 +66,13 @@ stdenv.mkDerivation (finalAttrs: {
   '';
 
   meta = {
-    description = "Linux virtualization for macOS";
+    description = "Fast Linux virtualization for macOS and Linux";
     homepage = "https://github.com/polymath-as/bobrvm";
     license = lib.licenses.bsl11;
     platforms = [
       "aarch64-darwin"
       "x86_64-darwin"
+      "x86_64-linux"
     ];
     mainProgram = "bobrvm";
   };

@@ -57,10 +57,13 @@ pub fn build(b: *std.Build) !void {
     // while the development shell can build frameworks for the native app.
     const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
     const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
-    const objc_dependency = b.dependency("zig_objc", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const objc_dependency = if (target.result.os.tag == .macos)
+        b.dependency("zig_objc", .{
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        null;
 
     const emit_xcframework = b.option(
         bool,
@@ -134,7 +137,7 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (target.result.os.tag == .macos) {
-        root_module.addImport("objc", objc_dependency.module("objc"));
+        root_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -163,13 +166,16 @@ pub fn build(b: *std.Build) !void {
 
     wireVenus(root_module, build_options, gpu_venus, virgl_lib);
 
-    const lib = b.addLibrary(.{
-        .name = "bobrvm",
-        .root_module = root_module,
-        .linkage = .static,
-    });
+    const lib = if (target.result.os.tag == .macos)
+        b.addLibrary(.{
+            .name = "bobrvm",
+            .root_module = root_module,
+            .linkage = .static,
+        })
+    else
+        null;
 
-    b.installArtifact(lib);
+    if (lib) |artifact| b.installArtifact(artifact);
 
     b.installDirectory(.{
         .source_dir = b.path("include"),
@@ -178,14 +184,17 @@ pub fn build(b: *std.Build) !void {
     });
 
     const cli_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(if (target.result.os.tag == .linux)
+            "src/main_linux.zig"
+        else
+            "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
     if (target.result.os.tag == .macos) {
-        cli_module.addImport("objc", objc_dependency.module("objc"));
+        cli_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -339,7 +348,7 @@ pub fn build(b: *std.Build) !void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
-        test_module.addImport("objc", objc_dependency.module("objc"));
+        test_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -363,6 +372,7 @@ pub fn build(b: *std.Build) !void {
 
     // Test step
     const main_tests = b.addTest(.{
+        .name = "bobrvm-core-tests",
         .root_module = test_module,
         .filters = test_filters,
     });
@@ -370,6 +380,8 @@ pub fn build(b: *std.Build) !void {
     const run_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    const test_compile_step = b.step("test-compile", "Compile unit tests without running them");
+    test_compile_step.dependOn(&main_tests.step);
     const wayland_test_module = b.createModule(.{
         .root_source_file = b.path("src/guest_tools/wayland.zig"),
         .target = target,
@@ -377,11 +389,13 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     const wayland_tests = b.addTest(.{
+        .name = "bobrvm-wayland-tests",
         .root_module = wayland_test_module,
         .filters = test_filters,
     });
     const run_wayland_tests = b.addRunArtifact(wayland_tests);
     test_step.dependOn(&run_wayland_tests.step);
+    test_compile_step.dependOn(&wayland_tests.step);
 
     // ==========================================================================
     // Integration test: bare-metal ARM64 test binary (pure assembly)
@@ -425,7 +439,7 @@ pub fn build(b: *std.Build) !void {
     // their Ghostty dependency must not be instantiated while building the
     // portable Zig artifacts.
     if (target.result.os.tag == .macos and !is_nix_build) {
-        const xcframework = XCFrameworkStep.create(b, lib);
+        const xcframework = XCFrameworkStep.create(b, lib.?);
         xcframework_step.dependOn(&xcframework.step);
 
         const ghostty_steps = addGhosttySteps(b, optimize);

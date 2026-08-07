@@ -13,6 +13,7 @@
 //!   - status: 1 byte result
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
@@ -580,14 +581,8 @@ pub const Block = struct {
         // Punch the aligned interior so sparse files actually shrink.
         const hole_start = std.mem.alignForward(u64, start, PUNCH_ALIGN);
         const hole_end = std.mem.alignBackward(u64, start + len, PUNCH_ALIGN);
-        var punched = false;
-        if (hole_end > hole_start) {
-            var args = FPunchhole{
-                .fp_offset = @intCast(hole_start),
-                .fp_length = @intCast(hole_end - hole_start),
-            };
-            punched = std.c.fcntl(file.handle, std.c.F.PUNCHHOLE, &args) == 0;
-        }
+        const punched = hole_end > hole_start and
+            punchHole(file.handle, hole_start, hole_end - hole_start);
 
         if (!must_zero) return .ok; // discard: advisory, done either way
 
@@ -608,6 +603,27 @@ pub const Block = struct {
             n_ranges = 1;
         }
         return writeZeroRanges(file, ranges[0..n_ranges]);
+    }
+
+    fn punchHole(fd: std.posix.fd_t, offset: u64, length: u64) bool {
+        if (comptime builtin.os.tag == .macos) {
+            var args = FPunchhole{
+                .fp_offset = @intCast(offset),
+                .fp_length = @intCast(length),
+            };
+            return std.c.fcntl(fd, std.c.F.PUNCHHOLE, &args) == 0;
+        }
+        if (comptime builtin.os.tag == .linux) {
+            const mode = std.os.linux.FALLOC.FL_KEEP_SIZE |
+                std.os.linux.FALLOC.FL_PUNCH_HOLE;
+            return std.os.linux.fallocate(
+                fd,
+                mode,
+                @intCast(offset),
+                @intCast(length),
+            ) == 0;
+        }
+        return false;
     }
 
     noinline fn writeZeroRanges(file: std.Io.File, ranges: []const [2]u64) Status {
