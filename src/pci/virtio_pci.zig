@@ -453,26 +453,27 @@ pub const VirtioPciTransport = struct {
     }
 
     fn readDeviceFeatures(self: *VirtioPciTransport) u32 {
-        if (self.device_feature_select == 0) {
-            return @truncate(self.device_features);
-        } else {
-            return @truncate(self.device_features >> 32);
-        }
+        return switch (self.device_feature_select) {
+            0 => @truncate(self.device_features),
+            1 => @truncate(self.device_features >> 32),
+            else => 0,
+        };
     }
 
     fn readDriverFeatures(self: *VirtioPciTransport) u32 {
-        if (self.driver_feature_select == 0) {
-            return @truncate(self.driver_features);
-        } else {
-            return @truncate(self.driver_features >> 32);
-        }
+        return switch (self.driver_feature_select) {
+            0 => @truncate(self.driver_features),
+            1 => @truncate(self.driver_features >> 32),
+            else => 0,
+        };
     }
 
     fn writeDriverFeatures(self: *VirtioPciTransport, value: u32) void {
-        if (self.driver_feature_select == 0) {
-            self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value;
-        } else {
-            self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32);
+        switch (self.driver_feature_select) {
+            0 => self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value,
+            1 => self.driver_features =
+                (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32),
+            else => {},
         }
     }
 
@@ -485,6 +486,7 @@ pub const VirtioPciTransport = struct {
     }
 
     fn handleNotify(self: *VirtioPciTransport, queue_idx: u32) void {
+        if (!self.isReady()) return;
         if (self.notify_callback) |cb| {
             cb(queue_idx, self.notify_userdata);
         }
@@ -858,6 +860,47 @@ test "VirtioPciTransport preserves standard high device status bits" {
     transport.writeBar(status_offset, 1, 0xC3);
 
     try std.testing.expectEqual(@as(u32, 0xC3), transport.readBar(status_offset, 1));
+}
+
+test "VirtioPciTransport ignores feature selector pages above one" {
+    const features: u64 = 0x1122_3344_5566_7788;
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, features, 1, 64);
+    defer transport.deinit();
+
+    transport.writeBar(@intFromEnum(CommonCfgReg.device_feature_select), 4, 2);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        transport.readBar(@intFromEnum(CommonCfgReg.device_feature), 4),
+    );
+
+    transport.writeBar(@intFromEnum(CommonCfgReg.driver_feature_select), 4, 2);
+    transport.writeBar(@intFromEnum(CommonCfgReg.driver_feature), 4, std.math.maxInt(u32));
+    try std.testing.expectEqual(@as(u64, 0), transport.driver_features);
+}
+
+test "VirtioPciTransport notifications require a ready driver" {
+    const State = struct {
+        notifications: usize = 0,
+        queue: u32 = 0,
+
+        fn notify(queue: u32, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.notifications += 1;
+            self.queue = queue;
+        }
+    };
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, 0, 1, 64);
+    defer transport.deinit();
+    var state = State{};
+    transport.setNotifyCallback(State.notify, &state);
+
+    transport.writeBar(BAR_NOTIFY_OFFSET, 4, 7);
+    try std.testing.expectEqual(@as(usize, 0), state.notifications);
+
+    transport.writeBar(@intFromEnum(CommonCfgReg.device_status), 1, 0x0C);
+    transport.writeBar(BAR_NOTIFY_OFFSET, 4, 7);
+    try std.testing.expectEqual(@as(usize, 1), state.notifications);
+    try std.testing.expectEqual(@as(u32, 7), state.queue);
 }
 
 test "VirtioPciTransport ignores unnamed common configuration offsets" {
