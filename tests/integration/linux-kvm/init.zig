@@ -9,6 +9,10 @@ const module_paths = [_][:0]const u8{
     "/modules/virtio_pci_modern_dev.ko",
     "/modules/virtio_pci_legacy_dev.ko",
     "/modules/virtio_pci.ko",
+    "/modules/failover.ko",
+    "/modules/net_failover.ko",
+    "/modules/virtio_net.ko",
+    "/modules/af_packet.ko",
     "/modules/virtio_blk.ko",
     "/modules/crc16.ko",
     "/modules/mbcache.ko",
@@ -21,7 +25,9 @@ pub fn main() noreturn {
     _ = linux.mount("devtmpfs", "/dev", "devtmpfs", 0, 0);
     for (module_paths) |path| {
         if (!loadModule(path) and debug_port_available) {
-            emit("BOBRVM_MODULE_LOAD_FAILED\n");
+            emit("BOBRVM_MODULE_LOAD_FAILED ");
+            emit(path);
+            emit("\n");
         }
     }
 

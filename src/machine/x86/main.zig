@@ -1,9 +1,11 @@
 //! Minimal x86 PC machine for direct Linux boot on KVM.
 
 const std = @import("std");
+const callback_binding = @import("../../callback.zig");
 const global = @import("../../global.zig");
 const GuestMemory = @import("../../guest_memory.zig").GuestMemory;
 const kvm = @import("../../hypervisor/kvm/main.zig");
+const mininat = @import("../../net/mininat.zig");
 const pci = @import("../../pci/main.zig");
 const virtio = @import("../../virtio/main.zig");
 const boot = @import("boot.zig");
@@ -12,6 +14,9 @@ const gdt_address: u64 = 0x500;
 const pci_block_slot: u5 = 1;
 const pci_block_irq: u32 = 11;
 const pci_bar_initial: u32 = 0xd000_0000;
+const pci_net_slot: u5 = 2;
+const pci_net_irq: u32 = 10;
+const pci_net_bar_initial: u32 = 0xd001_0000;
 const serial_irq: u32 = 4;
 
 pub const SerialSink = struct {
@@ -98,6 +103,13 @@ pub const Machine = struct {
     block_irq_desired: bool = false,
     block_irq_injected: bool = false,
     block_notify_mmio_exits: u64 = 0,
+    net: ?*virtio.Net = null,
+    pci_net: ?*pci.VirtioPciDevice = null,
+    nat: mininat.MiniNat = undefined,
+    net_enabled: bool = false,
+    net_wakeup: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    net_irq_desired: bool = false,
+    net_irq_injected: bool = false,
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     vcpu_thread_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     exits_total: u64 = 0,
@@ -107,6 +119,7 @@ pub const Machine = struct {
     pub const InitError = kvm.OpenError || kvm.CreateError || boot.LoadError;
     pub const AttachDiskError = virtio.Block.Error || std.Io.File.StatError ||
         kvm.FastPathError || std.Thread.SpawnError;
+    pub const AttachNetworkError = virtio.Net.Error || std.Thread.SpawnError;
     pub const SerialInputError = kvm.InterruptError;
     pub const RunError = kvm.RunError || kvm.FastPathError || kvm.InterruptError || error{
         ExitLimitReached,
@@ -166,6 +179,9 @@ pub const Machine = struct {
 
     pub fn deinit(self: *Machine) void {
         self.stopBlockFastPath();
+        if (self.net_enabled) self.nat.stop();
+        if (self.pci_net) |device| device.deinit();
+        if (self.net) |net| net.deinit();
         if (self.pci_block) |device| device.deinit();
         if (self.block) |block| block.deinit();
         self.vcpu.deinit();
@@ -216,6 +232,67 @@ pub const Machine = struct {
         }
     }
 
+    /// The machine address must remain stable until deinit because callbacks retain it.
+    pub fn attachNetwork(self: *Machine, allocator: std.mem.Allocator) AttachNetworkError!void {
+        std.debug.assert(self.net == null);
+        std.debug.assert(self.pci_net == null);
+        std.debug.assert(!self.net_enabled);
+
+        const net = try virtio.Net.init(allocator);
+        errdefer net.deinit();
+        const device = try pci.VirtioPciDevice.init(
+            allocator,
+            1,
+            0x0001,
+            net.transport.device_features,
+            2,
+            @sizeOf(virtio.net.Config),
+        );
+        errdefer device.deinit();
+        device.writeConfig(0x10, 4, pci_net_bar_initial);
+        device.config[0x3c] = pci_net_irq;
+        device.transport.setDeviceConfig(std.mem.asBytes(&net.config));
+        device.transport.setNotifyCallback(netNotify, self);
+        net.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
+        net.setIrqCallback(virtio.mmio.Irq.initRaw(netIrq, self));
+
+        self.net = net;
+        self.pci_net = device;
+        errdefer {
+            self.net = null;
+            self.pci_net = null;
+        }
+        self.nat = mininat.MiniNat.init(
+            allocator,
+            callback_binding.Handler1(Machine, []const u8, void, natReply).bind(self),
+        );
+        self.nat.setReplyLease(
+            callback_binding.Handler1(
+                Machine,
+                usize,
+                ?mininat.ReplyLease,
+                natReplyReserve,
+            ).bind(self),
+            callback_binding.Handler1(
+                Machine,
+                mininat.ReplyLease,
+                void,
+                natReplyCommit,
+            ).bind(self),
+        );
+        self.nat.setRxReady(
+            callback_binding.Handler0(Machine, bool, natRxReady).bind(self),
+        );
+        self.nat.start() catch |err| {
+            self.nat.stop();
+            return err;
+        };
+        self.net_enabled = true;
+        net.setTxCallback(
+            callback_binding.Handler1(Machine, []const u8, void, netTx).bind(self),
+        );
+    }
+
     pub fn run(self: *Machine, serial: SerialSink, exits_max: u64) RunError!RunOutcome {
         self.vcpu_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
         defer self.vcpu_thread_id.store(0, .release);
@@ -223,15 +300,24 @@ pub const Machine = struct {
         while (self.exits_total < exits_max) {
             self.vcpu.clearExitRequest();
             if (self.stop_requested.load(.acquire)) return .stopped;
+            if (self.net_wakeup.swap(false, .acq_rel)) {
+                self.processNet();
+                try self.syncNetIrq();
+            }
             if (self.block_worker_failed.load(.acquire)) {
                 return error.FastDevicePathFailed;
             }
             self.exits_total += 1;
             const exit = self.vcpu.runOnce() catch |err| switch (err) {
-                error.Interrupted => if (self.stop_requested.load(.acquire))
-                    return .stopped
-                else
-                    return err,
+                error.Interrupted => {
+                    if (self.stop_requested.load(.acquire)) return .stopped;
+                    if (self.net_wakeup.swap(false, .acq_rel)) {
+                        self.processNet();
+                        try self.syncNetIrq();
+                        continue;
+                    }
+                    return err;
+                },
                 else => return err,
             };
             switch (exit) {
@@ -243,6 +329,8 @@ pub const Machine = struct {
                 .unknown => return error.UnknownExit,
             }
             try self.syncBlockIrq();
+            if (self.net_wakeup.swap(false, .acq_rel)) self.processNet();
+            try self.syncNetIrq();
         }
         return error.ExitLimitReached;
     }
@@ -303,6 +391,7 @@ pub const Machine = struct {
         const old_bar_address = device.getBar0Addr();
         device.writeConfig(address.register, access.size, value);
         const new_bar_address = device.getBar0Addr();
+        if (address.device != pci_block_slot) return;
         self.rebindBlockIoEvent(old_bar_address, new_bar_address) catch |err| {
             device.writeConfig(0x10, 4, old_bar_address);
             return err;
@@ -401,8 +490,23 @@ pub const Machine = struct {
     }
 
     fn handlePciBar(self: *Machine, access: kvm.MmioExit) bool {
-        const device = self.pci_block orelse return false;
-        const block = self.block orelse return false;
+        if (self.pci_block) |device| {
+            if (self.block) |block| {
+                if (self.handleBlockPciBar(device, block, access)) return true;
+            }
+        }
+        if (self.pci_net) |device| {
+            if (self.net) |net| return self.handleNetPciBar(device, net, access);
+        }
+        return false;
+    }
+
+    fn handleBlockPciBar(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        block: *virtio.Block,
+        access: kvm.MmioExit,
+    ) bool {
         const bar_address: u64 = device.getBar0Addr();
         if (bar_address == 0 or access.address < bar_address) return false;
         const offset_u64 = access.address - bar_address;
@@ -439,14 +543,47 @@ pub const Machine = struct {
         return true;
     }
 
+    fn handleNetPciBar(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        net: *virtio.Net,
+        access: kvm.MmioExit,
+    ) bool {
+        const bar_address: u64 = device.getBar0Addr();
+        if (bar_address == 0 or access.address < bar_address) return false;
+        const offset_u64 = access.address - bar_address;
+        if (offset_u64 >= pci.virtio_pci.BAR0_SIZE) return false;
+        const value = readIoValue(access.data) orelse return false;
+        const offset: u32 = @intCast(offset_u64);
+
+        if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+            offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE and
+            access.direction == .read)
+        {
+            self.readNetIsr(device, net, access, offset);
+            return true;
+        }
+        if (access.direction == .read) {
+            if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+                device.transport.setDeviceConfig(std.mem.asBytes(&net.config));
+            }
+            writeIoValue(access.data, device.readBar0(offset, @intCast(access.data.len)));
+        } else {
+            device.writeBar0(offset, @intCast(access.data.len), value);
+        }
+        return true;
+    }
+
     fn pciDevice(
         self: *Machine,
         address: pci.x86_config.ConfigAddress,
     ) ?*pci.VirtioPciDevice {
-        if (address.bus != 0 or address.device != pci_block_slot or address.function != 0) {
-            return null;
-        }
-        return self.pci_block;
+        if (address.bus != 0 or address.function != 0) return null;
+        return switch (address.device) {
+            pci_block_slot => self.pci_block,
+            pci_net_slot => self.pci_net,
+            else => null,
+        };
     }
 
     fn getGuestMemory(self: *Machine, address: u64, length: usize) ?[]u8 {
@@ -476,6 +613,81 @@ pub const Machine = struct {
         target.driver_addr = source.driver_addr;
         target.device_addr = source.device_addr;
         block.pollRequests();
+    }
+
+    fn netNotify(queue_index: u32, userdata: ?*anyopaque) void {
+        if (queue_index >= 2) return;
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        self.processNet();
+    }
+
+    fn processNet(self: *Machine) void {
+        const device = self.pci_net orelse return;
+        const net = self.net orelse return;
+        for (device.transport.queues, 0..) |source, queue_index| {
+            const target = &net.transport.queues[queue_index];
+            target.num = source.size;
+            target.ready = source.enable;
+            target.desc_addr = source.desc_addr;
+            target.driver_addr = source.driver_addr;
+            target.device_addr = source.device_addr;
+        }
+        net.poll();
+    }
+
+    fn netIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const device = self.pci_net orelse return;
+        const net = self.net orelse return;
+        device.transport.isr_status.queue_interrupt =
+            net.transport.interrupt_status.used_buffer;
+        device.transport.isr_status.config_change =
+            net.transport.interrupt_status.config_change;
+        self.net_irq_desired = level;
+    }
+
+    fn syncNetIrq(self: *Machine) kvm.InterruptError!void {
+        if (self.net_irq_desired == self.net_irq_injected) return;
+        try self.vm.setIrqLine(pci_net_irq, self.net_irq_desired);
+        self.net_irq_injected = self.net_irq_desired;
+    }
+
+    fn netTx(self: *Machine, frame: []const u8) void {
+        self.nat.handleFrame(frame);
+    }
+
+    fn natReply(self: *Machine, frame: []const u8) void {
+        const net = self.net orelse return;
+        net.queueRxFrame(frame);
+        self.wakeNet();
+    }
+
+    fn natReplyReserve(self: *Machine, frame_len: usize) ?mininat.ReplyLease {
+        const net = self.net orelse return null;
+        const reservation = net.reserveRxFrame(frame_len) orelse return null;
+        return .{ .frame = reservation.bytes, .token = reservation.storage_index };
+    }
+
+    fn natReplyCommit(self: *Machine, lease: mininat.ReplyLease) void {
+        const net = self.net orelse return;
+        net.commitRxFrame(.{
+            .bytes = lease.frame,
+            .storage_index = @intCast(lease.token),
+        });
+        self.wakeNet();
+    }
+
+    fn natRxReady(self: *Machine) bool {
+        const net = self.net orelse return false;
+        return net.rxReady();
+    }
+
+    fn wakeNet(self: *Machine) void {
+        self.net_wakeup.store(true, .release);
+        const thread_id = self.vcpu_thread_id.load(.acquire);
+        if (thread_id == 0 or thread_id == @as(u32, @intCast(std.Thread.getCurrentId()))) return;
+        self.vcpu.requestExit();
+        kvm.interruptThread(thread_id);
     }
 
     fn blockIrq(level: bool, userdata: ?*anyopaque) void {
@@ -515,6 +727,22 @@ pub const Machine = struct {
         block.transport.interrupt_status = @bitCast(current & ~result);
         if (@as(u32, @bitCast(block.transport.interrupt_status)) == 0) {
             self.block_irq_desired = false;
+        }
+    }
+
+    fn readNetIsr(
+        self: *Machine,
+        device: *pci.VirtioPciDevice,
+        net: *virtio.Net,
+        access: kvm.MmioExit,
+        offset: u32,
+    ) void {
+        const result = device.readBar0(offset, @intCast(access.data.len));
+        writeIoValue(access.data, result);
+        const current: u32 = @bitCast(net.transport.interrupt_status);
+        net.transport.interrupt_status = @bitCast(current & ~result);
+        if (@as(u32, @bitCast(net.transport.interrupt_status)) == 0) {
+            self.net_irq_desired = false;
         }
     }
 

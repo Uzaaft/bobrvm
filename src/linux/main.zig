@@ -55,6 +55,22 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeAll("KVM console: guest accepted serial input\n");
         return;
     }
+    if (std.mem.eql(u8, command, "kvm-network-smoke")) {
+        const kernel_path = args.next() orelse return missingNetworkSmokeArgument();
+        const initrd_path = args.next() orelse return missingNetworkSmokeArgument();
+        const disk_path = args.next() orelse return missingNetworkSmokeArgument();
+        run_kernel.executeNetworkSmoke(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            disk_path,
+        ) catch |err| {
+            printNamedError("KVM network smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM network: guest reached the built-in gateway\n");
+        return;
+    }
     if (std.mem.eql(u8, command, "run-kernel")) {
         const kernel_path = args.next() orelse {
             writeAll("error: run-kernel requires a bzImage path\n");
@@ -154,6 +170,11 @@ fn missingConsoleSmokeArgument() noreturn {
     std.process.exit(1);
 }
 
+fn missingNetworkSmokeArgument() noreturn {
+    writeAll("error: kvm-network-smoke requires bzImage, initrd, and disk paths\n");
+    std.process.exit(1);
+}
+
 fn printUsage() void {
     writeAll(
         \\bobrvm - fast Linux virtualization
@@ -165,6 +186,7 @@ fn printUsage() void {
         \\  kvm-smoke   Run a tiny x86 payload through KVM
         \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
         \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
+        \\  kvm-network-smoke <bzImage> <initrd> <disk>  Verify built-in NAT
         \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
         \\  version     Show version information
         \\  help        Show this help message

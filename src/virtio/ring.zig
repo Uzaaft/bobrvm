@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 
 pub const GetMemFn = *const fn (addr: u64, len: usize) ?[]u8;
@@ -32,6 +33,16 @@ pub const Desc = struct {
 /// Read one descriptor from the descriptor table.
 pub fn readDesc(qc: mmio.QueueConfig, idx: u16, get_mem: GetMemFn) ?Desc {
     const mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
+    return decodeDesc(mem);
+}
+
+pub fn readDescMemory(qc: mmio.QueueConfig, idx: u16, memory: GuestMemory) ?Desc {
+    const mem = memory.get(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
+    return decodeDesc(mem);
+}
+
+fn decodeDesc(mem: []const u8) Desc {
+    assert(mem.len == 16);
     return .{
         .addr = std.mem.readInt(u64, mem[0..8], .little),
         .len = std.mem.readInt(u32, mem[8..12], .little),
@@ -46,6 +57,11 @@ pub fn availIdx(qc: mmio.QueueConfig, get_mem: GetMemFn) ?u16 {
     return std.mem.readInt(u16, mem[2..4], .little);
 }
 
+pub fn availIdxMemory(qc: mmio.QueueConfig, memory: GuestMemory) ?u16 {
+    const mem = memory.get(qc.driver_addr, 6) orelse return null;
+    return std.mem.readInt(u16, mem[2..4], .little);
+}
+
 /// Read the descriptor index at an avail ring position.
 pub fn availEntry(qc: mmio.QueueConfig, pos: u16, get_mem: GetMemFn) ?u16 {
     const ring_idx = pos % qc.num;
@@ -53,16 +69,39 @@ pub fn availEntry(qc: mmio.QueueConfig, pos: u16, get_mem: GetMemFn) ?u16 {
     return std.mem.readInt(u16, mem[0..2], .little);
 }
 
+pub fn availEntryMemory(qc: mmio.QueueConfig, pos: u16, memory: GuestMemory) ?u16 {
+    const ring_idx = pos % qc.num;
+    const mem = memory.get(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse return null;
+    return std.mem.readInt(u16, mem[0..2], .little);
+}
+
 /// Append an entry to the used ring and bump its index.
 pub fn pushUsed(qc: mmio.QueueConfig, desc_idx: u16, len: u32, get_mem: GetMemFn) void {
     const used_ring = get_mem(qc.device_addr, 6) orelse return;
-    var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
+    const used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
     const pos = used_idx % qc.num;
     const entry = get_mem(qc.device_addr + 4 + @as(u64, pos) * 8, 8) orelse return;
+    writeUsedEntry(used_ring, entry, desc_idx, len, used_idx);
+}
+
+pub fn pushUsedMemory(qc: mmio.QueueConfig, desc_idx: u16, len: u32, memory: GuestMemory) void {
+    const used_ring = memory.get(qc.device_addr, 6) orelse return;
+    const used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
+    const pos = used_idx % qc.num;
+    const entry = memory.get(qc.device_addr + 4 + @as(u64, pos) * 8, 8) orelse return;
+    writeUsedEntry(used_ring, entry, desc_idx, len, used_idx);
+}
+
+fn writeUsedEntry(
+    used_ring: []u8,
+    entry: []u8,
+    desc_idx: u16,
+    len: u32,
+    used_idx: u16,
+) void {
     std.mem.writeInt(u32, entry[0..4], desc_idx, .little);
     std.mem.writeInt(u32, entry[4..8], len, .little);
-    used_idx +%= 1;
-    std.mem.writeInt(u16, @ptrCast(used_ring[2..4]), used_idx, .little);
+    std.mem.writeInt(u16, @ptrCast(used_ring[2..4]), used_idx +% 1, .little);
 }
 
 /// A descriptor chain collected from guest memory.
@@ -78,6 +117,19 @@ pub const Chain = struct {
         var idx = head;
         while (chain.count < MAX_CHAIN) {
             const desc = readDesc(qc, idx, get_mem) orelse break;
+            chain.descs[chain.count] = desc;
+            chain.count += 1;
+            if (!desc.hasNext()) break;
+            idx = desc.next;
+        }
+        return chain;
+    }
+
+    pub fn collectMemory(qc: mmio.QueueConfig, head: u16, memory: GuestMemory) Chain {
+        var chain: Chain = .{};
+        var idx = head;
+        while (chain.count < MAX_CHAIN) {
+            const desc = readDescMemory(qc, idx, memory) orelse break;
             chain.descs[chain.count] = desc;
             chain.count += 1;
             if (!desc.hasNext()) break;

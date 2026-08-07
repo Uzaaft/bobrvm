@@ -44,6 +44,14 @@ runCommand "bobrvm-linux-kvm-fixture" {
     >"$out/root/modules/virtio_pci_legacy_dev.ko"
   xz -dc "$module_root/drivers/virtio/virtio_pci.ko.xz" \
     >"$out/root/modules/virtio_pci.ko"
+  xz -dc "$module_root/net/core/failover.ko.xz" \
+    >"$out/root/modules/failover.ko"
+  xz -dc "$module_root/drivers/net/net_failover.ko.xz" \
+    >"$out/root/modules/net_failover.ko"
+  xz -dc "$module_root/drivers/net/virtio_net.ko.xz" \
+    >"$out/root/modules/virtio_net.ko"
+  xz -dc "$module_root/net/packet/af_packet.ko.xz" \
+    >"$out/root/modules/af_packet.ko"
   xz -dc "$module_root/drivers/block/virtio_blk.ko.xz" \
     >"$out/root/modules/virtio_blk.ko"
   xz -dc "$module_root/lib/crc/crc16.ko.xz" \

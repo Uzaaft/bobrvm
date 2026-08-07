@@ -111,6 +111,7 @@ const State = struct {
             .kernel_path = self.kernel_path,
             .initrd_path = self.initrd_path,
             .disk_path = self.disk_path,
+            .network_enabled = true,
             .command_line = run_kernel.command_line,
             .exits_max = exits_max,
         }, x86.SerialSink.bind(State, self, writeSerial)) catch |err| {

@@ -35,12 +35,13 @@ pub const Config = struct {
     initrd_path: ?[]const u8 = null,
     disk_path: ?[]const u8 = null,
     disk_read_only: bool = false,
+    network_enabled: bool = false,
     command_line: []const u8,
     exits_max: u64,
 };
 
 pub const CreateError = boot.ParseError || x86.Machine.InitError ||
-    x86.Machine.AttachDiskError || error{
+    x86.Machine.AttachDiskError || x86.Machine.AttachNetworkError || error{
     OpenKernelFailed,
     ReadKernelFailed,
     OpenInitrdFailed,
@@ -84,6 +85,7 @@ pub fn create(
     if (config.disk_path) |path| {
         try self.machine.attachDisk(allocator, path, config.disk_read_only);
     }
+    if (config.network_enabled) try self.machine.attachNetwork(allocator);
     return self;
 }
 

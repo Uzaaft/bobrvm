@@ -646,6 +646,7 @@ pub const VirtioPciDevice = struct {
         self.config[0x09] = 0x00; // Prog IF
         self.config[0x0A] = 0x00; // Subclass
         self.config[0x0B] = switch (self.transport.device_id) {
+            1 => 0x02, // Network controller
             2 => 0x01, // Mass storage
             16 => 0x03, // Display controller
             else => 0x00,
@@ -856,6 +857,14 @@ test "virtio GPU uses the modern device id and display class" {
     try std.testing.expectEqual(@as(u8, 0x50), device.config[0x02]);
     try std.testing.expectEqual(@as(u8, 0x10), device.config[0x03]);
     try std.testing.expectEqual(@as(u8, 0x03), device.config[0x0B]);
+}
+
+test "virtio network uses the modern device id and network class" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 1, 1, 0, 2, 12);
+    defer dev.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0x1041), dev.readConfig(0x02, 2));
+    try std.testing.expectEqual(@as(u64, 0x02), dev.readConfig(0x0b, 1));
 }
 
 test "VirtioPciTransport allocation profile" {

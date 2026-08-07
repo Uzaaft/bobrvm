@@ -25,6 +25,7 @@ pub fn execute(
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .disk_path = disk_path,
+        .network_enabled = true,
         .command_line = command_line,
         .exits_max = exits_max,
     }, x86.SerialSink.bind(Stdout, &output, Stdout.write));
@@ -58,15 +59,16 @@ pub fn executeConsoleSmoke(
     initrd_path: []const u8,
     disk_path: []const u8,
 ) !void {
-    var output = ConsoleSmokeOutput{};
+    var output = SmokeOutput{};
     const vm = try VM.create(allocator, .{
         .memory_bytes = memory_bytes,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .disk_path = disk_path,
+        .network_enabled = true,
         .command_line = command_line ++ " bobrvm.console_test=1",
         .exits_max = exits_max,
-    }, x86.SerialSink.bind(ConsoleSmokeOutput, &output, ConsoleSmokeOutput.write));
+    }, x86.SerialSink.bind(SmokeOutput, &output, SmokeOutput.write));
     defer vm.destroy();
     try vm.start();
 
@@ -74,6 +76,29 @@ pub fn executeConsoleSmoke(
     const input = "bobrvm-input-ok\n";
     if (try vm.writeConsole(input) != input.len) return error.ConsoleInputQueueFull;
     if (!waitForSignal(vm, &output.accepted, 500)) return error.ConsoleInputTimeout;
+    if (try vm.join() != .guest_shutdown) return error.UnexpectedRunOutcome;
+}
+
+pub fn executeNetworkSmoke(
+    allocator: std.mem.Allocator,
+    kernel_path: []const u8,
+    initrd_path: []const u8,
+    disk_path: []const u8,
+) !void {
+    var output = SmokeOutput{};
+    const vm = try VM.create(allocator, .{
+        .memory_bytes = memory_bytes,
+        .kernel_path = kernel_path,
+        .initrd_path = initrd_path,
+        .disk_path = disk_path,
+        .network_enabled = true,
+        .command_line = command_line ++ " bobrvm.network_test=1",
+        .exits_max = exits_max,
+    }, x86.SerialSink.bind(SmokeOutput, &output, SmokeOutput.write));
+    defer vm.destroy();
+    try vm.start();
+
+    if (!waitForSignal(vm, &output.network, 500)) return error.NetworkTimeout;
     if (try vm.join() != .guest_shutdown) return error.UnexpectedRunOutcome;
 }
 
@@ -94,24 +119,28 @@ const DiscardOutput = struct {
     fn write(_: *DiscardOutput, _: []const u8) void {}
 };
 
-const ConsoleSmokeOutput = struct {
+const SmokeOutput = struct {
     const ready_marker = "BOBRVM_CONSOLE_INPUT_READY";
     const accepted_marker = "BOBRVM_CONSOLE_INPUT_OK";
+    const network_marker = "BOBRVM_NETWORK_OK";
 
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     accepted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    network: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ready_index: usize = 0,
     accepted_index: usize = 0,
+    network_index: usize = 0,
 
-    fn write(self: *ConsoleSmokeOutput, bytes: []const u8) void {
+    fn write(self: *SmokeOutput, bytes: []const u8) void {
         var stdout = Stdout{};
         stdout.write(bytes);
         self.feedMarker(bytes, ready_marker, &self.ready_index, &self.ready);
         self.feedMarker(bytes, accepted_marker, &self.accepted_index, &self.accepted);
+        self.feedMarker(bytes, network_marker, &self.network_index, &self.network);
     }
 
     fn feedMarker(
-        _: *ConsoleSmokeOutput,
+        _: *SmokeOutput,
         bytes: []const u8,
         marker: []const u8,
         index: *usize,

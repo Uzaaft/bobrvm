@@ -229,6 +229,7 @@ const VirtioMmioDevice = union(enum) {
     fn setGuestMemory(self: VirtioMmioDevice, accessor: *const fn (u64, usize) ?[]u8) void {
         switch (self) {
             .block => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
+            .net => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
             inline else => |device| device.setGuestMemory(accessor),
         }
     }

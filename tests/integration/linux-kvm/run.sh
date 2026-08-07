@@ -14,11 +14,14 @@ test_dir="$(mktemp -d -p /tmp bobrvm-linux-kvm.XXXXXXXX)"
 output_file="$test_dir/output"
 disk_copy="$test_dir/disk"
 console_disk_copy="$test_dir/console-disk"
+network_disk_copy="$test_dir/network-disk"
 trap 'rm -rf "$test_dir"' EXIT
 cp "$4" "$disk_copy"
 cp "$4" "$console_disk_copy"
+cp "$4" "$network_disk_copy"
 chmod u+w "$disk_copy"
 chmod u+w "$console_disk_copy"
+chmod u+w "$network_disk_copy"
 command=("$1" run-kernel "$2" "$3" "$disk_copy")
 
 set +e
@@ -93,4 +96,22 @@ if ! grep -q "^$console_marker$" "$console_output"; then
     exit 1
 fi
 
-echo "Linux KVM E2E: $expected_marker $fast_path_marker lifecycle-stop console-input"
+network_output="$test_dir/network-output"
+set +e
+timeout 10s \
+    "$1" kvm-network-smoke "$2" "$3" "$network_disk_copy" \
+    >"$network_output" 2>&1
+network_status="$?"
+set -e
+cat "$network_output"
+if [[ "$network_status" -ne 0 ]]; then
+    echo "error: KVM network smoke exited with status $network_status" >&2
+    exit 1
+fi
+network_marker="KVM network: guest reached the built-in gateway"
+if ! grep -q "^$network_marker$" "$network_output"; then
+    echo "error: $network_marker was not observed" >&2
+    exit 1
+fi
+
+echo "Linux KVM E2E: rootfs fast-block lifecycle-stop console-input network"
