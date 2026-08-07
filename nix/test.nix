@@ -2,6 +2,7 @@
   lib,
   stdenv,
   libiconv,
+  virglrenderer,
   zig,
 }:
 stdenv.mkDerivation (finalAttrs: {
@@ -16,7 +17,9 @@ stdenv.mkDerivation (finalAttrs: {
   };
 
   nativeBuildInputs = [zig];
-  buildInputs = lib.optional stdenv.hostPlatform.isDarwin libiconv;
+  buildInputs =
+    lib.optional stdenv.hostPlatform.isDarwin libiconv
+    ++ lib.optional stdenv.hostPlatform.isLinux virglrenderer;
 
   dontConfigure = true;
   dontUseZigBuild = true;
@@ -36,7 +39,9 @@ stdenv.mkDerivation (finalAttrs: {
     fi
     for test_binary in "''${test_binaries[@]}"; do
       ${stdenv.cc.bintools.dynamicLinker} \
-        --library-path ${stdenv.cc.libc}/lib \
+        --library-path ${lib.makeLibraryPath (
+      [stdenv.cc.libc] ++ lib.optional stdenv.hostPlatform.isLinux virglrenderer
+    )} \
         "$test_binary"
     done
     runHook postBuild

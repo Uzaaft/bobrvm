@@ -10,6 +10,7 @@
   gtk4,
   patchelf,
   pkg-config,
+  virglrenderer,
   wrapGAppsHook4,
   zig,
   optimize ? "ReleaseFast",
@@ -63,6 +64,7 @@ stdenv.mkDerivation (finalAttrs: {
       alsa-lib
       gsettings-desktop-schemas
       gtk4
+      virglrenderer
     ];
 
   dontConfigure = true;

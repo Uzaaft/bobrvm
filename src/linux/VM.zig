@@ -57,6 +57,7 @@ pub const Config = struct {
     display_width: u32 = config_policy.display_width_default,
     display_height: u32 = config_policy.display_height_default,
     gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
+    gpu_3d_enabled: bool = false,
     shared_dir: ?[]const u8 = null,
     restore_path: ?[]const u8 = null,
     audio_enabled: bool = false,
@@ -213,6 +214,7 @@ pub fn create(
             config.display_width,
             config.display_height,
             config.gpu_memory_bytes,
+            config.gpu_3d_enabled,
         );
         try self.machine.attachInputDevices(allocator);
     }

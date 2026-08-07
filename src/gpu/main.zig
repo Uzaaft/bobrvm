@@ -337,6 +337,10 @@ pub const GpuDevice = struct {
         if (self.renderer) |*r| r.deinit();
     }
 
+    pub fn supportsAcceleration(_: *const GpuDevice) bool {
+        return true;
+    }
+
     /// Lazily create the Metal renderer. Returns null if no Metal device is
     /// available; callers then behave as decode-only (no execution).
     fn ensureRenderer(self: *GpuDevice) ?*virgl.Renderer {
@@ -380,12 +384,24 @@ pub const GpuDevice = struct {
         }
     }
 
+    pub fn hasContext(self: *const GpuDevice, id: ContextId) bool {
+        return self.contexts.contains(id);
+    }
+
     /// Record a 3D resource created by the guest, and back it on the GPU.
     /// This is the path the virtio-gpu device actually uses.
     pub fn createResourceRecord(self: *GpuDevice, res: Resource) Error!void {
         try self.resources.put(res.handle, res);
         self.backResource(res);
     }
+
+    pub fn removeResource(self: *GpuDevice, handle: ResourceHandle) void {
+        _ = self.resources.remove(handle);
+    }
+
+    pub fn attachResource(_: *GpuDevice, _: ContextId, _: ResourceHandle) void {}
+
+    pub fn detachResource(_: *GpuDevice, _: ContextId, _: ResourceHandle) void {}
 
     /// Give a recorded resource its GPU backing: buffers → MTLBuffer (sized
     /// by width, which holds the byte size for buffer resources), render

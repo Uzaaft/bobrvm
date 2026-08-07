@@ -15,6 +15,7 @@
   nushell,
   pandoc,
   pkg-config,
+  virglrenderer,
   zig,
   ziglint,
   zon2nix,
@@ -46,6 +47,7 @@ mkShell {
       gtk4
       hicolor-icon-theme
       OVMF.fd
+      virglrenderer
     ];
 
   shellHook =

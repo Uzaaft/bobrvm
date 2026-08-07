@@ -29,6 +29,14 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeAll("Audio smoke: played a 440 Hz stereo tone\n");
         return;
     }
+    if (std.mem.eql(u8, command, "gpu-smoke")) {
+        runGpuSmoke() catch |err| {
+            printNamedError("GPU smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("GPU smoke: surfaceless virgl renderer initialized\n");
+        return;
+    }
     if (std.mem.eql(u8, command, "kvm-smoke")) {
         kvm.runSmoke() catch |err| {
             printSmokeError(err);
@@ -270,6 +278,7 @@ fn printUsage() void {
         \\Commands:
         \\  kvm-info    Validate KVM and show acceleration capabilities
         \\  audio-smoke  Play a short tone through the Linux audio backend
+        \\  gpu-smoke    Initialize the accelerated Linux virgl renderer
         \\  kvm-smoke   Run a tiny x86 payload through KVM
         \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
         \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
@@ -303,6 +312,42 @@ fn runAudioSmoke() !void {
         .raw = .{ .nanoseconds = 400 * std.time.ns_per_ms },
         .clock = .awake,
     }, global.io()) catch {};
+}
+
+fn runGpuSmoke() !void {
+    const config_policy = @import("../config.zig");
+    const virgl = @import("../gpu/virgl/main.zig");
+    const virtio_gpu = @import("../virtio/gpu.zig");
+    const gpu = try virtio_gpu.Gpu.initWithMemoryLimit(
+        std.heap.c_allocator,
+        true,
+        config_policy.gpu_memory_bytes_default,
+    );
+    defer gpu.deinit();
+    if (!gpu.virgl_enabled) return error.AcceleratedRendererUnavailable;
+
+    try gpu.gpu_device.createContextId(1);
+    try gpu.gpu_device.createResourceRecord(.{
+        .handle = 1,
+        .target = .buffer,
+        .format = .r8_unorm,
+        .width = 4096,
+        .height = 1,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = 1 << 4,
+    });
+    gpu.gpu_device.attachResource(1, 1);
+    var nop = (virgl.CommandHeader{
+        .opcode = .nop,
+        .object_type = .null,
+        .length = 0,
+    }).encode();
+    try gpu.gpu_device.submit(1, std.mem.asBytes(&nop));
+    if (gpu.gpu_device.bufferContents(1) == null) return error.BufferUnavailable;
 }
 
 fn writeAll(bytes: []const u8) void {

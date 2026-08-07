@@ -21,6 +21,7 @@ shared_dir: ?[]const u8 = null,
 restore_path: ?[]const u8 = null,
 network_enabled: bool = true,
 audio_enabled: bool = true,
+gpu_3d_enabled: bool = true,
 forwards: [MAX_FORWARDS]mininat.Forward = @splat(.{ .host_port = 0, .guest_port = 0 }),
 forward_count: u8 = 0,
 command_line: []const u8 = @import("run_kernel.zig").command_line,
@@ -54,6 +55,10 @@ pub fn parse(args: []const []const u8) ParseError!AppConfig {
         }
         if (std.mem.eql(u8, argument, "--no-audio")) {
             result.audio_enabled = false;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--no-3d")) {
+            result.gpu_3d_enabled = false;
             continue;
         }
         index += 1;
@@ -218,4 +223,9 @@ test "snapshot restore directory is accepted" {
 test "audio defaults on and can be disabled" {
     try std.testing.expect((try parse(&.{})).audio_enabled);
     try std.testing.expect(!(try parse(&.{"--no-audio"})).audio_enabled);
+}
+
+test "3D acceleration defaults on and can be disabled" {
+    try std.testing.expect((try parse(&.{})).gpu_3d_enabled);
+    try std.testing.expect(!(try parse(&.{"--no-3d"})).gpu_3d_enabled);
 }

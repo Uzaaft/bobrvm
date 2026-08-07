@@ -690,18 +690,23 @@ pub const Machine = struct {
         );
     }
 
-    /// Attach a 2D virtio-GPU whose scanout can be consumed by the host UI.
+    /// Attach a virtio-GPU whose scanout can be consumed by the host UI.
     pub fn attachDisplay(
         self: *Machine,
         allocator: std.mem.Allocator,
         width: u32,
         height: u32,
         gpu_memory_bytes: u64,
+        enable_3d: bool,
     ) AttachDisplayError!void {
         std.debug.assert(self.gpu == null);
         std.debug.assert(self.pci_gpu == null);
 
-        const gpu = try virtio.Gpu.initWithMemoryLimit(allocator, false, gpu_memory_bytes);
+        const gpu = try virtio.Gpu.initWithMemoryLimit(
+            allocator,
+            enable_3d,
+            gpu_memory_bytes,
+        );
         errdefer gpu.deinit();
         gpu.setDisplaySize(width, height);
         gpu.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));

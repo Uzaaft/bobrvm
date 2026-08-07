@@ -49,12 +49,20 @@ pub const GpuDevice = struct {
         self.resources.deinit();
     }
 
+    pub fn supportsAcceleration(_: *const GpuDevice) bool {
+        return false;
+    }
+
     pub fn createContextId(self: *GpuDevice, id: u32) Error!void {
         try self.contexts.put(id, {});
     }
 
     pub fn destroyContextId(self: *GpuDevice, id: u32) void {
         _ = self.contexts.remove(id);
+    }
+
+    pub fn hasContext(self: *const GpuDevice, id: u32) bool {
+        return self.contexts.contains(id);
     }
 
     pub fn createResourceRecord(self: *GpuDevice, resource: Resource) Error!void {
@@ -64,6 +72,14 @@ pub const GpuDevice = struct {
     pub fn getResource(self: *GpuDevice, handle: u32) ?*Resource {
         return self.resources.getPtr(handle);
     }
+
+    pub fn removeResource(self: *GpuDevice, handle: u32) void {
+        _ = self.resources.remove(handle);
+    }
+
+    pub fn attachResource(_: *GpuDevice, _: u32, _: u32) void {}
+
+    pub fn detachResource(_: *GpuDevice, _: u32, _: u32) void {}
 
     pub fn submit(self: *GpuDevice, context_id: u32, commands: []const u8) Error!void {
         _ = self;

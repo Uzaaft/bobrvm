@@ -101,6 +101,11 @@ pub fn build(b: *std.Build) !void {
         "gpu-venus",
         "Enable the Venus/KosmicKrisp GPU backend",
     ) orelse false;
+    const gpu_virglrenderer = b.option(
+        bool,
+        "gpu-virglrenderer",
+        "Enable the Linux virglrenderer GPU backend",
+    ) orelse (target.result.os.tag == .linux);
     const home = environmentVariable(b, "HOME") orelse "/tmp";
     const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-upstream", .{home});
     const virgl_prefix = b.option(
@@ -112,6 +117,7 @@ pub fn build(b: *std.Build) !void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "gpu_venus", gpu_venus);
+    build_options.addOption(bool, "gpu_virglrenderer", gpu_virglrenderer);
     // Carried into venus.zig so it can self-configure the render-server binary +
     // KosmicKrisp ICD paths from this install prefix (no manual env needed).
     build_options.addOption([]const u8, "virgl_prefix", virgl_prefix);
@@ -131,6 +137,12 @@ pub fn build(b: *std.Build) !void {
                 m.linkSystemLibrary("virglrenderer", .{});
                 m.addRPath(.{ .cwd_relative = libdir });
             }
+        }
+    }.apply;
+
+    const wireVirglrenderer = struct {
+        fn apply(m: *std.Build.Module, enabled: bool) void {
+            if (enabled) m.linkSystemLibrary("virglrenderer", dynamic_link_options);
         }
     }.apply;
 
@@ -170,6 +182,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(root_module, build_options, gpu_venus, virgl_lib);
+    wireVirglrenderer(root_module, gpu_virglrenderer);
 
     const lib = if (target.result.os.tag == .macos)
         b.addLibrary(.{
@@ -226,6 +239,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
+    wireVirglrenderer(cli_module, gpu_virglrenderer);
     if (target.result.os.tag == .linux) {
         cli_module.linkSystemLibrary("alsa", dynamic_link_options);
     }
@@ -246,6 +260,7 @@ pub fn build(b: *std.Build) !void {
             .link_libc = true,
         });
         wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
+        wireVirglrenderer(gtk_module, gpu_virglrenderer);
         gtk_module.linkSystemLibrary("gtk4", dynamic_link_options);
         gtk_module.linkSystemLibrary("alsa", dynamic_link_options);
         const gtk_exe = b.addExecutable(.{
@@ -400,6 +415,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(test_module, build_options, gpu_venus, virgl_lib);
+    wireVirglrenderer(test_module, gpu_virglrenderer);
 
     // Test step
     const main_tests = b.addTest(.{

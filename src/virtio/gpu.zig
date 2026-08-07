@@ -19,8 +19,11 @@ const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 const virgl = @import("../gpu/virgl/main.zig");
+const gpu_virglrenderer = @import("build_options").gpu_virglrenderer;
 const gpu_module = if (builtin.os.tag == .macos)
     @import("../gpu/main.zig")
+else if (gpu_virglrenderer)
+    @import("../gpu/virglrenderer.zig")
 else
     @import("../gpu/stub.zig");
 const iosurface = @import("../gpu/iosurface.zig");
@@ -626,11 +629,13 @@ pub const Gpu = struct {
     /// resource id. 3D resources live in gpu_device, not self.resources, so
     /// their backing is tracked here rather than on a Resource2D.
     backing3d: std.AutoHashMap(u32, BackingEntries),
-    /// Readback of a 3D-rendered scanout resource's MTLTexture, so the
-    /// present path (which serves BGRA host pixels) can display GPU output.
+    /// Conservative allocation charge for each guest-created 3D resource.
+    resource3d_bytes: std.AutoHashMap(u32, u64),
+    /// Readback of a host-rendered 3D scanout, so the present path can display
+    /// GPU output as BGRA pixels when direct sharing is unavailable.
     scanout3d_data: []u8 = &.{},
     /// Grow-only scratch storage used to gather scattered guest texture data
-    /// before the synchronous Metal upload.
+    /// before a synchronous host-GPU upload.
     transfer3d_staging: []u8 = &.{},
     scanout3d_w: u32 = 0,
     scanout3d_h: u32 = 0,
@@ -707,14 +712,21 @@ pub const Gpu = struct {
     ) Error!*Gpu {
         assert(memory_bytes_limit >= config_policy.gpu_memory_bytes_min);
         assert(memory_bytes_limit <= config_policy.gpu_memory_bytes_max);
+        var gpu_device = if (comptime builtin.os.tag == .linux and gpu_virglrenderer)
+            gpu_module.GpuDevice.initWithAcceleration(alloc, enable_virgl)
+        else
+            gpu_module.GpuDevice.init(alloc);
+        errdefer gpu_device.deinit();
+        const virgl_active = enable_virgl and gpu_device.supportsAcceleration();
+
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         var features = virtio_version_1 | Features.EDID;
-        if (enable_virgl) features |= Features.VIRGL;
+        if (virgl_active) features |= Features.VIRGL;
         // Venus contexts are selected via the context_init capset id, which
         // needs VIRTIO_GPU_F_CONTEXT_INIT; venus also *requires* blob resources
         // (guest kernel VIRTGPU_PARAM_RESOURCE_BLOB — "kernel param 3").
-        if (gpu_venus and enable_virgl) features |= Features.CONTEXT_INIT | Features.RESOURCE_BLOB;
+        if (gpu_venus and virgl_active) features |= Features.CONTEXT_INIT | Features.RESOURCE_BLOB;
         const transport = try mmio.Transport.init(alloc, 16, features, 2); // 16 = GPU device ID
         errdefer transport.deinit(alloc);
 
@@ -723,7 +735,7 @@ pub const Gpu = struct {
 
         // Advertise the Venus capset (index 2, id 4) in addition to VIRGL/VIRGL2
         // when the venus host is available.
-        const num_capsets: u32 = if (!enable_virgl) 0 else if (gpu_venus) 3 else 2;
+        const num_capsets: u32 = if (!virgl_active) 0 else if (gpu_venus) 3 else 2;
 
         gpu.* = .{
             .alloc = alloc,
@@ -742,9 +754,10 @@ pub const Gpu = struct {
             .display_height = 800,
             .guest_memory = null,
             .frame_ready = null,
-            .virgl_enabled = enable_virgl,
-            .gpu_device = gpu_module.GpuDevice.init(alloc),
+            .virgl_enabled = virgl_active,
+            .gpu_device = gpu_device,
             .backing3d = std.AutoHashMap(u32, BackingEntries).init(alloc),
+            .resource3d_bytes = std.AutoHashMap(u32, u64).init(alloc),
             .scanout3d_data = &.{},
             .transfer3d_staging = &.{},
             .scanout3d_w = 0,
@@ -765,7 +778,7 @@ pub const Gpu = struct {
         // failure we simply don't advertise a usable venus capset — the guest
         // falls back to the legacy virgl path.
         if (comptime gpu_venus) {
-            if (enable_virgl) {
+            if (virgl_active) {
                 if (venus.ensureHost()) |h| {
                     gpu.venus_host = h.*;
                     log.info("venus GPU backend active (capset {d})", .{CAPSET_VENUS});
@@ -790,6 +803,7 @@ pub const Gpu = struct {
         var b3d = self.backing3d.valueIterator();
         while (b3d.next()) |list| list.deinit(self.alloc);
         self.backing3d.deinit();
+        self.resource3d_bytes.deinit();
         if (self.scanout3d_data.len > 0) self.alloc.free(self.scanout3d_data);
         if (self.transfer3d_staging.len > 0) self.alloc.free(self.transfer3d_staging);
         self.venus_contexts.deinit();
@@ -1264,9 +1278,11 @@ pub const Gpu = struct {
                     resp_type = .resp_err_unspec;
                 }
             },
-            .ctx_attach_resource, .ctx_detach_resource => {
-                // Resource<->context association: accepted (tracked later).
-                resp_type = if (self.virgl_enabled) .resp_ok_nodata else .resp_err_unspec;
+            .ctx_attach_resource => {
+                resp_type = self.cmdContextResource(header, req, true);
+            },
+            .ctx_detach_resource => {
+                resp_type = self.cmdContextResource(header, req, false);
             },
             .resource_create_3d => {
                 resp_type = self.cmdResourceCreate3D(req);
@@ -1344,6 +1360,9 @@ pub const Gpu = struct {
         const cmd = std.mem.bytesToValue(ResourceCreate2D, req[0..@sizeOf(ResourceCreate2D)]);
 
         if (cmd.resource_id == 0) return .resp_err_invalid_resource_id;
+        if (self.gpu_device.getResource(cmd.resource_id) != null) {
+            return .resp_err_invalid_resource_id;
+        }
         if (cmd.width == 0 or cmd.height == 0) return .resp_err_invalid_parameter;
         if (cmd.width > MAX_RESOURCE_DIM or cmd.height > MAX_RESOURCE_DIM) {
             return .resp_err_invalid_parameter;
@@ -1429,6 +1448,22 @@ pub const Gpu = struct {
             }
         }
 
+        if (self.gpu_device.getResource(cmd.resource_id) != null) {
+            self.gpu_device.removeResource(cmd.resource_id);
+            if (self.resource3d_bytes.fetchRemove(cmd.resource_id)) |charged| {
+                assert(self.memory_bytes_used >= charged.value);
+                self.memory_bytes_used -= charged.value;
+            }
+            if (self.backing3d.fetchRemove(cmd.resource_id)) |backing| {
+                var entries = backing.value;
+                entries.deinit(self.alloc);
+            }
+            if (self.scanout_resource_id == cmd.resource_id) {
+                self.scanout_resource_id = 0;
+            }
+            return .resp_ok_nodata;
+        }
+
         return .resp_err_invalid_resource_id;
     }
 
@@ -1462,8 +1497,28 @@ pub const Gpu = struct {
             });
             return .resp_err_invalid_resource_id;
         }
+        if (cmd.resource_id != 0) {
+            const dimensions = if (self.resources.get(cmd.resource_id)) |resource|
+                .{ resource.width, resource.height }
+            else if (self.gpu_device.getResource(cmd.resource_id)) |resource|
+                .{ resource.width, resource.height }
+            else
+                unreachable;
+            const right = std.math.add(u32, cmd.r.x, cmd.r.width) catch
+                return .resp_err_invalid_parameter;
+            const bottom = std.math.add(u32, cmd.r.y, cmd.r.height) catch
+                return .resp_err_invalid_parameter;
+            if (cmd.r.width == 0 or cmd.r.height == 0 or
+                right > dimensions[0] or bottom > dimensions[1])
+            {
+                return .resp_err_invalid_parameter;
+            }
+        }
         self.scanout_resource_id = cmd.resource_id;
         self.scanout_rect = cmd.r;
+        if (cmd.resource_id != 0 and !self.resources.contains(cmd.resource_id)) {
+            self.refresh3dScanout();
+        }
         self.frame_generation +%= 1; // new scanout target: force a present
         _ = self.presentation_generation.fetchAdd(1, .release);
         // A page flip IS a new frame. Compositors that drive KMS (niri and
@@ -1540,9 +1595,8 @@ pub const Gpu = struct {
         return .resp_ok_nodata;
     }
 
-    /// Read the current 3D scanout resource's MTLTexture into the host
-    /// present buffer. No-op for 2D scanouts (served from Resource2D) or when
-    /// there is no GPU-backed texture.
+    /// Read the current 3D scanout into the host present buffer. No-op for 2D
+    /// scanouts or when there is no GPU-backed texture.
     fn refresh3dScanout(self: *Gpu) void {
         const id = self.scanout_resource_id;
         if (id == 0) return;
@@ -1632,7 +1686,7 @@ pub const Gpu = struct {
     /// Transfer guest data into a 3D (virgl) resource. Only buffer resources
     /// are handled here — vertex/index/constant uploads — which is what
     /// draw_vbo needs. The scattered guest backing is copied straight into
-    /// the resource's shared-storage MTLBuffer (zero staging copy).
+    /// the host renderer's persistently attached buffer.
     fn cmdTransferToHost3D(self: *Gpu, req: []const u8, get_mem: anytype) CmdType {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (req.len < @sizeOf(TransferHost3D)) return .resp_err_invalid_parameter;
@@ -1691,7 +1745,7 @@ pub const Gpu = struct {
                 error.OutOfMemory => return .resp_err_out_of_memory,
                 error.InvalidBacking => return .resp_err_unspec,
             };
-            // No Metal backing (decode-only CI) is not an error, but the
+            // No host-renderer backing (decode-only CI) is not an error, but the
             // outcome is worth counting: a texture that never lands is why a
             // guest's textured draws come out blank.
             const up_ok = self.gpu_device.uploadToTextureRegion(
@@ -1899,13 +1953,25 @@ pub const Gpu = struct {
         switch (cmd.capset_index) {
             0 => {
                 info.capset_id = CAPSET_VIRGL;
-                info.capset_max_version = 1;
-                info.capset_max_size = CAPS_V1_SIZE;
+                if (comptime builtin.os.tag == .linux and gpu_virglrenderer) {
+                    const capset = self.gpu_device.getCapset(CAPSET_VIRGL);
+                    info.capset_max_version = capset.max_version;
+                    info.capset_max_size = capset.max_size;
+                } else {
+                    info.capset_max_version = 1;
+                    info.capset_max_size = CAPS_V1_SIZE;
+                }
             },
             1 => {
                 info.capset_id = CAPSET_VIRGL2;
-                info.capset_max_version = 2;
-                info.capset_max_size = CAPS_V2_SIZE;
+                if (comptime builtin.os.tag == .linux and gpu_virglrenderer) {
+                    const capset = self.gpu_device.getCapset(CAPSET_VIRGL2);
+                    info.capset_max_version = capset.max_version;
+                    info.capset_max_size = capset.max_size;
+                } else {
+                    info.capset_max_version = 2;
+                    info.capset_max_size = CAPS_V2_SIZE;
+                }
             },
             2 => {
                 // Venus capset — advertised only when compiled in and the host is up.
@@ -1929,6 +1995,23 @@ pub const Gpu = struct {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (req.len < @sizeOf(GetCapset)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(GetCapset, req[0..@sizeOf(GetCapset)]);
+
+        if (comptime builtin.os.tag == .linux and gpu_virglrenderer) {
+            if (cmd.capset_id != CAPSET_VIRGL and cmd.capset_id != CAPSET_VIRGL2) {
+                return .resp_err_invalid_parameter;
+            }
+            const capset = self.gpu_device.getCapset(cmd.capset_id);
+            if (capset.max_size == 0 or cmd.capset_version > capset.max_version) {
+                return .resp_err_invalid_parameter;
+            }
+            if (resp.len < @sizeOf(CtrlHeader) + capset.max_size) {
+                return .resp_err_unspec;
+            }
+            const blob = resp[@sizeOf(CtrlHeader)..][0..capset.max_size];
+            self.gpu_device.fillCaps(cmd.capset_id, cmd.capset_version, blob);
+            resp_len.* = @sizeOf(CtrlHeader) + capset.max_size;
+            return .resp_ok_capset;
+        }
 
         // Venus caps come from virglrenderer itself (its size is host-defined).
         var venus_ver: u32 = 0;
@@ -2120,15 +2203,79 @@ pub const Gpu = struct {
         return .resp_ok_nodata;
     }
 
+    fn cmdContextResource(
+        self: *Gpu,
+        header: CtrlHeader,
+        req: []const u8,
+        attach: bool,
+    ) CmdType {
+        if (!self.virgl_enabled) return .resp_err_unspec;
+        if (req.len < @sizeOf(CtxResource)) return .resp_err_invalid_parameter;
+        const cmd = std.mem.bytesToValue(CtxResource, req[0..@sizeOf(CtxResource)]);
+
+        if (comptime gpu_venus) {
+            if (self.venus_contexts.contains(header.ctx_id)) {
+                const host = if (self.venus_host) |*value| value else return .resp_err_unspec;
+                if (attach) {
+                    host.attachResource(header.ctx_id, cmd.resource_id);
+                } else {
+                    host.detachResource(header.ctx_id, cmd.resource_id);
+                }
+                return .resp_ok_nodata;
+            }
+        }
+
+        if (self.gpu_device.getResource(cmd.resource_id) == null) {
+            return .resp_err_invalid_resource_id;
+        }
+        if (!self.gpu_device.hasContext(header.ctx_id)) {
+            return .resp_err_invalid_context_id;
+        }
+        if (attach) {
+            self.gpu_device.attachResource(header.ctx_id, cmd.resource_id);
+        } else {
+            self.gpu_device.detachResource(header.ctx_id, cmd.resource_id);
+        }
+        return .resp_ok_nodata;
+    }
+
     fn cmdResourceCreate3D(self: *Gpu, req: []const u8) CmdType {
         if (!self.virgl_enabled) return .resp_err_unspec;
         if (req.len < @sizeOf(ResourceCreate3D)) return .resp_err_invalid_parameter;
         const cmd = std.mem.bytesToValue(ResourceCreate3D, req[0..@sizeOf(ResourceCreate3D)]);
         if (cmd.resource_id == 0) return .resp_err_invalid_resource_id;
+        if (self.resources.contains(cmd.resource_id) or
+            self.gpu_device.getResource(cmd.resource_id) != null)
+        {
+            return .resp_err_invalid_resource_id;
+        }
+        if (cmd.width == 0 or cmd.target > @intFromEnum(virgl.context.ResourceTarget.texture_cube_array) or
+            cmd.last_level > 15 or !validSampleCount(cmd.nr_samples))
+        {
+            return .resp_err_invalid_parameter;
+        }
+        const target: virgl.context.ResourceTarget = @enumFromInt(
+            @as(u8, @truncate(cmd.target)),
+        );
+        if (target != .buffer and
+            (cmd.width > MAX_RESOURCE_DIM or cmd.height == 0 or
+                cmd.height > MAX_RESOURCE_DIM or cmd.depth == 0 or
+                cmd.depth > MAX_RESOURCE_DIM or cmd.array_size == 0 or
+                cmd.array_size > MAX_RESOURCE_DIM))
+        {
+            return .resp_err_invalid_parameter;
+        }
+        const charged_bytes = resource3dCharge(cmd, target) orelse
+            return .resp_err_out_of_memory;
+        const memory_after = std.math.add(u64, self.memory_bytes_used, charged_bytes) catch
+            return .resp_err_out_of_memory;
+        if (memory_after > self.memory_bytes_limit) return .resp_err_out_of_memory;
+        self.resource3d_bytes.ensureUnusedCapacity(1) catch
+            return .resp_err_out_of_memory;
 
         self.gpu_device.createResourceRecord(.{
             .handle = cmd.resource_id,
-            .target = @enumFromInt(@as(u8, @truncate(cmd.target))),
+            .target = target,
             .format = @enumFromInt(cmd.format),
             .width = cmd.width,
             .height = cmd.height,
@@ -2139,7 +2286,30 @@ pub const Gpu = struct {
             .flags = cmd.flags,
             .bind = cmd.bind,
         }) catch return .resp_err_out_of_memory;
+        self.resource3d_bytes.putAssumeCapacity(cmd.resource_id, charged_bytes);
+        self.memory_bytes_used = memory_after;
         return .resp_ok_nodata;
+    }
+
+    fn resource3dCharge(
+        cmd: ResourceCreate3D,
+        target: virgl.context.ResourceTarget,
+    ) ?u64 {
+        if (target == .buffer) return cmd.width;
+        var bytes = std.math.mul(u64, cmd.width, cmd.height) catch return null;
+        bytes = std.math.mul(u64, bytes, cmd.depth) catch return null;
+        bytes = std.math.mul(u64, bytes, cmd.array_size) catch return null;
+        bytes = std.math.mul(u64, bytes, @max(cmd.nr_samples, 1)) catch return null;
+        bytes = std.math.mul(u64, bytes, 16) catch return null;
+        // A full mip chain consumes less than twice the base level.
+        return std.math.mul(u64, bytes, if (cmd.last_level == 0) 1 else 2) catch null;
+    }
+
+    fn validSampleCount(samples: u32) bool {
+        return switch (samples) {
+            0, 1, 2, 4, 8, 16 => true,
+            else => false,
+        };
     }
 
     fn cmdSubmit3D(
@@ -2365,6 +2535,60 @@ test "virgl capset info and submit decode" {
     // Destroy
     gpu.gpu_device.destroyContextId(7);
     try testing.expect(!gpu.gpu_device.contexts.contains(7));
+}
+
+test "3D resources are bounded, charged, and released" {
+    const gpu = try Gpu.initWithMemoryLimit(
+        testing.allocator,
+        true,
+        config_policy.gpu_memory_bytes_min,
+    );
+    defer gpu.deinit();
+    if (!gpu.virgl_enabled) return error.SkipZigTest;
+
+    var create = ResourceCreate3D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_3d) },
+        .resource_id = 41,
+        .target = @intFromEnum(virgl.context.ResourceTarget.buffer),
+        .format = @intFromEnum(virgl.protocol.Format.r8_unorm),
+        .bind = 1 << 4,
+        .width = 4096,
+        .height = 1,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+    };
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdResourceCreate3D(std.mem.asBytes(&create)),
+    );
+    try testing.expectEqual(@as(u64, 4096), gpu.memory_bytes_used);
+    try testing.expectEqual(@as(u64, 4096), gpu.resource3d_bytes.get(41).?);
+
+    const unref = ResourceUnref{
+        .header = .{ .type = @intFromEnum(CmdType.resource_unref) },
+        .resource_id = 41,
+    };
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdResourceUnref(std.mem.asBytes(&unref)),
+    );
+    try testing.expectEqual(@as(u64, 0), gpu.memory_bytes_used);
+
+    create.resource_id = 42;
+    create.width = @intCast(config_policy.gpu_memory_bytes_min + 1);
+    try testing.expectEqual(
+        CmdType.resp_err_out_of_memory,
+        gpu.cmdResourceCreate3D(std.mem.asBytes(&create)),
+    );
+    create.width = 4096;
+    create.nr_samples = 3;
+    try testing.expectEqual(
+        CmdType.resp_err_invalid_parameter,
+        gpu.cmdResourceCreate3D(std.mem.asBytes(&create)),
+    );
 }
 
 test "transfer_to_host_2d full-width fast path matches guest backing" {

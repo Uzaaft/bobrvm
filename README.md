@@ -5,11 +5,12 @@ uses Hypervisor.framework and macOS guests use Apple's Virtualization framework.
 On x86-64 Linux, the direct-boot VM uses KVM with a GTK host application. The
 platform applications stay thin while Zig owns virtualization and devices.
 
-The project is under active development. Linux guests can boot NixOS to a GUI
-or headless console with SMP, persistent virtio disks, input, built-in NAT, and
-2D virtio-GPU display output. On Apple Silicon, the optional Venus stack supports Vulkan 1.4 and
-OpenGL 4.6 through Zink using the vendored GPU dependencies in `third_party/`.
-The legacy virgl translator is a GL 2.x fallback.
+The project is under active development. Linux guests can boot to a GUI or
+headless console with SMP, persistent virtio disks, input, built-in NAT, audio,
+and accelerated virtio-GPU display output. Linux uses virglrenderer with a
+surfaceless EGL context and falls back to the 2D scanout when the host renderer
+is unavailable. On Apple Silicon, the optional Venus stack supports Vulkan 1.4
+and OpenGL 4.6 through Zink using the vendored GPU dependencies in `third_party/`.
 
 macOS guests support IPSW installation, persistent hardware identity, and
 native display, input, networking, and audio devices.
@@ -57,8 +58,9 @@ bobrvm-gtk
 
 For automation, the GTK executable also accepts `--iso`, `--disk`, `--kernel`,
 `--initrd`, `--share`, `--restore`, repeatable `--forward host:guest`, `--memory`,
-`--cpus`, `--display WxH`, and `--gpu-memory MiB`. Stereo virtio-snd playback is
-enabled by default and can be disabled with `--no-audio`.
+`--cpus`, `--display WxH`, and `--gpu-memory MiB`. Stereo virtio-snd playback and
+accelerated virgl graphics are enabled by default; use `--no-audio` or `--no-3d`
+to disable them.
 The Nix development shell and package provide OVMF automatically;
 `BOBRVM_OVMF_FD` and `BOBRVM_OVMF_VARS_FD` can override its images. Saving a VM
 creates a private writable variable store so UEFI boot entries survive restarts.
@@ -67,7 +69,9 @@ The x86 host supports direct kernel boot and an OVMF firmware path with primary 
 secondary virtio-pci block devices, including read-only ISO installation media,
 plus virtio GPU, keyboard, tablet, entropy, networking, 9p shared-folder, and
 multiport console devices. Guest PCM output is buffered away from the vCPU hot
-path and played through the desktop's default ALSA route.
+path and played through the desktop's default ALSA route. Guest virgl commands
+execute through the host's surfaceless EGL renderer, while GTK remains a thin
+presenter for the resulting scanout.
 Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
 the vCPU thread. A virtio-net adapter uses the shared Zig user-mode NAT, with no TAP
 device or host privileges required. The GTK application presents the guest's
