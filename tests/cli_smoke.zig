@@ -170,10 +170,58 @@ fn checkPersistence(
     );
 }
 
+fn runLimitedChild(init: std.process.Init, cli: []const u8) !void {
+    const ignore_file_size = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = 0,
+        .flags = 0,
+    };
+    std.posix.sigaction(.XFSZ, &ignore_file_size, null);
+    try std.posix.setrlimit(.FSIZE, .{ .cur = 0, .max = 0 });
+    var result = try std.process.run(init.gpa, init.io, .{
+        .argv = &.{ cli, "create", "vm-fault" },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
+    defer deinitResult(init.gpa, &result);
+    if (result.term == .exited and result.term.exited == 0) return error.ExpectedWriteFailure;
+}
+
+fn expectNoConfigFiles(home: *const TempHome) !void {
+    var dir = try home.dir.openDir(home.io, ".config/bobrvm/vms", .{ .iterate = true });
+    defer dir.close(home.io);
+    var entries = dir.iterate();
+    if (try entries.next(home.io) != null) return error.UnexpectedConfigFile;
+}
+
+fn checkAtomicFailure(
+    init: std.process.Init,
+    environ: *const std.process.Environ.Map,
+    executable: []const u8,
+    cli: []const u8,
+    home: *const TempHome,
+) !void {
+    var failed = try run(init, environ, &.{ executable, "--limited-child", cli });
+    defer deinitResult(init.gpa, &failed);
+    try expectExit(failed, 0);
+    try expectNoConfigFiles(home);
+
+    var retry = try run(init, environ, &.{ cli, "create", "vm-fault" });
+    defer deinitResult(init.gpa, &retry);
+    try expectExit(retry, 0);
+
+    var delete = try run(init, environ, &.{ cli, "rm", "vm-fault" });
+    defer deinitResult(init.gpa, &delete);
+    try expectExit(delete, 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
-    _ = args.skip();
+    const executable = args.next() orelse return error.MissingExecutablePath;
     const cli = args.next() orelse return error.MissingCliPath;
+    if (std.mem.eql(u8, cli, "--limited-child")) {
+        return runLimitedChild(init, args.next() orelse return error.MissingCliPath);
+    }
 
     var home = try TempHome.init(init.io);
     defer home.deinit();
@@ -182,5 +230,6 @@ pub fn main(init: std.process.Init) !void {
     try environ.put("HOME", home.home());
 
     try checkDispatch(init, &environ, cli);
+    try checkAtomicFailure(init, &environ, executable, cli, &home);
     try checkPersistence(init, &environ, cli);
 }

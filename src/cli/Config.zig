@@ -240,6 +240,17 @@ pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
     return std.fs.path.join(alloc, &.{ dir, filename });
 }
 
+fn getTemporaryConfigPath(alloc: Allocator, dir_path: []const u8) ![]const u8 {
+    const random_len = 12;
+    var random: [random_len]u8 = undefined;
+    global.io().random(&random);
+    var encoded: [std.base64.url_safe.Encoder.calcSize(random_len)]u8 = undefined;
+    _ = std.base64.url_safe.Encoder.encode(&encoded, &random);
+    var filename_buffer: [encoded.len + ".part".len]u8 = undefined;
+    const filename = try std.fmt.bufPrint(&filename_buffer, "{s}.part", .{encoded});
+    return std.fs.path.join(alloc, &.{ dir_path, filename });
+}
+
 pub fn save(self: *const Config, alloc: Allocator) !void {
     try validateName(self.name);
 
@@ -256,13 +267,26 @@ pub fn save(self: *const Config, alloc: Allocator) !void {
     );
     defer alloc.free(json_bytes);
 
-    const file = try std.Io.Dir.createFileAbsolute(global.io(), config_path, .{
+    const temporary_path = try getTemporaryConfigPath(alloc, dir_path);
+    defer alloc.free(temporary_path);
+    var temporary_exists = false;
+    defer if (temporary_exists) {
+        std.Io.Dir.deleteFileAbsolute(global.io(), temporary_path) catch {};
+    };
+
+    const file = try std.Io.Dir.createFileAbsolute(global.io(), temporary_path, .{
         .exclusive = true,
     });
+    temporary_exists = true;
     defer file.close(global.io());
 
     try file.writePositionalAll(global.io(), json_bytes, 0);
     try file.writePositionalAll(global.io(), "\n", json_bytes.len);
+    try file.sync(global.io());
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.renamePreserve(temporary_path, cwd, config_path, global.io());
+    temporary_exists = false;
 }
 
 fn validateName(name: []const u8) ParseError!void {
