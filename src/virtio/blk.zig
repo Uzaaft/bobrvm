@@ -494,7 +494,8 @@ pub const Block = struct {
         var total: usize = 0;
         for (data) |desc| {
             if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
-            if (desc.len > self.config.size_max) return .io_err;
+            if (self.transport.driver_features & Features.SIZE_MAX != 0 and
+                desc.len > self.config.size_max) return .io_err;
             buffers[count] = memory.get(desc.addr, desc.len) orelse return .io_err;
             total = std.math.add(usize, total, buffers[count].len) catch return .io_err;
             count += 1;
@@ -537,7 +538,8 @@ pub const Block = struct {
         var total: usize = 0;
         for (data) |desc| {
             if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
-            if (desc.len > self.config.size_max) return .io_err;
+            if (self.transport.driver_features & Features.SIZE_MAX != 0 and
+                desc.len > self.config.size_max) return .io_err;
             buffers[count] = memory.get(desc.addr, desc.len) orelse return .io_err;
             total = std.math.add(usize, total, buffers[count].len) catch return .io_err;
             count += 1;
@@ -883,6 +885,53 @@ test "block rejects overflowing sector offsets" {
     const memory = GuestMemory.bindGlobal(Ctx.get);
 
     try std.testing.expectEqual(Status.io_err, blk.executeRequest(header, &data, memory, &written));
+}
+
+test "size_max applies only when negotiated" {
+    const io = global.io();
+    const path = ".zig-cache/blk-size-max-test.raw";
+    var disk: [8192]u8 = undefined;
+    for (&disk, 0..) |*byte, index| byte.* = @truncate(index);
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, &disk, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, true);
+
+    const Ctx = struct {
+        var mem: [8192]u8 = @splat(0);
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const offset = addr - 0x1000;
+            if (offset + len > mem.len) return null;
+            return mem[offset..][0..len];
+        }
+    };
+    const data = [_]Block.GuestDesc{.{
+        .addr = 0x1000,
+        .len = 8192,
+        .flags = Block.GuestDesc.F_WRITE,
+        .next = 0,
+    }};
+    const header = RequestHeader{ .type = @intFromEnum(RequestType.in), .sector = 0 };
+    const memory = GuestMemory.bindGlobal(Ctx.get);
+    var written: u32 = 0;
+
+    try std.testing.expectEqual(Status.ok, blk.executeRequest(header, &data, memory, &written));
+    try std.testing.expectEqual(@as(u32, 8192), written);
+    try std.testing.expectEqualSlices(u8, &disk, &Ctx.mem);
+
+    blk.transport.driver_features |= Features.SIZE_MAX;
+    written = 0;
+    try std.testing.expectEqual(
+        Status.io_err,
+        blk.executeRequest(header, &data, memory, &written),
+    );
 }
 
 test "vectored block reads and writes preserve descriptor order" {
