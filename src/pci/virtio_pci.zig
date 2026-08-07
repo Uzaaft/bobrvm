@@ -721,7 +721,7 @@ pub const VirtioPciDevice = struct {
     /// Read PCI configuration space.
     pub fn readConfig(self: *VirtioPciDevice, offset: u12, size: u8) u64 {
         assert(size == 1 or size == 2 or size == 4);
-        if (offset + size > 4096) return 0xFFFFFFFF;
+        if (@as(usize, offset) + size > self.config.len) return 0xFFFFFFFF;
 
         return switch (size) {
             1 => self.config[offset],
@@ -737,6 +737,7 @@ pub const VirtioPciDevice = struct {
     /// Write PCI configuration space.
     pub fn writeConfig(self: *VirtioPciDevice, offset: u12, size: u8, value: u64) void {
         assert(size == 1 or size == 2 or size == 4);
+        if (@as(usize, offset) + size > self.config.len) return;
 
         switch (offset) {
             0x04 => {
@@ -938,6 +939,16 @@ test "VirtioPciDevice init and config" {
     // Check capabilities pointer
     const cap_ptr = dev.readConfig(0x34, 1);
     try std.testing.expectEqual(@as(u64, 0x40), cap_ptr);
+}
+
+test "VirtioPciDevice rejects config reads crossing its address space" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 0, 1, 64);
+    defer dev.deinit();
+
+    try std.testing.expectEqual(
+        @as(u64, 0xFFFF_FFFF),
+        dev.readConfig(std.math.maxInt(u12), 4),
+    );
 }
 
 test "VirtioPciDevice allocation profile" {
