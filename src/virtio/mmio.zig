@@ -320,18 +320,20 @@ pub const Transport = struct {
     }
 
     fn readDeviceFeatures(self: *Transport) u32 {
-        if (self.device_features_sel == 0) {
-            return @truncate(self.device_features);
-        } else {
-            return @truncate(self.device_features >> 32);
-        }
+        return switch (self.device_features_sel) {
+            0 => @truncate(self.device_features),
+            1 => @truncate(self.device_features >> 32),
+            else => 0,
+        };
     }
 
     fn writeDriverFeatures(self: *Transport, value: u32) void {
-        if (self.driver_features_sel == 0) {
-            self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value;
-        } else {
-            self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32);
+        switch (self.driver_features_sel) {
+            0 => self.driver_features =
+                (self.driver_features & 0xFFFFFFFF00000000) | value,
+            1 => self.driver_features =
+                (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32),
+            else => {},
         }
     }
 
@@ -507,4 +509,20 @@ test "Transport reset deasserts IRQ and notifications require DRIVER_OK" {
     try std.testing.expect(state.irq_level);
     transport.write(@intFromEnum(Reg.status), 0);
     try std.testing.expect(!state.irq_level);
+}
+
+test "Transport ignores feature selector pages above one" {
+    const transport = try Transport.init(
+        std.testing.allocator,
+        3,
+        0x1122_3344_5566_7788,
+        1,
+    );
+    defer transport.deinit(std.testing.allocator);
+
+    transport.write(@intFromEnum(Reg.device_features_sel), 2);
+    try std.testing.expectEqual(@as(u32, 0), transport.read(@intFromEnum(Reg.device_features)));
+    transport.write(@intFromEnum(Reg.driver_features_sel), 2);
+    transport.write(@intFromEnum(Reg.driver_features), 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u64, 0), transport.driver_features);
 }
