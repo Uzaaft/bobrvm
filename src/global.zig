@@ -3,8 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const os = @import("os/main.zig");
-const apprt = @import("apprt/main.zig");
 
 pub var state: GlobalState = .{};
 
@@ -13,9 +11,6 @@ pub const GlobalState = struct {
 
     initialized: bool = false,
 
-    /// Only one app per process.
-    active_app: ?*apprt.App = null,
-
     pub fn init(self: *GlobalState) void {
         if (self.initialized) return;
 
@@ -23,21 +18,12 @@ pub const GlobalState = struct {
             self.logging = parseLoggingConfig(std.mem.span(env_value));
         }
 
-        os.signal.registerCleanup(signalCleanup);
-
         self.initialized = true;
     }
 
     /// Deinitialize global state.
     pub fn deinit(self: *GlobalState) void {
-        os.signal.unregisterCleanup();
-        self.active_app = null;
         self.initialized = false;
-    }
-
-    /// Register the active app for signal cleanup.
-    pub fn setActiveApp(self: *GlobalState, app: ?*apprt.App) void {
-        self.active_app = app;
     }
 };
 
@@ -53,14 +39,6 @@ pub const GlobalState = struct {
 /// going through GlobalState.init().
 pub fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
-}
-
-/// Signal cleanup callback - destroys the active app.
-fn signalCleanup() void {
-    if (state.active_app) |app| {
-        app.destroy();
-        state.active_app = null;
-    }
 }
 
 pub const Logging = packed struct {

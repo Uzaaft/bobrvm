@@ -296,9 +296,6 @@ pub const App = struct {
         assert(app.vms_head == null);
         assert(app.vm_count == 0);
 
-        // Register with global state for signal cleanup
-        global.state.setActiveApp(app);
-
         log.info("app created successfully", .{});
         return app;
     }
@@ -308,9 +305,6 @@ pub const App = struct {
         assert(self.vm_count <= 1024); // Sanity bound
 
         log.debug("destroying app with {} VMs", .{self.vm_count});
-
-        // Unregister from global state
-        global.state.setActiveApp(null);
 
         while (self.vms_head) |vm| vm.destroy();
         assert(self.vm_count == 0);

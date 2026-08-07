@@ -4,10 +4,41 @@
 #include "bobrvm.h"
 
 #include <assert.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static struct sigaction old_sigint;
+static struct sigaction old_sigterm;
+
+static void host_signal_handler(int signal_number) {
+    (void)signal_number;
+}
+
+static void install_host_signal_handlers(void) {
+    struct sigaction action = {0};
+
+    action.sa_handler = host_signal_handler;
+    assert(sigemptyset(&action.sa_mask) == 0);
+    assert(sigaction(SIGINT, &action, &old_sigint) == 0);
+    assert(sigaction(SIGTERM, &action, &old_sigterm) == 0);
+}
+
+static void assert_host_signal_handlers(void) {
+    struct sigaction action = {0};
+
+    assert(sigaction(SIGINT, NULL, &action) == 0);
+    assert(action.sa_handler == host_signal_handler);
+    assert(sigaction(SIGTERM, NULL, &action) == 0);
+    assert(action.sa_handler == host_signal_handler);
+}
+
+static void restore_host_signal_handlers(void) {
+    assert(sigaction(SIGINT, &old_sigint, NULL) == 0);
+    assert(sigaction(SIGTERM, &old_sigterm, NULL) == 0);
+}
 
 static void test_configuration(void) {
     bobrvm_vm_config_s config = bobrvm_vm_config_defaults();
@@ -139,7 +170,9 @@ static void test_null_handles(void) {
 int main(void) {
     bobrvm_build_mode_e build_mode;
 
+    install_host_signal_handlers();
     bobrvm_init();
+    assert_host_signal_handlers();
 
     assert(strcmp(bobrvm_version(), "0.1.0") == 0);
     build_mode = bobrvm_build_mode();
@@ -155,5 +188,7 @@ int main(void) {
     test_null_handles();
 
     bobrvm_deinit();
+    assert_host_signal_handlers();
+    restore_host_signal_handlers();
     return 0;
 }
