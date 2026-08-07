@@ -242,6 +242,11 @@ pub const MouseButton = enum(c_int) {
     left = 0,
     right = 1,
     middle = 2,
+
+    /// Decode an untrusted C enum value without trapping.
+    pub fn fromInt(value: c_int) ?MouseButton {
+        return std.enums.fromInt(MouseButton, value);
+    }
 };
 
 /// Content scale for HiDPI displays.
@@ -249,6 +254,11 @@ pub const ContentScale = extern struct {
     x: f64 = 1.0,
     y: f64 = 1.0,
 };
+
+/// Return whether a C-provided scale is safe for coordinate conversion.
+pub fn contentScaleValid(x: f64, y: f64) bool {
+    return std.math.isFinite(x) and std.math.isFinite(y) and x > 0.0 and y > 0.0;
+}
 
 /// Application instance.
 /// Manages VMs and coordinates with Swift runtime via callbacks.
@@ -1025,8 +1035,10 @@ pub const Surface = struct {
     }
 
     pub fn handleMouseScroll(self: *Surface, dx: f64, dy: f64) void {
+        const delta_x = scrollDelta(dx) orelse return;
+        const delta_y = scrollDelta(dy) orelse return;
         const hw = self.vm.hw_machine orelse return;
-        hw.injectScroll(@intFromFloat(dx), @intFromFloat(dy));
+        hw.injectScroll(delta_x, delta_y);
     }
 };
 
@@ -1038,6 +1050,13 @@ fn pointerAxis(value: f64, content_scale: f64, surface_pixels: u32) i32 {
     const clamped = @max(0.0, @min(value, extent_points));
     const axis_max = 32767.0;
     return @intFromFloat(clamped * axis_max / extent_points);
+}
+
+fn scrollDelta(value: f64) ?i32 {
+    if (!std.math.isFinite(value)) return null;
+    const min: f64 = @floatFromInt(std.math.minInt(i32));
+    const max: f64 = @floatFromInt(std.math.maxInt(i32));
+    return @intFromFloat(std.math.clamp(value, min, max));
 }
 
 // =============================================================================
@@ -1058,6 +1077,25 @@ test "pointer axis maps view points through backing scale" {
     try std.testing.expectEqual(@as(i32, 16383), pointerAxis(500, 2, 2000));
     try std.testing.expectEqual(@as(i32, 32767), pointerAxis(1000, 2, 2000));
     try std.testing.expectEqual(@as(i32, 32767), pointerAxis(1200, 2, 2000));
+}
+
+test "C input values are decoded without traps" {
+    try std.testing.expectEqual(MouseButton.left, MouseButton.fromInt(0).?);
+    try std.testing.expectEqual(MouseButton.right, MouseButton.fromInt(1).?);
+    try std.testing.expectEqual(MouseButton.middle, MouseButton.fromInt(2).?);
+    try std.testing.expectEqual(null, MouseButton.fromInt(-1));
+    try std.testing.expectEqual(null, MouseButton.fromInt(3));
+
+    try std.testing.expect(contentScaleValid(1.0, 2.0));
+    try std.testing.expect(!contentScaleValid(0.0, 1.0));
+    try std.testing.expect(!contentScaleValid(std.math.nan(f64), 1.0));
+    try std.testing.expect(!contentScaleValid(1.0, std.math.inf(f64)));
+
+    try std.testing.expectEqual(@as(i32, 1), scrollDelta(1.9).?);
+    try std.testing.expectEqual(@as(i32, -1), scrollDelta(-1.9).?);
+    try std.testing.expectEqual(std.math.maxInt(i32), scrollDelta(std.math.floatMax(f64)).?);
+    try std.testing.expectEqual(std.math.minInt(i32), scrollDelta(-std.math.floatMax(f64)).?);
+    try std.testing.expectEqual(null, scrollDelta(std.math.nan(f64)));
 }
 
 test "VM lifecycle" {

@@ -19,6 +19,7 @@ pub const VMConfig = embedded.VMConfig;
 pub const KeyEvent = embedded.KeyEvent;
 pub const MouseButton = embedded.MouseButton;
 pub const ContentScale = embedded.ContentScale;
+pub const contentScaleValid = embedded.contentScaleValid;
 
 test {
     _ = embedded;

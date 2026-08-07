@@ -442,7 +442,11 @@ pub export fn bobrvm_surface_set_size(surface: ?*apprt.Surface, width: u32, heig
     s.setSize(width, height);
 }
 
-pub export fn bobrvm_surface_request_display_size(surface: ?*apprt.Surface, width: u32, height: u32) void {
+pub export fn bobrvm_surface_request_display_size(
+    surface: ?*apprt.Surface,
+    width: u32,
+    height: u32,
+) void {
     const s = surface orelse return;
     if (width == 0 or height == 0) return;
     s.requestDisplaySize(width, height);
@@ -450,7 +454,7 @@ pub export fn bobrvm_surface_request_display_size(surface: ?*apprt.Surface, widt
 
 pub export fn bobrvm_surface_set_content_scale(surface: ?*apprt.Surface, x: f64, y: f64) void {
     const s = surface orelse return;
-    if (x <= 0.0 or y <= 0.0) return;
+    if (!apprt.contentScaleValid(x, y)) return;
     s.setContentScale(x, y);
 }
 
@@ -485,7 +489,8 @@ pub export fn bobrvm_surface_mouse_button(
     pressed: bool,
 ) void {
     const s = surface orelse return;
-    s.handleMouseButton(@enumFromInt(button), pressed);
+    const decoded = apprt.MouseButton.fromInt(button) orelse return;
+    s.handleMouseButton(decoded, pressed);
 }
 
 pub export fn bobrvm_surface_mouse_pos(surface: ?*apprt.Surface, x: f64, y: f64) void {
