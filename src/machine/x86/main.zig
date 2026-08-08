@@ -2133,6 +2133,11 @@ pub const Machine = struct {
             writeIoValue(access.data, device.readBar0(offset, @intCast(access.data.len)));
         } else {
             device.writeBar0(offset, @intCast(access.data.len), value);
+            if (offset == pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+                @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status) and value == 0)
+            {
+                net.reset();
+            }
         }
         return true;
     }

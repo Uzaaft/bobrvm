@@ -185,6 +185,13 @@ pub const Net = struct {
         self.tx = tx;
     }
 
+    /// Reset queue-owned state when the guest resets the PCI transport.
+    pub fn reset(self: *Net) void {
+        self.transport.reset();
+        self.rx_last_avail = 0;
+        self.tx_last_avail = 0;
+    }
+
     /// Queue a frame for delivery to the guest. Thread-safe; the frame
     /// is copied. Drops when the queue is full (like a real NIC).
     pub fn queueRxFrame(self: *Net, frame: []const u8) void {
@@ -581,6 +588,18 @@ test "Net init" {
 
 test "NetHeader size" {
     try testing.expectEqual(@as(usize, 12), @sizeOf(NetHeader));
+}
+
+test "Net reset clears queue cursors" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+    net.rx_last_avail = 17;
+    net.tx_last_avail = 23;
+
+    net.reset();
+
+    try testing.expectEqual(@as(u16, 0), net.rx_last_avail);
+    try testing.expectEqual(@as(u16, 0), net.tx_last_avail);
 }
 
 test "Net queues and drops rx frames at capacity" {
