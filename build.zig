@@ -261,6 +261,7 @@ pub fn build(b: *std.Build) !void {
         });
         wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
         wireVirglrenderer(gtk_module, gpu_virglrenderer);
+        gtk_module.linkSystemLibrary("libadwaita-1", dynamic_link_options);
         gtk_module.linkSystemLibrary("gtk4", dynamic_link_options);
         gtk_module.linkSystemLibrary("alsa", dynamic_link_options);
         const gtk_exe = b.addExecutable(.{
@@ -269,6 +270,21 @@ pub fn build(b: *std.Build) !void {
         });
         const install_gtk = b.addInstallArtifact(gtk_exe, .{});
         b.getInstallStep().dependOn(&install_gtk.step);
+        const install_desktop = b.addInstallFile(
+            b.path("linux/com.bobrvm.Bobrvm.desktop"),
+            "share/applications/com.bobrvm.Bobrvm.desktop",
+        );
+        const install_metainfo = b.addInstallFile(
+            b.path("linux/com.bobrvm.Bobrvm.metainfo.xml"),
+            "share/metainfo/com.bobrvm.Bobrvm.metainfo.xml",
+        );
+        const install_icon = b.addInstallFile(
+            b.path("macos/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png"),
+            "share/icons/hicolor/256x256/apps/com.bobrvm.Bobrvm.png",
+        );
+        b.getInstallStep().dependOn(&install_desktop.step);
+        b.getInstallStep().dependOn(&install_metainfo.step);
+        b.getInstallStep().dependOn(&install_icon.step);
 
         const gtk_run = b.addRunArtifact(gtk_exe);
         gtk_run.step.dependOn(&install_gtk.step);

@@ -8,6 +8,7 @@
   gsettings-desktop-schemas,
   libiconv,
   gtk4,
+  libadwaita,
   patchelf,
   pkg-config,
   virglrenderer,
@@ -29,6 +30,8 @@ stdenv.mkDerivation (finalAttrs: {
         ../build.zig.zon
         ../include
         ../LICENSE
+        ../linux
+        ../macos/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png
         ../src
         ../third_party
         ../tools
@@ -64,6 +67,7 @@ stdenv.mkDerivation (finalAttrs: {
       alsa-lib
       gsettings-desktop-schemas
       gtk4
+      libadwaita
       virglrenderer
     ];
 

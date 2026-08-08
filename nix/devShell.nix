@@ -10,6 +10,7 @@
   gsettings-desktop-schemas,
   gtk4,
   hicolor-icon-theme,
+  libadwaita,
   alejandra,
   jujutsu,
   nushell,
@@ -46,6 +47,7 @@ mkShell {
       gsettings-desktop-schemas
       gtk4
       hicolor-icon-theme
+      libadwaita
       OVMF.fd
       virglrenderer
     ];

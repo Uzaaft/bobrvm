@@ -35,6 +35,7 @@ test {
         _ = std.testing.refAllDecls(@import("machine/x86/main.zig"));
         _ = @import("linux/VM.zig");
         _ = @import("linux/AppConfig.zig");
+        _ = @import("linux/Preferences.zig");
         _ = std.testing.refAllDecls(@import("pci/virtio_pci.zig"));
         _ = std.testing.refAllDecls(@import("pci/x86_config.zig"));
         _ = std.testing.refAllDecls(worker);

@@ -21,7 +21,7 @@ the prerelease tagged [`tip`](https://github.com/polymath-as/bobrvm/releases/tag
 ## Requirements
 
 - Apple Silicon Mac running macOS 13 or later
-- Or x86-64 Linux with KVM and GTK 4
+- Or x86-64 Linux with KVM, GTK 4, and Libadwaita 1.5 or later
 - Nix for the Zig core
 - Xcode and the Swift toolchain for the macOS app
 
@@ -45,11 +45,14 @@ See [macos/README.md](macos/README.md) for Xcode and framework builds.
 
 ### Linux host preview
 
-The Linux package installs a dependency-light headless binary and a separate GTK
-application. Both use the same cancellable Zig VM lifecycle and KVM device model.
+The Linux package installs a dependency-light headless binary and a separate
+Libadwaita application, including desktop metadata and an application icon. Both
+use the same cancellable Zig VM lifecycle and KVM device model.
 The GTK application manages a persistent VM library, installer media, sparse raw
 disks, shared folders, port forwards, memory, CPUs, networking, pause/resume,
-guest management, clipboard sharing, host-to-guest file delivery, and quiesced snapshots:
+guest management, clipboard sharing, host-to-guest file delivery, and quiesced snapshots.
+Its Libadwaita interface provides separate Library, Display, Console, and Preferences
+destinations, persistent defaults for new VMs, and lifecycle controls in the window header:
 
 ```sh
 bobrvm run-kernel bzImage initrd writable-root.raw

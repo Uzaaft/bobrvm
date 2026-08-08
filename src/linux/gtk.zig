@@ -1,17 +1,30 @@
 //! Thin GTK host application for the shared Linux VM lifecycle.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const agent = @import("../agent/main.zig");
 const config_policy = @import("../config.zig");
 const disk = @import("../disk.zig");
 const global = @import("../global.zig");
 const AppConfig = @import("AppConfig.zig");
+const Preferences = @import("Preferences.zig");
 const SavedConfig = @import("../cli/Config.zig");
 const VM = @import("VM.zig");
 const x86 = @import("../machine/x86/main.zig");
 const mininat = @import("../net/mininat.zig");
 
 const c = struct {
+    pub const AdwApplication = opaque {};
+    pub const AdwApplicationWindow = opaque {};
+    pub const AdwAlertDialog = opaque {};
+    pub const AdwBanner = opaque {};
+    pub const AdwDialog = opaque {};
+    pub const AdwHeaderBar = opaque {};
+    pub const AdwPreferencesGroup = opaque {};
+    pub const AdwToolbarView = opaque {};
+    pub const AdwViewStack = opaque {};
+    pub const AdwViewStackPage = opaque {};
+    pub const AdwViewSwitcher = opaque {};
     pub const GtkApplication = opaque {};
     pub const GtkButton = opaque {};
     pub const GtkWindow = opaque {};
@@ -33,11 +46,13 @@ const c = struct {
     pub const GtkSpinButton = opaque {};
     pub const GtkLabel = opaque {};
     pub const GtkScrolledWindow = opaque {};
+    pub const GtkAdjustment = opaque {};
     pub const GtkWidget = opaque {};
     pub const GFile = opaque {};
     pub const GAsyncResult = opaque {};
     pub const GCancellable = opaque {};
     pub const GError = opaque {};
+    pub const GParamSpec = opaque {};
     pub const GdkClipboard = opaque {};
     pub const GdkDisplay = opaque {};
     pub const cairo_t = opaque {};
@@ -58,7 +73,92 @@ const c = struct {
     pub const GDK_CONTROL_MASK: c_uint = 1 << 2;
     pub const GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES: c_uint = 3;
     pub const CAIRO_FORMAT_ARGB32: c_int = 0;
+    pub const ADW_RESPONSE_DESTRUCTIVE: c_int = 2;
 
+    pub extern fn adw_alert_dialog_new(
+        heading: [*:0]const u8,
+        body: [*:0]const u8,
+    ) ?*AdwDialog;
+    pub extern fn adw_alert_dialog_add_response(
+        dialog: *AdwAlertDialog,
+        id: [*:0]const u8,
+        label: [*:0]const u8,
+    ) void;
+    pub extern fn adw_alert_dialog_set_close_response(
+        dialog: *AdwAlertDialog,
+        response: [*:0]const u8,
+    ) void;
+    pub extern fn adw_alert_dialog_set_default_response(
+        dialog: *AdwAlertDialog,
+        response: [*:0]const u8,
+    ) void;
+    pub extern fn adw_alert_dialog_set_response_appearance(
+        dialog: *AdwAlertDialog,
+        response: [*:0]const u8,
+        appearance: c_int,
+    ) void;
+    pub extern fn adw_dialog_present(dialog: *AdwDialog, parent: *GtkWidget) void;
+    pub extern fn adw_application_new(
+        application_id: [*:0]const u8,
+        flags: c_uint,
+    ) ?*AdwApplication;
+    pub extern fn adw_application_window_new(application: *GtkApplication) ?*GtkWidget;
+    pub extern fn adw_application_window_set_content(
+        window: *AdwApplicationWindow,
+        content: *GtkWidget,
+    ) void;
+    pub extern fn adw_banner_new(title: [*:0]const u8) ?*GtkWidget;
+    pub extern fn adw_header_bar_new() ?*GtkWidget;
+    pub extern fn adw_header_bar_set_title_widget(
+        header_bar: *AdwHeaderBar,
+        title_widget: *GtkWidget,
+    ) void;
+    pub extern fn adw_header_bar_pack_end(
+        header_bar: *AdwHeaderBar,
+        child: *GtkWidget,
+    ) void;
+    pub extern fn adw_toolbar_view_new() ?*GtkWidget;
+    pub extern fn adw_toolbar_view_add_top_bar(
+        toolbar_view: *AdwToolbarView,
+        widget: *GtkWidget,
+    ) void;
+    pub extern fn adw_toolbar_view_set_content(
+        toolbar_view: *AdwToolbarView,
+        content: *GtkWidget,
+    ) void;
+    pub extern fn adw_preferences_group_new() ?*GtkWidget;
+    pub extern fn adw_preferences_group_set_title(
+        group: *AdwPreferencesGroup,
+        title: [*:0]const u8,
+    ) void;
+    pub extern fn adw_preferences_group_set_description(
+        group: *AdwPreferencesGroup,
+        description: [*:0]const u8,
+    ) void;
+    pub extern fn adw_preferences_group_add(
+        group: *AdwPreferencesGroup,
+        child: *GtkWidget,
+    ) void;
+    pub extern fn adw_view_stack_new() ?*GtkWidget;
+    pub extern fn adw_view_stack_add_titled(
+        stack: *AdwViewStack,
+        child: *GtkWidget,
+        name: [*:0]const u8,
+        title: [*:0]const u8,
+    ) ?*AdwViewStackPage;
+    pub extern fn adw_view_stack_set_visible_child_name(
+        stack: *AdwViewStack,
+        name: [*:0]const u8,
+    ) void;
+    pub extern fn adw_view_stack_page_set_icon_name(
+        page: *AdwViewStackPage,
+        icon_name: [*:0]const u8,
+    ) void;
+    pub extern fn adw_view_switcher_new() ?*GtkWidget;
+    pub extern fn adw_view_switcher_set_stack(
+        view_switcher: *AdwViewSwitcher,
+        stack: *AdwViewStack,
+    ) void;
     pub extern fn gtk_application_new(
         application_id: [*:0]const u8,
         flags: c_uint,
@@ -67,6 +167,7 @@ const c = struct {
     pub extern fn gtk_window_set_title(window: *GtkWindow, title: [*:0]const u8) void;
     pub extern fn gtk_window_set_default_size(window: *GtkWindow, width: c_int, height: c_int) void;
     pub extern fn gtk_window_set_child(window: *GtkWindow, child: *GtkWidget) void;
+    pub extern fn gtk_window_is_active(window: *GtkWindow) gboolean;
     pub extern fn gtk_window_present(window: *GtkWindow) void;
     pub extern fn gtk_window_destroy(window: *GtkWindow) void;
     pub extern fn gtk_box_new(orientation: c_int, spacing: c_int) ?*GtkWidget;
@@ -108,6 +209,7 @@ const c = struct {
     ) void;
     pub extern fn gtk_editable_get_text(editable: *GtkEditable) [*:0]const u8;
     pub extern fn gtk_editable_set_text(editable: *GtkEditable, text: [*:0]const u8) void;
+    pub extern fn gtk_editable_set_width_chars(editable: *GtkEditable, count: c_int) void;
     pub extern fn gtk_file_chooser_native_new(
         title: [*:0]const u8,
         parent: *GtkWindow,
@@ -139,6 +241,11 @@ const c = struct {
         scrolled_window: *GtkScrolledWindow,
         child: *GtkWidget,
     ) void;
+    pub extern fn gtk_scrolled_window_get_vadjustment(
+        scrolled_window: *GtkScrolledWindow,
+    ) *GtkAdjustment;
+    pub extern fn gtk_adjustment_get_upper(adjustment: *GtkAdjustment) f64;
+    pub extern fn gtk_adjustment_set_value(adjustment: *GtkAdjustment, value: f64) void;
     pub extern fn gtk_event_controller_key_new() ?*GtkEventController;
     pub extern fn gtk_event_controller_motion_new() ?*GtkEventController;
     pub extern fn gtk_event_controller_scroll_new(flags: c_uint) ?*GtkEventController;
@@ -158,6 +265,11 @@ const c = struct {
     pub extern fn gtk_widget_set_margin_end(widget: *GtkWidget, margin: c_int) void;
     pub extern fn gtk_widget_set_sensitive(widget: *GtkWidget, sensitive: gboolean) void;
     pub extern fn gtk_widget_set_focusable(widget: *GtkWidget, focusable: gboolean) void;
+    pub extern fn gtk_widget_set_size_request(
+        widget: *GtkWidget,
+        width: c_int,
+        height: c_int,
+    ) void;
     pub extern fn gtk_widget_get_width(widget: *GtkWidget) c_int;
     pub extern fn gtk_widget_get_height(widget: *GtkWidget) c_int;
     pub extern fn gtk_widget_queue_draw(widget: *GtkWidget) void;
@@ -175,8 +287,13 @@ const c = struct {
         destroy_data: ?*const anyopaque,
         connect_flags: c_uint,
     ) c_ulong;
+    pub extern fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong) void;
     pub extern fn g_timeout_add(
         interval_ms: c_uint,
+        function: *const fn (?*anyopaque) callconv(.c) gboolean,
+        data: ?*anyopaque,
+    ) c_uint;
+    pub extern fn g_idle_add(
         function: *const fn (?*anyopaque) callconv(.c) gboolean,
         data: ?*anyopaque,
     ) c_uint;
@@ -207,6 +324,7 @@ const c = struct {
         stride: c_int,
     ) ?*cairo_surface_t;
     pub extern fn cairo_surface_destroy(surface: *cairo_surface_t) void;
+    pub extern fn cairo_surface_mark_dirty(surface: *cairo_surface_t) void;
     pub extern fn cairo_set_source_rgb(context: *cairo_t, red: f64, green: f64, blue: f64) void;
     pub extern fn cairo_set_source_surface(
         context: *cairo_t,
@@ -222,6 +340,46 @@ const c = struct {
 const exits_max: u64 = 100_000_000;
 const output_pending_bytes: usize = 64 * 1024;
 const console_history_bytes: usize = 64 * 1024;
+const display_width_in_window_max: u32 = 960;
+const display_height_with_console_max: u32 = 480;
+const sessions_max: usize = 8;
+
+const SessionRegistry = struct {
+    sessions: [sessions_max]?*State = @splat(null),
+    count: usize = 0,
+    retired: ?*State = null,
+    clipboard_owner: ?*State = null,
+
+    fn add(self: *SessionRegistry, session: *State) error{TooManySessions}!void {
+        if (self.count == self.sessions.len) return error.TooManySessions;
+        for (&self.sessions) |*slot| {
+            if (slot.* != null) continue;
+            slot.* = session;
+            self.count += 1;
+            return;
+        }
+        unreachable;
+    }
+
+    fn retire(self: *SessionRegistry, session: *State) void {
+        for (&self.sessions) |*slot| {
+            if (slot.* != session) continue;
+            slot.* = null;
+            self.count -= 1;
+            session.retired_next = self.retired;
+            self.retired = session;
+            if (self.clipboard_owner == session) self.clipboard_owner = null;
+            session.clipboard_active.store(false, .release);
+            return;
+        }
+    }
+
+    fn claimClipboard(self: *SessionRegistry, session: *State) void {
+        if (self.clipboard_owner) |owner| owner.clipboard_active.store(false, .release);
+        self.clipboard_owner = session;
+        session.clipboard_active.store(true, .release);
+    }
+};
 
 const SnapshotStatus = enum(u8) {
     idle,
@@ -232,6 +390,14 @@ const SnapshotStatus = enum(u8) {
 
 const State = struct {
     allocator: std.mem.Allocator,
+    app: *c.GtkApplication,
+    registry: *SessionRegistry,
+    library_shell: bool,
+    session_arena: ?*std.heap.ArenaAllocator = null,
+    session_name: ?[]const u8 = null,
+    retired_next: ?*State = null,
+    default_memory_bytes: usize,
+    default_vcpu_count: u8,
     memory_bytes: usize,
     vcpu_count: u8,
     display_width: u32,
@@ -251,11 +417,14 @@ const State = struct {
     forwards: [AppConfig.MAX_FORWARDS]mininat.Forward,
     forward_count: u8,
     command_line: []const u8,
+    load_saved_configuration: bool,
     loaded_firmware_path: ?[]u8 = null,
     loaded_vars_path: ?[]const u8 = null,
     loaded_command_line: ?[]u8 = null,
     vm: ?*VM = null,
     window: ?*c.GtkWindow = null,
+    view_stack: ?*c.AdwViewStack = null,
+    configuration_container: ?*c.GtkWidget = null,
     status: ?*c.GtkLabel = null,
     console: ?*c.GtkLabel = null,
     display: ?*c.GtkWidget = null,
@@ -277,6 +446,9 @@ const State = struct {
     network_check: ?*c.GtkCheckButton = null,
     audio_check: ?*c.GtkCheckButton = null,
     gpu_3d_check: ?*c.GtkCheckButton = null,
+    settings_memory_spin: ?*c.GtkSpinButton = null,
+    settings_vcpu_spin: ?*c.GtkSpinButton = null,
+    settings_status: ?*c.GtkLabel = null,
     start_button: ?*c.GtkWidget = null,
     pause_button: ?*c.GtkWidget = null,
     stop_button: ?*c.GtkWidget = null,
@@ -287,7 +459,10 @@ const State = struct {
     send_file_button: ?*c.GtkWidget = null,
     snapshot_button: ?*c.GtkWidget = null,
     guest_tools: ?*c.GtkLabel = null,
+    console_scroll: ?*c.GtkScrolledWindow = null,
     clipboard: ?*c.GdkClipboard = null,
+    clipboard_signal_handler: c_ulong = 0,
+    clipboard_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     clipboard_lock: std.Io.Mutex = .init,
     clipboard_text: []u8,
     clipboard_text_len: usize = 0,
@@ -317,8 +492,8 @@ const State = struct {
             self.setError(err);
             return;
         };
-        const firmware_path = self.firmware_path orelse if (self.iso_path != null or
-            self.disk_path != null and self.kernel_path == null)
+        const firmware_path = self.firmware_path orelse if (self.kernel_path == null and
+            (self.iso_path != null or self.disk_path != null))
             defaultFirmwarePath()
         else
             null;
@@ -366,13 +541,73 @@ const State = struct {
             return;
         };
         c.gtk_label_set_text(self.status.?, "Running");
+        c.adw_view_stack_set_visible_child_name(self.view_stack.?, "display");
         self.setRunningControls(true);
         _ = c.g_timeout_add(16, tick, self);
     }
 
     fn startFromForm(self: *State) void {
         if (!self.readForm()) return;
+        if (self.library_shell) {
+            self.openSession() catch |err| self.setError(err);
+            return;
+        }
         self.start();
+    }
+
+    fn openSession(self: *State) !void {
+        const session = try self.allocator.create(State);
+        errdefer self.allocator.destroy(session);
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        errdefer self.allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const frame_pixels = try allocateFrameBuffer(
+            self.allocator,
+            self.display_width,
+            self.display_height,
+        );
+        errdefer self.allocator.free(frame_pixels);
+        const clipboard_text = try self.allocator.alloc(
+            u8,
+            agent.native.clipboard_text_bytes_max + 1,
+        );
+        errdefer self.allocator.free(clipboard_text);
+        session.* = .{
+            .allocator = self.allocator,
+            .app = self.app,
+            .registry = self.registry,
+            .library_shell = false,
+            .session_arena = arena,
+            .session_name = try dupeOptional(owned, entryValue(self.vm_name_entry.?)),
+            .default_memory_bytes = self.default_memory_bytes,
+            .default_vcpu_count = self.default_vcpu_count,
+            .memory_bytes = self.memory_bytes,
+            .vcpu_count = self.vcpu_count,
+            .display_width = self.display_width,
+            .display_height = self.display_height,
+            .gpu_memory_bytes = self.gpu_memory_bytes,
+            .firmware_path = try dupeOptional(owned, self.firmware_path),
+            .vars_path = try dupeOptional(owned, self.vars_path),
+            .kernel_path = try dupeOptional(owned, self.kernel_path),
+            .initrd_path = try dupeOptional(owned, self.initrd_path),
+            .disk_path = try dupeOptional(owned, self.disk_path),
+            .iso_path = try dupeOptional(owned, self.iso_path),
+            .shared_dir = try dupeOptional(owned, self.shared_dir),
+            .restore_path = try dupeOptional(owned, self.restore_path),
+            .network_enabled = self.network_enabled,
+            .audio_enabled = self.audio_enabled,
+            .gpu_3d_enabled = self.gpu_3d_enabled,
+            .forwards = self.forwards,
+            .forward_count = self.forward_count,
+            .command_line = try owned.dupe(u8, self.command_line),
+            .load_saved_configuration = false,
+            .frame_pixels = frame_pixels,
+            .clipboard_text = clipboard_text,
+        };
+        try self.registry.add(session);
+        activate(self.app, session);
     }
 
     fn ensureFrameBuffer(self: *State) !void {
@@ -467,8 +702,8 @@ const State = struct {
         const name = entryValue(self.vm_name_entry.?) orelse {
             return self.setError(error.InvalidName);
         };
-        const firmware = self.firmware_path orelse if (self.iso_path != null or
-            self.disk_path != null and self.kernel_path == null)
+        const firmware = self.firmware_path orelse if (self.kernel_path == null and
+            (self.iso_path != null or self.disk_path != null))
             defaultFirmwarePath()
         else
             null;
@@ -553,11 +788,11 @@ const State = struct {
         self.gpu_memory_bytes = config.gpu_memory_mb * 1024 * 1024;
         c.gtk_drawing_area_set_content_width(
             @ptrCast(self.display.?),
-            @intCast(self.display_width),
+            @intCast(@min(self.display_width, display_width_in_window_max)),
         );
         c.gtk_drawing_area_set_content_height(
             @ptrCast(self.display.?),
-            @intCast(self.display_height),
+            @intCast(@min(self.display_height, display_height_with_console_max)),
         );
         c.gtk_check_button_set_active(
             self.network_check.?,
@@ -609,6 +844,124 @@ const State = struct {
         c.gtk_label_set_text(self.status.?, "Configuration loaded");
     }
 
+    fn loadSelectedOrNew(self: *State) void {
+        const selected = c.gtk_combo_box_text_get_active_text(self.vm_selector.?) orelse {
+            self.newConfiguration();
+            return;
+        };
+        c.g_free(selected);
+        self.loadConfiguration();
+    }
+
+    fn newConfiguration(self: *State) void {
+        if (self.vm != null) return;
+        self.clearLoadedConfiguration();
+        const defaults = AppConfig{
+            .memory_bytes = self.default_memory_bytes,
+            .vcpu_count = self.default_vcpu_count,
+        };
+        self.resetConfigurationState(&defaults);
+        self.resetConfigurationForm(&defaults);
+        c.gtk_combo_box_set_active(@ptrCast(self.vm_selector.?), -1);
+        c.gtk_label_set_text(self.status.?, "New configuration");
+    }
+
+    fn resetConfigurationState(self: *State, defaults: *const AppConfig) void {
+        self.memory_bytes = defaults.memory_bytes;
+        self.vcpu_count = defaults.vcpu_count;
+        self.display_width = defaults.display_width;
+        self.display_height = defaults.display_height;
+        self.gpu_memory_bytes = defaults.gpu_memory_bytes;
+        self.firmware_path = null;
+        self.vars_path = null;
+        self.kernel_path = null;
+        self.initrd_path = null;
+        self.disk_path = null;
+        self.iso_path = null;
+        self.shared_dir = null;
+        self.restore_path = null;
+        self.network_enabled = defaults.network_enabled;
+        self.audio_enabled = defaults.audio_enabled;
+        self.gpu_3d_enabled = defaults.gpu_3d_enabled;
+        self.command_line = defaults.command_line;
+        self.forward_count = 0;
+    }
+
+    fn resetConfigurationForm(self: *State, defaults: *const AppConfig) void {
+        setEntryValue(self, self.vm_name_entry.?, null);
+        for ([_]*c.GtkEntry{
+            self.disk_entry.?,
+            self.iso_entry.?,
+            self.kernel_entry.?,
+            self.initrd_entry.?,
+            self.shared_entry.?,
+            self.restore_entry.?,
+            self.forward_entry.?,
+        }) |entry| setEntryValue(self, entry, null);
+        c.gtk_spin_button_set_value(
+            self.memory_spin.?,
+            @floatFromInt(defaults.memory_bytes / 1024 / 1024),
+        );
+        c.gtk_spin_button_set_value(self.vcpu_spin.?, @floatFromInt(defaults.vcpu_count));
+        c.gtk_spin_button_set_value(
+            self.display_width_spin.?,
+            @floatFromInt(defaults.display_width),
+        );
+        c.gtk_spin_button_set_value(
+            self.display_height_spin.?,
+            @floatFromInt(defaults.display_height),
+        );
+        c.gtk_spin_button_set_value(
+            self.gpu_memory_spin.?,
+            @floatFromInt(defaults.gpu_memory_bytes / 1024 / 1024),
+        );
+        c.gtk_spin_button_set_value(self.disk_size_spin.?, 64);
+        c.gtk_check_button_set_active(
+            self.network_check.?,
+            if (defaults.network_enabled) c.TRUE else c.FALSE,
+        );
+        c.gtk_check_button_set_active(
+            self.audio_check.?,
+            if (defaults.audio_enabled) c.TRUE else c.FALSE,
+        );
+        c.gtk_check_button_set_active(
+            self.gpu_3d_check.?,
+            if (defaults.gpu_3d_enabled) c.TRUE else c.FALSE,
+        );
+        c.gtk_drawing_area_set_content_width(
+            @ptrCast(self.display.?),
+            @intCast(@min(defaults.display_width, display_width_in_window_max)),
+        );
+        c.gtk_drawing_area_set_content_height(
+            @ptrCast(self.display.?),
+            @intCast(@min(defaults.display_height, display_height_with_console_max)),
+        );
+    }
+
+    fn clearLoadedConfiguration(self: *State) void {
+        if (self.loaded_firmware_path) |path| self.allocator.free(path);
+        if (self.loaded_vars_path) |path| self.allocator.free(path);
+        if (self.loaded_command_line) |command| self.allocator.free(command);
+        self.loaded_firmware_path = null;
+        self.loaded_vars_path = null;
+        self.loaded_command_line = null;
+    }
+
+    fn savePreferences(self: *State) void {
+        const memory_mib = c.gtk_spin_button_get_value_as_int(self.settings_memory_spin.?);
+        const vcpu_count = c.gtk_spin_button_get_value_as_int(self.settings_vcpu_spin.?);
+        if (memory_mib <= 0 or vcpu_count <= 0) return self.setError(error.InvalidConfig);
+        const preferences = Preferences{
+            .memory_mib = @intCast(memory_mib),
+            .vcpu_count = @intCast(vcpu_count),
+        };
+        preferences.save(self.allocator) catch |err| return self.setError(err);
+        self.default_memory_bytes = @as(usize, @intCast(memory_mib)) * 1024 * 1024;
+        self.default_vcpu_count = @intCast(vcpu_count);
+        c.gtk_label_set_text(self.status.?, "Default settings saved");
+        c.gtk_label_set_text(self.settings_status.?, "Defaults saved");
+    }
+
     fn writeForwards(self: *State) void {
         var buffer: [AppConfig.MAX_FORWARDS * 12]u8 = undefined;
         var length: usize = 0;
@@ -630,6 +983,7 @@ const State = struct {
             return self.setError(err);
         };
         self.refreshLibrary(null);
+        self.loadSelectedOrNew();
         c.gtk_label_set_text(self.status.?, "Configuration removed");
     }
 
@@ -663,6 +1017,10 @@ const State = struct {
     }
 
     fn setRunningControls(self: *State, running: bool) void {
+        c.gtk_widget_set_sensitive(
+            self.configuration_container.?,
+            if (running) c.FALSE else c.TRUE,
+        );
         c.gtk_widget_set_sensitive(self.start_button.?, if (running) c.FALSE else c.TRUE);
         c.gtk_widget_set_sensitive(self.pause_button.?, if (running) c.TRUE else c.FALSE);
         c.gtk_widget_set_sensitive(self.stop_button.?, if (running) c.TRUE else c.FALSE);
@@ -825,6 +1183,13 @@ const State = struct {
     }
 
     fn flushClipboard(self: *State) void {
+        if (!self.clipboard_active.load(.acquire)) {
+            _ = self.host_clipboard_requested.swap(false, .acq_rel);
+            self.clipboard_lock.lockUncancelable(global.io());
+            self.guest_clipboard_pending = false;
+            self.clipboard_lock.unlock(global.io());
+            return;
+        }
         if (self.host_clipboard_requested.swap(false, .acq_rel)) {
             if (self.clipboard) |clipboard| {
                 c.gdk_clipboard_read_text_async(clipboard, null, hostClipboardRead, self);
@@ -898,6 +1263,7 @@ const State = struct {
         self.console_len += cleaned_len;
         self.console_history[self.console_len] = 0;
         c.gtk_label_set_text(self.console.?, self.console_history[0..self.console_len :0].ptr);
+        _ = c.g_idle_add(scrollConsoleToEnd, self);
     }
 
     fn filterConsoleByte(self: *State, byte: u8) ?u8 {
@@ -942,6 +1308,17 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         writeStderr(message);
         std.process.exit(1);
     };
+    const preferences = Preferences.load(std.heap.c_allocator) catch Preferences{};
+    const app_adw = c.adw_application_new(
+        "com.bobrvm.Bobrvm",
+        c.G_APPLICATION_DEFAULT_FLAGS,
+    ) orelse {
+        writeStderr("error: unable to create Libadwaita application\n");
+        std.process.exit(1);
+    };
+    defer c.g_object_unref(app_adw);
+    const app: *c.GtkApplication = @ptrCast(app_adw);
+    var registry = SessionRegistry{};
     const initial_pixels = std.math.mul(
         usize,
         @intCast(config.display_width),
@@ -968,8 +1345,16 @@ pub fn main(minimal: std.process.Init.Minimal) void {
     defer std.heap.c_allocator.free(clipboard_text);
     var state = State{
         .allocator = std.heap.c_allocator,
-        .memory_bytes = config.memory_bytes,
-        .vcpu_count = config.vcpu_count,
+        .app = app,
+        .registry = &registry,
+        .library_shell = argument_count == 0,
+        .default_memory_bytes = @intCast(preferences.memory_mib * 1024 * 1024),
+        .default_vcpu_count = preferences.vcpu_count,
+        .memory_bytes = if (argument_count == 0)
+            @intCast(preferences.memory_mib * 1024 * 1024)
+        else
+            config.memory_bytes,
+        .vcpu_count = if (argument_count == 0) preferences.vcpu_count else config.vcpu_count,
         .display_width = config.display_width,
         .display_height = config.display_height,
         .gpu_memory_bytes = config.gpu_memory_bytes,
@@ -987,6 +1372,7 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         .forwards = config.forwards,
         .forward_count = config.forward_count,
         .command_line = config.command_line,
+        .load_saved_configuration = argument_count == 0,
         .frame_pixels = frame_pixels,
         .clipboard_text = clipboard_text,
     };
@@ -996,11 +1382,6 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         if (state.loaded_vars_path) |path| state.allocator.free(path);
         if (state.loaded_command_line) |command| state.allocator.free(command);
     }
-    const app = c.gtk_application_new("com.bobrvm.Bobrvm", c.G_APPLICATION_DEFAULT_FLAGS) orelse {
-        writeStderr("error: unable to create GTK application\n");
-        std.process.exit(1);
-    };
-    defer c.g_object_unref(app);
     _ = c.g_signal_connect_data(app, "activate", @ptrCast(&activate), &state, null, 0);
     const status = c.g_application_run(@ptrCast(app), 0, null);
     if (state.snapshot_thread) |thread| {
@@ -1011,17 +1392,45 @@ pub fn main(minimal: std.process.Init.Minimal) void {
         vm.requestStop();
         state.finish();
     }
+    for (registry.sessions) |session_optional| {
+        if (session_optional) |session| deinitSession(session);
+    }
+    var retired = registry.retired;
+    while (retired) |session| {
+        retired = session.retired_next;
+        deinitSession(session);
+    }
     if (status != 0) std.process.exit(@intCast(status));
+}
+
+fn deinitSession(state: *State) void {
+    if (state.snapshot_thread) |thread| {
+        thread.join();
+        state.snapshot_thread = null;
+    }
+    if (state.vm) |vm| {
+        vm.requestStop();
+        state.finish();
+    }
+    state.clearLoadedConfiguration();
+    state.allocator.free(state.frame_pixels);
+    state.allocator.free(state.clipboard_text);
+    if (state.session_arena) |arena| {
+        arena.deinit();
+        state.allocator.destroy(arena);
+    }
+    state.allocator.destroy(state);
 }
 
 fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
-    const window_widget = c.gtk_application_window_new(app) orelse return;
+    const window_widget = c.adw_application_window_new(app) orelse return;
+    const application_window: *c.AdwApplicationWindow = @ptrCast(window_widget);
     const window: *c.GtkWindow = @ptrCast(window_widget);
     state.window = window;
     if (c.gdk_display_get_default()) |display| {
         state.clipboard = c.gdk_display_get_clipboard(display);
-        _ = c.g_signal_connect_data(
+        state.clipboard_signal_handler = c.g_signal_connect_data(
             state.clipboard.?,
             "changed",
             @ptrCast(&clipboardChanged),
@@ -1030,17 +1439,47 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
             0,
         );
     }
-    c.gtk_window_set_title(window, "bobrvm");
+    var title_buffer: [160]u8 = undefined;
+    const title = if (state.session_name) |name|
+        std.fmt.bufPrintZ(&title_buffer, "bobrvm — {s}", .{name}) catch "bobrvm"
+    else
+        "bobrvm";
+    c.gtk_window_set_title(window, title.ptr);
     c.gtk_window_set_default_size(window, 1100, 900);
+    const toolbar_widget = c.adw_toolbar_view_new() orelse return;
+    const toolbar: *c.AdwToolbarView = @ptrCast(toolbar_widget);
+    const view_stack_widget = c.adw_view_stack_new() orelse return;
+    const view_stack: *c.AdwViewStack = @ptrCast(view_stack_widget);
+    state.view_stack = view_stack;
+    const header_widget = c.adw_header_bar_new() orelse return;
+    const header: *c.AdwHeaderBar = @ptrCast(header_widget);
+    const switcher_widget = c.adw_view_switcher_new() orelse return;
+    const switcher: *c.AdwViewSwitcher = @ptrCast(switcher_widget);
+    c.adw_view_switcher_set_stack(switcher, view_stack);
+    c.adw_header_bar_set_title_widget(header, switcher_widget);
+    c.adw_toolbar_view_add_top_bar(toolbar, header_widget);
+    if (builtin.mode == .Debug) {
+        const banner = c.adw_banner_new("Debug build — performance may be degraded") orelse return;
+        c.adw_toolbar_view_add_top_bar(toolbar, banner);
+    }
+    const content_scroll_widget = c.gtk_scrolled_window_new() orelse return;
+    c.gtk_widget_add_css_class(content_scroll_widget, "background");
+    const content_scroll: *c.GtkScrolledWindow = @ptrCast(content_scroll_widget);
     const box_widget = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12) orelse return;
     const box: *c.GtkBox = @ptrCast(box_widget);
     c.gtk_widget_set_margin_top(@ptrCast(box), 16);
     c.gtk_widget_set_margin_bottom(@ptrCast(box), 16);
     c.gtk_widget_set_margin_start(@ptrCast(box), 16);
     c.gtk_widget_set_margin_end(@ptrCast(box), 16);
-    const title = c.gtk_label_new("bobrvm Linux virtual machine") orelse return;
-    c.gtk_widget_add_css_class(title, "title-2");
-    c.gtk_box_append(box, title);
+    const configuration_widget = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12) orelse return;
+    const configuration: *c.GtkBox = @ptrCast(configuration_widget);
+    state.configuration_container = configuration_widget;
+    c.gtk_box_append(box, configuration_widget);
+    const library_group = addPreferencesGroup(
+        configuration,
+        "Virtual Machine Library",
+        "Choose a saved machine or create and save a new configuration.",
+    ) orelse return;
     const library = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
     const selector_widget = c.gtk_combo_box_text_new() orelse return;
     state.vm_selector = @ptrCast(selector_widget);
@@ -1048,9 +1487,13 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const name_entry: *c.GtkEntry = @ptrCast(name_widget);
     state.vm_name_entry = name_entry;
     c.gtk_entry_set_placeholder_text(name_entry, "VM name");
+    c.gtk_editable_set_width_chars(@ptrCast(name_entry), 18);
+    const new_button = c.gtk_button_new_with_label("New") orelse return;
     const load_button = c.gtk_button_new_with_label("Load") orelse return;
     const save_button = c.gtk_button_new_with_label("Save") orelse return;
     const delete_button = c.gtk_button_new_with_label("Remove") orelse return;
+    c.gtk_widget_add_css_class(delete_button, "destructive-action");
+    _ = c.g_signal_connect_data(new_button, "clicked", @ptrCast(&newClicked), state, null, 0);
     _ = c.g_signal_connect_data(load_button, "clicked", @ptrCast(&loadClicked), state, null, 0);
     _ = c.g_signal_connect_data(save_button, "clicked", @ptrCast(&saveClicked), state, null, 0);
     _ = c.g_signal_connect_data(
@@ -1063,13 +1506,19 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     );
     c.gtk_widget_set_hexpand(name_widget, c.TRUE);
     c.gtk_box_append(@ptrCast(library), selector_widget);
+    c.gtk_box_append(@ptrCast(library), new_button);
     c.gtk_box_append(@ptrCast(library), name_widget);
     c.gtk_box_append(@ptrCast(library), load_button);
     c.gtk_box_append(@ptrCast(library), save_button);
     c.gtk_box_append(@ptrCast(library), delete_button);
-    c.gtk_box_append(box, library);
+    c.adw_preferences_group_add(library_group, library);
+    const storage_group = addPreferencesGroup(
+        configuration,
+        "Storage and Boot",
+        "Boot from UEFI media or use a kernel directly, and manage guest storage.",
+    ) orelse return;
     const iso_entry = addPathRow(
-        box,
+        storage_group,
         state,
         "Installer ISO",
         "Choose a bootable ISO image",
@@ -1078,7 +1527,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     ) orelse return;
     state.iso_entry = iso_entry;
     const disk_entry = addPathRow(
-        box,
+        storage_group,
         state,
         "Virtual Disk",
         "Choose an existing raw disk",
@@ -1087,7 +1536,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     ) orelse return;
     state.disk_entry = disk_entry;
     const kernel_entry = addPathRow(
-        box,
+        storage_group,
         state,
         "Kernel",
         "Optional bzImage for direct boot",
@@ -1096,7 +1545,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     ) orelse return;
     state.kernel_entry = kernel_entry;
     const initrd_entry = addPathRow(
-        box,
+        storage_group,
         state,
         "Initrd",
         "Optional initramfs for direct boot",
@@ -1105,7 +1554,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     ) orelse return;
     state.initrd_entry = initrd_entry;
     const shared_entry = addPathRow(
-        box,
+        storage_group,
         state,
         "Shared Folder",
         "Optional host directory mounted with tag ‘host’",
@@ -1114,7 +1563,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     ) orelse return;
     state.shared_entry = shared_entry;
     const restore_entry = addPathRow(
-        box,
+        storage_group,
         state,
         "Restore Snapshot",
         "Optional snapshot directory for the next start",
@@ -1129,11 +1578,17 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const forward_entry: *c.GtkEntry = @ptrCast(forward_widget);
     state.forward_entry = forward_entry;
     c.gtk_entry_set_placeholder_text(forward_entry, "2222:22, 8080:80");
+    c.gtk_editable_set_width_chars(@ptrCast(forward_entry), 24);
     c.gtk_widget_set_hexpand(forward_widget, c.TRUE);
     c.gtk_box_append(forward_row, forward_label);
     c.gtk_box_append(forward_row, forward_widget);
-    c.gtk_box_append(box, forward_row_widget);
+    c.adw_preferences_group_add(storage_group, forward_row_widget);
     state.writeForwards();
+    const hardware_group = addPreferencesGroup(
+        configuration,
+        "CPU, Memory, and Devices",
+        "Resources and devices are applied the next time the virtual machine starts.",
+    ) orelse return;
     const hardware = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12) orelse return;
     const memory_label = c.gtk_label_new("Memory (MiB)") orelse return;
     const memory_spin_widget = c.gtk_spin_button_new_with_range(128, 65_536, 128) orelse return;
@@ -1153,6 +1608,11 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const audio: *c.GtkCheckButton = @ptrCast(audio_widget);
     c.gtk_check_button_set_active(audio, if (state.audio_enabled) c.TRUE else c.FALSE);
     state.audio_check = audio;
+    const graphics_group = addPreferencesGroup(
+        configuration,
+        "Graphics",
+        "Configure the maximum guest display and shared graphics memory.",
+    ) orelse return;
     const graphics = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12) orelse return;
     const gpu_3d_widget = c.gtk_check_button_new_with_label("Accelerated 3D") orelse return;
     const gpu_3d: *c.GtkCheckButton = @ptrCast(gpu_3d_widget);
@@ -1184,7 +1644,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         @floatFromInt(state.gpu_memory_bytes / (1024 * 1024)),
     );
     state.gpu_memory_spin = gpu_memory_spin;
-    const storage = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
+    const disk_tools = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
     const disk_size_label = c.gtk_label_new("Disk (GiB)") orelse return;
     const disk_size_widget = c.gtk_spin_button_new_with_range(1, 4096, 1) orelse return;
     const disk_size: *c.GtkSpinButton = @ptrCast(disk_size_widget);
@@ -1214,11 +1674,16 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(graphics), gpu_memory_label);
     c.gtk_box_append(@ptrCast(graphics), gpu_memory_widget);
     c.gtk_box_append(@ptrCast(graphics), gpu_3d_widget);
-    c.gtk_box_append(@ptrCast(storage), disk_size_label);
-    c.gtk_box_append(@ptrCast(storage), disk_size_widget);
-    c.gtk_box_append(@ptrCast(storage), create_disk);
-    c.gtk_box_append(@ptrCast(storage), grow_disk);
-    const controls = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
+    c.gtk_box_append(@ptrCast(disk_tools), disk_size_label);
+    c.gtk_box_append(@ptrCast(disk_tools), disk_size_widget);
+    c.gtk_box_append(@ptrCast(disk_tools), create_disk);
+    c.gtk_box_append(@ptrCast(disk_tools), grow_disk);
+    c.adw_preferences_group_add(storage_group, disk_tools);
+    const controls_group = addPreferencesGroup(
+        box,
+        "Guest Integration",
+        "Guest services become available when the integration agent connects.",
+    ) orelse return;
     const start_button = c.gtk_button_new_with_label("Start") orelse return;
     const pause_button = c.gtk_button_new_with_label("Pause") orelse return;
     const stop_button = c.gtk_button_new_with_label("Stop") orelse return;
@@ -1228,6 +1693,8 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const sync_time_button = c.gtk_button_new_with_label("Sync Time") orelse return;
     const send_file_button = c.gtk_button_new_with_label("Send File…") orelse return;
     const snapshot_button = c.gtk_button_new_with_label("Snapshot…") orelse return;
+    c.gtk_widget_add_css_class(start_button, "suggested-action");
+    c.gtk_widget_add_css_class(stop_button, "destructive-action");
     state.start_button = start_button;
     state.pause_button = pause_button;
     state.stop_button = stop_button;
@@ -1281,15 +1748,16 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         null,
         0,
     );
-    c.gtk_box_append(@ptrCast(controls), start_button);
-    c.gtk_box_append(@ptrCast(controls), pause_button);
-    c.gtk_box_append(@ptrCast(controls), stop_button);
-    c.gtk_box_append(@ptrCast(controls), shutdown_button);
-    c.gtk_box_append(@ptrCast(controls), reboot_button);
-    c.gtk_box_append(@ptrCast(controls), trim_button);
-    c.gtk_box_append(@ptrCast(controls), sync_time_button);
-    c.gtk_box_append(@ptrCast(controls), send_file_button);
-    c.gtk_box_append(@ptrCast(controls), snapshot_button);
+    c.adw_header_bar_pack_end(header, stop_button);
+    c.adw_header_bar_pack_end(header, pause_button);
+    c.adw_header_bar_pack_end(header, start_button);
+    const guest_controls = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8) orelse return;
+    c.gtk_box_append(@ptrCast(guest_controls), shutdown_button);
+    c.gtk_box_append(@ptrCast(guest_controls), reboot_button);
+    c.gtk_box_append(@ptrCast(guest_controls), trim_button);
+    c.gtk_box_append(@ptrCast(guest_controls), sync_time_button);
+    c.gtk_box_append(@ptrCast(guest_controls), send_file_button);
+    c.gtk_box_append(@ptrCast(guest_controls), snapshot_button);
     const status_widget = c.gtk_label_new("Ready") orelse return;
     const status: *c.GtkLabel = @ptrCast(status_widget);
     state.status = status;
@@ -1299,19 +1767,19 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     const display_widget = c.gtk_drawing_area_new() orelse return;
     const display: *c.GtkDrawingArea = @ptrCast(display_widget);
     state.display = display_widget;
-    c.gtk_drawing_area_set_content_width(display, @intCast(state.display_width));
-    c.gtk_drawing_area_set_content_height(display, @intCast(state.display_height));
-    c.gtk_drawing_area_set_draw_func(display, drawDisplay, state, null);
-    _ = c.g_signal_connect_data(
+    c.gtk_drawing_area_set_content_width(
         display,
-        "resize",
-        @ptrCast(&displayResized),
-        state,
-        null,
-        0,
+        @intCast(@min(state.display_width, display_width_in_window_max)),
     );
+    c.gtk_drawing_area_set_content_height(
+        display,
+        @intCast(@min(state.display_height, display_height_with_console_max)),
+    );
+    c.gtk_drawing_area_set_draw_func(display, drawDisplay, state, null);
     c.gtk_widget_set_hexpand(display_widget, c.TRUE);
-    c.gtk_widget_set_vexpand(display_widget, c.TRUE);
+    // Keep the serial console reachable when firmware hands off to a guest
+    // initramfs that does not contain virtio_gpu.
+    c.gtk_widget_set_vexpand(display_widget, c.FALSE);
     const console_widget = c.gtk_label_new("") orelse return;
     const console: *c.GtkLabel = @ptrCast(console_widget);
     state.console = console;
@@ -1323,18 +1791,109 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_set_vexpand(console_widget, c.TRUE);
     const scrolled_widget = c.gtk_scrolled_window_new() orelse return;
     const scrolled: *c.GtkScrolledWindow = @ptrCast(scrolled_widget);
+    state.console_scroll = scrolled;
     c.gtk_widget_set_hexpand(scrolled_widget, c.TRUE);
     c.gtk_widget_set_vexpand(scrolled_widget, c.TRUE);
+    c.gtk_widget_set_size_request(scrolled_widget, -1, 240);
     c.gtk_scrolled_window_set_child(scrolled, console_widget);
-    c.gtk_box_append(box, @ptrCast(hardware));
-    c.gtk_box_append(box, @ptrCast(graphics));
-    c.gtk_box_append(box, @ptrCast(storage));
-    c.gtk_box_append(box, @ptrCast(controls));
-    c.gtk_box_append(box, @ptrCast(status));
-    c.gtk_box_append(box, guest_tools_widget);
-    c.gtk_box_append(box, display_widget);
-    c.gtk_box_append(box, scrolled_widget);
-    c.gtk_window_set_child(window, @ptrCast(box));
+    c.adw_preferences_group_add(hardware_group, hardware);
+    c.adw_preferences_group_add(graphics_group, graphics);
+    c.adw_preferences_group_add(controls_group, guest_controls);
+    c.adw_preferences_group_add(controls_group, status_widget);
+    c.adw_preferences_group_add(controls_group, guest_tools_widget);
+    const display_box_widget = createPageBox() orelse return;
+    const display_box: *c.GtkBox = @ptrCast(display_box_widget);
+    const display_group = addPreferencesGroup(
+        display_box,
+        "Display",
+        "The guest framebuffer accepts keyboard, pointer, and scroll input.",
+    ) orelse return;
+    c.adw_preferences_group_add(display_group, display_widget);
+    const console_box_widget = createPageBox() orelse return;
+    const console_box: *c.GtkBox = @ptrCast(console_box_widget);
+    const console_group = addPreferencesGroup(
+        console_box,
+        "Serial Console",
+        "Boot and guest console output remains available when graphics are offline.",
+    ) orelse return;
+    c.gtk_widget_set_vexpand(@ptrCast(console_group), c.TRUE);
+    c.adw_preferences_group_add(console_group, scrolled_widget);
+    const settings_box_widget = createPageBox() orelse return;
+    const settings_box: *c.GtkBox = @ptrCast(settings_box_widget);
+    const settings_group = addPreferencesGroup(
+        settings_box,
+        "Default VM Settings",
+        "These resources are applied when creating a new virtual machine.",
+    ) orelse return;
+    const settings_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12) orelse return;
+    const settings_memory_label = c.gtk_label_new("Memory (MiB)") orelse return;
+    const settings_memory_widget = c.gtk_spin_button_new_with_range(
+        128,
+        65_536,
+        128,
+    ) orelse return;
+    state.settings_memory_spin = @ptrCast(settings_memory_widget);
+    c.gtk_spin_button_set_value(
+        state.settings_memory_spin.?,
+        @floatFromInt(state.default_memory_bytes / 1024 / 1024),
+    );
+    const settings_vcpu_label = c.gtk_label_new("CPUs") orelse return;
+    const settings_vcpu_widget = c.gtk_spin_button_new_with_range(1, 64, 1) orelse return;
+    state.settings_vcpu_spin = @ptrCast(settings_vcpu_widget);
+    c.gtk_spin_button_set_value(
+        state.settings_vcpu_spin.?,
+        @floatFromInt(state.default_vcpu_count),
+    );
+    const save_defaults = c.gtk_button_new_with_label("Save Defaults") orelse return;
+    c.gtk_widget_add_css_class(save_defaults, "suggested-action");
+    _ = c.g_signal_connect_data(
+        save_defaults,
+        "clicked",
+        @ptrCast(&savePreferencesClicked),
+        state,
+        null,
+        0,
+    );
+    c.gtk_box_append(@ptrCast(settings_row), settings_memory_label);
+    c.gtk_box_append(@ptrCast(settings_row), settings_memory_widget);
+    c.gtk_box_append(@ptrCast(settings_row), settings_vcpu_label);
+    c.gtk_box_append(@ptrCast(settings_row), settings_vcpu_widget);
+    c.gtk_box_append(@ptrCast(settings_row), save_defaults);
+    c.adw_preferences_group_add(settings_group, settings_row);
+    const settings_status_widget = c.gtk_label_new("") orelse return;
+    state.settings_status = @ptrCast(settings_status_widget);
+    c.adw_preferences_group_add(settings_group, settings_status_widget);
+    c.gtk_scrolled_window_set_child(content_scroll, box_widget);
+    const library_page = c.adw_view_stack_add_titled(
+        view_stack,
+        content_scroll_widget,
+        "library",
+        "Library",
+    ) orelse return;
+    c.adw_view_stack_page_set_icon_name(library_page, "view-grid-symbolic");
+    const display_page = c.adw_view_stack_add_titled(
+        view_stack,
+        display_box_widget,
+        "display",
+        "Display",
+    ) orelse return;
+    c.adw_view_stack_page_set_icon_name(display_page, "video-display-symbolic");
+    const console_page = c.adw_view_stack_add_titled(
+        view_stack,
+        console_box_widget,
+        "console",
+        "Console",
+    ) orelse return;
+    c.adw_view_stack_page_set_icon_name(console_page, "utilities-terminal-symbolic");
+    const settings_page = c.adw_view_stack_add_titled(
+        view_stack,
+        settings_box_widget,
+        "preferences",
+        "Preferences",
+    ) orelse return;
+    c.adw_view_stack_page_set_icon_name(settings_page, "preferences-system-symbolic");
+    c.adw_toolbar_view_set_content(toolbar, view_stack_widget);
+    c.adw_application_window_set_content(application_window, toolbar_widget);
     const keys = c.gtk_event_controller_key_new() orelse return;
     _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&keyPressed), state, null, 0);
     _ = c.g_signal_connect_data(keys, "key-released", @ptrCast(&keyReleased), state, null, 0);
@@ -1354,9 +1913,20 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     _ = c.g_signal_connect_data(scroll, "scroll", @ptrCast(&pointerScroll), state, null, 0);
     c.gtk_widget_add_controller(display_widget, scroll);
     _ = c.g_signal_connect_data(window, "close-request", @ptrCast(&closeRequest), state, null, 0);
+    _ = c.g_signal_connect_data(window, "destroy", @ptrCast(&windowDestroyed), state, null, 0);
+    _ = c.g_signal_connect_data(
+        window,
+        "notify::is-active",
+        @ptrCast(&windowActiveChanged),
+        state,
+        null,
+        0,
+    );
     state.setRunningControls(false);
     state.refreshLibrary(null);
+    if (state.load_saved_configuration) state.loadSelectedOrNew();
     c.gtk_window_present(window);
+    state.registry.claimClipboard(state);
     if (state.kernel_path != null or state.firmware_path != null or
         state.iso_path != null or state.disk_path != null)
     {
@@ -1365,7 +1935,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
 }
 
 fn addPathRow(
-    box: *c.GtkBox,
+    group: *c.AdwPreferencesGroup,
     state: *State,
     label_text: [*:0]const u8,
     placeholder: [*:0]const u8,
@@ -1378,6 +1948,7 @@ fn addPathRow(
     const entry_widget = c.gtk_entry_new() orelse return null;
     const entry: *c.GtkEntry = @ptrCast(entry_widget);
     c.gtk_entry_set_placeholder_text(entry, placeholder);
+    c.gtk_editable_set_width_chars(@ptrCast(entry), 24);
     setEntryValue(state, entry, initial_value);
     c.gtk_widget_set_hexpand(entry_widget, c.TRUE);
     const browse = c.gtk_button_new_with_label("Browse…") orelse return null;
@@ -1385,8 +1956,48 @@ fn addPathRow(
     c.gtk_box_append(row, label);
     c.gtk_box_append(row, entry_widget);
     c.gtk_box_append(row, browse);
-    c.gtk_box_append(box, row_widget);
+    c.adw_preferences_group_add(group, row_widget);
     return entry;
+}
+
+fn addPreferencesGroup(
+    box: *c.GtkBox,
+    title: [*:0]const u8,
+    description: [*:0]const u8,
+) ?*c.AdwPreferencesGroup {
+    const widget = c.adw_preferences_group_new() orelse return null;
+    const group: *c.AdwPreferencesGroup = @ptrCast(widget);
+    c.adw_preferences_group_set_title(group, title);
+    c.adw_preferences_group_set_description(group, description);
+    c.gtk_box_append(box, widget);
+    return group;
+}
+
+fn createPageBox() ?*c.GtkWidget {
+    const widget = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12) orelse return null;
+    c.gtk_widget_add_css_class(widget, "background");
+    c.gtk_widget_set_margin_top(widget, 16);
+    c.gtk_widget_set_margin_bottom(widget, 16);
+    c.gtk_widget_set_margin_start(widget, 16);
+    c.gtk_widget_set_margin_end(widget, 16);
+    return widget;
+}
+
+fn allocateFrameBuffer(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+) (std.mem.Allocator.Error || error{Overflow})![]u8 {
+    const pixels = try std.math.mul(usize, @intCast(width), @intCast(height));
+    const bytes = try std.math.mul(usize, pixels, 4);
+    return allocator.alloc(u8, bytes);
+}
+
+fn dupeOptional(
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
 }
 
 fn setEntryValue(state: *State, entry: *c.GtkEntry, value: ?[]const u8) void {
@@ -1546,6 +2157,7 @@ fn snapshotThreadMain(state: *State, vm: *VM, path: []u8) void {
 
 fn guestClipboard(text: []const u8, userdata: ?*anyopaque) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (!state.clipboard_active.load(.acquire)) return;
     if (text.len > agent.native.clipboard_text_bytes_max) return;
     if (!std.unicode.utf8ValidateSlice(text)) return;
     state.clipboard_lock.lockUncancelable(global.io());
@@ -1557,11 +2169,13 @@ fn guestClipboard(text: []const u8, userdata: ?*anyopaque) void {
 
 fn requestHostClipboard(userdata: ?*anyopaque) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (!state.clipboard_active.load(.acquire)) return;
     state.host_clipboard_requested.store(true, .release);
 }
 
 fn clipboardChanged(_: *c.GdkClipboard, userdata: ?*anyopaque) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (state.registry.clipboard_owner != state) return;
     if (state.ignore_clipboard_change) {
         state.ignore_clipboard_change = false;
         return;
@@ -1582,6 +2196,7 @@ fn hostClipboardRead(
         return;
     };
     defer c.g_free(text);
+    if (state.registry.clipboard_owner != state) return;
     const bytes = std.mem.span(text);
     if (bytes.len > agent.native.clipboard_text_bytes_max) return;
     if (state.vm) |vm| vm.sendHostClipboard(bytes);
@@ -1592,12 +2207,49 @@ fn loadClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     state.loadConfiguration();
 }
 
+fn newClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.newConfiguration();
+}
+
+fn savePreferencesClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.savePreferences();
+}
+
 fn saveClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
     state.saveConfiguration();
 }
 
 fn deleteClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const selected = c.gtk_combo_box_text_get_active_text(state.vm_selector.?) orelse return;
+    c.g_free(selected);
+    const dialog = c.adw_alert_dialog_new(
+        "Remove Virtual Machine?",
+        "The saved configuration will be removed. Disk images and snapshots are kept.",
+    ) orelse return;
+    const alert: *c.AdwAlertDialog = @ptrCast(dialog);
+    c.adw_alert_dialog_add_response(alert, "cancel", "Cancel");
+    c.adw_alert_dialog_add_response(alert, "remove", "Remove");
+    c.adw_alert_dialog_set_close_response(alert, "cancel");
+    c.adw_alert_dialog_set_default_response(alert, "cancel");
+    c.adw_alert_dialog_set_response_appearance(
+        alert,
+        "remove",
+        c.ADW_RESPONSE_DESTRUCTIVE,
+    );
+    _ = c.g_signal_connect_data(dialog, "response", @ptrCast(&deleteResponse), state, null, 0);
+    c.adw_dialog_present(dialog, @ptrCast(state.window.?));
+}
+
+fn deleteResponse(
+    _: *c.AdwAlertDialog,
+    response: [*:0]const u8,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    if (!std.mem.eql(u8, std.mem.span(response), "remove")) return;
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
     state.deleteConfiguration();
 }
@@ -1742,6 +2394,29 @@ fn closeRequest(_: *c.GtkWindow, userdata: ?*anyopaque) callconv(.c) c.gboolean 
     return c.TRUE;
 }
 
+fn windowDestroyed(window: *c.GtkWindow, userdata: ?*anyopaque) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    if (state.window != window) return;
+    state.window = null;
+    if (state.clipboard) |clipboard| {
+        if (state.clipboard_signal_handler != 0) {
+            c.g_signal_handler_disconnect(clipboard, state.clipboard_signal_handler);
+            state.clipboard_signal_handler = 0;
+        }
+    }
+    if (state.session_arena != null) state.registry.retire(state);
+}
+
+fn windowActiveChanged(
+    window: *c.GtkWindow,
+    _: *c.GParamSpec,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    if (c.gtk_window_is_active(window) == c.FALSE) return;
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    state.registry.claimClipboard(state);
+}
+
 fn tick(userdata: ?*anyopaque) callconv(.c) c.gboolean {
     const state: *State = @ptrCast(@alignCast(userdata orelse return c.G_SOURCE_REMOVE));
     state.flushOutput();
@@ -1752,6 +2427,14 @@ fn tick(userdata: ?*anyopaque) callconv(.c) c.gboolean {
     state.flushClipboard();
     if (vm.state() != .stopped) return c.G_SOURCE_CONTINUE;
     state.finish();
+    return c.G_SOURCE_REMOVE;
+}
+
+fn scrollConsoleToEnd(userdata: ?*anyopaque) callconv(.c) c.gboolean {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return c.G_SOURCE_REMOVE));
+    const scrolled = state.console_scroll orelse return c.G_SOURCE_REMOVE;
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(scrolled);
+    c.gtk_adjustment_set_value(adjustment, c.gtk_adjustment_get_upper(adjustment));
     return c.G_SOURCE_REMOVE;
 }
 
@@ -1774,6 +2457,7 @@ fn drawDisplay(
         @intCast(state.frame_width * 4),
     ) orelse return;
     defer c.cairo_surface_destroy(surface);
+    c.cairo_surface_mark_dirty(surface);
     const scale = @min(
         @as(f64, @floatFromInt(width)) / @as(f64, @floatFromInt(state.frame_width)),
         @as(f64, @floatFromInt(height)) / @as(f64, @floatFromInt(state.frame_height)),
@@ -1966,6 +2650,24 @@ fn linuxKeyCode(keyval: c_uint) ?u16 {
         0xffff => 111,
         else => null,
     };
+}
+
+test "session registry reuses retired slots" {
+    var registry = SessionRegistry{};
+    var sessions: [sessions_max + 1]*State = undefined;
+    for (&sessions) |*session| {
+        session.* = try std.testing.allocator.create(State);
+        session.*.retired_next = null;
+    }
+    defer for (sessions) |session| std.testing.allocator.destroy(session);
+
+    for (sessions[0..sessions_max]) |session| try registry.add(session);
+    try std.testing.expectError(error.TooManySessions, registry.add(sessions[sessions_max]));
+    registry.retire(sessions[3]);
+    try registry.add(sessions[sessions_max]);
+
+    try std.testing.expectEqual(sessions_max, registry.count);
+    try std.testing.expectEqual(sessions[3], registry.retired.?);
 }
 
 fn keySequence(keyval: c_uint, modifiers: c_uint) ?[]const u8 {
