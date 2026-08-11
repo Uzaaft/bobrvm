@@ -197,6 +197,15 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
 }
 
 pub fn validate(self: *const Config) ParseError!void {
+    if (self.forward_count > MAX_FORWARDS) return ParseError.InvalidArgument;
+    for (self.forwards[0..self.forward_count], 0..) |forward, index| {
+        if (forward.host_port == 0 or forward.guest_port == 0) {
+            return ParseError.InvalidArgument;
+        }
+        for (self.forwards[0..index]) |earlier| {
+            if (earlier.host_port == forward.host_port) return ParseError.InvalidArgument;
+        }
+    }
     const memory_bytes = std.math.mul(u64, self.memory_mb, 1024 * 1024) catch {
         return ParseError.InvalidArgument;
     };
@@ -243,12 +252,46 @@ pub fn ensureConfigDir(alloc: Allocator) ![]const u8 {
 
 pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
     try validateName(name);
-
     const dir = try getConfigDir(alloc);
     defer alloc.free(dir);
     const filename = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
     defer alloc.free(filename);
     return std.fs.path.join(alloc, &.{ dir, filename });
+}
+
+pub fn getVarsPath(alloc: Allocator, name: []const u8) ![]const u8 {
+    try validateName(name);
+    const dir = try getConfigDir(alloc);
+    defer alloc.free(dir);
+    const filename = try std.fmt.allocPrint(alloc, "{s}.vars.fd", .{name});
+    defer alloc.free(filename);
+    return std.fs.path.join(alloc, &.{ dir, filename });
+}
+
+/// Create a private writable UEFI variable store once and return its owned path.
+pub fn ensureVars(alloc: Allocator, name: []const u8, template_path: []const u8) ![]const u8 {
+    const dir = try ensureConfigDir(alloc);
+    defer alloc.free(dir);
+    const vars_path = try getVarsPath(alloc, name);
+    errdefer alloc.free(vars_path);
+    const existing = std.Io.Dir.openFileAbsolute(global.io(), vars_path, .{}) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const template = try std.Io.Dir.cwd().openFile(global.io(), template_path, .{
+            .mode = .read_only,
+        });
+        defer template.close(global.io());
+        const bytes = try file_compat.readToEndAlloc(template, alloc, 16 * 1024 * 1024);
+        defer alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len % std.heap.page_size_min != 0) {
+            return error.InvalidFirmwareVariables;
+        }
+        const output = try std.Io.Dir.createFileAbsolute(global.io(), vars_path, .{});
+        defer output.close(global.io());
+        try output.writePositionalAll(global.io(), bytes, 0);
+        return vars_path;
+    };
+    existing.close(global.io());
+    return vars_path;
 }
 
 pub fn save(self: *const Config, alloc: Allocator) !void {
@@ -270,12 +313,15 @@ pub fn save(self: *const Config, alloc: Allocator) !void {
     try file.writePositionalAll(global.io(), "\n", json_bytes.len);
 }
 
-fn validateName(name: []const u8) ParseError!void {
+pub fn validateName(name: []const u8) ParseError!void {
     const suffix = ".json";
 
     if (name.len == 0) return error.MissingName;
     if (name.len > std.Io.Dir.max_name_bytes - suffix.len) return error.InvalidName;
     if (std.mem.indexOfAny(u8, name, "/\x00") != null) return error.InvalidName;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.InvalidName;
+    }
 }
 
 pub const LoadedConfig = struct {
@@ -288,6 +334,7 @@ pub const LoadedConfig = struct {
 };
 
 pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
+    try validateName(name);
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
@@ -320,6 +367,7 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
 }
 
 pub fn delete(alloc: Allocator, name: []const u8) !void {
+    try validateName(name);
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
@@ -329,6 +377,12 @@ pub fn delete(alloc: Allocator, name: []const u8) !void {
         }
         return err;
     };
+    const vars_path = try getVarsPath(alloc, name);
+    defer alloc.free(vars_path);
+    std.Io.Dir.deleteFileAbsolute(global.io(), vars_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 pub fn listAll(alloc: Allocator) ![][]const u8 {
@@ -337,7 +391,7 @@ pub fn listAll(alloc: Allocator) ![][]const u8 {
 
     var dir = std.Io.Dir.openDirAbsolute(global.io(), dir_path, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
-            return &.{};
+            return try alloc.alloc([]const u8, 0);
         }
         return err;
     };
@@ -390,7 +444,6 @@ test "persisted config uses shared GPU memory validation" {
     const valid = Config{ .gpu_memory_mb = 2048 };
     try valid.validate();
 }
-
 test "config paths reject names outside the VM directory" {
     const invalid_names = [_][]const u8{
         "../escape",

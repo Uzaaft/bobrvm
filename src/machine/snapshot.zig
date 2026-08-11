@@ -19,6 +19,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const hypervisor = @import("../hypervisor/main.zig");
+const pci = @import("../pci/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
 const mmio = @import("../virtio/mmio.zig");
@@ -335,6 +336,106 @@ fn transportSerializedBytes(t: *const mmio.Transport) usize {
 }
 
 // =============================================================================
+// Virtio PCI transport
+// =============================================================================
+
+fn pciTransportSerializedBytes(device: *const pci.VirtioPciDevice) usize {
+    const transport = device.transport;
+    const queue_bytes = 3 * @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
+    return device.config.len + 5 * @sizeOf(u32) + 2 * @sizeOf(u64) +
+        2 * @sizeOf(u16) + 3 * @sizeOf(u8) +
+        transport.queues.len * queue_bytes + transport.device_config.len;
+}
+
+pub fn serializePciDevice(alloc: Allocator, device: *const pci.VirtioPciDevice) ![]u8 {
+    const transport = device.transport;
+    assert(transport.queues.len > 0);
+    assert(transport.queues.len <= pci.virtio_pci.VirtioPciTransport.MAX_QUEUES);
+    assert(transport.device_config.len <= std.math.maxInt(u32));
+    const serialized_bytes = pciTransportSerializedBytes(device);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try out.bytes(&device.config);
+    try out.int(u32, device.bar0_addr);
+    try out.int(u32, transport.device_id);
+    try out.int(u64, transport.device_features);
+    try out.int(u64, transport.driver_features);
+    try out.int(u32, transport.device_feature_select);
+    try out.int(u32, transport.driver_feature_select);
+    try out.int(u8, @bitCast(transport.status));
+    try out.int(u8, transport.config_generation);
+    try out.int(u16, transport.queue_select);
+    try out.int(u16, transport.num_queues);
+    try out.int(u8, @bitCast(transport.isr_status));
+    for (transport.queues) |queue| {
+        try out.int(u16, queue.size);
+        try out.int(u16, queue.size_max);
+        try out.int(u8, @intFromBool(queue.enable));
+        try out.int(u16, queue.notify_off);
+        try out.int(u64, queue.desc_addr);
+        try out.int(u64, queue.driver_addr);
+        try out.int(u64, queue.device_addr);
+    }
+    try out.int(u32, @intCast(transport.device_config.len));
+    try out.bytes(transport.device_config);
+    assert(out.buf.items.len == serialized_bytes);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendPciDeviceSection(
+    builder: *Builder,
+    alloc: Allocator,
+    name: []const u8,
+    device: *const pci.VirtioPciDevice,
+) !void {
+    const data = try serializePciDevice(alloc, device);
+    defer alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializePciDevice(
+    _: Allocator,
+    device: *pci.VirtioPciDevice,
+    data: []const u8,
+) !void {
+    var cur = Cursor{ .buf = data };
+    const config = try cur.bytes(device.config.len);
+    @memcpy(&device.config, config);
+    device.bar0_addr = try cur.int(u32);
+    const transport = device.transport;
+    if (try cur.int(u32) != transport.device_id) return error.Mismatch;
+    if (try cur.int(u64) != transport.device_features) return error.Mismatch;
+    transport.driver_features = try cur.int(u64);
+    transport.device_feature_select = try cur.int(u32);
+    transport.driver_feature_select = try cur.int(u32);
+    transport.status = @bitCast(try cur.int(u8));
+    transport.config_generation = try cur.int(u8);
+    transport.queue_select = try cur.int(u16);
+    const queue_count = try cur.int(u16);
+    if (queue_count != transport.num_queues or queue_count != transport.queues.len) {
+        return error.Mismatch;
+    }
+    transport.isr_status = @bitCast(try cur.int(u8));
+    for (transport.queues) |*queue| {
+        queue.size = try cur.int(u16);
+        const size_max = try cur.int(u16);
+        if (size_max != queue.size_max or queue.size > size_max) return error.Mismatch;
+        queue.enable = try cur.int(u8) != 0;
+        queue.notify_off = try cur.int(u16);
+        queue.desc_addr = try cur.int(u64);
+        queue.driver_addr = try cur.int(u64);
+        queue.device_addr = try cur.int(u64);
+    }
+    const config_len = try cur.int(u32);
+    if (config_len != transport.device_config.len) return error.Mismatch;
+    @memcpy(transport.device_config, try cur.bytes(config_len));
+    if (cur.off != cur.buf.len) return error.Mismatch;
+}
+
+// =============================================================================
 // Devices
 // =============================================================================
 
@@ -467,6 +568,56 @@ pub fn deserializeRng(_: Allocator, rng: *virtio.Rng, data: []const u8) !void {
     var cur = Cursor{ .buf = data };
     try deserializeTransport(&cur, &rng.transport);
     rng.last_avail = try cur.int(u16);
+}
+
+pub fn serializeSnd(alloc: Allocator, snd: *const virtio.Snd) ![]u8 {
+    const state = snd.snapshotState();
+    const serialized_bytes = transportSerializedBytes(snd.transport) +
+        6 * @sizeOf(u16) + 2 * @sizeOf(u32);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try serializeTransport(&out, snd.transport);
+    try out.int(u16, state.ctrl_last_avail);
+    try out.int(u16, state.tx_last_avail);
+    try out.int(u32, state.buffer_bytes);
+    try out.int(u32, state.period_bytes);
+    try out.int(u16, state.channels);
+    try out.int(u16, state.format);
+    try out.int(u16, state.rate);
+    try out.int(u16, state.stream_state);
+    assert(out.buf.items.len == serialized_bytes);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendSndSection(
+    builder: *Builder,
+    alloc: Allocator,
+    name: []const u8,
+    snd: *const virtio.Snd,
+) !void {
+    const data = try serializeSnd(alloc, snd);
+    defer alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializeSnd(_: Allocator, snd: *virtio.Snd, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, snd.transport);
+    const state = virtio.snd.SnapshotState{
+        .ctrl_last_avail = try cur.int(u16),
+        .tx_last_avail = try cur.int(u16),
+        .buffer_bytes = try cur.int(u32),
+        .period_bytes = try cur.int(u32),
+        .channels = @intCast(try cur.int(u16)),
+        .format = @intCast(try cur.int(u16)),
+        .rate = @intCast(try cur.int(u16)),
+        .stream_state = @intCast(try cur.int(u16)),
+    };
+    if (cur.off != cur.buf.len) return error.Mismatch;
+    try snd.restoreSnapshotState(state);
 }
 
 pub fn serializeNet(alloc: Allocator, net: *const virtio.Net) ![]u8 {
@@ -748,10 +899,16 @@ pub const GicCodec = DeviceCodec(gic_mod.Gic, appendGicSection, deserializeGic);
 pub const ConsoleCodec = DeviceCodec(virtio.Console, appendConsoleSection, deserializeConsole);
 pub const BlockCodec = DeviceCodec(virtio.Block, appendBlockSection, deserializeBlock);
 pub const RngCodec = DeviceCodec(virtio.Rng, appendRngSection, deserializeRng);
+pub const SndCodec = DeviceCodec(virtio.Snd, appendSndSection, deserializeSnd);
 pub const NetCodec = DeviceCodec(virtio.Net, appendNetSection, deserializeNet);
 pub const InputCodec = DeviceCodec(virtio.Input, appendInputSection, deserializeInput);
 pub const P9Codec = DeviceCodec(virtio.P9, appendP9Section, deserializeP9);
 pub const GpuCodec = DeviceCodec(virtio.Gpu, appendGpuSection, deserializeGpu);
+pub const PciDeviceCodec = DeviceCodec(
+    pci.VirtioPciDevice,
+    appendPciDeviceSection,
+    deserializePciDevice,
+);
 
 // =============================================================================
 // Tests
@@ -775,16 +932,45 @@ test "snapshot: container roundtrip and unknown sections" {
     try testing.expectError(error.BadMagic, Reader.init("XXXXXXXX\x01\x00\x00\x00"));
 }
 
-test "snapshot: malformed section size does not overflow" {
-    var bytes: [MAGIC.len + 4 + 1 + 1 + 8]u8 = undefined;
+test "snapshot: oversized section is rejected without integer overflow" {
+    var bytes: [MAGIC.len + 4 + 1 + 1 + 8]u8 = @splat(0);
     @memcpy(bytes[0..MAGIC.len], MAGIC);
     std.mem.writeInt(u32, bytes[MAGIC.len..][0..4], VERSION, .little);
     bytes[MAGIC.len + 4] = 1;
     bytes[MAGIC.len + 5] = 'x';
-    std.mem.writeInt(u64, bytes[bytes.len - 8 ..][0..8], std.math.maxInt(u64), .little);
-
+    std.mem.writeInt(u64, bytes[bytes.len - 8 ..], std.math.maxInt(u64), .little);
     const reader = try Reader.init(&bytes);
     try testing.expect(reader.section("x") == null);
+}
+
+test "snapshot: virtio PCI transport roundtrip" {
+    const first = try pci.VirtioPciDevice.init(testing.allocator, 2, 0x55aa, 2, 8);
+    defer first.deinit();
+    const second = try pci.VirtioPciDevice.init(testing.allocator, 2, 0x55aa, 2, 8);
+    defer second.deinit();
+    first.writeConfig(0x10, 4, 0xd000_0000);
+    first.transport.driver_features = 0x1122_3344_5566_7788;
+    first.transport.status = .{ .acknowledge = true, .driver_ok = true };
+    first.transport.queue_select = 1;
+    first.transport.queues[1].size = 128;
+    first.transport.queues[1].enable = true;
+    first.transport.queues[1].desc_addr = 0x1000;
+    first.transport.queues[1].driver_addr = 0x2000;
+    first.transport.queues[1].device_addr = 0x3000;
+    @memcpy(first.transport.device_config, "pci-test");
+
+    const bytes = try serializePciDevice(testing.allocator, first);
+    defer testing.allocator.free(bytes);
+    try deserializePciDevice(testing.allocator, second, bytes);
+    try testing.expectEqual(first.bar0_addr, second.bar0_addr);
+    try testing.expectEqual(first.transport.driver_features, second.transport.driver_features);
+    try testing.expectEqual(first.transport.status, second.transport.status);
+    try testing.expectEqualDeep(first.transport.queues, second.transport.queues);
+    try testing.expectEqualSlices(
+        u8,
+        first.transport.device_config,
+        second.transport.device_config,
+    );
 }
 
 test "snapshot: builder rejects section names above the wire limit" {
@@ -793,7 +979,6 @@ test "snapshot: builder rejects section names above the wire limit" {
     var name: [std.math.maxInt(u8) + 1]u8 = @splat('x');
     try testing.expectError(error.NameTooLong, builder.section(&name, "data"));
 }
-
 test "snapshot: gic state roundtrip" {
     const gic = try gic_mod.Gic.init(testing.allocator, 2);
     defer gic.deinit();
@@ -964,6 +1149,36 @@ test "snapshot: RNG device roundtrip" {
     try testing.expect(rng2.transport.queues[0].ready);
     try testing.expectEqual(@as(u64, 0x6000_0000), rng2.transport.queues[0].driver_addr);
     try testing.expectEqual(@as(u16, 29), rng2.last_avail);
+}
+
+test "snapshot: sound device roundtrip" {
+    const sound = try virtio.Snd.init(testing.allocator);
+    defer sound.deinit();
+    sound.transport.status = @bitCast(@as(u8, 0x0f));
+    sound.transport.queues[2].ready = true;
+    sound.transport.queues[2].device_addr = 0x7000_0000;
+    try sound.restoreSnapshotState(.{
+        .ctrl_last_avail = 13,
+        .tx_last_avail = 17,
+        .buffer_bytes = 8192,
+        .period_bytes = 4096,
+        .channels = virtio.snd.CHANNELS,
+        .format = virtio.snd.FMT_S16,
+        .rate = virtio.snd.RATE_48000,
+        .stream_state = 3,
+    });
+    const data = try serializeSnd(testing.allocator, sound);
+    defer testing.allocator.free(data);
+
+    const restored = try virtio.Snd.init(testing.allocator);
+    defer restored.deinit();
+    try deserializeSnd(testing.allocator, restored, data);
+
+    const state = restored.snapshotState();
+    try testing.expectEqual(@as(u16, 13), state.ctrl_last_avail);
+    try testing.expectEqual(@as(u16, 17), state.tx_last_avail);
+    try testing.expect(restored.transport.queues[2].ready);
+    try testing.expectEqual(@as(u64, 0x7000_0000), restored.transport.queues[2].device_addr);
 }
 
 test "snapshot: RNG section assembly allocation profile" {

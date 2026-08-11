@@ -20,13 +20,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const c = @cImport({
+    @cInclude("sys/stat.h");
+    @cInclude("unistd.h");
+});
 
 const log = std.log.scoped(.p9);
 
-// Darwin libc (not exposed by zig 0.16's std.c). Plain symbols are correct
-// on arm64 (the $INODE64 suffix is an x86_64-only artifact).
-extern "c" fn lstat(path: [*:0]const u8, st: *std.c.Stat) c_int;
-extern "c" fn truncate(path: [*:0]const u8, length: std.c.off_t) c_int;
+const HostStat = c.struct_stat;
 
 // Message types (9P2000.L + classic core).
 pub const Tlerror = 6; // R only
@@ -238,14 +239,65 @@ pub const P9Server = struct {
 
     const Qid = struct { type: u8, version: u32, path: u64 };
 
-    fn qidFromStat(st: std.c.Stat) Qid {
-        const S = std.c.S;
-        const t: u8 = if (S.ISDIR(st.mode)) 0x80 else if (S.ISLNK(st.mode)) 0x02 else 0x00;
+    fn qidFromStat(st: HostStat) Qid {
+        const mode = statMode(st);
+        const t: u8 = if (std.c.S.ISDIR(mode))
+            0x80
+        else if (std.c.S.ISLNK(mode))
+            0x02
+        else
+            0x00;
         return .{
             .type = t,
-            .version = @truncate(@as(u64, @bitCast(@as(i64, st.mtimespec.sec)))),
-            .path = st.ino,
+            .version = @truncate(@as(u64, @bitCast(statMtimeSec(st)))),
+            .path = @intCast(st.st_ino),
         };
+    }
+
+    fn statMode(st: HostStat) u32 {
+        return @intCast(st.st_mode);
+    }
+
+    fn statAtimeSec(st: HostStat) i64 {
+        if (comptime @hasField(HostStat, "st_atimespec")) {
+            return @intCast(st.st_atimespec.tv_sec);
+        }
+        return @intCast(st.st_atim.tv_sec);
+    }
+
+    fn statAtimeNsec(st: HostStat) i64 {
+        if (comptime @hasField(HostStat, "st_atimespec")) {
+            return @intCast(st.st_atimespec.tv_nsec);
+        }
+        return @intCast(st.st_atim.tv_nsec);
+    }
+
+    fn statMtimeSec(st: HostStat) i64 {
+        if (comptime @hasField(HostStat, "st_mtimespec")) {
+            return @intCast(st.st_mtimespec.tv_sec);
+        }
+        return @intCast(st.st_mtim.tv_sec);
+    }
+
+    fn statMtimeNsec(st: HostStat) i64 {
+        if (comptime @hasField(HostStat, "st_mtimespec")) {
+            return @intCast(st.st_mtimespec.tv_nsec);
+        }
+        return @intCast(st.st_mtim.tv_nsec);
+    }
+
+    fn statCtimeSec(st: HostStat) i64 {
+        if (comptime @hasField(HostStat, "st_ctimespec")) {
+            return @intCast(st.st_ctimespec.tv_sec);
+        }
+        return @intCast(st.st_ctim.tv_sec);
+    }
+
+    fn statCtimeNsec(st: HostStat) i64 {
+        if (comptime @hasField(HostStat, "st_ctimespec")) {
+            return @intCast(st.st_ctimespec.tv_nsec);
+        }
+        return @intCast(st.st_ctim.tv_nsec);
     }
 
     fn lerror(w: *Writer, tag: u16, ecode: u32) usize {
@@ -340,17 +392,17 @@ pub const P9Server = struct {
         return true;
     }
 
-    fn statRel(self: *P9Server, rel: []const u8) !std.c.Stat {
+    fn statRel(self: *P9Server, rel: []const u8) !HostStat {
         return self.statRelAlloc(self.alloc, rel);
     }
 
-    fn statRelAlloc(self: *P9Server, alloc: Allocator, rel: []const u8) !std.c.Stat {
+    fn statRelAlloc(self: *P9Server, alloc: Allocator, rel: []const u8) !HostStat {
         assert(rel.len <= MSIZE_MAX);
         assert(self.root.len <= std.math.maxInt(u32));
         const path = try self.hostPathAlloc(alloc, rel);
         defer alloc.free(path);
-        var st: std.c.Stat = undefined;
-        if (lstat(path.ptr, &st) != 0) return error.Stat;
+        var st: HostStat = undefined;
+        if (c.lstat(path.ptr, &st) != 0) return error.Stat;
         return st;
     }
 
@@ -421,8 +473,8 @@ pub const P9Server = struct {
                 const fid = try r.u32v();
                 var path_storage: [std.fs.max_path_bytes]u8 = undefined;
                 const path = try self.hostPathInto("", &path_storage);
-                var st: std.c.Stat = undefined;
-                if (lstat(path.ptr, &st) != 0) return error.Stat;
+                var st: HostStat = undefined;
+                if (c.lstat(path.ptr, &st) != 0) return error.Stat;
                 const rel = try self.alloc.dupe(u8, "");
                 errdefer self.alloc.free(rel);
                 if (self.fids.fetchRemove(fid)) |old| {
@@ -495,8 +547,8 @@ pub const P9Server = struct {
                 fid.fd = fd;
                 fid.open_linux_flags = flags;
 
-                var st: std.c.Stat = undefined;
-                if (std.c.fstat(fd, &st) != 0) return error.Errno;
+                var st: HostStat = undefined;
+                if (c.fstat(fd, &st) != 0) return error.Errno;
                 w.qid(qidFromStat(st));
                 w.u32v(0); // iounit: use msize-derived default
                 return w.finish(Tlopen + 1, tag);
@@ -528,8 +580,8 @@ pub const P9Server = struct {
                 // On restore, re-open WITHOUT re-creating/truncating.
                 fid.open_linux_flags = flags & ~@as(u32, L_O_CREAT | L_O_EXCL | L_O_TRUNC);
 
-                var st: std.c.Stat = undefined;
-                if (std.c.fstat(fd, &st) != 0) return error.Errno;
+                var st: HostStat = undefined;
+                if (c.fstat(fd, &st) != 0) return error.Errno;
                 w.qid(qidFromStat(st));
                 w.u32v(0);
                 return w.finish(Tlcreate + 1, tag);
@@ -540,25 +592,25 @@ pub const P9Server = struct {
                 const fid = try self.getFid(fid_id);
                 var path_storage: [std.fs.max_path_bytes]u8 = undefined;
                 const path = try self.hostPathInto(fid.rel, &path_storage);
-                var st: std.c.Stat = undefined;
-                if (lstat(path.ptr, &st) != 0) return error.Stat;
+                var st: HostStat = undefined;
+                if (c.lstat(path.ptr, &st) != 0) return error.Stat;
 
                 w.u64v(0x000007ff); // valid: P9_GETATTR_BASIC
                 w.qid(qidFromStat(st));
-                w.u32v(st.mode);
-                w.u32v(st.uid);
-                w.u32v(st.gid);
-                w.u64v(st.nlink);
-                w.u64v(@bitCast(@as(i64, st.rdev)));
-                w.u64v(@bitCast(st.size));
+                w.u32v(statMode(st));
+                w.u32v(@intCast(st.st_uid));
+                w.u32v(@intCast(st.st_gid));
+                w.u64v(@intCast(st.st_nlink));
+                w.u64v(@bitCast(@as(i64, @intCast(st.st_rdev))));
+                w.u64v(@bitCast(@as(i64, @intCast(st.st_size))));
                 w.u64v(4096); // blksize
-                w.u64v(@bitCast(st.blocks));
-                w.u64v(@bitCast(@as(i64, st.atimespec.sec)));
-                w.u64v(@bitCast(@as(i64, st.atimespec.nsec)));
-                w.u64v(@bitCast(@as(i64, st.mtimespec.sec)));
-                w.u64v(@bitCast(@as(i64, st.mtimespec.nsec)));
-                w.u64v(@bitCast(@as(i64, st.ctimespec.sec)));
-                w.u64v(@bitCast(@as(i64, st.ctimespec.nsec)));
+                w.u64v(@bitCast(@as(i64, @intCast(st.st_blocks))));
+                w.u64v(@bitCast(statAtimeSec(st)));
+                w.u64v(@bitCast(statAtimeNsec(st)));
+                w.u64v(@bitCast(statMtimeSec(st)));
+                w.u64v(@bitCast(statMtimeNsec(st)));
+                w.u64v(@bitCast(statCtimeSec(st)));
+                w.u64v(@bitCast(statCtimeNsec(st)));
                 w.u64v(0); // btime sec
                 w.u64v(0); // btime nsec
                 w.u64v(0); // gen
@@ -581,7 +633,7 @@ pub const P9Server = struct {
                 if (valid & SETATTR_SIZE != 0) {
                     if (fid.fd) |fd| {
                         if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.Errno;
-                    } else if (truncate(path.ptr, @intCast(size)) != 0) {
+                    } else if (c.truncate(path.ptr, @intCast(size)) != 0) {
                         return error.Errno;
                     }
                 }
@@ -670,8 +722,8 @@ pub const P9Server = struct {
                 const path = try self.hostPathInto(rel, &path_storage);
 
                 if (std.c.mkdir(path.ptr, @intCast(mode & 0o7777)) != 0) return error.Errno;
-                var st: std.c.Stat = undefined;
-                if (lstat(path.ptr, &st) != 0) return error.Stat;
+                var st: HostStat = undefined;
+                if (c.lstat(path.ptr, &st) != 0) return error.Stat;
                 w.qid(qidFromStat(st));
                 return w.finish(Tmkdir + 1, tag);
             },
@@ -697,9 +749,12 @@ pub const P9Server = struct {
                 const fid = try self.getFid(fid_id);
                 var path_storage: [std.fs.max_path_bytes]u8 = undefined;
                 const path = try self.hostPathInto(fid.rel, &path_storage);
-                var st: std.c.Stat = undefined;
-                if (lstat(path.ptr, &st) != 0) return error.Stat;
-                const rc = if (std.c.S.ISDIR(st.mode)) std.c.rmdir(path.ptr) else std.c.unlink(path.ptr);
+                var st: HostStat = undefined;
+                if (c.lstat(path.ptr, &st) != 0) return error.Stat;
+                const rc = if (std.c.S.ISDIR(statMode(st)))
+                    std.c.rmdir(path.ptr)
+                else
+                    std.c.unlink(path.ptr);
                 if (self.fids.fetchRemove(fid_id)) |old| {
                     var v = old.value;
                     self.dropFid(&v);

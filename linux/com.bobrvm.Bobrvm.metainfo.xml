@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.bobrvm.Bobrvm</id>
+  <name>bobrvm</name>
+  <summary>Run hardware-accelerated virtual machines</summary>
+  <developer id="com.bobrvm">
+    <name>bobrvm contributors</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>BUSL-1.1</project_license>
+  <url type="homepage">https://github.com/polymath-as/bobrvm</url>
+  <description>
+    <p>
+      bobrvm creates and runs Linux virtual machines with accelerated graphics,
+      networking, audio, shared folders, snapshots, and guest integration.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.bobrvm.Bobrvm.desktop</launchable>
+  <provides>
+    <binary>bobrvm-gtk</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>Emulator</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>

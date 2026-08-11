@@ -1,8 +1,18 @@
 {
   lib,
   stdenv,
+  OVMF,
+  alsa-lib,
+  glib,
+  gobject-introspection,
+  gsettings-desktop-schemas,
   libiconv,
+  gtk4,
+  libadwaita,
+  patchelf,
   pkg-config,
+  virglrenderer,
+  wrapGAppsHook4,
   zig,
   optimize ? "ReleaseFast",
 }:
@@ -20,6 +30,8 @@ stdenv.mkDerivation (finalAttrs: {
         ../build.zig.zon
         ../include
         ../LICENSE
+        ../linux
+        ../macos/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png
         ../src
         ../third_party
         ../tools
@@ -38,11 +50,26 @@ stdenv.mkDerivation (finalAttrs: {
     inherit (finalAttrs) zigDeps;
   };
 
-  nativeBuildInputs = [
-    pkg-config
-    zig
-  ];
-  buildInputs = [libiconv];
+  nativeBuildInputs =
+    [
+      pkg-config
+      patchelf
+      zig
+    ]
+    ++ lib.optionals stdenv.hostPlatform.isLinux [
+      gobject-introspection
+      wrapGAppsHook4
+    ];
+  buildInputs =
+    lib.optional stdenv.hostPlatform.isDarwin libiconv
+    ++ lib.optionals stdenv.hostPlatform.isLinux [
+      glib
+      alsa-lib
+      gsettings-desktop-schemas
+      gtk4
+      libadwaita
+      virglrenderer
+    ];
 
   dontConfigure = true;
   dontUseZigBuild = true;
@@ -52,23 +79,38 @@ stdenv.mkDerivation (finalAttrs: {
     export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
-    zig build -Dcpu=baseline -Doptimize=${optimize}
+    zig build \
+      -Dcpu=baseline \
+      -Doptimize=${optimize}
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     cp -R zig-out/. "$out"
+    ${lib.optionalString stdenv.hostPlatform.isLinux ''
+      patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm"
+      patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm-gtk"
+      mkdir -p "$out/share/bobrvm"
+      cp ${OVMF.fd}/FV/OVMF.fd "$out/share/bobrvm/OVMF.fd"
+      cp ${OVMF.fd}/FV/OVMF_VARS.fd "$out/share/bobrvm/OVMF_VARS.fd"
+    ''}
     runHook postInstall
   '';
 
+  preFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
+    gappsWrapperArgs+=(--set BOBRVM_OVMF_FD "$out/share/bobrvm/OVMF.fd")
+    gappsWrapperArgs+=(--set BOBRVM_OVMF_VARS_FD "$out/share/bobrvm/OVMF_VARS.fd")
+  '';
+
   meta = {
-    description = "Linux virtualization for macOS";
+    description = "Fast Linux virtualization for macOS and Linux";
     homepage = "https://github.com/polymath-as/bobrvm";
     license = lib.licenses.bsl11;
     platforms = [
       "aarch64-darwin"
       "x86_64-darwin"
+      "x86_64-linux"
     ];
     mainProgram = "bobrvm";
   };

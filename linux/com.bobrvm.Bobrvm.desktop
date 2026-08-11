@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=bobrvm
+GenericName=Virtual Machine Manager
+Comment=Create and run hardware-accelerated virtual machines
+Exec=bobrvm-gtk
+Icon=com.bobrvm.Bobrvm
+Terminal=false
+Categories=System;Emulator;
+Keywords=virtualization;virtual machine;Linux;KVM;
+StartupNotify=true
+StartupWMClass=com.bobrvm.Bobrvm

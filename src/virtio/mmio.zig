@@ -359,6 +359,12 @@ pub const Transport = struct {
 
     /// Reset device to initial state.
     pub fn reset(self: *Transport) void {
+        // Firmware can reset a device without first acknowledging its interrupt.
+        // Drop the level before clearing the status so the next driver receives
+        // a fresh edge when the machine routes legacy PCI interrupts through a PIC.
+        if (@as(u32, @bitCast(self.interrupt_status)) != 0) {
+            if (self.irq) |irq| irq.call(false);
+        }
         self.status = .{};
         self.driver_features = 0;
         self.device_features_sel = 0;
@@ -429,6 +435,29 @@ test "Transport status reset" {
     // Reset by writing 0
     transport.write(@intFromEnum(Reg.status), 0);
     try std.testing.expect(!transport.status.acknowledge);
+}
+
+test "Transport reset deasserts a pending interrupt" {
+    const transport = try Transport.init(std.testing.allocator, 3, 0, 2);
+    defer transport.deinit(std.testing.allocator);
+
+    const Line = struct {
+        level: bool = false,
+
+        fn cb(level: bool, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.level = level;
+        }
+    };
+    var line = Line{};
+    transport.setIrqCallback(Irq.initRaw(Line.cb, &line));
+    transport.signalUsedBuffer();
+    try std.testing.expect(line.level);
+
+    transport.write(@intFromEnum(Reg.status), 0);
+
+    try std.testing.expect(!line.level);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(transport.interrupt_status)));
 }
 
 test "Transport config change raises and ack clears the interrupt line" {

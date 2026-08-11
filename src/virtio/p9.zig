@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 const p9 = @import("../fs/p9.zig");
@@ -34,7 +35,7 @@ pub const P9 = struct {
     resp_buf: []u8,
 
     /// Guest memory accessor.
-    guest_memory: ?ring.GetMemFn = null,
+    guest_memory: ?GuestMemory = null,
 
     const AllocationLayout = struct {
         transport_offset: usize,
@@ -129,8 +130,12 @@ pub const P9 = struct {
     }
 
     /// Set guest memory accessor.
-    pub fn setGuestMemory(self: *P9, accessor: ring.GetMemFn) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *P9, accessor: anytype) void {
+        self.guest_memory = switch (@typeInfo(@TypeOf(accessor))) {
+            .@"fn", .pointer => GuestMemory.bindGlobal(accessor),
+            .@"struct" => accessor,
+            else => @compileError("unsupported guest-memory accessor"),
+        };
     }
 
     pub fn setIrqCallback(self: *P9, irq: mmio.Irq) void {
@@ -186,7 +191,7 @@ pub const P9 = struct {
             var req_len: usize = 0;
             for (chain.slice()) |desc| {
                 if (desc.isWrite()) continue;
-                const data = get_mem(desc.addr, desc.len) orelse continue;
+                const data = ring.get(get_mem, desc.addr, desc.len) orelse continue;
                 const n = @min(data.len, self.req_buf.len - req_len);
                 @memcpy(self.req_buf[req_len..][0..n], data[0..n]);
                 req_len += n;
@@ -200,7 +205,7 @@ pub const P9 = struct {
                 for (chain.slice()) |desc| {
                     if (!desc.isWrite()) continue;
                     if (off >= resp_len) break;
-                    const data = get_mem(desc.addr, desc.len) orelse continue;
+                    const data = ring.get(get_mem, desc.addr, desc.len) orelse continue;
                     const n = @min(data.len, resp_len - off);
                     @memcpy(data[0..n], self.resp_buf[off..][0..n]);
                     off += n;

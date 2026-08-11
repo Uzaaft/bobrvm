@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const callback_binding = @import("../callback.zig");
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 
@@ -98,7 +99,7 @@ pub const Net = struct {
     rx_mutex: std.Io.Mutex,
 
     /// Guest memory accessor.
-    guest_memory: ?ring.GetMemFn,
+    guest_memory: ?GuestMemory,
 
     /// Guest → host frame sink.
     tx: ?Tx,
@@ -172,8 +173,8 @@ pub const Net = struct {
         self.alloc.destroy(self);
     }
 
-    pub fn setGuestMemory(self: *Net, accessor: ring.GetMemFn) void {
-        self.guest_memory = accessor;
+    pub fn setGuestMemory(self: *Net, memory: GuestMemory) void {
+        self.guest_memory = memory;
     }
 
     pub fn setIrqCallback(self: *Net, irq: mmio.Irq) void {
@@ -182,6 +183,13 @@ pub const Net = struct {
 
     pub fn setTxCallback(self: *Net, tx: Tx) void {
         self.tx = tx;
+    }
+
+    /// Reset queue-owned state when the guest resets the PCI transport.
+    pub fn reset(self: *Net) void {
+        self.transport.reset();
+        self.rx_last_avail = 0;
+        self.tx_last_avail = 0;
     }
 
     /// Queue a frame for delivery to the guest. Thread-safe; the frame
@@ -307,15 +315,20 @@ pub const Net = struct {
         if (!qc.ready or qc.num == 0) return;
         const get_mem = self.guest_memory orelse return;
 
-        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        const avail_idx = ring.availIdxMemory(qc, get_mem) orelse return;
+        const pending = avail_idx -% self.tx_last_avail;
+        if (pending > qc.num) {
+            log.warn("rejecting TX avail jump {} larger than queue {}", .{ pending, qc.num });
+            return;
+        }
         var processed: u32 = 0;
 
-        while (self.tx_last_avail != avail_idx) : (processed += 1) {
-            const head = ring.availEntry(qc, self.tx_last_avail, get_mem) orelse break;
-            const chain = ring.Chain.collect(qc, head, get_mem);
+        while (self.tx_last_avail != avail_idx and processed < qc.num) : (processed += 1) {
+            const head = ring.availEntryMemory(qc, self.tx_last_avail, get_mem) orelse break;
+            const chain = ring.Chain.collectMemory(qc, head, get_mem);
 
             self.transmitChain(&chain, get_mem);
-            ring.pushUsed(qc, head, 0, get_mem);
+            ring.pushUsedMemory(qc, head, 0, get_mem);
             self.tx_last_avail +%= 1;
         }
 
@@ -326,13 +339,13 @@ pub const Net = struct {
 
     /// Gather one TX chain (skipping the 12-byte header) and hand the
     /// frame to the backend.
-    fn transmitChain(self: *Net, chain: *const ring.Chain, get_mem: ring.GetMemFn) void {
+    fn transmitChain(self: *Net, chain: *const ring.Chain, memory: GuestMemory) void {
         if (chain.count == 1) {
             const desc = chain.descs[0];
             if (!desc.isWrite() and desc.len > @sizeOf(NetHeader) and
                 desc.len <= @sizeOf(NetHeader) + MAX_FRAME)
             {
-                const mem = get_mem(desc.addr, desc.len) orelse return;
+                const mem = memory.get(desc.addr, desc.len) orelse return;
                 const frame = mem[@sizeOf(NetHeader)..];
                 assert(frame.len > 0);
                 assert(frame.len <= MAX_FRAME);
@@ -347,8 +360,8 @@ pub const Net = struct {
                 header_desc.len == @sizeOf(NetHeader) and
                 frame_desc.len > 0 and frame_desc.len <= MAX_FRAME)
             {
-                _ = get_mem(header_desc.addr, header_desc.len) orelse return;
-                const frame = get_mem(frame_desc.addr, frame_desc.len) orelse return;
+                _ = memory.get(header_desc.addr, header_desc.len) orelse return;
+                const frame = memory.get(frame_desc.addr, frame_desc.len) orelse return;
                 assert(frame.len > 0);
                 assert(frame.len <= MAX_FRAME);
                 if (self.tx) |tx| tx.call(frame);
@@ -356,13 +369,13 @@ pub const Net = struct {
             }
         }
 
-        self.transmitGathered(chain, get_mem);
+        self.transmitGathered(chain, memory);
     }
 
     noinline fn transmitGathered(
         self: *Net,
         chain: *const ring.Chain,
-        get_mem: ring.GetMemFn,
+        memory: GuestMemory,
     ) void {
         var frame_buf: [MAX_FRAME]u8 = undefined;
         var frame_len: usize = 0;
@@ -370,7 +383,7 @@ pub const Net = struct {
 
         for (chain.slice()) |desc| {
             if (desc.isWrite()) continue;
-            const mem = get_mem(desc.addr, desc.len) orelse return;
+            const mem = memory.get(desc.addr, desc.len) orelse return;
             var data: []const u8 = mem;
             if (skip > 0) {
                 const n = @min(skip, data.len);
@@ -398,20 +411,25 @@ pub const Net = struct {
         defer self.rx_mutex.unlock(global.io());
         if (self.rx_count == 0) return;
 
-        const avail_idx = ring.availIdx(qc, get_mem) orelse return;
+        const avail_idx = ring.availIdxMemory(qc, get_mem) orelse return;
+        const pending = avail_idx -% self.rx_last_avail;
+        if (pending > qc.num) {
+            log.warn("rejecting RX avail jump {} larger than queue {}", .{ pending, qc.num });
+            return;
+        }
         var last_avail = self.rx_last_avail;
         var delivered: usize = 0;
 
-        while (last_avail != avail_idx and delivered < self.rx_count) {
-            const head = ring.availEntry(qc, last_avail, get_mem) orelse break;
-            const chain = ring.Chain.collect(qc, head, get_mem);
+        while (last_avail != avail_idx and delivered < self.rx_count and delivered < qc.num) {
+            const head = ring.availEntryMemory(qc, last_avail, get_mem) orelse break;
+            const chain = ring.Chain.collectMemory(qc, head, get_mem);
             const frame_index = (self.rx_head + delivered) % self.rx_frames.len;
             const queued = self.rx_frames[frame_index];
             const storage = self.rx_storage[queued.storage_index].bytes();
             const frame = storage[0..queued.len];
 
             const written = deliverFrame(&chain, frame, get_mem) orelse break;
-            ring.pushUsed(qc, head, written, get_mem);
+            ring.pushUsedMemory(qc, head, written, get_mem);
 
             delivered += 1;
             last_avail +%= 1;
@@ -516,7 +534,7 @@ pub const Net = struct {
 
     /// Scatter header + frame into a writable RX chain; returns bytes
     /// written or null when the chain is unusable.
-    fn deliverFrame(chain: *const ring.Chain, frame: []const u8, get_mem: ring.GetMemFn) ?u32 {
+    fn deliverFrame(chain: *const ring.Chain, frame: []const u8, memory: GuestMemory) ?u32 {
         const header = NetHeader{};
         const header_bytes = std.mem.asBytes(&header);
 
@@ -526,7 +544,7 @@ pub const Net = struct {
 
         for (chain.slice()) |desc| {
             if (!desc.isWrite()) continue;
-            const mem = get_mem(desc.addr, desc.len) orelse return null;
+            const mem = memory.get(desc.addr, desc.len) orelse return null;
             var dst = mem;
             while (dst.len > 0 and src_stage < total) {
                 if (src_stage < header_bytes.len) {
@@ -570,6 +588,18 @@ test "Net init" {
 
 test "NetHeader size" {
     try testing.expectEqual(@as(usize, 12), @sizeOf(NetHeader));
+}
+
+test "Net reset clears queue cursors" {
+    const net = try Net.init(testing.allocator);
+    defer net.deinit();
+    net.rx_last_avail = 17;
+    net.tx_last_avail = 23;
+
+    net.reset();
+
+    try testing.expectEqual(@as(u16, 0), net.rx_last_avail);
+    try testing.expectEqual(@as(u16, 0), net.tx_last_avail);
 }
 
 test "Net queues and drops rx frames at capacity" {
@@ -710,10 +740,13 @@ test "Net sends a contiguous TX payload without copying" {
     chain.count = 1;
 
     test_tx_frame = null;
-    net.transmitChain(&chain, testTxGetMem);
+    net.transmitChain(&chain, GuestMemory.bindGlobal(testTxGetMem));
     const frame = test_tx_frame.?;
     try testing.expectEqual(test_tx_memory.len - @sizeOf(NetHeader), frame.len);
-    try testing.expectEqual(@intFromPtr(&test_tx_memory) + @sizeOf(NetHeader), @intFromPtr(frame.ptr));
+    try testing.expectEqual(
+        @intFromPtr(&test_tx_memory) + @sizeOf(NetHeader),
+        @intFromPtr(frame.ptr),
+    );
 }
 
 test "Net borrows a split-header TX payload without copying" {
@@ -728,7 +761,7 @@ test "Net borrows a split-header TX payload without copying" {
 
     test_tx_split_ptr = 0;
     test_tx_split_matches = false;
-    net.transmitChain(&chain, testTxSplitGetMem);
+    net.transmitChain(&chain, GuestMemory.bindGlobal(testTxSplitGetMem));
     try testing.expect(test_tx_split_matches);
     try testing.expectEqual(@intFromPtr(&test_tx_split_payload), test_tx_split_ptr);
 }

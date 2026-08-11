@@ -5,6 +5,7 @@
 //! device is unavailable when the resource is created.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Opaque `IOSurfaceRef`.
 pub const Ref = *anyopaque;
@@ -46,7 +47,7 @@ const pixel_format_bgra: i32 = 0x42475241;
 
 pub const BYTES_PER_PIXEL: u32 = 4;
 
-pub const IOSurface = struct {
+const DarwinIOSurface = struct {
     ref: Ref,
     base: [*]u8,
     /// Row stride in bytes; guaranteed to equal `width * 4` (see `createBGRA`).
@@ -122,9 +123,32 @@ pub const IOSurface = struct {
     }
 };
 
+const UnsupportedIOSurface = struct {
+    ref: Ref,
+    base: [*]u8,
+    bytes_per_row: usize,
+
+    pub fn createBGRA(width: u32, height: u32) ?UnsupportedIOSurface {
+        _ = width;
+        _ = height;
+        return null;
+    }
+
+    pub fn pixels(self: UnsupportedIOSurface, size: usize) []u8 {
+        return self.base[0..size];
+    }
+
+    pub fn release(self: UnsupportedIOSurface) void {
+        _ = self;
+    }
+};
+
+pub const IOSurface = if (builtin.os.tag == .macos) DarwinIOSurface else UnsupportedIOSurface;
+
 /// Base address of a surface identified only by its ref (e.g. one obtained
 /// from another module). Returns null if the ref has no mapping.
 pub fn baseAddressOf(ref: Ref) ?[*]u8 {
+    if (builtin.os.tag != .macos) return null;
     return IOSurfaceGetBaseAddress(ref);
 }
 

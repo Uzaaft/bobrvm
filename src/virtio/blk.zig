@@ -13,9 +13,11 @@
 //!   - status: 1 byte result
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const mmio = @import("mmio.zig");
 
 /// Block feature bits.
@@ -154,7 +156,7 @@ pub const Block = struct {
     read_only: bool,
 
     /// Guest memory accessor.
-    guest_memory: ?*const fn (addr: u64, len: usize) ?[]u8,
+    guest_memory: ?GuestMemory,
 
     /// Interrupt callback.
     interrupt_callback: ?*const fn (userdata: ?*anyopaque) void,
@@ -243,13 +245,19 @@ pub const Block = struct {
     /// Set guest memory accessor.
     pub fn setGuestMemory(
         self: *Block,
-        accessor: *const fn (u64, usize) ?[]u8,
+        memory: GuestMemory,
     ) void {
-        self.guest_memory = accessor;
+        self.guest_memory = memory;
     }
 
     pub fn setIrqCallback(self: *Block, irq: mmio.Irq) void {
         self.transport.setIrqCallback(irq);
+    }
+
+    /// Reset transport and relinquish the previous driver's request ring.
+    pub fn reset(self: *Block) void {
+        self.transport.reset();
+        self.request_last_avail = 0;
     }
 
     /// Set interrupt callback.
@@ -319,9 +327,12 @@ pub const Block = struct {
     fn readDesc(
         qc: mmio.QueueConfig,
         idx: u16,
-        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        memory: GuestMemory,
     ) ?GuestDesc {
-        const mem = get_mem(qc.desc_addr + @as(u64, idx) * 16, 16) orelse return null;
+        if (idx >= qc.num) return null;
+        const relative = std.math.mul(u64, idx, 16) catch return null;
+        const address = std.math.add(u64, qc.desc_addr, relative) catch return null;
+        const mem = memory.get(address, 16) orelse return null;
         return .{
             .addr = std.mem.readInt(u64, mem[0..8], .little),
             .len = std.mem.readInt(u32, mem[8..12], .little),
@@ -332,26 +343,32 @@ pub const Block = struct {
 
     fn processRequestQueue(self: *Block) void {
         const qc = self.transport.queues[0];
-        if (!qc.ready or qc.num == 0) return;
-        const get_mem = self.guest_memory orelse return;
+        if (!qc.ready or qc.num == 0 or qc.num > QUEUE_SIZE) return;
+        const memory = self.guest_memory orelse return;
 
-        const avail_ring = get_mem(qc.driver_addr, 6) orelse return;
+        const avail_ring = memory.get(qc.driver_addr, 6) orelse return;
         const avail_idx = std.mem.readInt(u16, avail_ring[2..4], .little);
 
         var last_avail_idx = self.request_last_avail;
         var processed: u32 = 0;
 
-        while (last_avail_idx != avail_idx) : (processed += 1) {
+        while (last_avail_idx != avail_idx and processed < qc.num) : (processed += 1) {
             const ring_idx = last_avail_idx % qc.num;
-            const ring_entry = get_mem(qc.driver_addr + 4 + @as(u64, ring_idx) * 2, 2) orelse break;
+            const ring_offset = std.math.mul(u64, ring_idx, 2) catch break;
+            const ring_base = std.math.add(u64, qc.driver_addr, 4) catch break;
+            const ring_address = std.math.add(u64, ring_base, ring_offset) catch break;
+            const ring_entry = memory.get(ring_address, 2) orelse break;
             const desc_idx = std.mem.readInt(u16, ring_entry[0..2], .little);
 
-            const written = self.processRequestGuest(qc, desc_idx, get_mem);
+            const written = self.processRequestGuest(qc, desc_idx, memory);
 
-            const used_ring = get_mem(qc.device_addr, 6) orelse break;
+            const used_ring = memory.get(qc.device_addr, 6) orelse break;
             var used_idx = std.mem.readInt(u16, used_ring[2..4], .little);
             const used_ring_idx = used_idx % qc.num;
-            const used_entry = get_mem(qc.device_addr + 4 + @as(u64, used_ring_idx) * 8, 8) orelse break;
+            const used_offset = std.math.mul(u64, used_ring_idx, 8) catch break;
+            const used_base = std.math.add(u64, qc.device_addr, 4) catch break;
+            const used_address = std.math.add(u64, used_base, used_offset) catch break;
+            const used_entry = memory.get(used_address, 8) orelse break;
             std.mem.writeInt(u32, used_entry[0..4], desc_idx, .little);
             std.mem.writeInt(u32, used_entry[4..8], written, .little);
             used_idx +%= 1;
@@ -372,14 +389,14 @@ pub const Block = struct {
         self: *Block,
         qc: mmio.QueueConfig,
         head: u16,
-        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        memory: GuestMemory,
     ) u32 {
         // Collect the descriptor chain.
         var descs: [MAX_CHAIN]GuestDesc = undefined;
         var count: usize = 0;
         var idx = head;
         while (count < MAX_CHAIN) {
-            const desc = readDesc(qc, idx, get_mem) orelse break;
+            const desc = readDesc(qc, idx, memory) orelse break;
             descs[count] = desc;
             count += 1;
             if ((desc.flags & GuestDesc.F_NEXT) == 0) break;
@@ -397,16 +414,16 @@ pub const Block = struct {
 
         if (header_desc.len < @sizeOf(RequestHeader)) {
             status = .io_err;
-        } else if (get_mem(header_desc.addr, @sizeOf(RequestHeader))) |hdr_mem| {
+        } else if (memory.get(header_desc.addr, @sizeOf(RequestHeader))) |hdr_mem| {
             const header = std.mem.bytesToValue(RequestHeader, hdr_mem[0..@sizeOf(RequestHeader)]);
             const data = descs[1 .. count - 1];
-            status = self.executeRequest(header, data, get_mem, &data_written);
+            status = self.executeRequest(header, data, memory, &data_written);
         } else {
             status = .io_err;
         }
 
         // Status byte is always written.
-        if (get_mem(status_desc.addr, 1)) |status_mem| {
+        if (memory.get(status_desc.addr, 1)) |status_mem| {
             status_mem[0] = @intFromEnum(status);
         }
 
@@ -417,13 +434,13 @@ pub const Block = struct {
         self: *Block,
         header: RequestHeader,
         data: []const GuestDesc,
-        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        memory: GuestMemory,
         data_written: *u32,
     ) Status {
         const req_type: RequestType = @enumFromInt(header.type);
         switch (req_type) {
-            .in => return self.executeRead(header.sector, data, get_mem, data_written),
-            .out => return self.executeWrite(header.sector, data, get_mem),
+            .in => return self.executeRead(header.sector, data, memory, data_written),
+            .out => return self.executeWrite(header.sector, data, memory),
             .flush => {
                 if (self.file) |f| {
                     f.sync(global.io()) catch return .io_err;
@@ -434,7 +451,7 @@ pub const Block = struct {
                 // Serial ID: write into the first writable data buffer.
                 for (data) |desc| {
                     if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
-                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
+                    const buf = memory.get(desc.addr, desc.len) orelse return .io_err;
                     const id = "bobrvm";
                     const n = @min(buf.len, id.len);
                     @memcpy(buf[0..n], id[0..n]);
@@ -451,7 +468,7 @@ pub const Block = struct {
                 for (data) |desc| {
                     if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
                     if (desc.len % @sizeOf(DiscardWriteZeroes) != 0) return .unsupp;
-                    const buf = get_mem(desc.addr, desc.len) orelse return .io_err;
+                    const buf = memory.get(desc.addr, desc.len) orelse return .io_err;
                     var off: usize = 0;
                     while (off < buf.len) : (off += @sizeOf(DiscardWriteZeroes)) {
                         const seg = std.mem.bytesToValue(
@@ -472,7 +489,7 @@ pub const Block = struct {
         self: *Block,
         sector: u64,
         data: []const GuestDesc,
-        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        memory: GuestMemory,
         data_written: *u32,
     ) Status {
         assert(data.len <= MAX_CHAIN - 2);
@@ -483,17 +500,24 @@ pub const Block = struct {
         var total: usize = 0;
         for (data) |desc| {
             if ((desc.flags & GuestDesc.F_WRITE) == 0) continue;
-            buffers[count] = get_mem(desc.addr, desc.len) orelse return .io_err;
-            total += buffers[count].len;
+            if (self.transport.driver_features & Features.SIZE_MAX != 0 and
+                desc.len > self.config.size_max) return .io_err;
+            buffers[count] = memory.get(desc.addr, desc.len) orelse return .io_err;
+            total = std.math.add(usize, total, buffers[count].len) catch return .io_err;
             count += 1;
         }
-        const offset = sector * SECTOR_SIZE;
-        if (offset + total > self.capacity_bytes or offset + total < offset) return .io_err;
+        const offset = std.math.mul(u64, sector, SECTOR_SIZE) catch return .io_err;
+        const end = std.math.add(u64, offset, total) catch return .io_err;
+        if (end > self.capacity_bytes) return .io_err;
 
         var active = buffers[0..count];
         var completed: usize = 0;
         while (completed < total) {
-            const n = file.readPositional(global.io(), active, offset + completed) catch return .io_err;
+            const n = file.readPositional(
+                global.io(),
+                active,
+                offset + completed,
+            ) catch return .io_err;
             if (n == 0) {
                 for (active) |buffer| @memset(buffer, 0);
                 break;
@@ -509,7 +533,7 @@ pub const Block = struct {
         self: *Block,
         sector: u64,
         data: []const GuestDesc,
-        get_mem: *const fn (addr: u64, len: usize) ?[]u8,
+        memory: GuestMemory,
     ) Status {
         assert(data.len <= MAX_CHAIN - 2);
         assert(SECTOR_SIZE > 0);
@@ -520,17 +544,24 @@ pub const Block = struct {
         var total: usize = 0;
         for (data) |desc| {
             if ((desc.flags & GuestDesc.F_WRITE) != 0) continue;
-            buffers[count] = get_mem(desc.addr, desc.len) orelse return .io_err;
-            total += buffers[count].len;
+            if (self.transport.driver_features & Features.SIZE_MAX != 0 and
+                desc.len > self.config.size_max) return .io_err;
+            buffers[count] = memory.get(desc.addr, desc.len) orelse return .io_err;
+            total = std.math.add(usize, total, buffers[count].len) catch return .io_err;
             count += 1;
         }
-        const offset = sector * SECTOR_SIZE;
-        if (offset + total > self.capacity_bytes or offset + total < offset) return .io_err;
+        const offset = std.math.mul(u64, sector, SECTOR_SIZE) catch return .io_err;
+        const end = std.math.add(u64, offset, total) catch return .io_err;
+        if (end > self.capacity_bytes) return .io_err;
 
         var active = buffers[0..count];
         var completed: usize = 0;
         while (completed < total) {
-            const n = file.writePositional(global.io(), active, offset + completed) catch return .io_err;
+            const n = file.writePositional(
+                global.io(),
+                active,
+                offset + completed,
+            ) catch return .io_err;
             if (n == 0) return .io_err;
             active = advanceBuffersConst(active, n);
             completed += n;
@@ -572,22 +603,17 @@ pub const Block = struct {
     /// any remainder the punch couldn't cover is explicitly zeroed.
     fn executeDiscardSegment(self: *Block, seg: DiscardWriteZeroes, must_zero: bool) Status {
         const file = self.file orelse return .io_err;
-        const start = seg.sector * SECTOR_SIZE;
-        const len = @as(u64, seg.num_sectors) * SECTOR_SIZE;
+        const start = std.math.mul(u64, seg.sector, SECTOR_SIZE) catch return .io_err;
+        const len = std.math.mul(u64, seg.num_sectors, SECTOR_SIZE) catch return .io_err;
         if (len == 0) return .ok;
-        if (start + len > self.capacity_bytes or start + len < start) return .io_err;
+        const end = std.math.add(u64, start, len) catch return .io_err;
+        if (end > self.capacity_bytes) return .io_err;
 
         // Punch the aligned interior so sparse files actually shrink.
         const hole_start = std.mem.alignForward(u64, start, PUNCH_ALIGN);
-        const hole_end = std.mem.alignBackward(u64, start + len, PUNCH_ALIGN);
-        var punched = false;
-        if (hole_end > hole_start) {
-            var args = FPunchhole{
-                .fp_offset = @intCast(hole_start),
-                .fp_length = @intCast(hole_end - hole_start),
-            };
-            punched = std.c.fcntl(file.handle, std.c.F.PUNCHHOLE, &args) == 0;
-        }
+        const hole_end = std.mem.alignBackward(u64, end, PUNCH_ALIGN);
+        const punched = hole_end > hole_start and
+            punchHole(file.handle, hole_start, hole_end - hole_start);
 
         if (!must_zero) return .ok; // discard: advisory, done either way
 
@@ -599,15 +625,36 @@ pub const Block = struct {
                 ranges[n_ranges] = .{ start, hole_start };
                 n_ranges += 1;
             }
-            if (hole_end < start + len) {
-                ranges[n_ranges] = .{ hole_end, start + len };
+            if (hole_end < end) {
+                ranges[n_ranges] = .{ hole_end, end };
                 n_ranges += 1;
             }
         } else {
-            ranges[0] = .{ start, start + len };
+            ranges[0] = .{ start, end };
             n_ranges = 1;
         }
         return writeZeroRanges(file, ranges[0..n_ranges]);
+    }
+
+    fn punchHole(fd: std.posix.fd_t, offset: u64, length: u64) bool {
+        if (comptime builtin.os.tag == .macos) {
+            var args = FPunchhole{
+                .fp_offset = @intCast(offset),
+                .fp_length = @intCast(length),
+            };
+            return std.c.fcntl(fd, std.c.F.PUNCHHOLE, &args) == 0;
+        }
+        if (comptime builtin.os.tag == .linux) {
+            const mode = std.os.linux.FALLOC.FL_KEEP_SIZE |
+                std.os.linux.FALLOC.FL_PUNCH_HOLE;
+            return std.os.linux.fallocate(
+                fd,
+                mode,
+                @intCast(offset),
+                @intCast(length),
+            ) == 0;
+        }
+        return false;
     }
 
     noinline fn writeZeroRanges(file: std.Io.File, ranges: []const [2]u64) Status {
@@ -642,6 +689,21 @@ test "Block init" {
     // Check device ID
     const device_id = blk.read(@intFromEnum(mmio.Reg.device_id));
     try std.testing.expectEqual(@as(u32, 2), device_id);
+}
+
+test "Block reset clears request queue ownership" {
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+
+    blk.request_last_avail = 37;
+    blk.transport.queues[0].ready = true;
+    blk.transport.interrupt_status.used_buffer = true;
+
+    blk.reset();
+
+    try std.testing.expectEqual(@as(u16, 0), blk.request_last_avail);
+    try std.testing.expect(!blk.transport.queues[0].ready);
+    try std.testing.expect(!blk.transport.interrupt_status.used_buffer);
 }
 
 test "Block config read" {
@@ -767,11 +829,130 @@ test "discard request path via executeRequest" {
         .{ .addr = 0x1000, .len = @sizeOf(DiscardWriteZeroes), .flags = 0, .next = 0 },
     };
     var written: u32 = 0;
-    try std.testing.expectEqual(Status.ok, blk.executeRequest(header, &data, Ctx.get, &written));
+    const memory = GuestMemory.bindGlobal(Ctx.get);
+    try std.testing.expectEqual(Status.ok, blk.executeRequest(header, &data, memory, &written));
 
     // Read-only disks refuse.
     blk.read_only = true;
-    try std.testing.expectEqual(Status.io_err, blk.executeRequest(header, &data, Ctx.get, &written));
+    try std.testing.expectEqual(Status.io_err, blk.executeRequest(header, &data, memory, &written));
+}
+
+test "block bounds request processing to the configured queue size" {
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+
+    const Ctx = struct {
+        var mem: [4096]u8 = @splat(0);
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    const queue = &blk.transport.queues[0];
+    queue.* = .{
+        .num = 8,
+        .ready = true,
+        .desc_addr = 0x1000,
+        .driver_addr = 0x1100,
+        .device_addr = 0x1200,
+    };
+    std.mem.writeInt(u16, Ctx.mem[0x102..0x104], 1000, .little);
+    blk.setGuestMemory(GuestMemory.bindGlobal(Ctx.get));
+
+    blk.pollRequests();
+
+    try std.testing.expectEqual(@as(u16, 8), blk.request_last_avail);
+    try std.testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, Ctx.mem[0x202..0x204], .little));
+}
+
+test "block rejects overflowing sector offsets" {
+    const io = global.io();
+    const path = ".zig-cache/blk-sector-overflow-test.raw";
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.setLength(io, Block.SECTOR_SIZE);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, false);
+
+    const Ctx = struct {
+        var mem: [512]u8 = @splat(0);
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const off = addr - 0x1000;
+            if (off + len > mem.len) return null;
+            return mem[off..][0..len];
+        }
+    };
+    const data = [_]Block.GuestDesc{
+        .{
+            .addr = 0x1000,
+            .len = 512,
+            .flags = Block.GuestDesc.F_WRITE,
+            .next = 0,
+        },
+    };
+    const header = RequestHeader{
+        .type = @intFromEnum(RequestType.in),
+        .sector = std.math.maxInt(u64),
+    };
+    var written: u32 = 0;
+    const memory = GuestMemory.bindGlobal(Ctx.get);
+
+    try std.testing.expectEqual(Status.io_err, blk.executeRequest(header, &data, memory, &written));
+}
+
+test "size_max applies only when negotiated" {
+    const io = global.io();
+    const path = ".zig-cache/blk-size-max-test.raw";
+    var disk: [8192]u8 = undefined;
+    for (&disk, 0..) |*byte, index| byte.* = @truncate(index);
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, &disk, 0);
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+    try blk.attachDisk(path, true);
+
+    const Ctx = struct {
+        var mem: [8192]u8 = @splat(0);
+        fn get(addr: u64, len: usize) ?[]u8 {
+            if (addr < 0x1000) return null;
+            const offset = addr - 0x1000;
+            if (offset + len > mem.len) return null;
+            return mem[offset..][0..len];
+        }
+    };
+    const data = [_]Block.GuestDesc{.{
+        .addr = 0x1000,
+        .len = 8192,
+        .flags = Block.GuestDesc.F_WRITE,
+        .next = 0,
+    }};
+    const header = RequestHeader{ .type = @intFromEnum(RequestType.in), .sector = 0 };
+    const memory = GuestMemory.bindGlobal(Ctx.get);
+    var written: u32 = 0;
+
+    try std.testing.expectEqual(Status.ok, blk.executeRequest(header, &data, memory, &written));
+    try std.testing.expectEqual(@as(u32, 8192), written);
+    try std.testing.expectEqualSlices(u8, &disk, &Ctx.mem);
+
+    blk.transport.driver_features |= Features.SIZE_MAX;
+    written = 0;
+    try std.testing.expectEqual(
+        Status.io_err,
+        blk.executeRequest(header, &data, memory, &written),
+    );
 }
 
 test "vectored block reads and writes preserve descriptor order" {
@@ -805,7 +986,11 @@ test "vectored block reads and writes preserve descriptor order" {
     };
     var written: u32 = 0;
     const read_header = RequestHeader{ .type = @intFromEnum(RequestType.in), .sector = 2 };
-    try std.testing.expectEqual(Status.ok, blk.executeRequest(read_header, &read_data, Ctx.get, &written));
+    const memory = GuestMemory.bindGlobal(Ctx.get);
+    try std.testing.expectEqual(
+        Status.ok,
+        blk.executeRequest(read_header, &read_data, memory, &written),
+    );
     try std.testing.expectEqual(@as(u32, 1024), written);
     try std.testing.expectEqualSlices(u8, disk[1024..1536], Ctx.mem[0..512]);
     try std.testing.expectEqualSlices(u8, disk[1536..2048], Ctx.mem[1024..1536]);
@@ -817,7 +1002,10 @@ test "vectored block reads and writes preserve descriptor order" {
         .{ .addr = 0x1400, .len = 512, .flags = 0, .next = 0 },
     };
     const write_header = RequestHeader{ .type = @intFromEnum(RequestType.out), .sector = 4 };
-    try std.testing.expectEqual(Status.ok, blk.executeRequest(write_header, &write_data, Ctx.get, &written));
+    try std.testing.expectEqual(
+        Status.ok,
+        blk.executeRequest(write_header, &write_data, memory, &written),
+    );
     _ = try blk.file.?.readPositionalAll(io, &disk, 0);
     try std.testing.expectEqualSlices(u8, Ctx.mem[0..512], disk[2048..2560]);
     try std.testing.expectEqualSlices(u8, Ctx.mem[1024..1536], disk[2560..3072]);

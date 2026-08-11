@@ -1,0 +1,360 @@
+//! Linux command-line entry point.
+
+const std = @import("std");
+const global = @import("../global.zig");
+const kvm = @import("../hypervisor/kvm/main.zig");
+const run_kernel = @import("run_kernel.zig");
+const Audio = @import("Audio.zig");
+
+pub fn main(minimal: std.process.Init.Minimal) void {
+    var args = minimal.args.iterate();
+    _ = args.skip();
+    const command = args.next() orelse {
+        printUsage();
+        return;
+    };
+
+    if (std.mem.eql(u8, command, "kvm-info")) {
+        printKvmInfo() catch |err| {
+            printError(err);
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, command, "audio-smoke")) {
+        runAudioSmoke() catch |err| {
+            printNamedError("audio smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("Audio smoke: played a 440 Hz stereo tone\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "gpu-smoke")) {
+        runGpuSmoke() catch |err| {
+            printNamedError("GPU smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("GPU smoke: surfaceless virgl renderer initialized\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "kvm-smoke")) {
+        kvm.runSmoke() catch |err| {
+            printSmokeError(err);
+            std.process.exit(1);
+        };
+        writeAll("KVM smoke: marker I/O exit followed by halt\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "kvm-lifecycle-smoke")) {
+        const kernel_path = args.next() orelse {
+            writeAll("error: kvm-lifecycle-smoke requires a bzImage path\n");
+            std.process.exit(1);
+        };
+        run_kernel.executeStopSmoke(std.heap.c_allocator, kernel_path) catch |err| {
+            printNamedError("KVM lifecycle smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM lifecycle: host stop joined cleanly\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "kvm-console-smoke")) {
+        const kernel_path = args.next() orelse return missingConsoleSmokeArgument();
+        const initrd_path = args.next() orelse return missingConsoleSmokeArgument();
+        const disk_path = args.next() orelse return missingConsoleSmokeArgument();
+        run_kernel.executeConsoleSmoke(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            disk_path,
+        ) catch |err| {
+            printNamedError("KVM console smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM console: guest accepted serial input\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "kvm-network-smoke")) {
+        const kernel_path = args.next() orelse return missingNetworkSmokeArgument();
+        const initrd_path = args.next() orelse return missingNetworkSmokeArgument();
+        const disk_path = args.next() orelse return missingNetworkSmokeArgument();
+        run_kernel.executeNetworkSmoke(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            disk_path,
+        ) catch |err| {
+            printNamedError("KVM network smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM network: guest reached the built-in gateway\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "kvm-boot-benchmark")) {
+        const kernel_path = args.next() orelse return missingBootBenchmarkArgument();
+        const initrd_path = args.next() orelse return missingBootBenchmarkArgument();
+        const disk_path = args.next() orelse return missingBootBenchmarkArgument();
+        const result = run_kernel.executeBootBenchmark(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            disk_path,
+        ) catch |err| {
+            printNamedError("KVM boot benchmark", err);
+            std.process.exit(1);
+        };
+        printBootBenchmark(result);
+        return;
+    }
+    if (std.mem.eql(u8, command, "kvm-firmware-smoke")) {
+        const firmware_path = args.next() orelse return missingFirmwareSmokeArgument();
+        const disk_path = args.next() orelse return missingFirmwareSmokeArgument();
+        const iso_path = args.next() orelse return missingFirmwareSmokeArgument();
+        run_kernel.executeFirmwareSmoke(
+            std.heap.c_allocator,
+            firmware_path,
+            disk_path,
+            iso_path,
+        ) catch |err| {
+            printNamedError("KVM firmware smoke", err);
+            std.process.exit(1);
+        };
+        writeAll("KVM firmware: OVMF probed virtio installation storage\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "run-kernel")) {
+        const kernel_path = args.next() orelse {
+            writeAll("error: run-kernel requires a bzImage path\n");
+            std.process.exit(1);
+        };
+        const initrd_path = args.next();
+        run_kernel.execute(
+            std.heap.c_allocator,
+            kernel_path,
+            initrd_path,
+            args.next(),
+        ) catch |err| {
+            printNamedError("direct kernel boot", err);
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, command, "run-firmware")) {
+        const firmware_path = args.next() orelse {
+            writeAll("error: run-firmware requires an OVMF firmware path\n");
+            std.process.exit(1);
+        };
+        run_kernel.executeFirmware(
+            std.heap.c_allocator,
+            firmware_path,
+            args.next(),
+            args.next(),
+        ) catch |err| {
+            printNamedError("firmware boot", err);
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, command, "version") or
+        std.mem.eql(u8, command, "--version") or
+        std.mem.eql(u8, command, "-v"))
+    {
+        writeAll("bobrvm 0.1.0\n");
+        return;
+    }
+    if (std.mem.eql(u8, command, "help") or
+        std.mem.eql(u8, command, "--help") or
+        std.mem.eql(u8, command, "-h"))
+    {
+        printUsage();
+        return;
+    }
+
+    writeAll("error: unknown command\n");
+    printUsage();
+    std.process.exit(1);
+}
+
+fn printKvmInfo() kvm.OpenError!void {
+    var host = try kvm.Kvm.open();
+    defer host.deinit();
+
+    var buffer: [512]u8 = undefined;
+    const output = std.fmt.bufPrint(&buffer,
+        \\KVM API: {d}
+        \\vCPU run mapping: {d} bytes
+        \\user memory: {}
+        \\irqfd: {}
+        \\irqfd resample: {}
+        \\ioeventfd: {}
+        \\immediate exit: {}
+        \\userspace MSRs: {}
+        \\fast device path: {}
+        \\
+    , .{
+        kvm.API_VERSION,
+        host.vcpu_run_size,
+        host.capabilities.user_memory,
+        host.capabilities.irqfd,
+        host.capabilities.irqfd_resample,
+        host.capabilities.ioeventfd,
+        host.capabilities.immediate_exit,
+        host.capabilities.x86_user_space_msr,
+        host.capabilities.supportsFastDevicePath(),
+    }) catch unreachable;
+    writeAll(output);
+}
+
+fn printError(err: kvm.OpenError) void {
+    const message = switch (err) {
+        error.AccessDenied => "cannot access /dev/kvm; check group membership and permissions",
+        error.DeviceUnavailable => "KVM is unavailable; enable CPU virtualization and load kvm",
+        error.UnsupportedApiVersion => "the host exposes an unsupported KVM API version",
+        error.MissingUserMemory => "KVM lacks required userspace-memory support",
+        error.IoctlFailed => "a KVM capability query failed",
+    };
+    var buffer: [256]u8 = undefined;
+    const output = std.fmt.bufPrint(&buffer, "error: {s}\n", .{message}) catch unreachable;
+    writeAll(output);
+}
+
+fn printSmokeError(err: anyerror) void {
+    printNamedError("KVM smoke", err);
+}
+
+fn printNamedError(operation: []const u8, err: anyerror) void {
+    var buffer: [256]u8 = undefined;
+    const output = std.fmt.bufPrint(
+        &buffer,
+        "error: {s} failed: {s}\n",
+        .{ operation, @errorName(err) },
+    ) catch unreachable;
+    writeAll(output);
+}
+
+fn missingConsoleSmokeArgument() noreturn {
+    writeAll("error: kvm-console-smoke requires bzImage, initrd, and disk paths\n");
+    std.process.exit(1);
+}
+
+fn missingNetworkSmokeArgument() noreturn {
+    writeAll("error: kvm-network-smoke requires bzImage, initrd, and disk paths\n");
+    std.process.exit(1);
+}
+
+fn missingBootBenchmarkArgument() noreturn {
+    writeAll("error: kvm-boot-benchmark requires bzImage, initrd, and disk paths\n");
+    std.process.exit(1);
+}
+
+fn missingFirmwareSmokeArgument() noreturn {
+    writeAll("error: kvm-firmware-smoke requires OVMF, disk, and ISO paths\n");
+    std.process.exit(1);
+}
+
+fn printBootBenchmark(result: run_kernel.BootBenchmark) void {
+    var buffer: [256]u8 = undefined;
+    const output = std.fmt.bufPrint(
+        &buffer,
+        "KVM boot benchmark: samples={d} vcpus={d} create_us_min={d} " ++
+            "boot_us_min={d} boot_us_median={d} total_us_min={d}\n",
+        .{
+            result.samples,
+            result.vcpus,
+            result.create_us_min,
+            result.boot_us_min,
+            result.boot_us_median,
+            result.total_us_min,
+        },
+    ) catch unreachable;
+    writeAll(output);
+}
+
+fn printUsage() void {
+    writeAll(
+        \\bobrvm - fast Linux virtualization
+        \\
+        \\Usage: bobrvm <command>
+        \\
+        \\Commands:
+        \\  kvm-info    Validate KVM and show acceleration capabilities
+        \\  audio-smoke  Play a short tone through the Linux audio backend
+        \\  gpu-smoke    Initialize the accelerated Linux virgl renderer
+        \\  kvm-smoke   Run a tiny x86 payload through KVM
+        \\  kvm-lifecycle-smoke <bzImage>  Verify host-requested VM stop
+        \\  kvm-console-smoke <bzImage> <initrd> <disk>  Verify serial input
+        \\  kvm-network-smoke <bzImage> <initrd> <disk>  Verify built-in NAT
+        \\  kvm-boot-benchmark <bzImage> <initrd> <disk>  Measure boot readiness
+        \\  kvm-firmware-smoke <OVMF> <disk> <ISO>  Verify UEFI installation storage
+        \\  run-kernel  Direct boot: run-kernel <bzImage> [initrd] [writable-disk]
+        \\  run-firmware  UEFI boot: run-firmware <OVMF.fd> [disk] [installer.iso]
+        \\  version     Show version information
+        \\  help        Show this help message
+        \\
+    );
+}
+
+fn runAudioSmoke() !void {
+    const virtio_snd = @import("../virtio/snd.zig");
+    const frames = @divExact(virtio_snd.SAMPLE_RATE_HZ, 4);
+    var samples: [frames * 2]i16 = undefined;
+    for (0..frames) |frame| {
+        const phase = 2.0 * std.math.pi * 440.0 * @as(f64, @floatFromInt(frame)) /
+            @as(f64, @floatFromInt(virtio_snd.SAMPLE_RATE_HZ));
+        const sample: i16 = @intFromFloat(@sin(phase) * 8192.0);
+        samples[frame * 2] = sample;
+        samples[frame * 2 + 1] = sample;
+    }
+    const audio = try Audio.create(std.heap.c_allocator);
+    defer audio.destroy();
+    const sink = audio.playbackSink();
+    sink.on_period.?(std.mem.sliceAsBytes(&samples), sink.userdata);
+    std.Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = 400 * std.time.ns_per_ms },
+        .clock = .awake,
+    }, global.io()) catch {};
+}
+
+fn runGpuSmoke() !void {
+    const config_policy = @import("../config.zig");
+    const virgl = @import("../gpu/virgl/main.zig");
+    const virtio_gpu = @import("../virtio/gpu.zig");
+    const gpu = try virtio_gpu.Gpu.initWithMemoryLimit(
+        std.heap.c_allocator,
+        true,
+        config_policy.gpu_memory_bytes_default,
+    );
+    defer gpu.deinit();
+    if (!gpu.virgl_enabled) return error.AcceleratedRendererUnavailable;
+
+    try gpu.gpu_device.createContextId(1);
+    try gpu.gpu_device.createResourceRecord(.{
+        .handle = 1,
+        .target = .buffer,
+        .format = .r8_unorm,
+        .width = 4096,
+        .height = 1,
+        .depth = 1,
+        .array_size = 1,
+        .last_level = 0,
+        .nr_samples = 0,
+        .flags = 0,
+        .bind = 1 << 4,
+    });
+    gpu.gpu_device.attachResource(1, 1);
+    var nop = (virgl.CommandHeader{
+        .opcode = .nop,
+        .object_type = .null,
+        .length = 0,
+    }).encode();
+    try gpu.gpu_device.submit(1, std.mem.asBytes(&nop));
+    if (gpu.gpu_device.bufferContents(1) == null) return error.BufferUnavailable;
+}
+
+fn writeAll(bytes: []const u8) void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const written = std.c.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
+        if (written <= 0) return;
+        remaining = remaining[@intCast(written)..];
+    }
+}

@@ -9,6 +9,11 @@ const GhosttySteps = struct {
     install_root_step: *std.Build.Step,
 };
 
+const dynamic_link_options: std.Build.Module.LinkSystemLibraryOptions = .{
+    .preferred_link_mode = .dynamic,
+    .search_strategy = .mode_first,
+};
+
 fn environmentVariable(b: *std.Build, key: []const u8) ?[]const u8 {
     if (@hasField(std.Build.Graph, "environ_map")) {
         return b.graph.environ_map.get(key);
@@ -57,10 +62,13 @@ pub fn build(b: *std.Build) !void {
     // while the development shell can build frameworks for the native app.
     const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
     const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
-    const objc_dependency = b.dependency("zig_objc", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const objc_dependency = if (target.result.os.tag == .macos)
+        b.dependency("zig_objc", .{
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        null;
 
     const emit_xcframework = b.option(
         bool,
@@ -80,7 +88,7 @@ pub fn build(b: *std.Build) !void {
 
     // Keep the primary workflows visible in `zig build --help` regardless of
     // which artifacts the default install emits.
-    const run_step = b.step("run", "Build and run the macOS app");
+    const run_step = b.step("run", "Build and run the native app");
     const macos_app_step = b.step("macos-app", "Build the macOS app");
     const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
     const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
@@ -113,6 +121,11 @@ pub fn build(b: *std.Build) !void {
         "gpu-venus",
         "Enable the Venus/KosmicKrisp GPU backend",
     ) orelse false;
+    const gpu_virglrenderer = b.option(
+        bool,
+        "gpu-virglrenderer",
+        "Enable the Linux virglrenderer GPU backend",
+    ) orelse (target.result.os.tag == .linux);
     const home = environmentVariable(b, "HOME") orelse "/tmp";
     const default_virgl_prefix = b.fmt("{s}/.local/opt/virgl-upstream", .{home});
     const virgl_prefix = b.option(
@@ -124,6 +137,7 @@ pub fn build(b: *std.Build) !void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "gpu_venus", gpu_venus);
+    build_options.addOption(bool, "gpu_virglrenderer", gpu_virglrenderer);
     // Carried into venus.zig so it can self-configure the render-server binary +
     // KosmicKrisp ICD paths from this install prefix (no manual env needed).
     build_options.addOption([]const u8, "virgl_prefix", virgl_prefix);
@@ -146,6 +160,12 @@ pub fn build(b: *std.Build) !void {
         }
     }.apply;
 
+    const wireVirglrenderer = struct {
+        fn apply(m: *std.Build.Module, enabled: bool) void {
+            if (enabled) m.linkSystemLibrary("virglrenderer", dynamic_link_options);
+        }
+    }.apply;
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main_c.zig"),
         .target = target,
@@ -154,7 +174,7 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (target.result.os.tag == .macos) {
-        root_module.addImport("objc", objc_dependency.module("objc"));
+        root_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -182,14 +202,18 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(root_module, build_options, gpu_venus, virgl_lib);
+    wireVirglrenderer(root_module, gpu_virglrenderer);
 
-    const lib = b.addLibrary(.{
-        .name = "bobrvm",
-        .root_module = root_module,
-        .linkage = .static,
-    });
+    const lib = if (target.result.os.tag == .macos)
+        b.addLibrary(.{
+            .name = "bobrvm",
+            .root_module = root_module,
+            .linkage = .static,
+        })
+    else
+        null;
 
-    b.installArtifact(lib);
+    if (lib) |artifact| b.installArtifact(artifact);
 
     b.installDirectory(.{
         .source_dir = b.path("include"),
@@ -198,14 +222,17 @@ pub fn build(b: *std.Build) !void {
     });
 
     const cli_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(if (target.result.os.tag == .linux)
+            "src/main_linux.zig"
+        else
+            "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
     if (target.result.os.tag == .macos) {
-        cli_module.addImport("objc", objc_dependency.module("objc"));
+        cli_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -232,6 +259,10 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
+    wireVirglrenderer(cli_module, gpu_virglrenderer);
+    if (target.result.os.tag == .linux) {
+        cli_module.linkSystemLibrary("alsa", dynamic_link_options);
+    }
 
     const cli_exe = b.addExecutable(.{
         .name = "bobrvm",
@@ -240,6 +271,46 @@ pub fn build(b: *std.Build) !void {
 
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
+
+    if (target.result.os.tag == .linux) {
+        const gtk_module = b.createModule(.{
+            .root_source_file = b.path("src/main_gtk.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
+        wireVirglrenderer(gtk_module, gpu_virglrenderer);
+        gtk_module.linkSystemLibrary("libadwaita-1", dynamic_link_options);
+        gtk_module.linkSystemLibrary("gtk4", dynamic_link_options);
+        gtk_module.linkSystemLibrary("alsa", dynamic_link_options);
+        const gtk_exe = b.addExecutable(.{
+            .name = "bobrvm-gtk",
+            .root_module = gtk_module,
+        });
+        const install_gtk = b.addInstallArtifact(gtk_exe, .{});
+        b.getInstallStep().dependOn(&install_gtk.step);
+        const install_desktop = b.addInstallFile(
+            b.path("linux/com.bobrvm.Bobrvm.desktop"),
+            "share/applications/com.bobrvm.Bobrvm.desktop",
+        );
+        const install_metainfo = b.addInstallFile(
+            b.path("linux/com.bobrvm.Bobrvm.metainfo.xml"),
+            "share/metainfo/com.bobrvm.Bobrvm.metainfo.xml",
+        );
+        const install_icon = b.addInstallFile(
+            b.path("macos/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png"),
+            "share/icons/hicolor/256x256/apps/com.bobrvm.Bobrvm.png",
+        );
+        b.getInstallStep().dependOn(&install_desktop.step);
+        b.getInstallStep().dependOn(&install_metainfo.step);
+        b.getInstallStep().dependOn(&install_icon.step);
+
+        const gtk_run = b.addRunArtifact(gtk_exe);
+        gtk_run.step.dependOn(&install_gtk.step);
+        if (b.args) |args| gtk_run.addArgs(args);
+        run_step.dependOn(&gtk_run.step);
+    }
 
     // Code-sign the installed CLI with hypervisor entitlement (macOS only)
     if (target.result.os.tag == .macos and !is_nix_build) {
@@ -359,7 +430,7 @@ pub fn build(b: *std.Build) !void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
-        test_module.addImport("objc", objc_dependency.module("objc"));
+        test_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -380,9 +451,11 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(test_module, build_options, gpu_venus, virgl_lib);
+    wireVirglrenderer(test_module, gpu_virglrenderer);
 
     // Test step
     const main_tests = b.addTest(.{
+        .name = "bobrvm-core-tests",
         .root_module = test_module,
         .filters = test_filters,
     });
@@ -390,7 +463,6 @@ pub fn build(b: *std.Build) !void {
     const run_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
-
     const virtqueue_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/virtqueue_fuzz.zig"),
         .target = target,
@@ -451,6 +523,8 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_snapshot_container_fuzz_tests.step);
     snapshot_container_fuzz_step.dependOn(&run_snapshot_container_fuzz_tests.step);
 
+    const test_compile_step = b.step("test-compile", "Compile unit tests without running them");
+    test_compile_step.dependOn(&main_tests.step);
     const wayland_test_module = b.createModule(.{
         .root_source_file = b.path("src/guest_tools/wayland.zig"),
         .target = target,
@@ -458,11 +532,13 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     const wayland_tests = b.addTest(.{
+        .name = "bobrvm-wayland-tests",
         .root_module = wayland_test_module,
         .filters = test_filters,
     });
     const run_wayland_tests = b.addRunArtifact(wayland_tests);
     test_step.dependOn(&run_wayland_tests.step);
+    test_compile_step.dependOn(&wayland_tests.step);
 
     // ==========================================================================
     // Integration test: bare-metal ARM64 test binary (pure assembly)
@@ -527,7 +603,7 @@ pub fn build(b: *std.Build) !void {
     // their Ghostty dependency must not be instantiated while building the
     // portable Zig artifacts.
     if (target.result.os.tag == .macos and !is_nix_build) {
-        const xcframework = XCFrameworkStep.create(b, lib);
+        const xcframework = XCFrameworkStep.create(b, lib.?);
         xcframework_step.dependOn(&xcframework.step);
 
         const ghostty_steps = addGhosttySteps(b, optimize);
@@ -557,6 +633,10 @@ pub fn build(b: *std.Build) !void {
         try ghostty_step.addError(message, .{});
         if (emit_xcframework) b.default_step.dependOn(xcframework_step);
         if (emit_macos_app) b.default_step.dependOn(macos_app_step);
+    } else if (target.result.os.tag == .linux) {
+        try macos_app_step.addError("the macOS app can only build on macOS", .{});
+        try xcframework_step.addError("BobrvmKit.xcframework requires macOS", .{});
+        try ghostty_step.addError("GhosttyKit.xcframework requires macOS", .{});
     } else {
         try run_step.addError("the macOS app can only run on macOS", .{});
         try macos_app_step.addError("the macOS app can only build on macOS", .{});

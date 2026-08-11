@@ -16,6 +16,7 @@ const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
 const console_session = @import("../console/Session.zig");
 const global = @import("../global.zig");
+const GuestMemory = @import("../guest_memory.zig").GuestMemory;
 const thread_compat = @import("../compat/thread.zig");
 
 const hypervisor = @import("../hypervisor/main.zig");
@@ -227,6 +228,9 @@ const VirtioMmioDevice = union(enum) {
 
     fn setGuestMemory(self: VirtioMmioDevice, accessor: *const fn (u64, usize) ?[]u8) void {
         switch (self) {
+            .block => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
+            .net => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
+            .rng => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
             inline else => |device| device.setGuestMemory(accessor),
         }
     }
@@ -2541,7 +2545,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             self.alloc,
             2,
-            0x0002,
             blk_features,
             1,
             @sizeOf(virtio.blk.Config),
@@ -2568,7 +2571,6 @@ pub const Machine = struct {
         self.pci_gpu = try pci.VirtioPciDevice.init(
             self.alloc,
             16,
-            0x0010,
             gpu_dev.transport.device_features,
             2,
             @sizeOf(virtio.gpu.Config),

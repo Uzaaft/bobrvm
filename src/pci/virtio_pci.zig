@@ -70,6 +70,7 @@ pub const CommonCfgReg = enum(u8) {
     queue_device_lo = 0x30,
     queue_device_hi = 0x34,
     queue_reset = 0x38,
+    _,
 };
 
 /// BAR region offsets (all in BAR0).
@@ -88,6 +89,7 @@ pub const BAR0_SIZE: u32 = 0x1000;
 /// Queue configuration state.
 pub const QueueConfig = struct {
     size: u16 = 0,
+    size_max: u16 = 0,
     enable: bool = false,
     notify_off: u16 = 0,
     desc_addr: u64 = 0,
@@ -159,7 +161,7 @@ pub const VirtioPciTransport = struct {
     irq_callback: ?*const fn (userdata: ?*anyopaque) void,
     irq_userdata: ?*anyopaque,
 
-    pub const MAX_QUEUES = 8;
+    pub const MAX_QUEUES = 16;
     pub const MAX_QUEUE_SIZE: u16 = 256;
 
     const AllocationLayout = struct {
@@ -168,7 +170,10 @@ pub const VirtioPciTransport = struct {
         size: usize,
     };
 
-    fn allocationLayout(num_queues: u16, device_config_size: usize) Allocator.Error!AllocationLayout {
+    fn allocationLayout(
+        num_queues: u16,
+        device_config_size: usize,
+    ) Allocator.Error!AllocationLayout {
         assert(num_queues > 0);
         assert(num_queues <= MAX_QUEUES);
         comptime assert(@alignOf(VirtioPciTransport) >= @alignOf(QueueConfig));
@@ -225,7 +230,10 @@ pub const VirtioPciTransport = struct {
     ) void {
         assert(queues.len > 0);
         assert(queues.len <= MAX_QUEUES);
-        @memset(queues, QueueConfig{ .size = MAX_QUEUE_SIZE });
+        @memset(queues, QueueConfig{
+            .size = MAX_QUEUE_SIZE,
+            .size_max = MAX_QUEUE_SIZE,
+        });
         @memset(device_config, 0);
 
         self.* = .{
@@ -288,7 +296,9 @@ pub const VirtioPciTransport = struct {
             return self.readIsr();
         } else if (offset >= BAR_NOTIFY_OFFSET and offset < BAR_NOTIFY_OFFSET + BAR_NOTIFY_SIZE) {
             return 0;
-        } else if (offset >= BAR_DEVICE_CFG_OFFSET and offset < BAR_DEVICE_CFG_OFFSET + BAR_DEVICE_CFG_SIZE) {
+        } else if (offset >= BAR_DEVICE_CFG_OFFSET and
+            offset < BAR_DEVICE_CFG_OFFSET + BAR_DEVICE_CFG_SIZE)
+        {
             return self.readDeviceConfig(@truncate(offset - BAR_DEVICE_CFG_OFFSET), size);
         }
         return 0xFFFFFFFF;
@@ -304,7 +314,9 @@ pub const VirtioPciTransport = struct {
             self.isr_status = .{};
         } else if (offset >= BAR_NOTIFY_OFFSET and offset < BAR_NOTIFY_OFFSET + BAR_NOTIFY_SIZE) {
             self.handleNotify(value);
-        } else if (offset >= BAR_DEVICE_CFG_OFFSET and offset < BAR_DEVICE_CFG_OFFSET + BAR_DEVICE_CFG_SIZE) {
+        } else if (offset >= BAR_DEVICE_CFG_OFFSET and
+            offset < BAR_DEVICE_CFG_OFFSET + BAR_DEVICE_CFG_SIZE)
+        {
             self.writeDeviceConfig(@truncate(offset - BAR_DEVICE_CFG_OFFSET), size, value);
         }
     }
@@ -337,6 +349,7 @@ pub const VirtioPciTransport = struct {
             .queue_device_lo => if (self.currentQueue()) |q| @truncate(q.device_addr) else 0,
             .queue_device_hi => if (self.currentQueue()) |q| @truncate(q.device_addr >> 32) else 0,
             .queue_reset => 0,
+            else => 0xFFFFFFFF,
         };
     }
 
@@ -354,7 +367,7 @@ pub const VirtioPciTransport = struct {
             },
             .queue_size => {
                 if (self.currentQueue()) |q| {
-                    q.size = @truncate(value);
+                    if (value > 0 and value <= q.size_max) q.size = @truncate(value);
                 }
             },
             .queue_enable => {
@@ -395,7 +408,8 @@ pub const VirtioPciTransport = struct {
             .queue_reset => {
                 if (value != 0) {
                     if (self.currentQueue()) |q| {
-                        q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
+                        const size_max = q.size_max;
+                        q.* = QueueConfig{ .size = size_max, .size_max = size_max };
                     }
                 }
             },
@@ -410,34 +424,36 @@ pub const VirtioPciTransport = struct {
     }
 
     fn readDeviceConfig(self: *VirtioPciTransport, offset: u8, size: u8) u32 {
-        if (offset + size > self.device_config.len) return 0;
+        const start: usize = offset;
+        if (start > self.device_config.len or size > self.device_config.len - start) return 0;
 
         return switch (size) {
-            1 => self.device_config[offset],
-            2 => @as(u32, self.device_config[offset]) |
-                (@as(u32, self.device_config[offset + 1]) << 8),
-            4 => @as(u32, self.device_config[offset]) |
-                (@as(u32, self.device_config[offset + 1]) << 8) |
-                (@as(u32, self.device_config[offset + 2]) << 16) |
-                (@as(u32, self.device_config[offset + 3]) << 24),
+            1 => self.device_config[start],
+            2 => @as(u32, self.device_config[start]) |
+                (@as(u32, self.device_config[start + 1]) << 8),
+            4 => @as(u32, self.device_config[start]) |
+                (@as(u32, self.device_config[start + 1]) << 8) |
+                (@as(u32, self.device_config[start + 2]) << 16) |
+                (@as(u32, self.device_config[start + 3]) << 24),
             else => 0,
         };
     }
 
     fn writeDeviceConfig(self: *VirtioPciTransport, offset: u8, size: u8, value: u32) void {
-        if (offset + size > self.device_config.len) return;
+        const start: usize = offset;
+        if (start > self.device_config.len or size > self.device_config.len - start) return;
 
         switch (size) {
-            1 => self.device_config[offset] = @truncate(value),
+            1 => self.device_config[start] = @truncate(value),
             2 => {
-                self.device_config[offset] = @truncate(value);
-                self.device_config[offset + 1] = @truncate(value >> 8);
+                self.device_config[start] = @truncate(value);
+                self.device_config[start + 1] = @truncate(value >> 8);
             },
             4 => {
-                self.device_config[offset] = @truncate(value);
-                self.device_config[offset + 1] = @truncate(value >> 8);
-                self.device_config[offset + 2] = @truncate(value >> 16);
-                self.device_config[offset + 3] = @truncate(value >> 24);
+                self.device_config[start] = @truncate(value);
+                self.device_config[start + 1] = @truncate(value >> 8);
+                self.device_config[start + 2] = @truncate(value >> 16);
+                self.device_config[start + 3] = @truncate(value >> 24);
             },
             else => {},
         }
@@ -470,7 +486,8 @@ pub const VirtioPciTransport = struct {
         if (self.driver_feature_select == 0) {
             self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value;
         } else {
-            self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32);
+            self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) |
+                (@as(u64, value) << 32);
         }
     }
 
@@ -497,7 +514,8 @@ pub const VirtioPciTransport = struct {
         self.isr_status = .{};
 
         for (self.queues) |*q| {
-            q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
+            const size_max = q.size_max;
+            q.* = QueueConfig{ .size = size_max, .size_max = size_max };
         }
     }
 
@@ -522,6 +540,14 @@ pub const VirtioPciTransport = struct {
         const len = @min(data.len, self.device_config.len);
         @memcpy(self.device_config[0..len], data[0..len]);
     }
+
+    pub fn setQueueSizeMax(self: *VirtioPciTransport, queue_index: u16, size: u16) void {
+        assert(queue_index < self.queues.len);
+        assert(size > 0);
+        assert(size <= MAX_QUEUE_SIZE);
+        self.queues[queue_index].size = size;
+        self.queues[queue_index].size_max = size;
+    }
 };
 
 /// Virtio PCI device with full PCI config space.
@@ -535,16 +561,16 @@ pub const VirtioPciDevice = struct {
     /// BAR0 address (assigned by OS/firmware).
     bar0_addr: u32,
 
-    /// Device-specific info.
-    subsystem_id: u16,
-
     const AllocationLayout = struct {
         transport_offset: usize,
         transport: VirtioPciTransport.AllocationLayout,
         size: usize,
     };
 
-    fn allocationLayout(num_queues: u16, device_config_size: usize) Allocator.Error!AllocationLayout {
+    fn allocationLayout(
+        num_queues: u16,
+        device_config_size: usize,
+    ) Allocator.Error!AllocationLayout {
         comptime assert(@alignOf(VirtioPciDevice) >= @alignOf(VirtioPciTransport));
         const transport_offset = std.mem.alignForward(
             usize,
@@ -564,7 +590,6 @@ pub const VirtioPciDevice = struct {
     pub fn init(
         alloc: Allocator,
         device_id: u32,
-        subsystem_id: u16,
         device_features: u64,
         num_queues: u16,
         device_config_size: usize,
@@ -580,7 +605,8 @@ pub const VirtioPciDevice = struct {
             allocation.ptr + layout.transport_offset + layout.transport.queues_offset,
         ));
         const queues = queues_ptr[0..num_queues];
-        const device_config_offset = layout.transport_offset + layout.transport.device_config_offset;
+        const device_config_offset = layout.transport_offset +
+            layout.transport.device_config_offset;
         const device_config = allocation[device_config_offset..];
         transport.initEmbedded(alloc, device_id, device_features, queues, device_config);
 
@@ -589,7 +615,6 @@ pub const VirtioPciDevice = struct {
             .transport = transport,
             .config = [_]u8{0} ** 4096,
             .bar0_addr = 0,
-            .subsystem_id = subsystem_id,
         };
 
         dev.initConfigSpace();
@@ -612,13 +637,9 @@ pub const VirtioPciDevice = struct {
     fn initConfigSpace(self: *VirtioPciDevice) void {
         // Vendor ID: Virtio (0x1AF4)
         self.setConfigU16(0x00, 0x1AF4);
-        // Device ID: Use transitional IDs for UEFI compatibility
-        // Block = 0x1001, Console = 0x1003, etc. (not modern-only 0x1040+)
-        const device_id: u16 = switch (self.transport.device_id) {
-            2 => 0x1001, // virtio-blk transitional
-            3 => 0x1003, // virtio-console transitional
-            else => 0x1040 + @as(u16, @truncate(self.transport.device_id)),
-        };
+        // This transport exposes only the modern capability layout, so advertising a
+        // transitional ID would make firmware look for the absent legacy I/O BAR.
+        const device_id = 0x1040 + @as(u16, @truncate(self.transport.device_id));
         self.setConfigU16(0x02, device_id);
         // Command: All disabled initially (UEFI enables after BAR assignment)
         self.setConfigU16(0x04, 0x0000);
@@ -628,8 +649,12 @@ pub const VirtioPciDevice = struct {
         self.config[0x08] = 0x01;
         // PCI class code helps firmware and the guest choose the right driver.
         self.config[0x09] = 0x00; // Prog IF
-        self.config[0x0A] = 0x00; // Subclass
+        self.config[0x0A] = switch (self.transport.device_id) {
+            16 => 0x80, // Other display controller; this device has no legacy VGA BAR.
+            else => 0x00,
+        };
         self.config[0x0B] = switch (self.transport.device_id) {
+            1 => 0x02, // Network controller
             2 => 0x01, // Mass storage
             16 => 0x03, // Display controller
             else => 0x00,
@@ -640,8 +665,8 @@ pub const VirtioPciDevice = struct {
         self.setConfigU32(0x10, 0x00000000);
         // Subsystem Vendor ID
         self.setConfigU16(0x2C, 0x1AF4);
-        // Subsystem ID
-        self.setConfigU16(0x2E, self.subsystem_id);
+        // EDK2 uses this value to distinguish modern-only from transitional devices.
+        self.setConfigU16(0x2E, 0x0040);
         // Capabilities pointer
         self.config[0x34] = 0x40;
         // Interrupt pin: INTA#
@@ -662,22 +687,56 @@ pub const VirtioPciDevice = struct {
         var cap_offset: u8 = 0x40;
 
         // Common configuration capability
-        cap_offset = self.addCapability(cap_offset, .common_cfg, BAR_COMMON_CFG_OFFSET, BAR_COMMON_CFG_SIZE, false);
+        cap_offset = self.addCapability(
+            cap_offset,
+            .common_cfg,
+            BAR_COMMON_CFG_OFFSET,
+            BAR_COMMON_CFG_SIZE,
+            false,
+        );
 
         // Notification capability (with multiplier)
         const notify_cap_offset = cap_offset;
-        cap_offset = self.addCapability(cap_offset, .notify_cfg, BAR_NOTIFY_OFFSET, BAR_NOTIFY_SIZE, false);
+        cap_offset = self.addCapability(
+            cap_offset,
+            .notify_cfg,
+            BAR_NOTIFY_OFFSET,
+            BAR_NOTIFY_SIZE,
+            false,
+        );
         // Add notify_off_multiplier (0 = same address for all queues)
         self.setConfigU32(notify_cap_offset + 16, 0);
 
-        // ISR status capability
-        cap_offset = self.addCapability(cap_offset, .isr_cfg, BAR_ISR_OFFSET, BAR_ISR_SIZE, false);
+        // A device configuration capability is optional. Linux rejects a capability whose
+        // advertised region has zero length, as is the case for virtio-rng.
+        const has_device_config = self.transport.device_config.len > 0;
+        cap_offset = self.addCapability(
+            cap_offset,
+            .isr_cfg,
+            BAR_ISR_OFFSET,
+            BAR_ISR_SIZE,
+            !has_device_config,
+        );
 
-        // Device-specific configuration capability (last in chain, next=0)
-        _ = self.addCapability(cap_offset, .device_cfg, BAR_DEVICE_CFG_OFFSET, @intCast(self.transport.device_config.len), true);
+        if (has_device_config) {
+            _ = self.addCapability(
+                cap_offset,
+                .device_cfg,
+                BAR_DEVICE_CFG_OFFSET,
+                @intCast(self.transport.device_config.len),
+                true,
+            );
+        }
     }
 
-    fn addCapability(self: *VirtioPciDevice, offset: u8, cap_type: CapType, bar_offset: u32, length: u32, is_last: bool) u8 {
+    fn addCapability(
+        self: *VirtioPciDevice,
+        offset: u8,
+        cap_type: CapType,
+        bar_offset: u32,
+        length: u32,
+        is_last: bool,
+    ) u8 {
         const cap_len: u8 = if (cap_type == .notify_cfg) 20 else 16;
         const next_offset = offset + cap_len;
 
@@ -754,6 +813,11 @@ pub const VirtioPciDevice = struct {
                     log.info("BAR0 assigned to 0x{x}", .{self.bar0_addr});
                 }
             },
+            0x14...0x27 => {},
+            0x30...0x33 => {
+                // This device has no expansion ROM. Probing must keep the register zero.
+                self.setConfigU32(0x30, 0);
+            },
             else => {
                 // Generic write for writable regions
                 if (offset < 0x40) {
@@ -804,13 +868,52 @@ test "VirtioPciTransport init" {
     try std.testing.expectEqual(@as(u16, 1), transport.num_queues);
 }
 
+test "VirtioPciTransport supports bounded multiport console queues" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 3, 0, 12, 12);
+    defer transport.deinit();
+
+    for (0..12) |queue_index| {
+        transport.setQueueSizeMax(@intCast(queue_index), 128);
+    }
+    transport.queue_select = 11;
+    transport.writeBar(
+        BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.queue_size),
+        2,
+        256,
+    );
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[11].size);
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[11].size_max);
+}
+
+test "VirtioPciTransport reset preserves queue capacity" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 3, 0, 2, 8);
+    defer transport.deinit();
+    transport.setQueueSizeMax(0, 128);
+    transport.queues[0].enable = true;
+
+    transport.reset();
+
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[0].size);
+    try std.testing.expectEqual(@as(u16, 128), transport.queues[0].size_max);
+    try std.testing.expect(!transport.queues[0].enable);
+}
+
 test "virtio GPU uses the modern device id and display class" {
-    const device = try VirtioPciDevice.init(std.testing.allocator, 16, 16, 0, 2, 16);
+    const device = try VirtioPciDevice.init(std.testing.allocator, 16, 0, 2, 16);
     defer device.deinit();
 
     try std.testing.expectEqual(@as(u8, 0x50), device.config[0x02]);
     try std.testing.expectEqual(@as(u8, 0x10), device.config[0x03]);
     try std.testing.expectEqual(@as(u8, 0x03), device.config[0x0B]);
+    try std.testing.expectEqual(@as(u8, 0x80), device.config[0x0A]);
+}
+
+test "virtio network uses the modern device id and network class" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 1, 0, 2, 12);
+    defer dev.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0x1041), dev.readConfig(0x02, 2));
+    try std.testing.expectEqual(@as(u64, 0x02), dev.readConfig(0x0b, 1));
 }
 
 test "VirtioPciTransport allocation profile" {
@@ -839,30 +942,62 @@ test "VirtioPciTransport common config read" {
     defer transport.deinit();
 
     // Read num_queues
-    const num_queues = transport.readBar(BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.num_queues), 2);
+    const num_queues = transport.readBar(
+        BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.num_queues),
+        2,
+    );
     try std.testing.expectEqual(@as(u32, 2), num_queues);
 
     // Read device_feature (low 32 bits)
     transport.device_feature_select = 0;
-    const features_lo = transport.readBar(BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.device_feature), 4);
+    const features_lo = transport.readBar(
+        BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.device_feature),
+        4,
+    );
     try std.testing.expectEqual(@as(u32, 0x100), features_lo);
 }
 
+test "VirtioPciTransport rejects malformed BAR accesses" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 2, 0, 1, 64);
+    defer transport.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), transport.readBar(0x01, 1));
+    transport.writeBar(0x01, 1, 0xAA);
+
+    const config_edge = BAR_DEVICE_CFG_OFFSET + 255;
+    try std.testing.expectEqual(@as(u32, 0), transport.readBar(config_edge, 4));
+    transport.writeBar(config_edge, 4, 0xAABBCCDD);
+    try std.testing.expectEqual(@as(u8, 0), transport.device_config[63]);
+}
+
 test "VirtioPciDevice init and config" {
-    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0x0002, 0, 1, 64);
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
     defer dev.deinit();
 
     // Check vendor ID
     const vendor = dev.readConfig(0x00, 2);
     try std.testing.expectEqual(@as(u64, 0x1AF4), vendor);
 
-    // Check device ID (0x1001 for transitional block device)
+    // Check device ID (0x1042 for modern block device)
     const device_id = dev.readConfig(0x02, 2);
-    try std.testing.expectEqual(@as(u64, 0x1001), device_id);
+    try std.testing.expectEqual(@as(u64, 0x1042), device_id);
 
     // Check capabilities pointer
     const cap_ptr = dev.readConfig(0x34, 1);
     try std.testing.expectEqual(@as(u64, 0x40), cap_ptr);
+    try std.testing.expectEqual(@as(u64, 0x40), dev.readConfig(0x2e, 2));
+}
+
+test "VirtioPciDevice omits an empty device configuration capability" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 4, 0, 1, 0);
+    defer dev.deinit();
+
+    const isr_capability_offset: u8 = 0x64;
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(CapType.isr_cfg)),
+        dev.readConfig(isr_capability_offset + 3, 1),
+    );
+    try std.testing.expectEqual(@as(u64, 0), dev.readConfig(isr_capability_offset + 1, 1));
 }
 
 test "VirtioPciDevice allocation profile" {
@@ -872,7 +1007,6 @@ test "VirtioPciDevice allocation profile" {
     const dev = try VirtioPciDevice.init(
         counted.allocator(),
         2,
-        0x0002,
         0,
         num_queues,
         device_config_size,
@@ -888,7 +1022,7 @@ test "VirtioPciDevice allocation profile" {
 }
 
 test "VirtioPciDevice BAR sizing" {
-    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0x0002, 0, 1, 64);
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
     defer dev.deinit();
 
     // Write all 1s to BAR0
@@ -897,4 +1031,22 @@ test "VirtioPciDevice BAR sizing" {
     // Read back should show size mask
     const bar0 = dev.readConfig(0x10, 4);
     try std.testing.expectEqual(@as(u64, 0xFFFFF000), bar0);
+}
+
+test "VirtioPciDevice reports only BAR0" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
+    defer dev.deinit();
+
+    dev.writeConfig(0x14, 4, 0xFFFFFFFF);
+
+    try std.testing.expectEqual(@as(u64, 0), dev.readConfig(0x14, 4));
+}
+
+test "VirtioPciDevice reports no expansion ROM" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 2, 0, 1, 64);
+    defer dev.deinit();
+
+    dev.writeConfig(0x30, 4, 0xFFFFFFFF);
+
+    try std.testing.expectEqual(@as(u64, 0), dev.readConfig(0x30, 4));
 }
