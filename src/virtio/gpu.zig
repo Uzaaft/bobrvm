@@ -922,6 +922,13 @@ pub const Gpu = struct {
         self.transport.setIrqCallback(irq);
     }
 
+    /// Reset transport and relinquish the previous driver's queue rings.
+    pub fn reset(self: *Gpu) void {
+        self.transport.reset();
+        self.ctrl_last_avail = 0;
+        self.cursor_last_avail = 0;
+    }
+
     /// Wire the host-visible memory window (Venus). `map`/`unmap` bridge host
     /// blob memory into the guest window via HVF; this also advertises the
     /// virtio shm region so the guest kernel sets VIRTGPU_PARAM_HOST_VISIBLE.
@@ -1694,6 +1701,17 @@ pub const Gpu = struct {
 
         const res = self.gpu_device.getResource(cmd.resource_id) orelse
             return .resp_err_invalid_resource_id;
+        if (comptime builtin.os.tag == .linux and gpu_virglrenderer) {
+            return if (self.gpu_device.transferToHost(
+                cmd.resource_id,
+                cmd.header.ctx_id,
+                cmd.level,
+                cmd.stride,
+                cmd.layer_stride,
+                cmd.box,
+                cmd.offset,
+            )) .resp_ok_nodata else .resp_err_unspec;
+        }
         if (res.target != .buffer) {
             // Texture upload: gather the box rect from the scattered guest
             // backing into staging, then a region replaceRegion. 32-bit
@@ -1934,6 +1952,13 @@ pub const Gpu = struct {
 
         dest.replace(self.alloc, entries_mem, cmd.nr_entries) catch
             return .resp_err_out_of_memory;
+
+        if (comptime builtin.os.tag == .linux and gpu_virglrenderer) {
+            if (self.gpu_device.getResource(cmd.resource_id) != null) {
+                self.gpu_device.attachBacking(cmd.resource_id, dest.items(), get_mem) catch
+                    return .resp_err_unspec;
+            }
+        }
 
         return .resp_ok_nodata;
     }
@@ -2225,11 +2250,15 @@ pub const Gpu = struct {
             }
         }
 
-        if (self.gpu_device.getResource(cmd.resource_id) == null) {
-            return .resp_err_invalid_resource_id;
-        }
         if (!self.gpu_device.hasContext(header.ctx_id)) {
             return .resp_err_invalid_context_id;
+        }
+        // Linux associates every GEM object with the rendering context, including
+        // scanout-only 2D resources. Those live in bobrvm's software scanout map,
+        // not virglrenderer, so their context association needs no host call.
+        if (self.resources.contains(cmd.resource_id)) return .resp_ok_nodata;
+        if (self.gpu_device.getResource(cmd.resource_id) == null) {
+            return .resp_err_invalid_resource_id;
         }
         if (attach) {
             self.gpu_device.attachResource(header.ctx_id, cmd.resource_id);
@@ -2375,10 +2404,19 @@ pub const Gpu = struct {
             req[0..@sizeOf(ResourceDetachBacking)],
         );
 
-        const res = self.resources.getPtr(cmd.resource_id) orelse
-            return .resp_err_invalid_resource_id;
-        res.entries.deinit(self.alloc);
-        return .resp_ok_nodata;
+        if (self.resources.getPtr(cmd.resource_id)) |resource| {
+            resource.entries.deinit(self.alloc);
+            return .resp_ok_nodata;
+        }
+        if (self.backing3d.fetchRemove(cmd.resource_id)) |backing| {
+            var entries = backing.value;
+            entries.deinit(self.alloc);
+            if (comptime builtin.os.tag == .linux and gpu_virglrenderer) {
+                self.gpu_device.detachBacking(cmd.resource_id);
+            }
+            return .resp_ok_nodata;
+        }
+        return .resp_err_invalid_resource_id;
     }
 
     pub fn mmioSize() usize {
@@ -2520,6 +2558,30 @@ test "virgl capset info and submit decode" {
     const hdr = CtrlHeader{ .type = @intFromEnum(CmdType.ctx_create), .ctx_id = 7 };
     try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdCtxCreate(hdr, &.{}));
     try testing.expect(gpu.gpu_device.contexts.contains(7));
+
+    const create_2d = ResourceCreate2D{
+        .header = .{ .type = @intFromEnum(CmdType.resource_create_2d) },
+        .resource_id = 9,
+        .format = 2,
+        .width = 4,
+        .height = 4,
+    };
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdResourceCreate2D(std.mem.asBytes(&create_2d)),
+    );
+    const context_resource = CtxResource{
+        .header = .{ .type = @intFromEnum(CmdType.ctx_attach_resource), .ctx_id = 7 },
+        .resource_id = 9,
+    };
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdContextResource(hdr, std.mem.asBytes(&context_resource), true),
+    );
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdContextResource(hdr, std.mem.asBytes(&context_resource), false),
+    );
 
     // Synthetic virgl stream: NOP + SET_SCISSOR (skipped) decoded without error
     var stream: [5]u32 = undefined;
@@ -3047,6 +3109,21 @@ test "scanout frame generation advances only on flush of the scanout" {
     _ = gpu.cmdResourceFlush(std.mem.asBytes(&flush_other));
     try testing.expectEqual(g, gpu.scanout().?.generation);
     try testing.expectEqual(present_after_scanout + 1, gpu.presentationGeneration());
+}
+
+test "GPU reset clears queue cursors" {
+    const gpu = try Gpu.init(testing.allocator, false);
+    defer gpu.deinit();
+
+    gpu.ctrl_last_avail = 17;
+    gpu.cursor_last_avail = 9;
+    gpu.transport.status = 4;
+
+    gpu.reset();
+
+    try testing.expectEqual(@as(u16, 0), gpu.ctrl_last_avail);
+    try testing.expectEqual(@as(u16, 0), gpu.cursor_last_avail);
+    try testing.expectEqual(@as(u32, 0), gpu.transport.status);
 }
 
 test "hardware cursor: update_cursor sets image+position, move_cursor repositions only" {

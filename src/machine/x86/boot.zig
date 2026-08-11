@@ -134,6 +134,16 @@ pub const Image = struct {
         command_line: []const u8,
         initrd: ?[]const u8,
     ) LoadError!Layout {
+        return self.loadWithHighMemory(guest_memory, 0, command_line, initrd);
+    }
+
+    pub fn loadWithHighMemory(
+        self: Image,
+        guest_memory: []u8,
+        high_memory_bytes: usize,
+        command_line: []const u8,
+        initrd: ?[]const u8,
+    ) LoadError!Layout {
         if (command_line.len + 1 > self.cmdline_size) return error.CommandLineTooLong;
 
         const kernel = self.protectedKernel();
@@ -146,7 +156,7 @@ pub const Image = struct {
         if (kernel_end > guest_memory.len) return error.KernelTooLarge;
 
         @memcpy(try guestRange(guest_memory, kernel_load_address, kernel.len), kernel);
-        try self.writeBootParams(guest_memory, command_line);
+        try self.writeBootParams(guest_memory, high_memory_bytes, command_line);
         const initrd_address = if (initrd) |bytes|
             try self.loadInitrd(guest_memory, bytes, kernel_end)
         else
@@ -163,6 +173,7 @@ pub const Image = struct {
     fn writeBootParams(
         self: Image,
         guest_memory: []u8,
+        high_memory_bytes: usize,
         command_line: []const u8,
     ) LoadError!void {
         const params = try guestRange(
@@ -178,8 +189,13 @@ pub const Image = struct {
         params[type_of_loader_offset] = 0xff;
         writeInt(u32, params, code32_start_offset, @intCast(kernel_load_address));
         writeInt(u32, params, command_line_pointer_offset, @intCast(command_line_address));
-        writeInt(u32, params, alt_memory_kib_offset, memoryAboveOneMib(guest_memory.len));
-        writeE820(params, guest_memory.len);
+        writeInt(
+            u32,
+            params,
+            alt_memory_kib_offset,
+            memoryAboveOneMib(guest_memory.len, high_memory_bytes),
+        );
+        writeE820(params, guest_memory.len, high_memory_bytes);
 
         const command_buffer = try guestRange(
             guest_memory,
@@ -232,27 +248,41 @@ fn guestRange(memory: []u8, address: u64, length: usize) LoadError![]u8 {
     return memory[offset..][0..length];
 }
 
-fn memoryAboveOneMib(memory_bytes: usize) u32 {
-    if (memory_bytes <= kernel_load_address) return 0;
+fn memoryAboveOneMib(low_memory_bytes: usize, high_memory_bytes: usize) u32 {
+    const total_bytes = std.math.add(
+        usize,
+        low_memory_bytes,
+        high_memory_bytes,
+    ) catch return std.math.maxInt(u32);
+    if (total_bytes <= kernel_load_address) return 0;
     return @intCast(@min(
-        (memory_bytes - @as(usize, kernel_load_address)) / 1024,
+        (total_bytes - @as(usize, kernel_load_address)) / 1024,
         std.math.maxInt(u32),
     ));
 }
 
-fn writeE820(params: []u8, memory_bytes: usize) void {
-    const entries = [_]struct { address: u64, size: u64, kind: u32 }{
-        .{ .address = 0, .size = 0x9_fc00, .kind = e820_ram },
-        .{ .address = 0x9_fc00, .size = 0x400, .kind = e820_reserved },
-        .{ .address = 0xf_0000, .size = 0x1_0000, .kind = e820_reserved },
-        .{
-            .address = kernel_load_address,
-            .size = memory_bytes - @as(usize, kernel_load_address),
-            .kind = e820_ram,
-        },
+fn writeE820(params: []u8, low_memory_bytes: usize, high_memory_bytes: usize) void {
+    const Entry = struct { address: u64, size: u64, kind: u32 };
+    var entries: [5]Entry = undefined;
+    entries[0] = .{ .address = 0, .size = 0x9_fc00, .kind = e820_ram };
+    entries[1] = .{ .address = 0x9_fc00, .size = 0x400, .kind = e820_reserved };
+    entries[2] = .{ .address = 0xf_0000, .size = 0x1_0000, .kind = e820_reserved };
+    entries[3] = .{
+        .address = kernel_load_address,
+        .size = low_memory_bytes - @as(usize, kernel_load_address),
+        .kind = e820_ram,
     };
-    params[e820_count_offset] = entries.len;
-    for (entries, 0..) |entry, index| {
+    var count: u8 = 4;
+    if (high_memory_bytes > 0) {
+        entries[count] = .{
+            .address = 0x1_0000_0000,
+            .size = high_memory_bytes,
+            .kind = e820_ram,
+        };
+        count += 1;
+    }
+    params[e820_count_offset] = count;
+    for (entries[0..count], 0..) |entry, index| {
         const offset = e820_table_offset + index * e820_entry_bytes;
         writeInt(u64, params, offset, entry.address);
         writeInt(u64, params, offset + 8, entry.size);
@@ -332,6 +362,37 @@ test "bzImage loader writes kernel command line and E820 map" {
         @as(u32, @intCast(kernel_load_address)),
         readInt(u32, memory, boot_params_address + code32_start_offset),
     );
+}
+
+test "bzImage loader reports high RAM above the four GiB hole" {
+    var image_storage: [2048]u8 = undefined;
+    validImage(&image_storage);
+    std.mem.writeInt(u32, image_storage[init_size_offset..][0..4], 0x20_0000, .little);
+    const image = try Image.parse(&image_storage);
+
+    const memory = try std.testing.allocator.alloc(u8, 8 * 1024 * 1024);
+    defer std.testing.allocator.free(memory);
+    @memset(memory, 0);
+    const high_memory_bytes: usize = 1024 * 1024 * 1024;
+    _ = try image.loadWithHighMemory(
+        memory,
+        high_memory_bytes,
+        "console=ttyS0",
+        null,
+    );
+
+    const params = memory[boot_params_address..][0..boot_params_bytes];
+    try std.testing.expectEqual(@as(u8, 5), params[e820_count_offset]);
+    const high_entry = e820_table_offset + 4 * e820_entry_bytes;
+    try std.testing.expectEqual(
+        @as(u64, 0x1_0000_0000),
+        readInt(u64, params, high_entry),
+    );
+    try std.testing.expectEqual(
+        @as(u64, high_memory_bytes),
+        readInt(u64, params, high_entry + 8),
+    );
+    try std.testing.expectEqual(e820_ram, readInt(u32, params, high_entry + 16));
 }
 
 test "bzImage loader places initrd below the kernel limit" {

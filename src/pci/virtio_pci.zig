@@ -707,17 +707,26 @@ pub const VirtioPciDevice = struct {
         // Add notify_off_multiplier (0 = same address for all queues)
         self.setConfigU32(notify_cap_offset + 16, 0);
 
-        // ISR status capability
-        cap_offset = self.addCapability(cap_offset, .isr_cfg, BAR_ISR_OFFSET, BAR_ISR_SIZE, false);
-
-        // Device-specific configuration capability (last in chain, next=0)
-        _ = self.addCapability(
+        // A device configuration capability is optional. Linux rejects a capability whose
+        // advertised region has zero length, as is the case for virtio-rng.
+        const has_device_config = self.transport.device_config.len > 0;
+        cap_offset = self.addCapability(
             cap_offset,
-            .device_cfg,
-            BAR_DEVICE_CFG_OFFSET,
-            @intCast(self.transport.device_config.len),
-            true,
+            .isr_cfg,
+            BAR_ISR_OFFSET,
+            BAR_ISR_SIZE,
+            !has_device_config,
         );
+
+        if (has_device_config) {
+            _ = self.addCapability(
+                cap_offset,
+                .device_cfg,
+                BAR_DEVICE_CFG_OFFSET,
+                @intCast(self.transport.device_config.len),
+                true,
+            );
+        }
     }
 
     fn addCapability(
@@ -977,6 +986,18 @@ test "VirtioPciDevice init and config" {
     const cap_ptr = dev.readConfig(0x34, 1);
     try std.testing.expectEqual(@as(u64, 0x40), cap_ptr);
     try std.testing.expectEqual(@as(u64, 0x40), dev.readConfig(0x2e, 2));
+}
+
+test "VirtioPciDevice omits an empty device configuration capability" {
+    const dev = try VirtioPciDevice.init(std.testing.allocator, 4, 0, 1, 0);
+    defer dev.deinit();
+
+    const isr_capability_offset: u8 = 0x64;
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(CapType.isr_cfg)),
+        dev.readConfig(isr_capability_offset + 3, 1),
+    );
+    try std.testing.expectEqual(@as(u64, 0), dev.readConfig(isr_capability_offset + 1, 1));
 }
 
 test "VirtioPciDevice allocation profile" {

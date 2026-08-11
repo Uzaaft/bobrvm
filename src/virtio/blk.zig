@@ -254,6 +254,12 @@ pub const Block = struct {
         self.transport.setIrqCallback(irq);
     }
 
+    /// Reset transport and relinquish the previous driver's request ring.
+    pub fn reset(self: *Block) void {
+        self.transport.reset();
+        self.request_last_avail = 0;
+    }
+
     /// Set interrupt callback.
     pub fn setInterruptCallback(
         self: *Block,
@@ -683,6 +689,21 @@ test "Block init" {
     // Check device ID
     const device_id = blk.read(@intFromEnum(mmio.Reg.device_id));
     try std.testing.expectEqual(@as(u32, 2), device_id);
+}
+
+test "Block reset clears request queue ownership" {
+    const blk = try Block.init(std.testing.allocator);
+    defer blk.deinit();
+
+    blk.request_last_avail = 37;
+    blk.transport.queues[0].ready = true;
+    blk.transport.interrupt_status.used_buffer = true;
+
+    blk.reset();
+
+    try std.testing.expectEqual(@as(u16, 0), blk.request_last_avail);
+    try std.testing.expect(!blk.transport.queues[0].ready);
+    try std.testing.expect(!blk.transport.interrupt_status.used_buffer);
 }
 
 test "Block config read" {

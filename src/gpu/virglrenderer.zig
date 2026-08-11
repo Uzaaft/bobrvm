@@ -84,6 +84,16 @@ extern "c" fn virgl_renderer_resource_create(
     iov_count: u32,
 ) callconv(.c) c_int;
 extern "c" fn virgl_renderer_resource_unref(handle: u32) callconv(.c) void;
+extern "c" fn virgl_renderer_resource_attach_iov(
+    handle: c_int,
+    iov: [*]Iovec,
+    iov_count: c_int,
+) callconv(.c) c_int;
+extern "c" fn virgl_renderer_resource_detach_iov(
+    handle: c_int,
+    iov: ?*?[*]Iovec,
+    iov_count: ?*c_int,
+) callconv(.c) void;
 extern "c" fn virgl_renderer_submit_cmd(
     buffer: *anyopaque,
     context_id: c_int,
@@ -97,7 +107,7 @@ extern "c" fn virgl_renderer_transfer_write_iov(
     layer_stride: u32,
     box: *Box,
     offset: u64,
-    iov: *Iovec,
+    iov: ?[*]Iovec,
     iov_count: u32,
 ) callconv(.c) c_int;
 extern "c" fn virgl_renderer_transfer_read_iov(
@@ -150,12 +160,16 @@ pub const Resource = struct {
     bind: u32,
     backing: ?[]align(@alignOf(u64)) u8 = null,
     iov: ?*Iovec = null,
+    guest_iovs: ?[]Iovec = null,
 };
 
 alloc: Allocator,
 contexts: std.AutoHashMap(u32, void),
 resources: std.AutoHashMap(u32, Resource),
+/// Requested by the VM configuration. The actual renderer is initialized
+/// lazily on the vCPU thread that executes all guest GPU commands.
 renderer: ?void,
+host_active: bool,
 
 pub const Error = Allocator.Error || error{
     InvalidCommand,
@@ -171,29 +185,41 @@ var callbacks = Callbacks{
 };
 
 pub fn initWithAcceleration(alloc: Allocator, enabled: bool) GpuDevice {
-    const available = enabled and claimHost();
-    if (available) log.info("surfaceless virgl renderer active", .{});
     return .{
         .alloc = alloc,
         .contexts = std.AutoHashMap(u32, void).init(alloc),
         .resources = std.AutoHashMap(u32, Resource).init(alloc),
-        .renderer = if (available) {} else null,
+        .renderer = if (enabled) {} else null,
+        .host_active = false,
     };
 }
 
 pub fn deinit(self: *GpuDevice) void {
     var contexts = self.contexts.keyIterator();
-    while (contexts.next()) |id| virgl_renderer_context_destroy(id.*);
+    while (contexts.next()) |id| {
+        if (self.host_active) virgl_renderer_context_destroy(id.*);
+    }
     self.contexts.deinit();
 
     var resources = self.resources.valueIterator();
     while (resources.next()) |resource| {
-        virgl_renderer_resource_unref(resource.handle);
+        if (self.host_active) {
+            if (resource.guest_iovs != null) {
+                virgl_renderer_resource_detach_iov(
+                    @intCast(resource.handle),
+                    null,
+                    null,
+                );
+            }
+            virgl_renderer_resource_unref(resource.handle);
+        }
+        if (resource.guest_iovs) |iovs| self.alloc.free(iovs);
         if (resource.iov) |iov| self.alloc.destroy(iov);
         if (resource.backing) |backing| self.alloc.free(backing);
     }
     self.resources.deinit();
-    if (self.renderer != null) releaseHost();
+    if (self.host_active) releaseHost();
+    self.host_active = false;
     self.renderer = null;
 }
 
@@ -206,20 +232,22 @@ pub const Capset = struct {
     max_size: u32,
 };
 
-pub fn getCapset(_: *const GpuDevice, id: u32) Capset {
+pub fn getCapset(self: *GpuDevice, id: u32) Capset {
+    if (!self.ensureRenderer()) return .{ .max_version = 0, .max_size = 0 };
     var max_version: u32 = 0;
     var max_size: u32 = 0;
     virgl_renderer_get_cap_set(id, &max_version, &max_size);
     return .{ .max_version = max_version, .max_size = max_size };
 }
 
-pub fn fillCaps(_: *const GpuDevice, id: u32, version: u32, output: []u8) void {
+pub fn fillCaps(self: *GpuDevice, id: u32, version: u32, output: []u8) void {
+    if (!self.ensureRenderer()) return;
     virgl_renderer_fill_caps(id, version, output.ptr);
 }
 
 pub fn createContextId(self: *GpuDevice, id: u32) Error!void {
     if (self.contexts.contains(id)) return;
-    if (self.renderer == null) return error.RendererFailure;
+    if (!self.ensureRenderer()) return error.RendererFailure;
     const name = "bobrvm";
     if (virgl_renderer_context_create(id, name.len, name) != 0) {
         return error.RendererFailure;
@@ -237,7 +265,7 @@ pub fn hasContext(self: *const GpuDevice, id: u32) bool {
 }
 
 pub fn createResourceRecord(self: *GpuDevice, resource: Resource) Error!void {
-    if (self.renderer == null) return error.RendererFailure;
+    if (!self.ensureRenderer()) return error.RendererFailure;
     self.removeResource(resource.handle);
 
     var owned = resource;
@@ -278,7 +306,11 @@ pub fn createResourceRecord(self: *GpuDevice, resource: Resource) Error!void {
 
 pub fn removeResource(self: *GpuDevice, handle: u32) void {
     const removed = self.resources.fetchRemove(handle) orelse return;
+    if (removed.value.guest_iovs != null) {
+        virgl_renderer_resource_detach_iov(@intCast(handle), null, null);
+    }
     virgl_renderer_resource_unref(handle);
+    if (removed.value.guest_iovs) |iovs| self.alloc.free(iovs);
     if (removed.value.iov) |iov| self.alloc.destroy(iov);
     if (removed.value.backing) |backing| self.alloc.free(backing);
 }
@@ -295,6 +327,85 @@ pub fn attachResource(self: *GpuDevice, context_id: u32, handle: u32) void {
 pub fn detachResource(self: *GpuDevice, context_id: u32, handle: u32) void {
     if (!self.contexts.contains(context_id) or !self.resources.contains(handle)) return;
     virgl_renderer_ctx_detach_resource(@intCast(context_id), @intCast(handle));
+}
+
+/// Make guest-owned backing visible to virglrenderer. The guest RAM mappings
+/// remain stable for the VM lifetime; only the iovec array is owned here.
+pub fn attachBacking(
+    self: *GpuDevice,
+    handle: u32,
+    entries: anytype,
+    get_mem: anytype,
+) Error!void {
+    const resource = self.resources.getPtr(handle) orelse return error.InvalidCommand;
+    if (entries.len == 0 or entries.len > std.math.maxInt(c_int)) {
+        return error.InvalidCommand;
+    }
+
+    const iovs = try self.alloc.alloc(Iovec, entries.len);
+    errdefer self.alloc.free(iovs);
+    for (entries, iovs) |entry, *iov| {
+        const memory = get_mem.get(entry.addr, entry.length) orelse return error.InvalidCommand;
+        iov.* = .{ .base = memory.ptr, .len = memory.len };
+    }
+
+    if (resource.guest_iovs != null or resource.iov != null) {
+        virgl_renderer_resource_detach_iov(@intCast(handle), null, null);
+    }
+    if (virgl_renderer_resource_attach_iov(
+        @intCast(handle),
+        iovs.ptr,
+        @intCast(iovs.len),
+    ) != 0) {
+        if (resource.iov) |iov| {
+            _ = virgl_renderer_resource_attach_iov(@intCast(handle), @ptrCast(iov), 1);
+        }
+        return error.RendererFailure;
+    }
+
+    if (resource.guest_iovs) |old| self.alloc.free(old);
+    resource.guest_iovs = iovs;
+}
+
+pub fn detachBacking(self: *GpuDevice, handle: u32) void {
+    const resource = self.resources.getPtr(handle) orelse return;
+    const iovs = resource.guest_iovs orelse return;
+    virgl_renderer_resource_detach_iov(@intCast(handle), null, null);
+    self.alloc.free(iovs);
+    resource.guest_iovs = null;
+}
+
+pub fn transferToHost(
+    self: *GpuDevice,
+    handle: u32,
+    context_id: u32,
+    level: u32,
+    stride: u32,
+    layer_stride: u32,
+    box_value: anytype,
+    offset: u64,
+) bool {
+    const resource = self.resources.get(handle) orelse return false;
+    if (resource.guest_iovs == null) return false;
+    var box = Box{
+        .x = box_value.x,
+        .y = box_value.y,
+        .z = box_value.z,
+        .w = box_value.w,
+        .h = box_value.h,
+        .d = box_value.d,
+    };
+    return virgl_renderer_transfer_write_iov(
+        handle,
+        context_id,
+        @intCast(level),
+        stride,
+        layer_stride,
+        &box,
+        offset,
+        null,
+        0,
+    ) == 0;
 }
 
 pub fn submit(self: *GpuDevice, context_id: u32, commands: []const u8) Error!void {
@@ -387,6 +498,14 @@ pub fn readbackResource(self: *GpuDevice, handle: u32, output: []u8) bool {
 
 pub fn scanoutSurfaceRef(_: *GpuDevice, _: u32) ?*anyopaque {
     return null;
+}
+
+fn ensureRenderer(self: *GpuDevice) bool {
+    if (self.host_active) return true;
+    if (self.renderer == null or !claimHost()) return false;
+    self.host_active = true;
+    log.info("surfaceless virgl renderer active on GPU command thread", .{});
+    return true;
 }
 
 fn claimHost() bool {

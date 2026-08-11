@@ -336,6 +336,16 @@ pub const Console = struct {
         self.transport.setIrqCallback(irq);
     }
 
+    /// Reset transport and queue-owned state before another driver takes ownership.
+    pub fn reset(self: *Console) void {
+        self.transport.reset();
+        self.receive_last_avail = 0;
+        self.transmit_last_avail = 0;
+        @memset(&self.mp_last_avail, 0);
+        self.ctrl_pending.clearRetainingCapacity();
+        for (self.ports) |*port| port.guest_open = false;
+    }
+
     /// Set dimensions before the device is exposed to the guest.
     pub fn setInitialSize(self: *Console, columns: u16, rows: u16) void {
         assert(columns > 0);
@@ -982,6 +992,29 @@ test "Console rejects guest avail jumps larger than the queue" {
 
     try std.testing.expect(!console.hasPendingTx());
     try std.testing.expectEqual(@as(u16, 0), console.transmit_last_avail);
+}
+
+test "Console reset clears multiport queue ownership" {
+    const console = try Console.init(std.testing.allocator, &.{"org.qemu.guest_agent.0"});
+    defer console.deinit();
+
+    console.receive_last_avail = 7;
+    console.transmit_last_avail = 9;
+    @memset(&console.mp_last_avail, 11);
+    console.queueCtrl(1, .port_open, 1, &.{});
+    console.ports[0].guest_open = true;
+    console.transport.queues[3].ready = true;
+    console.transport.interrupt_status.used_buffer = true;
+
+    console.reset();
+
+    try std.testing.expectEqual(@as(u16, 0), console.receive_last_avail);
+    try std.testing.expectEqual(@as(u16, 0), console.transmit_last_avail);
+    for (console.mp_last_avail) |cursor| try std.testing.expectEqual(@as(u16, 0), cursor);
+    try std.testing.expectEqual(@as(usize, 0), console.ctrl_pending.items.len);
+    try std.testing.expect(!console.ports[0].guest_open);
+    try std.testing.expect(!console.transport.queues[3].ready);
+    try std.testing.expect(!console.transport.interrupt_status.used_buffer);
 }
 
 var test_port_out: std.ArrayListUnmanaged(u8) = .empty;

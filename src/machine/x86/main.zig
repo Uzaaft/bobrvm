@@ -55,6 +55,7 @@ const bobrvm_agent_port: u32 = 3;
 const bobrvm_clipboard_port: u32 = 4;
 const serial_irq: u32 = 4;
 const ovmf_debug_port: u16 = 0x402;
+const pci_interrupt_line_offset: usize = 0x3c;
 const piix4_pm_function: u3 = 3;
 const piix4_pmba_offset: usize = 0x40;
 const piix4_pmregmisc_offset: usize = 0x80;
@@ -63,6 +64,29 @@ const acpi_timer_offset: u16 = 8;
 const acpi_timer_frequency_hz: u64 = 3_579_545;
 const acpi_timer_mask: u32 = 0x00ff_ffff;
 const firmware_address_end: u64 = 0x1_0000_0000;
+const low_memory_bytes_max: usize = 3 * 1024 * 1024 * 1024;
+const high_memory_address: u64 = firmware_address_end;
+const low_memory_slot: u32 = 0;
+const high_memory_slot: u32 = 1;
+const firmware_memory_slot: u32 = 2;
+
+const RamLayout = struct {
+    low_bytes: usize,
+    high_bytes: usize,
+
+    fn init(memory_bytes: usize) RamLayout {
+        const low_bytes = @min(memory_bytes, low_memory_bytes_max);
+        return .{
+            .low_bytes = low_bytes,
+            .high_bytes = memory_bytes - low_bytes,
+        };
+    }
+};
+
+fn pciInterruptLine(device: *const pci.VirtioPciDevice, fallback: u32) u32 {
+    const assigned = device.config[pci_interrupt_line_offset];
+    return if (assigned > 0 and assigned < 16) assigned else fallback;
+}
 const firmware_bytes_max: usize = 16 * 1024 * 1024;
 const suspend_magic = "BBRXSUS1";
 const suspend_version: u32 = 1;
@@ -110,6 +134,7 @@ const Serial = struct {
     scratch: u8 = 0,
     divisor_low: u8 = 1,
     divisor_high: u8 = 0,
+    transmit_interrupt_pending: bool = true,
 
     fn queue(self: *Serial, bytes: []const u8) usize {
         if (bytes.len > capacity - self.rx_len) return 0;
@@ -130,6 +155,20 @@ const Serial = struct {
 
     fn receiveInterruptPending(self: *const Serial) bool {
         return self.rx_len > 0 and self.interrupt_enable & 0x01 != 0;
+    }
+
+    fn interruptPending(self: *const Serial) bool {
+        return self.receiveInterruptPending() or
+            (self.transmit_interrupt_pending and self.interrupt_enable & 0x02 != 0);
+    }
+
+    fn readInterruptIdentification(self: *Serial) u8 {
+        if (self.receiveInterruptPending()) return 0x04;
+        if (self.transmit_interrupt_pending and self.interrupt_enable & 0x02 != 0) {
+            self.transmit_interrupt_pending = false;
+            return 0x02;
+        }
+        return 0x01;
     }
 };
 
@@ -208,6 +247,7 @@ pub const Machine = struct {
     vm: kvm.VM,
     vcpus: []VcpuSlot,
     memory: []align(std.heap.page_size_min) u8,
+    high_memory: ?[]align(std.heap.page_size_min) u8 = null,
     firmware_memory: ?[]align(std.heap.page_size_min) u8 = null,
     firmware_vars_bytes: usize = 0,
     exit_lock: std.Io.Mutex = .init,
@@ -232,6 +272,7 @@ pub const Machine = struct {
     block_stop_event: ?kvm.EventFd = null,
     block_worker: ?std.Thread = null,
     block_fast_enabled: bool = false,
+    block_irq_gsi: u32 = pci_block_irq,
     block_worker_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     block_worker_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     block_kicks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -399,14 +440,20 @@ pub const Machine = struct {
         {
             return error.InvalidVcpuCount;
         }
-        const memory = try vm.mapMemory(0, 0, memory_bytes);
+        const ram = RamLayout.init(memory_bytes);
+        const memory = try vm.mapMemory(low_memory_slot, 0, ram.low_bytes);
+        const high_memory = if (ram.high_bytes > 0)
+            try vm.mapMemory(high_memory_slot, high_memory_address, ram.high_bytes)
+        else
+            null;
         try vm.createPcInterrupts();
         var firmware_memory: ?[]align(std.heap.page_size_min) u8 = null;
         var firmware_vars_bytes: usize = 0;
 
         const linux_layout: ?boot.Layout = switch (boot_source) {
-            .linux => |linux| try linux.image.load(
+            .linux => |linux| try linux.image.loadWithHighMemory(
                 memory,
+                ram.high_bytes,
                 linux.command_line,
                 linux.initrd,
             ),
@@ -419,7 +466,11 @@ pub const Machine = struct {
                     return error.InvalidFirmware;
                 }
                 const address = firmware_address_end - firmware.bytes.len;
-                const mapped = try vm.mapMemory(1, address, firmware.bytes.len);
+                const mapped = try vm.mapMemory(
+                    firmware_memory_slot,
+                    address,
+                    firmware.bytes.len,
+                );
                 @memcpy(mapped, firmware.bytes);
                 firmware_memory = mapped;
                 firmware_vars_bytes = firmware.vars_bytes;
@@ -473,6 +524,7 @@ pub const Machine = struct {
             .vm = vm,
             .vcpus = vcpus,
             .memory = memory,
+            .high_memory = high_memory,
             .firmware_memory = firmware_memory,
             .firmware_vars_bytes = firmware_vars_bytes,
         };
@@ -521,6 +573,7 @@ pub const Machine = struct {
         self.vm.deinit();
         self.host.deinit();
         self.memory = undefined;
+        self.high_memory = null;
         self.firmware_memory = null;
         self.firmware_vars_bytes = 0;
     }
@@ -1283,13 +1336,17 @@ pub const Machine = struct {
         @memcpy(header[0..suspend_magic.len], suspend_magic);
         std.mem.writeInt(u32, header[8..12], suspend_version, .little);
         std.mem.writeInt(u64, header[12..20], state.len, .little);
-        std.mem.writeInt(u64, header[20..28], self.memory.len, .little);
+        std.mem.writeInt(u64, header[20..28], self.ramBytes(), .little);
         std.mem.writeInt(u64, header[28..36], firmware.len, .little);
         try file.writePositionalAll(io, &header, 0);
         try file.writePositionalAll(io, state, header.len);
         var offset: u64 = header.len + state.len;
         _ = try writeSparse(file, self.memory, offset);
         offset += self.memory.len;
+        if (self.high_memory) |high_memory| {
+            _ = try writeSparse(file, high_memory, offset);
+            offset += high_memory.len;
+        }
         _ = try writeSparse(file, firmware, offset);
         offset += firmware.len;
         if (std.c.ftruncate(file.handle, @intCast(offset)) != 0) return error.TruncateFailed;
@@ -1314,7 +1371,7 @@ pub const Machine = struct {
         const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
         defer file.close(io);
         const firmware = self.firmware_memory orelse self.memory[0..0];
-        const header = try readSuspendHeader(file, self.memory.len, firmware.len);
+        const header = try readSuspendHeader(file, self.ramBytes(), firmware.len);
         const state = try self.allocator.alloc(u8, @intCast(header.state_len));
         defer self.allocator.free(state);
         if (try file.readPositionalAll(io, state, suspend_header_bytes) != state.len) {
@@ -1323,6 +1380,10 @@ pub const Machine = struct {
         var offset: u64 = suspend_header_bytes + state.len;
         try readSnapshotBytes(file, self.memory, offset);
         offset += self.memory.len;
+        if (self.high_memory) |high_memory| {
+            try readSnapshotBytes(file, high_memory, offset);
+            offset += high_memory.len;
+        }
         try readSnapshotBytes(file, firmware, offset);
         try self.applyState(self.allocator, state);
     }
@@ -1576,6 +1637,7 @@ pub const Machine = struct {
             self.console_irq_injected,
             self.sound_irq_desired,
             self.sound_irq_injected,
+            self.serial.transmit_interrupt_pending,
         };
         for (values, 0..) |value, index| {
             result.irq_flags |= @as(u32, @intFromBool(value)) << @intCast(index);
@@ -1586,7 +1648,7 @@ pub const Machine = struct {
     fn restoreEmulatedState(self: *Machine, state: *const EmulatedState) !void {
         if (state.serial_rx_head >= Serial.capacity or state.serial_rx_len > Serial.capacity or
             state.cmos_index > std.math.maxInt(u7) or state.cmos_nmi_disabled > 1 or
-            state.irq_flags >> 21 != 0)
+            state.irq_flags >> 22 != 0)
         {
             return error.Corrupt;
         }
@@ -1626,6 +1688,7 @@ pub const Machine = struct {
             &self.console_irq_injected,
             &self.sound_irq_desired,
             &self.sound_irq_injected,
+            &self.serial.transmit_interrupt_pending,
         };
         for (values, 0..) |value, index| {
             value.* = state.irq_flags & (@as(u32, 1) << @intCast(index)) != 0;
@@ -1672,7 +1735,7 @@ pub const Machine = struct {
                 .idle => return error.InternalError,
             }
             if (self.stop_requested.load(.acquire)) return .stopped;
-            try self.processAsyncDevices();
+            try self.processAsyncDevices(index);
             if (self.block_worker_failed.load(.acquire)) return error.FastDevicePathFailed;
 
             const exit = slot.vcpu.runOnce() catch |err| switch (err) {
@@ -1712,11 +1775,11 @@ pub const Machine = struct {
         }
     }
 
-    fn processAsyncDevices(self: *Machine) RunError!void {
+    fn processAsyncDevices(self: *Machine, vcpu_index: usize) RunError!void {
         const network = self.net_wakeup.swap(false, .acq_rel);
         const input = self.input_wakeup.swap(false, .acq_rel);
         const console = self.console_wakeup.swap(false, .acq_rel);
-        const gpu = self.gpu_wakeup.swap(false, .acq_rel);
+        const gpu = vcpu_index == 0 and self.gpu_wakeup.swap(false, .acq_rel);
         if (!network and !input and !console and !gpu) return;
         self.exit_lock.lockUncancelable(global.io());
         defer self.exit_lock.unlock(global.io());
@@ -1732,7 +1795,10 @@ pub const Machine = struct {
             self.processConsole();
             try self.syncConsoleIrq();
         }
-        if (gpu) try self.syncGpuIrq();
+        if (gpu) {
+            self.processGpu();
+            try self.syncGpuIrq();
+        }
         try self.syncSoundIrq();
     }
 
@@ -1852,12 +1918,12 @@ pub const Machine = struct {
             self.writeDebugOutput(vcpu_index, access.data, serial);
         }
 
-        if (access.count != 1) return;
-        const value = readIoValue(access.data) orelse return;
         if (access.size == 1 and access.port >= 0x3f8 and access.port <= 0x3ff) {
-            try self.writeSerialRegister(access.port, @truncate(value), serial);
+            for (access.data) |value| try self.writeSerialRegister(access.port, value, serial);
             return;
         }
+        if (access.count != 1) return;
+        const value = readIoValue(access.data) orelse return;
         if (access.size == 1 and access.port == 0x70) {
             self.cmos_index = @truncate(value & 0x7f);
             self.cmos_nmi_disabled = value & 0x80 != 0;
@@ -1873,6 +1939,7 @@ pub const Machine = struct {
         if (self.chipsetConfigWrite(address, access.size, value)) return;
         const device = self.pciDevice(address) orelse return;
         const old_bar_address = device.getBar0Addr();
+        const old_irq = pciInterruptLine(device, pci_block_irq);
         device.writeConfig(address.register, access.size, value);
         const new_bar_address = device.getBar0Addr();
         if (address.device != pci_block_slot) return;
@@ -1880,19 +1947,22 @@ pub const Machine = struct {
             device.writeConfig(0x10, 4, old_bar_address);
             return err;
         };
+        const new_irq = pciInterruptLine(device, pci_block_irq);
+        self.rebindBlockIrq(old_irq, new_irq) catch |err| {
+            device.config[pci_interrupt_line_offset] = @intCast(old_irq);
+            return err;
+        };
     }
 
     fn handleIoRead(self: *Machine, access: kvm.IoExit) kvm.InterruptError!void {
         @memset(access.data, 0xff);
+        if (access.size == 1 and access.port >= 0x3f8 and access.port <= 0x3ff) {
+            for (access.data) |*value| value.* = try self.readSerialRegister(access.port);
+            return;
+        }
         if (access.count != 1) return;
         if (self.pci_config.readAddress(access.port, access.size)) |value| {
             writeIoValue(access.data, value);
-            return;
-        }
-        if (access.count == 1 and access.size == 1 and
-            access.port >= 0x3f8 and access.port <= 0x3ff)
-        {
-            @memset(access.data, try self.readSerialRegister(access.port));
             return;
         }
         if (access.size == 1 and access.port == 0x70) {
@@ -1939,10 +2009,14 @@ pub const Machine = struct {
                 self.serial.divisor_low = value;
             } else {
                 sink.write(&.{value});
+                self.serial.transmit_interrupt_pending = true;
             },
             1 => if (self.serial.line_control & 0x80 != 0) {
                 self.serial.divisor_high = value;
             } else {
+                if (self.serial.interrupt_enable & 0x02 == 0 and value & 0x02 != 0) {
+                    self.serial.transmit_interrupt_pending = true;
+                }
                 self.serial.interrupt_enable = value & 0x0f;
             },
             3 => self.serial.line_control = value,
@@ -1965,7 +2039,7 @@ pub const Machine = struct {
                 self.serial.divisor_high
             else
                 self.serial.interrupt_enable,
-            2 => if (self.serial.receiveInterruptPending()) 0x04 else 0x01,
+            2 => self.serial.readInterruptIdentification(),
             3 => self.serial.line_control,
             4 => self.serial.modem_control,
             5 => 0x60 | @as(u8, @intFromBool(self.serial.rx_len > 0)),
@@ -1978,7 +2052,7 @@ pub const Machine = struct {
     }
 
     fn updateSerialIrqLocked(self: *Machine) kvm.InterruptError!void {
-        const desired = self.serial.receiveInterruptPending();
+        const desired = self.serial.interruptPending();
         if (desired == self.serial_irq_injected) return;
         try self.vm.setIrqLine(serial_irq, desired);
         self.serial_irq_injected = desired;
@@ -2102,6 +2176,12 @@ pub const Machine = struct {
             writeIoValue(access.data, result);
         } else {
             device.writeBar0(offset, @intCast(access.data.len), value);
+            if (offset == pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+                @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status) and value == 0)
+            {
+                block.reset();
+                irq_desired.* = false;
+            }
         }
         return true;
     }
@@ -2169,6 +2249,11 @@ pub const Machine = struct {
             }
         } else {
             device.writeBar0(offset, @intCast(access.data.len), value);
+            if (offset == pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+                @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status) and value == 0)
+            {
+                gpu.reset();
+            }
         }
         return true;
     }
@@ -2272,7 +2357,6 @@ pub const Machine = struct {
         console: *virtio.Console,
         access: kvm.MmioExit,
     ) bool {
-        _ = self;
         const bar_address: u64 = device.getBar0Addr();
         if (bar_address == 0 or access.address < bar_address) return false;
         const offset_u64 = access.address - bar_address;
@@ -2295,6 +2379,12 @@ pub const Machine = struct {
             }
         } else {
             device.writeBar0(offset, @intCast(access.data.len), value);
+            if (offset == pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+                @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status) and value == 0)
+            {
+                console.reset();
+                self.console_irq_desired = false;
+            }
         }
         return true;
     }
@@ -2469,7 +2559,11 @@ pub const Machine = struct {
             0x5b,
             0x5c,
             0x5d,
-            => cmosByte(self.memory.len, self.cmos_index),
+            => cmosByte(
+                self.memory.len,
+                if (self.high_memory) |memory| memory.len else 0,
+                self.cmos_index,
+            ),
             else => self.cmos_data[self.cmos_index],
         };
     }
@@ -2482,10 +2576,21 @@ pub const Machine = struct {
     }
 
     fn getGuestMemory(self: *Machine, address: u64, length: usize) ?[]u8 {
-        if (address > self.memory.len) return null;
-        const offset: usize = @intCast(address);
-        if (length > self.memory.len - offset) return null;
-        return self.memory[offset..][0..length];
+        if (address <= self.memory.len) {
+            const offset: usize = @intCast(address);
+            if (length <= self.memory.len - offset) return self.memory[offset..][0..length];
+        }
+        const high_memory = self.high_memory orelse return null;
+        if (address < high_memory_address) return null;
+        const offset_u64 = address - high_memory_address;
+        if (offset_u64 > high_memory.len) return null;
+        const offset: usize = @intCast(offset_u64);
+        if (length > high_memory.len - offset) return null;
+        return high_memory[offset..][0..length];
+    }
+
+    fn ramBytes(self: *const Machine) usize {
+        return self.memory.len + if (self.high_memory) |memory| memory.len else 0;
     }
 
     fn blockNotify(queue_index: u32, userdata: ?*anyopaque) void {
@@ -2560,13 +2665,32 @@ pub const Machine = struct {
         const gpu = self.gpu orelse return;
         if (queue_index >= device.transport.queues.len or
             queue_index >= gpu.transport.queues.len) return;
-        const source = device.transport.queues[queue_index];
-        const target = &gpu.transport.queues[queue_index];
-        target.num = source.size;
-        target.ready = source.enable;
-        target.desc_addr = source.desc_addr;
-        target.driver_addr = source.driver_addr;
-        target.device_addr = source.device_addr;
+
+        // EGL contexts cannot move between host threads while current. Guest
+        // vCPUs may kick virtio-gpu from any CPU, so execute every renderer
+        // command on the primary vCPU thread that first initializes virgl.
+        const primary_thread_id = self.vcpus[0].thread_id.load(.acquire);
+        if (primary_thread_id == 0 or
+            primary_thread_id != @as(u32, @intCast(std.Thread.getCurrentId())))
+        {
+            self.gpu_wakeup.store(true, .release);
+            self.wakePrimaryVcpu();
+            return;
+        }
+        self.processGpu();
+    }
+
+    fn processGpu(self: *Machine) void {
+        const device = self.pci_gpu orelse return;
+        const gpu = self.gpu orelse return;
+        for (device.transport.queues, 0..) |source, queue_index| {
+            const target = &gpu.transport.queues[queue_index];
+            target.num = source.size;
+            target.ready = source.enable;
+            target.desc_addr = source.desc_addr;
+            target.driver_addr = source.driver_addr;
+            target.device_addr = source.device_addr;
+        }
         gpu.poll();
     }
 
@@ -2583,7 +2707,8 @@ pub const Machine = struct {
 
     fn syncGpuIrq(self: *Machine) kvm.InterruptError!void {
         if (self.gpu_irq_desired == self.gpu_irq_injected) return;
-        try self.vm.setIrqLine(pci_gpu_irq, self.gpu_irq_desired);
+        const device = self.pci_gpu orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_gpu_irq), self.gpu_irq_desired);
         self.gpu_irq_injected = self.gpu_irq_desired;
     }
 
@@ -2647,11 +2772,19 @@ pub const Machine = struct {
 
     fn syncInputIrqs(self: *Machine) kvm.InterruptError!void {
         if (self.keyboard_irq_desired != self.keyboard_irq_injected) {
-            try self.vm.setIrqLine(pci_keyboard_irq, self.keyboard_irq_desired);
+            const device = self.pci_keyboard orelse return;
+            try self.vm.setIrqLine(
+                pciInterruptLine(device, pci_keyboard_irq),
+                self.keyboard_irq_desired,
+            );
             self.keyboard_irq_injected = self.keyboard_irq_desired;
         }
         if (self.tablet_irq_desired != self.tablet_irq_injected) {
-            try self.vm.setIrqLine(pci_tablet_irq, self.tablet_irq_desired);
+            const device = self.pci_tablet orelse return;
+            try self.vm.setIrqLine(
+                pciInterruptLine(device, pci_tablet_irq),
+                self.tablet_irq_desired,
+            );
             self.tablet_irq_injected = self.tablet_irq_desired;
         }
     }
@@ -2705,7 +2838,8 @@ pub const Machine = struct {
 
     fn syncShareIrq(self: *Machine) kvm.InterruptError!void {
         if (self.share_irq_desired == self.share_irq_injected) return;
-        try self.vm.setIrqLine(pci_share_irq, self.share_irq_desired);
+        const device = self.pci_share orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_share_irq), self.share_irq_desired);
         self.share_irq_injected = self.share_irq_desired;
     }
 
@@ -2737,7 +2871,8 @@ pub const Machine = struct {
 
     fn syncRngIrq(self: *Machine) kvm.InterruptError!void {
         if (self.rng_irq_desired == self.rng_irq_injected) return;
-        try self.vm.setIrqLine(pci_rng_irq, self.rng_irq_desired);
+        const device = self.pci_rng orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_rng_irq), self.rng_irq_desired);
         self.rng_irq_injected = self.rng_irq_desired;
     }
 
@@ -2783,7 +2918,11 @@ pub const Machine = struct {
 
     fn syncConsoleIrq(self: *Machine) kvm.InterruptError!void {
         if (self.console_irq_desired == self.console_irq_injected) return;
-        try self.vm.setIrqLine(pci_console_irq, self.console_irq_desired);
+        const device = self.pci_console orelse return;
+        try self.vm.setIrqLine(
+            pciInterruptLine(device, pci_console_irq),
+            self.console_irq_desired,
+        );
         self.console_irq_injected = self.console_irq_desired;
     }
 
@@ -2816,7 +2955,8 @@ pub const Machine = struct {
 
     fn syncSoundIrq(self: *Machine) kvm.InterruptError!void {
         if (self.sound_irq_desired == self.sound_irq_injected) return;
-        try self.vm.setIrqLine(pci_sound_irq, self.sound_irq_desired);
+        const device = self.pci_sound orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_sound_irq), self.sound_irq_desired);
         self.sound_irq_injected = self.sound_irq_desired;
     }
 
@@ -2867,7 +3007,8 @@ pub const Machine = struct {
 
     fn syncNetIrq(self: *Machine) kvm.InterruptError!void {
         if (self.net_irq_desired == self.net_irq_injected) return;
-        try self.vm.setIrqLine(pci_net_irq, self.net_irq_desired);
+        const device = self.pci_net orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_net_irq), self.net_irq_desired);
         self.net_irq_injected = self.net_irq_desired;
     }
 
@@ -2923,7 +3064,8 @@ pub const Machine = struct {
     fn syncBlockIrq(self: *Machine) kvm.InterruptError!void {
         if (self.block_fast_enabled) return;
         if (self.block_irq_desired == self.block_irq_injected) return;
-        try self.vm.setIrqLine(pci_block_irq, self.block_irq_desired);
+        const device = self.pci_block orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_block_irq), self.block_irq_desired);
         self.block_irq_injected = self.block_irq_desired;
     }
 
@@ -2940,7 +3082,8 @@ pub const Machine = struct {
 
     fn syncBlock2Irq(self: *Machine) kvm.InterruptError!void {
         if (self.block2_irq_desired == self.block2_irq_injected) return;
-        try self.vm.setIrqLine(pci_block2_irq, self.block2_irq_desired);
+        const device = self.pci_block2 orelse return;
+        try self.vm.setIrqLine(pciInterruptLine(device, pci_block2_irq), self.block2_irq_desired);
         self.block2_irq_injected = self.block2_irq_desired;
     }
 
@@ -3019,13 +3162,15 @@ pub const Machine = struct {
 
         try self.vm.registerIoEvent(kick, notify_address);
         errdefer self.vm.unregisterIoEvent(kick, notify_address);
-        try self.vm.registerIrqFd(irq, resample, pci_block_irq);
-        errdefer self.vm.unregisterIrqFd(irq, resample, pci_block_irq);
+        const irq_gsi = pciInterruptLine(device, pci_block_irq);
+        try self.vm.registerIrqFd(irq, resample, irq_gsi);
+        errdefer self.vm.unregisterIrqFd(irq, resample, irq_gsi);
 
         self.block_kick_event = kick;
         self.block_irq_event = irq;
         self.block_resample_event = resample;
         self.block_stop_event = stop;
+        self.block_irq_gsi = irq_gsi;
         self.block_fast_enabled = true;
         transferred = true;
         self.block_worker = std.Thread.spawn(.{}, blockWorkerMain, .{self}) catch |err| {
@@ -3047,7 +3192,7 @@ pub const Machine = struct {
         self.vm.unregisterIrqFd(
             self.block_irq_event.?,
             self.block_resample_event.?,
-            pci_block_irq,
+            self.block_irq_gsi,
         );
         if (self.block_stop_event) |*event| event.deinit();
         if (self.block_resample_event) |*event| event.deinit();
@@ -3057,6 +3202,7 @@ pub const Machine = struct {
         self.block_resample_event = null;
         self.block_irq_event = null;
         self.block_kick_event = null;
+        self.block_irq_gsi = pci_block_irq;
         self.block_fast_enabled = false;
     }
 
@@ -3073,6 +3219,22 @@ pub const Machine = struct {
         if (blockNotifyAddress(old_bar_address)) |old_notify_address| {
             self.vm.unregisterIoEvent(event, old_notify_address);
         }
+    }
+
+    fn rebindBlockIrq(
+        self: *Machine,
+        old_irq: u32,
+        new_irq: u32,
+    ) kvm.FastPathError!void {
+        if (!self.block_fast_enabled or old_irq == new_irq) return;
+        const irq = self.block_irq_event orelse unreachable;
+        const resample = self.block_resample_event orelse unreachable;
+        self.vm.unregisterIrqFd(irq, resample, old_irq);
+        self.vm.registerIrqFd(irq, resample, new_irq) catch |err| {
+            self.vm.registerIrqFd(irq, resample, old_irq) catch {};
+            return err;
+        };
+        self.block_irq_gsi = new_irq;
     }
 
     fn blockNotifyAddress(bar_address: u32) ?u64 {
@@ -3157,18 +3319,23 @@ pub const Machine = struct {
         }
     }
 
-    fn cmosByte(memory_bytes: usize, index: u7) u8 {
+    fn cmosByte(low_memory_bytes: usize, high_memory_bytes: usize, index: u7) u8 {
         const kib: u64 = 1024;
         const mib: u64 = 1024 * kib;
-        const size: u64 = @intCast(memory_bytes);
-        const base_kib: u16 = @intCast(@min(size / kib, 640));
+        const low_size: u64 = @intCast(low_memory_bytes);
+        const high_size: u64 = @intCast(high_memory_bytes);
+        const base_kib: u16 = @intCast(@min(low_size / kib, 640));
         const extended_kib: u16 = @intCast(@min(
-            if (size > mib) (size - mib) / kib else 0,
+            if (low_size > mib) (low_size - mib) / kib else 0,
             std.math.maxInt(u16),
         ));
         const large_chunks: u16 = @intCast(@min(
-            if (size > 16 * mib) (size - 16 * mib) / (64 * kib) else 0,
+            if (low_size > 16 * mib) (low_size - 16 * mib) / (64 * kib) else 0,
             std.math.maxInt(u16),
+        ));
+        const high_chunks: u32 = @intCast(@min(
+            high_size / (64 * kib),
+            0x00ff_ffff,
         ));
         return switch (index) {
             0x14 => 0x02,
@@ -3179,7 +3346,9 @@ pub const Machine = struct {
             0x34 => @truncate(large_chunks),
             0x35 => @truncate(large_chunks >> 8),
             0x3d => 0x23,
-            0x5b, 0x5c, 0x5d => 0,
+            0x5b => @truncate(high_chunks),
+            0x5c => @truncate(high_chunks >> 8),
+            0x5d => @truncate(high_chunks >> 16),
             else => 0,
         };
     }
@@ -3283,6 +3452,18 @@ test "serial receive interrupt follows buffered input and IER" {
     try std.testing.expect(!serial.receiveInterruptPending());
 }
 
+test "serial transmit interrupt rearms when the holding register empties" {
+    var serial = Serial{};
+    serial.interrupt_enable = 0x02;
+
+    try std.testing.expect(serial.interruptPending());
+    try std.testing.expectEqual(@as(u8, 0x02), serial.readInterruptIdentification());
+    try std.testing.expect(!serial.interruptPending());
+
+    serial.transmit_interrupt_pending = true;
+    try std.testing.expect(serial.interruptPending());
+}
+
 test "absent MMIO reads return all bits set" {
     var data = [_]u8{ 0, 0, 0, 0 };
     const access = kvm.MmioExit{
@@ -3317,12 +3498,40 @@ test "block notification address follows PCI BAR relocation" {
     );
 }
 
+test "PCI interrupt line follows firmware assignment with direct boot fallback" {
+    const device = try pci.VirtioPciDevice.init(std.testing.allocator, 16, 0, 2, 0);
+    defer device.deinit();
+
+    try std.testing.expectEqual(pci_gpu_irq, pciInterruptLine(device, pci_gpu_irq));
+    device.config[pci_interrupt_line_offset] = 10;
+    try std.testing.expectEqual(@as(u32, 10), pciInterruptLine(device, pci_gpu_irq));
+    device.config[pci_interrupt_line_offset] = 0;
+    try std.testing.expectEqual(pci_gpu_irq, pciInterruptLine(device, pci_gpu_irq));
+}
+
 test "CMOS reports low memory without inventing RAM above four GiB" {
-    try std.testing.expectEqual(@as(u8, 0x80), Machine.cmosByte(512 * 1024 * 1024, 0x15));
-    try std.testing.expectEqual(@as(u8, 0x02), Machine.cmosByte(512 * 1024 * 1024, 0x16));
-    try std.testing.expectEqual(@as(u8, 0x00), Machine.cmosByte(512 * 1024 * 1024, 0x34));
-    try std.testing.expectEqual(@as(u8, 0x1f), Machine.cmosByte(512 * 1024 * 1024, 0x35));
-    try std.testing.expectEqual(@as(u8, 0), Machine.cmosByte(512 * 1024 * 1024, 0x5b));
+    try std.testing.expectEqual(@as(u8, 0x80), Machine.cmosByte(512 * 1024 * 1024, 0, 0x15));
+    try std.testing.expectEqual(@as(u8, 0x02), Machine.cmosByte(512 * 1024 * 1024, 0, 0x16));
+    try std.testing.expectEqual(@as(u8, 0x00), Machine.cmosByte(512 * 1024 * 1024, 0, 0x34));
+    try std.testing.expectEqual(@as(u8, 0x1f), Machine.cmosByte(512 * 1024 * 1024, 0, 0x35));
+    try std.testing.expectEqual(@as(u8, 0), Machine.cmosByte(512 * 1024 * 1024, 0, 0x5b));
+}
+
+test "x86 RAM above three GiB moves above the PCI hole" {
+    const below_hole = RamLayout.init(3 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(low_memory_bytes_max, below_hole.low_bytes);
+    try std.testing.expectEqual(@as(usize, 0), below_hole.high_bytes);
+
+    const four_gib = RamLayout.init(4 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(low_memory_bytes_max, four_gib.low_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), four_gib.high_bytes);
+}
+
+test "CMOS reports RAM above four GiB in 64 KiB chunks" {
+    const gib: usize = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u8, 0x00), Machine.cmosByte(3 * gib, gib, 0x5b));
+    try std.testing.expectEqual(@as(u8, 0x40), Machine.cmosByte(3 * gib, gib, 0x5c));
+    try std.testing.expectEqual(@as(u8, 0x00), Machine.cmosByte(3 * gib, gib, 0x5d));
 }
 
 test "PCI chipset identifies i440FX and PIIX3 bridges" {
