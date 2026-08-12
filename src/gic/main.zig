@@ -105,7 +105,7 @@ const InterruptState = struct {
     pending: bool = false,
     active: bool = false,
     priority: u8 = 0xFF, // Lowest priority
-    config: u2 = 0, // 0=level, 1=edge
+    config: u2 = 0, // 0b00=level, 0b10=edge
     group: u1 = 1, // Group 1 (non-secure)
     target_cpu: u8 = 0, // Target CPU for SPI
 };
@@ -206,7 +206,7 @@ pub const Gic = struct {
                 irq.priority = 0xA0; // Default priority
                 // SGIs (0-15) are always edge-triggered; PPIs (16-31)
                 // are level-triggered.
-                irq.config = if (intid < 16) 1 else 0;
+                irq.config = if (intid < 16) 0b10 else 0;
             }
         }
 
@@ -302,12 +302,11 @@ pub const Gic = struct {
     /// Check if any interrupt is pending for a CPU and inject if needed.
     fn checkPendingIrq(self: *Gic, cpu_id: u8) void {
         if (cpu_id >= self.num_cpus) return;
-        if ((self.ctlr & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS)) == 0) return;
 
         // Check SGIs/PPIs
         const redist = &self.redists[cpu_id];
         for (redist.sgi_ppi) |irq| {
-            if (irq.pending and irq.enabled and !irq.active) {
+            if (self.groupEnabled(irq.group) and irq.pending and irq.enabled and !irq.active) {
                 self.injectIrq(cpu_id);
                 return;
             }
@@ -315,7 +314,9 @@ pub const Gic = struct {
 
         // Check SPIs targeted at this CPU
         for (self.spis) |spi| {
-            if (spi.pending and spi.enabled and !spi.active and spi.target_cpu == cpu_id) {
+            if (self.groupEnabled(spi.group) and spi.pending and spi.enabled and
+                !spi.active and spi.target_cpu == cpu_id)
+            {
                 self.injectIrq(cpu_id);
                 return;
             }
@@ -332,13 +333,16 @@ pub const Gic = struct {
     /// (the state of the CPU's IRQ line). No side effects.
     pub fn hasDeliverableIrq(self: *const Gic, cpu_id: u8) bool {
         if (cpu_id >= self.num_cpus) return false;
-        if ((self.ctlr & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS)) == 0) return false;
 
         for (self.redists[cpu_id].sgi_ppi) |irq| {
-            if (irq.pending and irq.enabled and !irq.active) return true;
+            if (self.groupEnabled(irq.group) and irq.pending and irq.enabled and !irq.active) {
+                return true;
+            }
         }
         for (self.spis) |spi| {
-            if (spi.pending and spi.enabled and !spi.active and spi.target_cpu == cpu_id) {
+            if (self.groupEnabled(spi.group) and spi.pending and spi.enabled and
+                !spi.active and spi.target_cpu == cpu_id)
+            {
                 return true;
             }
         }
@@ -382,11 +386,11 @@ pub const Gic = struct {
         if (best_intid < 32) {
             const irq = &self.redists[cpu_id].sgi_ppi[best_intid];
             irq.active = true;
-            if (irq.config == 1) irq.pending = false; // Edge-triggered
+            if (irq.config & 0b10 != 0) irq.pending = false;
         } else if (best_intid < MAX_INTID) {
             const spi = &self.spis[best_intid - 32];
             spi.active = true;
-            if (spi.config == 1) spi.pending = false; // Edge-triggered
+            if (spi.config & 0b10 != 0) spi.pending = false;
         }
 
         return best_intid;
@@ -407,7 +411,7 @@ pub const Gic = struct {
         const redist = &self.redists[cpu_id];
         for (redist.sgi_ppi, 0..) |irq, i| {
             const group_matches = group == null or irq.group == group.?;
-            if (group_matches and irq.pending and irq.enabled and
+            if (group_matches and self.groupEnabled(irq.group) and irq.pending and irq.enabled and
                 !irq.active and irq.priority < best_priority)
             {
                 best_priority = irq.priority;
@@ -418,14 +422,19 @@ pub const Gic = struct {
         // Check SPIs
         for (self.spis, 0..) |spi, i| {
             const group_matches = group == null or spi.group == group.?;
-            if (group_matches and spi.pending and spi.enabled and !spi.active and
-                spi.target_cpu == cpu_id and spi.priority < best_priority)
+            if (group_matches and self.groupEnabled(spi.group) and spi.pending and spi.enabled and
+                !spi.active and spi.target_cpu == cpu_id and spi.priority < best_priority)
             {
                 best_priority = spi.priority;
                 best_intid = @as(u32, @intCast(i)) + 32;
             }
         }
         return best_intid;
+    }
+
+    fn groupEnabled(self: *const Gic, group: u1) bool {
+        const enable = if (group == 0) GICD.CTLR_ENABLE_G0 else GICD.CTLR_ENABLE_G1NS;
+        return self.ctlr & enable != 0;
     }
 
     /// End of interrupt (EOIR write).
@@ -686,7 +695,7 @@ pub const Gic = struct {
             if (intid < 32 or intid >= MAX_INTID) continue;
 
             const config: u2 = @truncate(value >> (@as(u5, @intCast(i)) * 2));
-            self.spis[intid - 32].config = config;
+            self.spis[intid - 32].config = config & 0b10;
         }
     }
 
@@ -891,7 +900,9 @@ pub const Gic = struct {
         while (i < 16) : (i += 1) {
             const intid = start + i;
             if (intid >= 32) break;
-            redist.sgi_ppi[intid].config = @truncate(value >> (i * 2));
+            if (intid < 16) continue;
+            const config: u2 = @truncate(value >> (i * 2));
+            redist.sgi_ppi[intid].config = config & 0b10;
         }
     }
 };
@@ -939,6 +950,7 @@ test "Gic SPI pending" {
     gic.spis[1].enabled = true;
     gic.spis[1].target_cpu = 0;
     gic.spis[1].priority = 0x80; // Mid-level priority
+    gic.distWrite(GICD.CTLR, 4, GICD.CTLR_ENABLE_G1NS);
 
     // Set pending
     gic.setSpiPending(33, true);
@@ -948,6 +960,44 @@ test "Gic SPI pending" {
     const intid = gic.ackInterrupt(0);
     try std.testing.expectEqual(@as(u32, 33), intid);
     try std.testing.expect(gic.spis[1].active);
+}
+
+test "Gic distributor enables gate their matching interrupt groups" {
+    const gic = try Gic.init(std.testing.allocator, 1);
+    defer gic.deinit();
+
+    gic.distWrite(GICD.ISENABLER + 4, 4, 1);
+    gic.distWrite(GICD.IPRIORITYR + 32, 4, 0x80);
+    gic.setSpiPending(32, true);
+    gic.distWrite(GICD.CTLR, 4, GICD.CTLR_ENABLE_G0);
+
+    try std.testing.expect(!gic.hasDeliverableIrq(0));
+    try std.testing.expectEqual(@as(u32, 1023), gic.ackInterruptForGroup(0, 1, 0xFF));
+
+    gic.distWrite(GICD.CTLR, 4, GICD.CTLR_ENABLE_G1NS);
+    try std.testing.expect(gic.hasDeliverableIrq(0));
+    try std.testing.expectEqual(@as(u32, 32), gic.ackInterruptForGroup(0, 1, 0xFF));
+}
+
+test "Gic interrupt configuration uses the architectural edge bit" {
+    const gic = try Gic.init(std.testing.allocator, 1);
+    defer gic.deinit();
+
+    gic.distWrite(GICD.CTLR, 4, GICD.CTLR_ENABLE_G1NS);
+    gic.distWrite(GICD.ISENABLER + 4, 4, 1);
+    gic.distWrite(GICD.IPRIORITYR + 32, 4, 0x80);
+    gic.distWrite(GICD.ICFGR + 8, 4, 0b10);
+    gic.setSpiPending(32, true);
+
+    try std.testing.expectEqual(@as(u32, 32), gic.ackInterruptForGroup(0, 1, 0xFF));
+    try std.testing.expectEqual(@as(u64, 0), gic.distRead(GICD.ISPENDR + 4, 4) & 1);
+    gic.endInterrupt(0, 32);
+
+    gic.distWrite(GICD.ICFGR + 8, 4, 0b01);
+    try std.testing.expectEqual(@as(u64, 0), gic.distRead(GICD.ICFGR + 8, 4) & 0b11);
+    gic.setSpiPending(32, true);
+    try std.testing.expectEqual(@as(u32, 32), gic.ackInterruptForGroup(0, 1, 0xFF));
+    try std.testing.expectEqual(@as(u64, 1), gic.distRead(GICD.ISPENDR + 4, 4) & 1);
 }
 
 test "Gic redistributor rejects offsets outside the configured CPUs" {

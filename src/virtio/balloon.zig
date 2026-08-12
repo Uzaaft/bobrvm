@@ -278,6 +278,7 @@ test "Balloon inflate advances actual, used ring, and keeps pages readable" {
         .driver_addr = 0x200,
         .device_addr = 0x300,
     };
+    balloon.write(@intFromEnum(mmio.Reg.status), 0x0C);
 
     balloon.write(@intFromEnum(mmio.Reg.queue_notify), 0);
 
@@ -334,6 +335,7 @@ test "Balloon deflate decrements actual" {
         .driver_addr = 0x200,
         .device_addr = 0x300,
     };
+    balloon.write(@intFromEnum(mmio.Reg.status), 0x0C);
 
     balloon.write(@intFromEnum(mmio.Reg.queue_notify), 1);
 

@@ -213,6 +213,8 @@ pub fn parse(text: []const u8) Error!Program {
 
 /// Parse TGSI directly into caller-provided storage.
 pub fn parseInto(prog: *Program, text: []const u8) Error!void {
+    if (!std.unicode.utf8ValidateSlice(text)) return Error.Malformed;
+
     // Field defaults apply (n_* = 0, uses_* = false); `undefined` would
     // leave the bool flags as garbage when never set by trackOperand.
     prog.* = .{ .stage = .vertex };
@@ -467,18 +469,32 @@ fn appendMask(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, o: Operand) !voi
 
 fn isSupportedName(op: []const u8) bool {
     const ops = [_][]const u8{
-        "MOV",   "ADD",   "SUB",  "MUL",     "MAD",  "DP2",  "DP3",  "DP4",
-        "MAX",   "MIN",   "RCP",  "RSQ",     "FRC",  "FLR",  "ABS",  "SQRT",
-        "TEX",   "TXP",   "TXB",  "TXL",     "TXF",  "CMP",  "LRP",  "SLT",
-        "SGE",   "SEQ",   "SNE",  "POW",     "EX2",  "LG2",  "SIN",  "COS",
-        "TRUNC", "ROUND", "SSG",  "DDX",     "DDY",  "CEIL", "XPD",  "NRM",
-        "DST",   "LIT",   "I2F",  "U2F",     "F2I",  "F2U",  "INEG", "IABS",
-        "UADD",  "UMUL",  "UMAD", "IMUL_HI", "ISHR", "USHR", "SHL",  "AND",
-        "OR",    "XOR",   "NOT",  "ISLT",    "ISGE", "USLT", "USGE", "IMAX",
-        "IMIN",  "UMAX",  "UMIN",
+        "MOV",   "ADD",  "SUB",  "MUL",  "MAD",  "DP2",  "DP3",  "DP4",
+        "MAX",   "MIN",  "RCP",  "RSQ",  "FRC",  "FLR",  "ABS",  "SQRT",
+        "TEX",   "TXB",  "TXL",  "TXF",  "CMP",  "LRP",  "SLT",  "SGE",
+        "SEQ",   "SNE",  "POW",  "EX2",  "LG2",  "SIN",  "COS",  "TRUNC",
+        "ROUND", "SSG",  "DDX",  "DDY",  "CEIL", "XPD",  "NRM",  "DST",
+        "LIT",   "I2F",  "U2F",  "F2I",  "F2U",  "INEG", "IABS", "UADD",
+        "UMUL",  "UMAD", "ISHR", "USHR", "SHL",  "AND",  "OR",   "XOR",
+        "NOT",   "ISLT", "ISGE", "USLT", "USGE", "IMAX", "IMIN", "UMAX",
+        "UMIN",
     };
     for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
     return false;
+}
+
+fn requiredSourceCount(op: []const u8) u8 {
+    const unary = [_][]const u8{
+        "MOV", "RCP",   "RSQ",   "FRC",  "FLR",  "ABS", "SQRT", "EX2", "LG2", "SIN",
+        "COS", "TRUNC", "ROUND", "SSG",  "DDX",  "DDY", "CEIL", "NRM", "LIT", "I2F",
+        "U2F", "F2I",   "F2U",   "INEG", "IABS", "NOT",
+    };
+    for (unary) |name| if (std.mem.eql(u8, op, name)) return 1;
+
+    const ternary = [_][]const u8{ "MAD", "CMP", "LRP", "UMAD" };
+    for (ternary) |name| if (std.mem.eql(u8, op, name)) return 3;
+
+    return 2;
 }
 
 /// Emit the float4 right-hand-side expression for a supported opcode.
@@ -1016,6 +1032,7 @@ fn emitBody(w: *std.ArrayListUnmanaged(u8), alloc: Allocator, prog: *const Progr
             try app(w, alloc, "    // unsupported: {s}\n", .{op});
             continue;
         }
+        if (instr.nsrc < requiredSourceCount(op)) return Error.Malformed;
         // dst.<mask> = (<rhs>).<mask>;
         try app(w, alloc, "    ", .{});
         try appendBase(w, alloc, prog, dst);
@@ -1149,4 +1166,16 @@ test "parse and emit arithmetic shader (MAD, DP4, swizzle, IMM, TEMP)" {
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "imm0 = float4(as_type<float>(0x3f000000u)") != null);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.position.x = (float4(dot(") != null);
     try std.testing.expect(std.mem.indexOf(u8, msl.source, "out.g1.xy = (in.a1.yxxx).xy;") != null);
+}
+
+test "emit rejects instructions with missing operands" {
+    const prog = try parse(
+        \\VERT
+        \\MOV TEMP[0]
+    );
+    try std.testing.expectError(error.Malformed, emit(std.testing.allocator, &prog));
+}
+
+test "parse rejects non-UTF-8 shader text" {
+    try std.testing.expectError(error.Malformed, parse("VERT\n\xFF"));
 }

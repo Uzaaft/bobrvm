@@ -189,6 +189,7 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
             };
         } else {
             log.warn("unknown argument: {s}", .{arg});
+            return ParseError.InvalidArgument;
         }
     }
 
@@ -197,15 +198,6 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
 }
 
 pub fn validate(self: *const Config) ParseError!void {
-    if (self.forward_count > MAX_FORWARDS) return ParseError.InvalidArgument;
-    for (self.forwards[0..self.forward_count], 0..) |forward, index| {
-        if (forward.host_port == 0 or forward.guest_port == 0) {
-            return ParseError.InvalidArgument;
-        }
-        for (self.forwards[0..index]) |earlier| {
-            if (earlier.host_port == forward.host_port) return ParseError.InvalidArgument;
-        }
-    }
     const memory_bytes = std.math.mul(u64, self.memory_mb, 1024 * 1024) catch {
         return ParseError.InvalidArgument;
     };
@@ -233,25 +225,14 @@ pub fn getConfigDir(alloc: Allocator) ![]const u8 {
 
 pub fn ensureConfigDir(alloc: Allocator) ![]const u8 {
     const dir_path = try getConfigDir(alloc);
-    std.Io.Dir.createDirAbsolute(global.io(), dir_path, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            const parent = std.fs.path.dirname(dir_path) orelse return err;
-            std.Io.Dir.createDirAbsolute(global.io(), parent, .default_dir) catch |e| switch (e) {
-                error.PathAlreadyExists => {},
-                else => return e,
-            };
-            std.Io.Dir.createDirAbsolute(global.io(), dir_path, .default_dir) catch |e| switch (e) {
-                error.PathAlreadyExists => {},
-                else => return e,
-            };
-        },
-    };
+    errdefer alloc.free(dir_path);
+    try std.Io.Dir.cwd().createDirPath(global.io(), dir_path);
     return dir_path;
 }
 
 pub fn getConfigPath(alloc: Allocator, name: []const u8) ![]const u8 {
     try validateName(name);
+
     const dir = try getConfigDir(alloc);
     defer alloc.free(dir);
     const filename = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
@@ -294,6 +275,17 @@ pub fn ensureVars(alloc: Allocator, name: []const u8, template_path: []const u8)
     return vars_path;
 }
 
+fn getTemporaryConfigPath(alloc: Allocator, dir_path: []const u8) ![]const u8 {
+    const random_len = 12;
+    var random: [random_len]u8 = undefined;
+    global.io().random(&random);
+    var encoded: [std.base64.url_safe.Encoder.calcSize(random_len)]u8 = undefined;
+    _ = std.base64.url_safe.Encoder.encode(&encoded, &random);
+    var filename_buffer: [encoded.len + ".part".len]u8 = undefined;
+    const filename = try std.fmt.bufPrint(&filename_buffer, "{s}.part", .{encoded});
+    return std.fs.path.join(alloc, &.{ dir_path, filename });
+}
+
 pub fn save(self: *const Config, alloc: Allocator) !void {
     try validateName(self.name);
 
@@ -303,25 +295,41 @@ pub fn save(self: *const Config, alloc: Allocator) !void {
     const config_path = try getConfigPath(alloc, self.name);
     defer alloc.free(config_path);
 
-    const json_bytes = try std.json.Stringify.valueAlloc(alloc, self.*, .{ .whitespace = .indent_2 });
+    const json_bytes = try std.json.Stringify.valueAlloc(
+        alloc,
+        self.*,
+        .{ .whitespace = .indent_2 },
+    );
     defer alloc.free(json_bytes);
 
-    const file = try std.Io.Dir.createFileAbsolute(global.io(), config_path, .{});
+    const temporary_path = try getTemporaryConfigPath(alloc, dir_path);
+    defer alloc.free(temporary_path);
+    var temporary_exists = false;
+    defer if (temporary_exists) {
+        std.Io.Dir.deleteFileAbsolute(global.io(), temporary_path) catch {};
+    };
+
+    const file = try std.Io.Dir.createFileAbsolute(global.io(), temporary_path, .{
+        .exclusive = true,
+    });
+    temporary_exists = true;
     defer file.close(global.io());
 
     try file.writePositionalAll(global.io(), json_bytes, 0);
     try file.writePositionalAll(global.io(), "\n", json_bytes.len);
+    try file.sync(global.io());
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.renamePreserve(temporary_path, cwd, config_path, global.io());
+    temporary_exists = false;
 }
 
-pub fn validateName(name: []const u8) ParseError!void {
+fn validateName(name: []const u8) ParseError!void {
     const suffix = ".json";
 
     if (name.len == 0) return error.MissingName;
     if (name.len > std.Io.Dir.max_name_bytes - suffix.len) return error.InvalidName;
     if (std.mem.indexOfAny(u8, name, "/\x00") != null) return error.InvalidName;
-    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
-        return error.InvalidName;
-    }
 }
 
 pub const LoadedConfig = struct {
@@ -334,7 +342,6 @@ pub const LoadedConfig = struct {
 };
 
 pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
-    try validateName(name);
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
@@ -353,6 +360,7 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
     errdefer arena.deinit();
 
     const parsed = try std.json.parseFromSlice(Config, arena.allocator(), content, .{
+        .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
 
@@ -367,7 +375,6 @@ pub fn load(alloc: Allocator, name: []const u8) !LoadedConfig {
 }
 
 pub fn delete(alloc: Allocator, name: []const u8) !void {
-    try validateName(name);
     const config_path = try getConfigPath(alloc, name);
     defer alloc.free(config_path);
 
@@ -377,12 +384,6 @@ pub fn delete(alloc: Allocator, name: []const u8) !void {
         }
         return err;
     };
-    const vars_path = try getVarsPath(alloc, name);
-    defer alloc.free(vars_path);
-    std.Io.Dir.deleteFileAbsolute(global.io(), vars_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
 }
 
 pub fn listAll(alloc: Allocator) ![][]const u8 {
@@ -391,7 +392,7 @@ pub fn listAll(alloc: Allocator) ![][]const u8 {
 
     var dir = std.Io.Dir.openDirAbsolute(global.io(), dir_path, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
-            return try alloc.alloc([]const u8, 0);
+            return &.{};
         }
         return err;
     };
@@ -444,6 +445,7 @@ test "persisted config uses shared GPU memory validation" {
     const valid = Config{ .gpu_memory_mb = 2048 };
     try valid.validate();
 }
+
 test "config paths reject names outside the VM directory" {
     const invalid_names = [_][]const u8{
         "../escape",
@@ -481,4 +483,63 @@ test "config paths enforce filename boundaries" {
         error.InvalidName,
         getConfigPath(std.testing.allocator, &name),
     );
+}
+
+test "CLI arguments project into VM configuration" {
+    // zig fmt: off
+    const argv = [_][*:0]const u8{
+        "--memory", "2048",
+        "--cpus", "4",
+        "--firmware", "/firmware.fd",
+        "--vars", "/vars.fd",
+        "--disk", "/disk.raw",
+        "--disk-readonly",
+        "--disk2", "/secondary.raw",
+        "--disk2-writable",
+        "--kernel", "/kernel",
+        "--initrd", "/initrd",
+        "--cmdline", "console=hvc0",
+        "--virgl",
+        "--sound",
+        "--share", "/shared",
+        "--restore", "/snapshot",
+        "--forward", "2222:22",
+        "--display", "1600x900",
+        "--gpu-memory", "1024",
+    };
+    // zig fmt: on
+    var args = (std.process.Args{ .vector = &argv }).iterate();
+
+    const parsed = try parseArgs(&args);
+
+    try std.testing.expectEqual(2048, parsed.memory_mb);
+    try std.testing.expectEqual(4, parsed.vcpu_count);
+    try std.testing.expectEqualStrings("/firmware.fd", parsed.firmware_path.?);
+    try std.testing.expectEqualStrings("/vars.fd", parsed.vars_path.?);
+    try std.testing.expectEqualStrings("/disk.raw", parsed.disk_path.?);
+    try std.testing.expect(parsed.disk_read_only);
+    try std.testing.expectEqualStrings("/secondary.raw", parsed.disk2_path.?);
+    try std.testing.expect(!parsed.disk2_read_only);
+    try std.testing.expectEqualStrings("/kernel", parsed.kernel_path.?);
+    try std.testing.expectEqualStrings("/initrd", parsed.initrd_path.?);
+    try std.testing.expectEqualStrings("console=hvc0", parsed.cmdline);
+    try std.testing.expect(parsed.enable_gpu);
+    try std.testing.expect(parsed.enable_virgl);
+    try std.testing.expect(parsed.enable_net);
+    try std.testing.expect(parsed.enable_snd);
+    try std.testing.expectEqualStrings("/shared", parsed.shared_dir.?);
+    try std.testing.expectEqualStrings("/snapshot", parsed.restore_path.?);
+    try std.testing.expectEqual(1, parsed.forward_count);
+    try std.testing.expectEqual(2222, parsed.forwards[0].host_port);
+    try std.testing.expectEqual(22, parsed.forwards[0].guest_port);
+    try std.testing.expectEqual(1600, parsed.display_width);
+    try std.testing.expectEqual(900, parsed.display_height);
+    try std.testing.expectEqual(1024, parsed.gpu_memory_mb);
+}
+
+test "CLI rejects unknown arguments" {
+    const argv = [_][*:0]const u8{"--memroy"};
+    var args = (std.process.Args{ .vector = &argv }).iterate();
+
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&args));
 }

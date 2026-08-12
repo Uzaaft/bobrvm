@@ -181,6 +181,7 @@ test "Rng fills posted buffers with entropy" {
         .driver_addr = 0x200,
         .device_addr = 0x300,
     };
+    rng.write(@intFromEnum(mmio.Reg.status), 0x0C);
 
     rng.write(@intFromEnum(mmio.Reg.queue_notify), 0);
 

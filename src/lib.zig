@@ -74,5 +74,9 @@ test {
     _ = @import("cli/Config.zig");
     _ = @import("cli/runner.zig");
     _ = @import("compat/file.zig");
+    _ = @import("compat/net.zig");
     _ = @import("compat/thread.zig");
+    _ = @import("gic/main.zig");
+    _ = @import("pci/main.zig");
+    _ = @import("c_abi_test.zig");
 }

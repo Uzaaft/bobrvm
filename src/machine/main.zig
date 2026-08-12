@@ -226,12 +226,14 @@ const VirtioMmioDevice = union(enum) {
     snd: *virtio.Snd,
     p9: *virtio.P9,
 
-    fn setGuestMemory(self: VirtioMmioDevice, accessor: *const fn (u64, usize) ?[]u8) void {
+    fn setGuestMemory(
+        self: VirtioMmioDevice,
+        comptime accessor: *const fn (u64, usize) ?[]u8,
+    ) void {
+        const memory = GuestMemory.bindGlobal(accessor);
         switch (self) {
-            .block => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
-            .net => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
-            .rng => |device| device.setGuestMemory(GuestMemory.bindGlobal(accessor)),
-            inline else => |device| device.setGuestMemory(accessor),
+            .balloon => |device| device.setGuestMemory(accessor),
+            inline else => |device| device.setGuestMemory(memory),
         }
     }
 
@@ -2545,6 +2547,7 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             self.alloc,
             2,
+            0x0002,
             blk_features,
             1,
             @sizeOf(virtio.blk.Config),
@@ -2571,6 +2574,7 @@ pub const Machine = struct {
         self.pci_gpu = try pci.VirtioPciDevice.init(
             self.alloc,
             16,
+            0x0010,
             gpu_dev.transport.device_features,
             2,
             @sizeOf(virtio.gpu.Config),

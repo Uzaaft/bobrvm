@@ -311,6 +311,7 @@ test "P9 device: identity, mount tag config, and a version exchange" {
         .driver_addr = 0x200,
         .device_addr = 0x300,
     };
+    dev.write(@intFromEnum(mmio.Reg.status), 0x0C);
 
     dev.write(@intFromEnum(mmio.Reg.queue_notify), 0);
 

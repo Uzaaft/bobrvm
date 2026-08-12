@@ -3117,13 +3117,13 @@ test "GPU reset clears queue cursors" {
 
     gpu.ctrl_last_avail = 17;
     gpu.cursor_last_avail = 9;
-    gpu.transport.status = 4;
+    gpu.transport.status = .{ .driver_ok = true };
 
     gpu.reset();
 
     try testing.expectEqual(@as(u16, 0), gpu.ctrl_last_avail);
     try testing.expectEqual(@as(u16, 0), gpu.cursor_last_avail);
-    try testing.expectEqual(@as(u32, 0), gpu.transport.status);
+    try testing.expectEqual(mmio.Status{}, gpu.transport.status);
 }
 
 test "hardware cursor: update_cursor sets image+position, move_cursor repositions only" {

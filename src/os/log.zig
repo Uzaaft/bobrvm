@@ -95,3 +95,10 @@ pub fn scopedLogger(comptime scope: @TypeOf(.EnumLiteral)) ?*Log {
     }
     return S.cached;
 }
+
+test "unified log types preserve standard log severity" {
+    try std.testing.expectEqual(LogType.debug, LogType.fromStdLevel(.debug));
+    try std.testing.expectEqual(LogType.info, LogType.fromStdLevel(.info));
+    try std.testing.expectEqual(LogType.@"error", LogType.fromStdLevel(.warn));
+    try std.testing.expectEqual(LogType.fault, LogType.fromStdLevel(.err));
+}

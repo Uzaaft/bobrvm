@@ -120,12 +120,36 @@ test "display dimensions and framebuffer budget are bounded" {
     }));
 }
 
+test "configuration policy accepts and rejects exact boundaries" {
+    try std.testing.expectError(error.InvalidMemory, validate(.{ .memory_bytes = 0 }));
+    try std.testing.expectError(error.InvalidVcpuCount, validate(.{ .vcpu_count = 0 }));
+    try std.testing.expectError(error.InvalidDisplaySize, validate(.{ .display_width = 0 }));
+    try std.testing.expectError(error.InvalidDisplaySize, validate(.{ .display_height = 0 }));
+    try validate(.{ .display_width = 0, .display_height = 0 });
+
+    try validate(.{ .gpu_memory_bytes = 0 });
+    try validate(.{ .gpu_memory_bytes = gpu_memory_bytes_min });
+    try validate(.{ .gpu_memory_bytes = gpu_memory_bytes_max });
+    try std.testing.expectError(error.InvalidGpuMemory, validate(.{
+        .gpu_memory_bytes = gpu_memory_bytes_min - 1,
+    }));
+    try std.testing.expectError(error.InvalidGpuMemory, validate(.{
+        .gpu_memory_bytes = gpu_memory_bytes_max + 1,
+    }));
+}
+
 test "ISO safety is case insensitive" {
     try std.testing.expect(isIsoPath("installer.ISO"));
     try std.testing.expectError(error.WritableIso, validate(.{
         .disk2_path = "installer.ISO",
         .disk2_read_only = false,
     }));
+    try std.testing.expectError(error.WritableIso, validate(.{
+        .disk_path = "installer.iso",
+        .disk_read_only = false,
+    }));
+    try validate(.{ .disk_path = "installer.iso", .disk_read_only = true });
+    try validate(.{ .disk2_path = "installer.ISO", .disk2_read_only = true });
 }
 
 test "raw disk extension is case insensitive" {

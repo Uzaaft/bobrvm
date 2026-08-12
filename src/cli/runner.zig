@@ -665,6 +665,7 @@ fn registerMachineForCleanup(hw: *machine.Machine) void {
 
 fn unregisterMachineForCleanup() void {
     cleanup_machine = null;
+    os.signal.unregisterCleanup();
 }
 
 /// Signal-handler cleanup. Runs in async-signal context while the vCPU

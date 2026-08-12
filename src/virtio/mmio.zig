@@ -80,9 +80,9 @@ pub const Status = packed struct(u8) {
     driver: bool = false,
     driver_ok: bool = false,
     features_ok: bool = false,
+    _padding: u2 = 0,
     device_needs_reset: bool = false,
     failed: bool = false,
-    _padding: u2 = 0,
 };
 
 /// MMIO transport state.
@@ -228,15 +228,15 @@ pub const Transport = struct {
             .device_id => self.device_id,
             .vendor_id => self.vendor_id,
             .device_features => self.readDeviceFeatures(),
-            .queue_num_max => 256, // Max queue size
+            .queue_num_max => if (self.currentQueue() != null) 256 else 0,
             .queue_ready => if (self.currentQueue()) |q| @intFromBool(q.ready) else 0,
             .interrupt_status => @bitCast(self.interrupt_status),
             .status => @as(u32, @intFromBool(self.status.acknowledge)) |
                 (@as(u32, @intFromBool(self.status.driver)) << 1) |
                 (@as(u32, @intFromBool(self.status.driver_ok)) << 2) |
                 (@as(u32, @intFromBool(self.status.features_ok)) << 3) |
-                (@as(u32, @intFromBool(self.status.device_needs_reset)) << 4) |
-                (@as(u32, @intFromBool(self.status.failed)) << 5),
+                (@as(u32, @intFromBool(self.status.device_needs_reset)) << 6) |
+                (@as(u32, @intFromBool(self.status.failed)) << 7),
             .config_generation => self.config_generation,
             // Shared-memory region query (selected by shm_sel). Only region 0
             // exists; a length of all-ones means "region does not exist".
@@ -254,11 +254,7 @@ pub const Transport = struct {
             .device_features_sel => self.device_features_sel = value,
             .driver_features => self.writeDriverFeatures(value),
             .driver_features_sel => self.driver_features_sel = value,
-            .queue_sel => {
-                if (value < self.queues.len) {
-                    self.queue_sel = value;
-                }
-            },
+            .queue_sel => self.queue_sel = value,
             .queue_num => {
                 if (self.currentQueue()) |q| {
                     q.num = @truncate(value);
@@ -324,18 +320,20 @@ pub const Transport = struct {
     }
 
     fn readDeviceFeatures(self: *Transport) u32 {
-        if (self.device_features_sel == 0) {
-            return @truncate(self.device_features);
-        } else {
-            return @truncate(self.device_features >> 32);
-        }
+        return switch (self.device_features_sel) {
+            0 => @truncate(self.device_features),
+            1 => @truncate(self.device_features >> 32),
+            else => 0,
+        };
     }
 
     fn writeDriverFeatures(self: *Transport, value: u32) void {
-        if (self.driver_features_sel == 0) {
-            self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value;
-        } else {
-            self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32);
+        switch (self.driver_features_sel) {
+            0 => self.driver_features =
+                (self.driver_features & 0xFFFFFFFF00000000) | value,
+            1 => self.driver_features =
+                (self.driver_features & 0x00000000FFFFFFFF) | (@as(u64, value) << 32),
+            else => {},
         }
     }
 
@@ -352,6 +350,7 @@ pub const Transport = struct {
     }
 
     fn handleNotify(self: *Transport, queue_idx: u32) void {
+        if (!self.isReady()) return;
         if (self.notify) |notify| {
             notify.call(queue_idx);
         }
@@ -371,6 +370,7 @@ pub const Transport = struct {
         self.driver_features_sel = 0;
         self.queue_sel = 0;
         self.interrupt_status = .{};
+        if (self.irq) |irq| irq.call(false);
 
         for (self.queues) |*q| {
             q.* = QueueConfig{};
@@ -485,4 +485,73 @@ test "Transport config change raises and ack clears the interrupt line" {
     transport.write(@intFromEnum(Reg.interrupt_ack), 0x2);
     try std.testing.expect(!line.level);
     try std.testing.expect(!transport.interrupt_status.config_change);
+}
+
+test "Transport status preserves the standard high status bits" {
+    const transport = try Transport.init(std.testing.allocator, 3, 0, 1);
+    defer transport.deinit(std.testing.allocator);
+
+    transport.write(@intFromEnum(Reg.status), 0xC0);
+    try std.testing.expect(transport.status.device_needs_reset);
+    try std.testing.expect(transport.status.failed);
+    try std.testing.expectEqual(@as(u32, 0xC0), transport.read(@intFromEnum(Reg.status)));
+}
+
+test "Transport unavailable queue selection reads a zero maximum" {
+    const transport = try Transport.init(std.testing.allocator, 3, 0, 2);
+    defer transport.deinit(std.testing.allocator);
+
+    transport.write(@intFromEnum(Reg.queue_sel), 99);
+    try std.testing.expectEqual(@as(u32, 99), transport.queue_sel);
+    try std.testing.expectEqual(@as(u32, 0), transport.read(@intFromEnum(Reg.queue_num_max)));
+}
+
+test "Transport reset deasserts IRQ and notifications require DRIVER_OK" {
+    const State = struct {
+        irq_level: bool = false,
+        notifications: usize = 0,
+
+        fn irq(level: bool, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.irq_level = level;
+        }
+
+        fn notify(_: u32, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.notifications += 1;
+        }
+    };
+
+    const transport = try Transport.init(std.testing.allocator, 3, 0, 1);
+    defer transport.deinit(std.testing.allocator);
+    var state = State{};
+    transport.setIrqCallback(Irq.initRaw(State.irq, &state));
+    transport.setNotifyCallback(Notify.initRaw(State.notify, &state));
+
+    transport.write(@intFromEnum(Reg.queue_notify), 0);
+    try std.testing.expectEqual(@as(usize, 0), state.notifications);
+    transport.write(@intFromEnum(Reg.status), 0x0C);
+    transport.write(@intFromEnum(Reg.queue_notify), 0);
+    try std.testing.expectEqual(@as(usize, 1), state.notifications);
+
+    transport.signalUsedBuffer();
+    try std.testing.expect(state.irq_level);
+    transport.write(@intFromEnum(Reg.status), 0);
+    try std.testing.expect(!state.irq_level);
+}
+
+test "Transport ignores feature selector pages above one" {
+    const transport = try Transport.init(
+        std.testing.allocator,
+        3,
+        0x1122_3344_5566_7788,
+        1,
+    );
+    defer transport.deinit(std.testing.allocator);
+
+    transport.write(@intFromEnum(Reg.device_features_sel), 2);
+    try std.testing.expectEqual(@as(u32, 0), transport.read(@intFromEnum(Reg.device_features)));
+    transport.write(@intFromEnum(Reg.driver_features_sel), 2);
+    transport.write(@intFromEnum(Reg.driver_features), 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u64, 0), transport.driver_features);
 }

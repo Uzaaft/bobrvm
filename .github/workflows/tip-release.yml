@@ -32,6 +32,50 @@ jobs:
       - name: Run Zig unit tests, property fuzzing, and build integration guest
         run: nix build --print-build-logs .#test
 
+  swift:
+    name: Swift contract tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Build Zig dependency directory
+        id: deps
+        run: |
+          nix build --print-build-logs .#deps
+          echo "path=$(readlink result)" >> "$GITHUB_OUTPUT"
+
+      - name: Build direct Zig dependency cache
+        id: direct-deps
+        run: |
+          nix build --print-build-logs .#framework-deps
+          echo "path=$(readlink result)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Zig caches
+        env:
+          BOBRVM_ZIG_DIRECT_DEPS: ${{ steps.direct-deps.outputs.path }}
+        run: |
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
+          ln -s "$BOBRVM_ZIG_DIRECT_DEPS" "$ZIG_GLOBAL_CACHE_DIR/p"
+
+      - name: Build app frameworks
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
+        run: nix develop --command zig build xcframework ghostty-lib
+
+      - name: Run hosted Swift tests
+        run: nix develop --command macos/build.nu --action test
+
   hypervisor:
     name: Bare-metal SMP integration
     if: >-
@@ -79,7 +123,7 @@ jobs:
   release:
     name: Build and publish
     if: github.event_name != 'pull_request'
-    needs: [test, hypervisor]
+    needs: [test, swift, hypervisor]
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
