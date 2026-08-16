@@ -83,13 +83,15 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, bobrvm-hypervisor]
     timeout-minutes: 30
-    env:
-      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/bobrvm-zig-global
-      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/bobrvm-zig-local
 
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+
+      - name: Configure Zig caches
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/bobrvm-zig-global" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$RUNNER_TEMP/bobrvm-zig-local" >> "$GITHUB_ENV"
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
