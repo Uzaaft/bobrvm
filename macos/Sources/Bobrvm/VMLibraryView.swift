@@ -205,6 +205,10 @@ private struct VMLibraryCard: View {
         }
 
         Divider()
+        if vmInstance.guestSystem != .macOS {
+            ISOMediaActions(vmInstance: vmInstance)
+            Divider()
+        }
         Button("Settings…", systemImage: "gearshape", action: edit)
     }
 

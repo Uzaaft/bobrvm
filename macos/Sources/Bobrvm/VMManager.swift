@@ -174,18 +174,60 @@ public final class VMManager: ObservableObject {
             isoReadOnly: true
         )
 
+        try replaceVM(
+            instance,
+            name: name,
+            config: newConfig,
+            isoPath: isoPath,
+            retinaEnabled: retinaEnabled
+        )
+
+        Self.logger.info("Updated VM configuration: \(name)")
+    }
+
+    public func updateISO(_ instance: VMInstance, path: String?) throws {
+        guard instance.guestSystem != .macOS else {
+            throw BobrvmError.invalidArgument
+        }
+
+        var newConfig = instance.config
+        newConfig.isoPath = path
+        newConfig.isoReadOnly = true
+
+        try replaceVM(
+            instance,
+            name: instance.name,
+            config: newConfig,
+            isoPath: path,
+            retinaEnabled: instance.retinaEnabled
+        )
+
+        Self.logger.info("Updated ISO media for VM: \(instance.name)")
+    }
+
+    private func replaceVM(
+        _ instance: VMInstance,
+        name: String,
+        config: VMConfig,
+        isoPath: String?,
+        retinaEnabled: Bool
+    ) throws {
+        guard instance.state == .stopped else {
+            throw BobrvmError.invalidState
+        }
+
         guard let index = vms.firstIndex(where: { $0.id == instance.id }) else {
             throw BobrvmError.invalidArgument
         }
 
         guard let app else { throw BobrvmError.invalidArgument }
         let newVM = instance.guestSystem != .macOS
-            ? try app.createVM(config: newConfig)
+            ? try app.createVM(config: config)
             : nil
         let updatedInstance = VMInstance(
             id: instance.id,
             name: name,
-            config: newConfig,
+            config: config,
             app: app,
             vm: newVM,
             isoPath: isoPath,
@@ -203,8 +245,6 @@ public final class VMManager: ObservableObject {
 
         instance.destroy()
         vms[index] = updatedInstance
-
-        Self.logger.info("Updated VM configuration: \(name)")
     }
 
     public func stopAllVMs() {

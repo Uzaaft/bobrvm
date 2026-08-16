@@ -225,6 +225,10 @@ struct VMContextMenu: View {
             Divider()
 
             Section {
+                if vmInstance.guestSystem != .macOS {
+                    ISOMediaActions(vmInstance: vmInstance)
+                }
+
                 if let diskPath = vmInstance.config.diskPath {
                     Button {
                         showInFinder(path: diskPath)
@@ -349,6 +353,15 @@ struct VMDetailView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .automatic) {
+                if vmInstance.guestSystem != .macOS {
+                    Menu {
+                        ISOMediaActions(vmInstance: vmInstance)
+                    } label: {
+                        Label("CD/DVD", systemImage: "opticaldisc")
+                    }
+                    .help(isoHelp)
+                }
+
                 switch vmInstance.state {
                 case .stopped:
                     Button(action: { try? vmInstance.start() }) {
@@ -453,6 +466,54 @@ struct VMDetailView: View {
         case .connecting: return "Guest Tools: Connecting"
         case .ready: return "Guest Tools: Ready"
         case .protocolError: return "Guest Tools: Protocol Error"
+        }
+    }
+
+    private var isoHelp: String {
+        guard let path = vmInstance.isoPath else { return "Attach an ISO image" }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+}
+
+struct ISOMediaActions: View {
+    @ObservedObject var vmInstance: VMInstance
+    @EnvironmentObject private var vmManager: VMManager
+
+    var body: some View {
+        Button {
+            attachISO()
+        } label: {
+            Label("Attach ISO…", systemImage: "opticaldisc.badge.plus")
+        }
+        .disabled(vmInstance.state != .stopped)
+
+        if vmInstance.isoPath != nil {
+            Button {
+                updateISO(path: nil, action: "detach")
+            } label: {
+                Label("Detach ISO", systemImage: "eject.fill")
+            }
+            .disabled(vmInstance.state != .stopped)
+        }
+    }
+
+    private func attachISO() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.iso]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        updateISO(path: url.path, action: "attach")
+    }
+
+    private func updateISO(path: String?, action: String) {
+        do {
+            try vmManager.updateISO(vmInstance, path: path)
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.messageText = "Could Not \(action.capitalized) ISO"
+            alert.runModal()
         }
     }
 }

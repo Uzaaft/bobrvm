@@ -111,6 +111,7 @@ struct EditVMView: View {
                             path: $isoPath,
                             types: [.iso]
                         )
+                        .disabled(isRunning)
                         .onChange(of: isoPath) { _ in hasChanges = true }
 
                         FilePickerField(
@@ -126,9 +127,7 @@ struct EditVMView: View {
                     Text("Storage")
                 } footer: {
                     Text(
-                        canGrowDisk
-                            ? "Raw disk capacity may only be increased while the VM is stopped."
-                            : "This disk format cannot be resized by Bobrvm."
+                        storageFooter
                     )
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -356,6 +355,16 @@ struct EditVMView: View {
         vmInstance.config.diskPath.map {
             URL(fileURLWithPath: $0).pathExtension.lowercased() == "raw"
         } ?? false
+    }
+
+    private var storageFooter: String {
+        if isRunning {
+            return "Stop the VM to attach or detach an ISO image."
+        }
+        if canGrowDisk {
+            return "Raw disk capacity may only be increased while the VM is stopped."
+        }
+        return "This disk format cannot be resized by Bobrvm."
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
