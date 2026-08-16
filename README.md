@@ -18,6 +18,14 @@ native display, input, networking, and audio devices.
 Automated Apple Silicon builds of the latest commit on `main` are published to
 the prerelease tagged [`tip`](https://github.com/polymath-as/bobrvm/releases/tag/tip).
 
+Install the latest successful `main` build with Homebrew:
+
+```sh
+brew tap polymath-as/bobrvm https://github.com/polymath-as/bobrvm
+brew trust --cask polymath-as/bobrvm/bobrvm
+brew install --cask bobrvm
+```
+
 ## Requirements
 
 - Apple Silicon Mac running macOS 13 or later
