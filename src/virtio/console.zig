@@ -274,6 +274,9 @@ pub const Console = struct {
 
         // Set up notification callback
         console.transport.initEmbedded(3, features, queues);
+        // pendingEntries refuses rings larger than QUEUE_SIZE, so never
+        // advertise more than that or every queue deadlocks the driver.
+        console.transport.queue_num_max = QUEUE_SIZE;
         console.transport.setNotifyCallback(mmio.bindNotify(Console, console, handleNotify));
 
         // Post-condition
@@ -977,6 +980,18 @@ fn pushTestAvail(base: u64, desc_idx: u16) void {
 fn testUsedIdx(base: u64) u16 {
     const used = TestMem.get(base + 0x800, 6).?;
     return std.mem.readInt(u16, used[2..4], .little);
+}
+
+test "Console advertises a queue maximum its ring processing accepts" {
+    const console = try Console.init(std.testing.allocator, &.{"org.qemu.guest_agent.0"});
+    defer console.deinit();
+
+    var qidx: u32 = 0;
+    while (qidx < console.transport.queues.len) : (qidx += 1) {
+        console.transport.write(@intFromEnum(mmio.Reg.queue_sel), qidx);
+        const max = console.transport.read(@intFromEnum(mmio.Reg.queue_num_max));
+        try std.testing.expectEqual(@as(u32, Console.QUEUE_SIZE), max);
+    }
 }
 
 test "Console rejects guest avail jumps larger than the queue" {

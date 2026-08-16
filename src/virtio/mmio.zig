@@ -99,6 +99,12 @@ pub const Transport = struct {
     interrupt_status: InterruptStatus,
     config_generation: u32,
 
+    /// Largest queue size the device backing this transport can service.
+    /// Advertised via queue_num_max; devices with smaller per-queue bounds
+    /// (e.g. the console) must lower it so the driver never configures a
+    /// ring the device will refuse to process.
+    queue_num_max: u16 = 256,
+
     /// Callback for queue notifications.
     notify: ?Notify,
 
@@ -228,7 +234,7 @@ pub const Transport = struct {
             .device_id => self.device_id,
             .vendor_id => self.vendor_id,
             .device_features => self.readDeviceFeatures(),
-            .queue_num_max => if (self.currentQueue() != null) 256 else 0,
+            .queue_num_max => if (self.currentQueue() != null) self.queue_num_max else 0,
             .queue_ready => if (self.currentQueue()) |q| @intFromBool(q.ready) else 0,
             .interrupt_status => @bitCast(self.interrupt_status),
             .status => @as(u32, @intFromBool(self.status.acknowledge)) |
