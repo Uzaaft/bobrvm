@@ -38,11 +38,17 @@ stdenv.mkDerivation (finalAttrs: {
       exit 1
     fi
     for test_binary in "''${test_binaries[@]}"; do
-      ${stdenv.cc.bintools.dynamicLinker} \
-        --library-path ${lib.makeLibraryPath (
-      [stdenv.cc.libc] ++ lib.optional stdenv.hostPlatform.isLinux virglrenderer
-    )} \
+      ${
+      if stdenv.hostPlatform.isDarwin
+      then ''
         "$test_binary"
+      ''
+      else ''
+        ${stdenv.cc.bintools.dynamicLinker} \
+          --library-path ${lib.makeLibraryPath [stdenv.cc.libc virglrenderer]} \
+          "$test_binary"
+      ''
+    }
     done
     zig build bare-metal-test
     zig build test-fuzz-virtqueue --fuzz=100K
