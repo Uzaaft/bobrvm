@@ -11,6 +11,8 @@
 #   bash tests/integration/up/up-warm-test.sh
 #
 # UP_WARM_WORKDIR overrides the scratch location (default: mktemp).
+# UP_WARM_CPUS sets the guest vCPU count (default: 2 — proves SMP
+# suspend/restore; set 1 for the single-CPU path).
 set -u
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 BIN=$REPO/zig-out/bin/bobrvm
@@ -29,7 +31,7 @@ mkdir -p "$PROJ"
 cat > "$PROJ/bobrvm.toml" <<EOF
 name = "up-warm-test"
 memory = 512
-cpus = 1
+cpus = ${UP_WARM_CPUS:-2}
 kernel = "$KERNEL"
 initrd = "$INITRD"
 share = false

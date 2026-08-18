@@ -315,6 +315,10 @@ const VcpuRunState = struct {
     pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     vtimer_unmask: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by a restored secondary once its vCPU exists and its
+    /// registers are applied; the restore path serializes on this so
+    /// HVF's creation-index-derived MPIDR matches our CPU numbering.
+    restore_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     entry_point: u64 = 0,
     context_id: u64 = 0,
     thread: ?std.Thread = null,
@@ -1264,15 +1268,6 @@ pub const Machine = struct {
         if (!was_paused) self.pause();
         errdefer if (!was_paused) self.unpause();
 
-        // Until SMP restore lands, refuse to write an image that can
-        // never be loaded (restoreFromFileInner rejects any vcpu1
-        // section): failing at save time beats a surprise at restore.
-        var started_vcpus: u32 = 0;
-        for (self.cpu_states) |*cpu| {
-            if (cpu.vcpu != null and cpu.started.load(.acquire)) started_vcpus += 1;
-        }
-        if (started_vcpus > 1) return error.SmpSnapshotUnsupported;
-
         const state = try self.captureState(self.alloc);
         defer self.alloc.free(state);
         const ram = self.ram orelse return error.NoRam;
@@ -1309,8 +1304,9 @@ pub const Machine = struct {
     }
 
     /// Restore state from a suspend image. Runs on vCPU 0's owning
-    /// thread (called from startSync before the run loop), so registers
-    /// apply directly. Single-vCPU images only for now.
+    /// thread (called from startSync before the run loop), so its
+    /// registers apply directly; captured secondaries are spawned onto
+    /// their own threads.
     fn restoreFromFile(self: *Machine, path: []const u8, vcpu: *hypervisor.Vcpu) Error!void {
         const io = global.io();
         const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch {
@@ -1365,7 +1361,26 @@ pub const Machine = struct {
 
         // Devices + GIC.
         const reader = try snapshot.Reader.init(state);
-        if (reader.section("vcpu1")) |_| return error.SmpRestoreUnsupported;
+
+        // Secondary vCPUs: each captured CPU gets its own thread (HVF
+        // requires create+run on the owning thread) which applies its
+        // registers and then waits for the machine to start. CPUs the
+        // image doesn't carry stay offline, matching the captured
+        // guest. An image with MORE CPUs than this machine cannot
+        // restore faithfully.
+        for (1..self.cpu_states.len) |i| {
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "vcpu{d}", .{i}) catch unreachable;
+            const data = reader.section(name) orelse continue;
+            if (data.len != @sizeOf(snapshot.VcpuState)) return error.BadImage;
+            try self.spawnRestoredSecondary(@intCast(i), data);
+        }
+        {
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "vcpu{d}", .{self.cpu_states.len}) catch unreachable;
+            if (reader.section(name)) |_| return error.VcpuCountMismatch;
+        }
+
         inline for (snapshot_sections) |Section| {
             try Section.restore(self, self.alloc, &reader);
         }
@@ -1376,6 +1391,96 @@ pub const Machine = struct {
         var vstate: snapshot.VcpuState = undefined;
         @memcpy(std.mem.asBytes(&vstate), vdata);
         try snapshot.restoreVcpu(vcpu, &vstate);
+    }
+
+    /// Register state handed to a restored secondary's thread; the
+    /// thread owns and frees it (the suspend-image buffer it was
+    /// copied from dies with restoreFromFileInner).
+    const SecondaryRestore = struct {
+        vstate: snapshot.VcpuState,
+    };
+
+    /// Spawn one restored secondary vCPU and wait until its vCPU
+    /// exists with registers applied. The wait serializes creations so
+    /// HVF's creation-index-derived MPIDR matches our CPU numbering.
+    fn spawnRestoredSecondary(self: *Machine, cpu_id: u8, data: []const u8) !void {
+        const state = &self.cpu_states[cpu_id];
+        assert(!state.started.load(.acquire));
+        assert(data.len == @sizeOf(snapshot.VcpuState));
+
+        const boot = try self.alloc.create(SecondaryRestore);
+        @memcpy(std.mem.asBytes(&boot.vstate), data);
+
+        state.restore_ready.store(false, .release);
+        state.started.store(true, .release);
+        state.thread = std.Thread.spawn(
+            .{},
+            restoredSecondaryVcpuMain,
+            .{ self, cpu_id, boot },
+        ) catch {
+            state.started.store(false, .release);
+            self.alloc.destroy(boot);
+            return error.RestoreFailed;
+        };
+
+        var waited_ms: u32 = 0;
+        while (!state.restore_ready.load(.acquire)) {
+            if (!state.started.load(.acquire)) return error.RestoreFailed;
+            if (waited_ms >= 2000) return error.RestoreFailed;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+            waited_ms += 1;
+        }
+    }
+
+    /// Entry point for a restored secondary vCPU thread: create the
+    /// vCPU here (owning thread), apply the captured registers, then
+    /// hold until the machine starts and enter the normal run loop.
+    fn restoredSecondaryVcpuMain(self: *Machine, cpu_id: u8, boot: *SecondaryRestore) void {
+        const state = &self.cpu_states[cpu_id];
+        defer self.alloc.destroy(boot);
+        const vm = self.hv_vm orelse {
+            state.started.store(false, .release);
+            return;
+        };
+
+        const vcpu = vm.createVcpu() catch |err| {
+            log.err("cpu {}: restored vCPU creation failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        setupVcpuFeatures(vcpu) catch |err| {
+            log.err("cpu {}: restored vCPU feature setup failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        snapshot.restoreVcpu(vcpu, &boot.vstate) catch |err| {
+            log.err("cpu {}: register restore failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        state.vcpu = vcpu;
+        state.restore_ready.store(true, .release);
+
+        // The machine starts running after restoreFromFile returns; a
+        // failed startup sets stop_requested so this never leaks.
+        while (!self.running.load(.acquire)) {
+            if (self.stop_requested.load(.acquire)) {
+                state.started.store(false, .release);
+                return;
+            }
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 200 * std.time.ns_per_us },
+                .clock = .awake,
+            }, global.io()) catch {};
+        }
+
+        self.runVcpuLoop(vcpu, cpu_id) catch |err| {
+            log.warn("cpu {}: restored vCPU loop failed: {}", .{ cpu_id, err });
+        };
+        state.started.store(false, .release);
     }
 
     /// Darwin lseek whence values for sparse-file traversal. This file
@@ -1517,8 +1622,14 @@ pub const Machine = struct {
 
         // Restoring: we ARE vCPU 0's owning thread here, so registers,
         // RAM, and device state can be applied directly before running.
+        // Restored secondaries wait on running/stop_requested, so a
+        // failed restore must raise stop and reap them before erroring.
         if (self.config.restore_path) |path| {
-            try self.restoreFromFile(path, vcpu);
+            self.restoreFromFile(path, vcpu) catch |err| {
+                self.stop_requested.store(true, .release);
+                self.joinSecondaryVcpus();
+                return err;
+            };
         }
         try self.checkStartupCancelled();
 
