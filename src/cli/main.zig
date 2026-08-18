@@ -11,6 +11,7 @@ pub const fork = @import("fork.zig");
 pub const mcp = @import("mcp.zig");
 pub const vz = @import("vz.zig");
 pub const ctl = @import("ctl.zig");
+pub const exec = @import("exec.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -22,6 +23,7 @@ pub const Subcommand = enum {
     run,
     up,
     fork,
+    exec,
     mcp,
     vz_run,
     status,
@@ -60,6 +62,7 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
         .run => try run.execute(alloc, &args),
         .up => try up.execute(alloc, &args, minimal.environ),
         .fork => try fork.execute(alloc, &args),
+        .exec => try exec.execute(alloc, &args),
         .mcp => try mcp.execute(alloc, &args, minimal.environ),
         .vz_run => try vz.execute(alloc, &args),
         .status => try ctl.execute(alloc, .status),
@@ -85,6 +88,7 @@ fn parseSubcommand(str: []const u8) ?Subcommand {
         .{ "run", .run },
         .{ "up", .up },
         .{ "fork", .fork },
+        .{ "exec", .exec },
         .{ "mcp", .mcp },
         .{ "vz-run", .vz_run },
         .{ "status", .status },
@@ -115,6 +119,7 @@ fn printUsage() void {
         \\Commands:
         \\  up               Boot the project's bobrvm.toml (resumes warm state)
         \\  fork             Run a disposable clone of the project's warm state
+        \\  exec -- <cmd>    Run a command in a disposable clone and print output
         \\  status           Show the project's detached runner and warm state
         \\  suspend          Save the detached runner's state and stop it
         \\  halt             Stop the project's detached runner

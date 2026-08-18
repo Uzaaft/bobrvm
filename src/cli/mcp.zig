@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const console_exec = @import("console_exec.zig");
 const global = @import("../global.zig");
 const project = @import("project.zig");
 
@@ -216,11 +217,7 @@ pub const Server = struct {
         self.next_marker += 1;
 
         var marker_buf: [48]u8 = undefined;
-        const marker_text = std.fmt.bufPrint(
-            &marker_buf,
-            "__BRVM_{d}_RC_",
-            .{marker},
-        ) catch unreachable;
+        const marker_text = console_exec.markerText(&marker_buf, marker);
 
         const line = try std.fmt.allocPrint(alloc, "{s} ; echo {s}$?\n", .{
             command, marker_text,
@@ -243,7 +240,7 @@ pub const Server = struct {
         while (true) {
             sandbox.out_mutex.lockUncancelable(io);
             const window = sandbox.output.items[@min(start_pos, sandbox.output.items.len)..];
-            const done = markerResult(window, marker_text);
+            const done = console_exec.findMarker(window, marker_text);
             if (done) |result| {
                 const captured = try alloc.dupe(u8, window[0..result.start]);
                 sandbox.out_mutex.unlock(io);
@@ -259,29 +256,6 @@ pub const Server = struct {
         }
     }
 };
-
-const MarkerResult = struct {
-    start: usize,
-    exit_code: i64,
-};
-
-/// Find the completion marker followed by digits. The tty echo of the
-/// injected command contains the marker followed by a literal "$?",
-/// which this deliberately does not match.
-fn markerResult(window: []const u8, marker_text: []const u8) ?MarkerResult {
-    var search: usize = 0;
-    while (std.mem.indexOfPos(u8, window, search, marker_text)) |idx| {
-        const tail = window[idx + marker_text.len ..];
-        var digits: usize = 0;
-        while (digits < tail.len and std.ascii.isDigit(tail[digits])) digits += 1;
-        if (digits > 0) {
-            const exit_code = std.fmt.parseInt(i64, tail[0..digits], 10) catch 0;
-            return .{ .start = idx, .exit_code = exit_code };
-        }
-        search = idx + 1;
-    }
-    return null;
-}
 
 // =============================================================================
 // JSON-RPC / MCP protocol
@@ -501,15 +475,7 @@ fn argInt(args: std.json.ObjectMap, key: []const u8) ?i64 {
     return value.integer;
 }
 
-/// The first captured line is usually the tty echo of the injected
-/// command (it contains the marker with a literal "$?"); drop it.
-fn stripCommandEcho(output: []const u8) []const u8 {
-    const newline = std.mem.indexOfScalar(u8, output, '\n') orelse return output;
-    if (std.mem.indexOf(u8, output[0..newline], "__BRVM_") != null) {
-        return output[newline + 1 ..];
-    }
-    return output;
-}
+const stripCommandEcho = console_exec.stripCommandEcho;
 
 pub fn execute(
     alloc: Allocator,
@@ -612,19 +578,5 @@ test "mcp: protocol handshake, tool list, and errors" {
         &server,
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"sandbox_list\"}}",
         "no sandboxes",
-    );
-}
-
-test "mcp: completion marker matches digits but not the command echo" {
-    // The echoed command carries the marker with a literal $?.
-    const echo_only = "run me ; echo __BRVM_7_RC_$?\r\n";
-    try testing.expect(markerResult(echo_only, "__BRVM_7_RC_") == null);
-
-    const done = "run me ; echo __BRVM_7_RC_$?\r\nhello\r\n__BRVM_7_RC_2\r\n";
-    const result = markerResult(done, "__BRVM_7_RC_").?;
-    try testing.expectEqual(@as(i64, 2), result.exit_code);
-    try testing.expectEqualStrings(
-        "hello\r\n",
-        stripCommandEcho(done[0..result.start]),
     );
 }
