@@ -19,6 +19,74 @@ const log = std.log.scoped(.cli);
 // zig 0.16's std.c lacks this on macOS; same workaround as virtio/rng.
 extern "c" fn getentropy(buf: [*]u8, len: usize) c_int;
 
+/// A prepared disposable clone: a private directory holding the cloned
+/// warm image and disks, plus a config pointing at them. Delete `dir`
+/// when the clone exits.
+pub const Clone = struct {
+    dir: []const u8,
+    config: @import("Config.zig"),
+};
+
+/// Clone the project's warm state into a private fork directory and
+/// derive the config that runs it: restore from the cloned image,
+/// write to cloned disks, no suspend target, no host port forwards
+/// (concurrent forks would collide on the ports).
+pub fn prepare(arena: Allocator, proj: *const project.Project) !Clone {
+    if (!project.fileExists(proj.warm_image)) {
+        log.err(
+            "no warm state for {s}: run bobrvm up, then quit with Ctrl-B z first",
+            .{proj.config.name},
+        );
+        return error.NoWarmState;
+    }
+
+    var seed_bytes: [8]u8 = undefined;
+    if (getentropy(&seed_bytes, seed_bytes.len) != 0) return error.Unexpected;
+    const dir = std.fmt.allocPrint(arena, "{s}/forks/{x:0>16}", .{
+        proj.state_dir, std.mem.readInt(u64, &seed_bytes, .little),
+    }) catch return error.OutOfMemory;
+    try std.Io.Dir.cwd().createDirPath(global.io(), dir);
+    errdefer deleteTree(dir);
+
+    var config = proj.config;
+    const warm_clone = try std.fs.path.join(arena, &.{ dir, "warm.img" });
+    try machine.Machine.cloneFile(arena, proj.warm_image, warm_clone);
+    config.restore_path = warm_clone;
+    config.suspend_path = null;
+    if (config.forward_count > 0) {
+        log.info("fork: dropping {d} port forward(s); forks own no host ports", .{
+            config.forward_count,
+        });
+        config.forward_count = 0;
+    }
+
+    // Writable disks: the warm image's device state references their
+    // content, so each fork gets its own copy-on-write clone.
+    if (config.disk_path) |disk| {
+        if (!config.disk_read_only) {
+            const clone = try std.fs.path.join(arena, &.{ dir, "disk0.raw" });
+            try machine.Machine.cloneFile(arena, disk, clone);
+            config.disk_path = clone;
+        }
+    }
+    if (config.disk2_path) |disk| {
+        if (!config.disk2_read_only) {
+            const clone = try std.fs.path.join(arena, &.{ dir, "disk1.raw" });
+            try machine.Machine.cloneFile(arena, disk, clone);
+            config.disk2_path = clone;
+        }
+    }
+
+    return .{ .dir = dir, .config = config };
+}
+
+/// Best-effort recursive delete of a fork directory.
+pub fn deleteTree(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(global.io(), path) catch |err| {
+        log.warn("fork cleanup of {s} failed: {}", .{ path, err });
+    };
+}
+
 pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -41,67 +109,15 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
         log.err("no {s} found in {s} or any parent directory", .{ project.FILE_NAME, cwd });
         return error.NoProjectFile;
     };
-    var proj = try project.load(arena, root);
+    const proj = try project.load(arena, root);
 
-    if (!project.fileExists(proj.warm_image)) {
-        log.err(
-            "no warm state for {s}: run bobrvm up, then quit with Ctrl-B z first",
-            .{proj.config.name},
-        );
-        return error.NoWarmState;
-    }
-
-    // A private directory per fork; everything in it is a clone and
-    // dies with the fork.
-    var seed_bytes: [8]u8 = undefined;
-    if (getentropy(&seed_bytes, seed_bytes.len) != 0) return error.Unexpected;
-    const fork_dir = std.fmt.allocPrint(arena, "{s}/forks/{x:0>16}", .{
-        proj.state_dir, std.mem.readInt(u64, &seed_bytes, .little),
-    }) catch return error.OutOfMemory;
-    try std.Io.Dir.cwd().createDirPath(global.io(), fork_dir);
-    defer deleteTree(fork_dir);
-
-    const fork_warm = try std.fs.path.join(arena, &.{ fork_dir, "warm.img" });
-    try machine.Machine.cloneFile(arena, proj.warm_image, fork_warm);
-    proj.config.restore_path = fork_warm;
-    // Forks are disposable: no suspend target, and no host port
-    // forwards (concurrent forks would collide on the host ports).
-    proj.config.suspend_path = null;
-    if (proj.config.forward_count > 0) {
-        log.info("fork: dropping {d} port forward(s); forks own no host ports", .{
-            proj.config.forward_count,
-        });
-        proj.config.forward_count = 0;
-    }
-
-    // Writable disks: the warm image's device state references their
-    // content, so each fork gets its own copy-on-write clone.
-    if (proj.config.disk_path) |disk| {
-        if (!proj.config.disk_read_only) {
-            const clone = try std.fs.path.join(arena, &.{ fork_dir, "disk0.raw" });
-            try machine.Machine.cloneFile(arena, disk, clone);
-            proj.config.disk_path = clone;
-        }
-    }
-    if (proj.config.disk2_path) |disk| {
-        if (!proj.config.disk2_read_only) {
-            const clone = try std.fs.path.join(arena, &.{ fork_dir, "disk1.raw" });
-            try machine.Machine.cloneFile(arena, disk, clone);
-            proj.config.disk2_path = clone;
-        }
-    }
+    const clone = try prepare(arena, &proj);
+    defer deleteTree(clone.dir);
 
     log.info("fork: {s} — disposable clone of the warm state (Ctrl-] to quit)", .{
-        proj.config.name,
+        clone.config.name,
     });
-    try runner.run(alloc, &proj.config);
-}
-
-/// Best-effort recursive delete of the fork directory.
-fn deleteTree(path: []const u8) void {
-    std.Io.Dir.cwd().deleteTree(global.io(), path) catch |err| {
-        log.warn("fork cleanup of {s} failed: {}", .{ path, err });
-    };
+    try runner.run(alloc, &clone.config);
 }
 
 fn printHelp() void {

@@ -75,6 +75,7 @@ test {
     _ = @import("cli/runner.zig");
     _ = @import("cli/toml.zig");
     _ = @import("cli/project.zig");
+    _ = @import("cli/mcp.zig");
     _ = @import("compat/file.zig");
     _ = @import("compat/net.zig");
     _ = @import("compat/thread.zig");
