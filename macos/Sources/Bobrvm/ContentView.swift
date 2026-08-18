@@ -317,6 +317,7 @@ struct VMListRow: View {
 
 struct VMDetailView: View {
     @ObservedObject var vmInstance: VMInstance
+    @State private var showingSettings = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -353,6 +354,13 @@ struct VMDetailView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .automatic) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .help("Virtual machine settings")
+
                 if vmInstance.guestSystem != .macOS {
                     Menu {
                         ISOMediaActions(vmInstance: vmInstance)
@@ -426,6 +434,9 @@ struct VMDetailView: View {
                 }
 
             }
+        }
+        .sheet(isPresented: $showingSettings) {
+            EditVMView(vmInstance: vmInstance)
         }
     }
 

@@ -204,17 +204,41 @@ struct EditVMView: View {
                                 icon: "gpu"
                             )
                         }
-                        ReadOnlyConfigRow(
-                            label: "Maximum Resolution",
-                            value: resolution.label,
-                            icon: "display"
-                        )
+                        if vmInstance.guestSystem == .macOS {
+                            ReadOnlyConfigRow(
+                                label: "Maximum Resolution",
+                                value: resolution.label,
+                                icon: "display"
+                            )
+                            ReadOnlyConfigRow(
+                                label: "Retina Resolution",
+                                value: retinaEnabled ? "Full" : "Standard",
+                                icon: "display.2"
+                            )
+                        } else {
+                            Picker("Maximum Guest Resolution", selection: $resolution) {
+                                ForEach(DisplayResolution.presets) { preset in
+                                    Text(preset.label).tag(preset)
+                                }
+                            }
+                            .onChange(of: resolution) { _ in hasChanges = true }
+
+                            Toggle(
+                                "Use full resolution for Retina display",
+                                isOn: $retinaEnabled
+                            )
+                            .onChange(of: retinaEnabled) { _ in hasChanges = true }
+                        }
                     } header: {
                         HStack {
                             Text("Graphics")
-                            Spacer()
-                            LockedBadge()
+                            if vmInstance.guestSystem == .macOS {
+                                Spacer()
+                                LockedBadge()
+                            }
                         }
+                    } footer: {
+                        Text(graphicsFooter)
                     }
                 } else {
                     Section {
@@ -316,15 +340,11 @@ struct EditVMView: View {
                 }
 
                 if isRunning {
-                    Button("Done") {
-                        if hasChanges {
-                            saveChanges()
-                        } else {
-                            dismiss()
-                        }
+                    Button("Apply") {
+                        saveChanges()
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(isSaving)
+                    .disabled(!hasChanges || !isValid || isSaving)
                 } else {
                     Button("Save") {
                         saveChanges()
@@ -367,6 +387,14 @@ struct EditVMView: View {
         return "This disk format cannot be resized by Bobrvm."
     }
 
+    private var graphicsFooter: String {
+        if vmInstance.guestSystem == .macOS {
+            return "Stop the VM to change its display configuration."
+        }
+        return "Resolution and Retina scaling apply immediately. "
+            + "Stop the VM to change graphics memory."
+    }
+
     private func formatBytes(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
@@ -375,20 +403,30 @@ struct EditVMView: View {
         isSaving = true
 
         do {
-            try vmManager.updateVM(
-                vmInstance,
-                name: name,
-                memoryGB: Int(memoryGB),
-                vcpuCount: Int(vcpuCount),
-                vramMB: Int(vramMB),
-                isoPath: isoPath.isEmpty ? nil : isoPath,
-                displayWidth: Int(resolution.width),
-                displayHeight: Int(resolution.height),
-                retinaEnabled: retinaEnabled,
-                networkEnabled: networkEnabled,
-                sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
-                diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil
-            )
+            if isRunning {
+                try vmManager.updateLiveSettings(
+                    vmInstance,
+                    name: name,
+                    displayWidth: resolution.width,
+                    displayHeight: resolution.height,
+                    retinaEnabled: retinaEnabled
+                )
+            } else {
+                try vmManager.updateVM(
+                    vmInstance,
+                    name: name,
+                    memoryGB: Int(memoryGB),
+                    vcpuCount: Int(vcpuCount),
+                    vramMB: Int(vramMB),
+                    isoPath: isoPath.isEmpty ? nil : isoPath,
+                    displayWidth: Int(resolution.width),
+                    displayHeight: Int(resolution.height),
+                    retinaEnabled: retinaEnabled,
+                    networkEnabled: networkEnabled,
+                    sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
+                    diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil
+                )
+            }
             dismiss()
         } catch {
             errorMessage = error.localizedDescription
@@ -413,7 +451,7 @@ struct RunningVMBanner: View {
                 Text(state == .paused ? "VM is Paused" : "VM is Running")
                     .font(.headline)
 
-                Text("Stop the VM to change hardware settings")
+                Text("Live-safe settings remain editable; stop the VM to change hardware.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }

@@ -127,6 +127,11 @@ public final class VMSurfaceView: NSView {
         updateContentScale()
     }
 
+    public func refreshDisplayPreferences() {
+        guard vmInstance != nil else { return }
+        updateContentScale()
+    }
+
     public override func resetCursorRects() {
         super.resetCursorRects()
         guard surface != nil else { return }
@@ -367,6 +372,8 @@ public struct VMSurfaceRepresentable: NSViewRepresentable {
                     logger.error("Failed to attach surface: \(error.localizedDescription)")
                 }
             }
+        } else {
+            nsView.refreshDisplayPreferences()
         }
     }
 
