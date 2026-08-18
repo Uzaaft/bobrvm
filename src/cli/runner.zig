@@ -98,6 +98,24 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     suspend_target = config.suspend_path;
     defer suspend_target = null;
 
+    // Detached runners have no console for Ctrl-B z; SIGUSR1 requests
+    // the same suspend-and-quit. The handler only sets a flag — this
+    // watcher does the heavy lifting and is joined before hw dies.
+    var suspend_watcher_stop = std.atomic.Value(bool).init(false);
+    var suspend_watcher: ?std.Thread = null;
+    defer if (suspend_watcher) |thread| {
+        suspend_watcher_stop.store(true, .release);
+        thread.join();
+    };
+    if (config.suspend_path) |path| {
+        os.signal.registerSuspendRequest();
+        suspend_watcher = std.Thread.spawn(
+            .{},
+            suspendWatcher,
+            .{ hw, path, &suspend_watcher_stop },
+        ) catch null;
+    }
+
     hw.setConsoleOutput(consoleOutput, null);
 
     // Debug: dump scanout frames when BOBRVM_DUMP_FRAMES=<dir> is set.
@@ -596,6 +614,28 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
             }
         }
         if (guest_start < n) hw.injectConsoleInput(buf[guest_start..n]);
+    }
+}
+
+/// Service SIGUSR1 suspend requests (the flag is all the handler may
+/// touch); ends after a successful suspend or when the run finishes.
+fn suspendWatcher(
+    hw: *machine.Machine,
+    path: []const u8,
+    stop: *std.atomic.Value(bool),
+) void {
+    while (!stop.load(.acquire)) {
+        if (os.signal.takeSuspendRequest()) {
+            log.info("suspending machine to {s} (SIGUSR1)", .{path});
+            hw.suspendToDisk(path) catch |err| {
+                log.err("suspend failed: {}; resuming", .{err});
+                hw.unpause();
+                continue;
+            };
+            hw.requestStop();
+            return;
+        }
+        sleepNs(100 * std.time.ns_per_ms);
     }
 }
 

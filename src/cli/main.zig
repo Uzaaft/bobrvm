@@ -10,6 +10,7 @@ pub const up = @import("up.zig");
 pub const fork = @import("fork.zig");
 pub const mcp = @import("mcp.zig");
 pub const vz = @import("vz.zig");
+pub const ctl = @import("ctl.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -23,6 +24,9 @@ pub const Subcommand = enum {
     fork,
     mcp,
     vz_run,
+    status,
+    halt,
+    suspend_vm,
     create,
     list,
     start,
@@ -54,10 +58,13 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
 
     switch (subcmd) {
         .run => try run.execute(alloc, &args),
-        .up => try up.execute(alloc, &args),
+        .up => try up.execute(alloc, &args, minimal.environ),
         .fork => try fork.execute(alloc, &args),
         .mcp => try mcp.execute(alloc, &args, minimal.environ),
         .vz_run => try vz.execute(alloc, &args),
+        .status => try ctl.execute(alloc, .status),
+        .halt => try ctl.execute(alloc, .halt),
+        .suspend_vm => try ctl.execute(alloc, .@"suspend"),
         .create => try create.execute(alloc, &args),
         .list => try list.execute(alloc),
         .start => try start.execute(alloc, &args),
@@ -80,6 +87,9 @@ fn parseSubcommand(str: []const u8) ?Subcommand {
         .{ "fork", .fork },
         .{ "mcp", .mcp },
         .{ "vz-run", .vz_run },
+        .{ "status", .status },
+        .{ "halt", .halt },
+        .{ "suspend", .suspend_vm },
         .{ "create", .create },
         .{ "list", .list },
         .{ "ls", .list },
@@ -105,6 +115,9 @@ fn printUsage() void {
         \\Commands:
         \\  up               Boot the project's bobrvm.toml (resumes warm state)
         \\  fork             Run a disposable clone of the project's warm state
+        \\  status           Show the project's detached runner and warm state
+        \\  suspend          Save the detached runner's state and stop it
+        \\  halt             Stop the project's detached runner
         \\  mcp              Serve sandboxes to AI agents over MCP (stdio)
         \\  vz-run           Boot on Virtualization.framework (lite engine, experimental)
         \\  run              Run a VM directly with options
