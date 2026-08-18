@@ -1369,7 +1369,7 @@ test "snapshot: input section assembly allocation profile" {
 }
 
 test "snapshot: P9 device roundtrip with fids" {
-    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".", false);
     defer dev.deinit();
     dev.transport.status = @bitCast(@as(u8, 0x0F));
     dev.transport.queues[0].ready = true;
@@ -1385,7 +1385,7 @@ test "snapshot: P9 device roundtrip with fids" {
     try testing.expectEqual(data.len, counted.allocated_bytes);
     try testing.expectEqual(@as(usize, 0), counted.resize_index);
 
-    const dev2 = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    const dev2 = try virtio.P9.init(testing.allocator, "hostshare", ".", false);
     defer dev2.deinit();
     try deserializeP9(testing.allocator, dev2, data);
     try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(dev2.transport.status)));
@@ -1398,7 +1398,7 @@ test "snapshot: P9 device roundtrip with fids" {
 }
 
 test "snapshot: P9 section assembly allocation profile" {
-    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".", false);
     defer dev.deinit();
     try dev.server.restoreFid(testing.allocator, 3, "src", null);
     try dev.server.restoreFid(testing.allocator, 9, "src/machine", null);

@@ -37,6 +37,9 @@ forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
 forward_count: u8 = 0,
 /// Host directory shared with the guest via 9p (--share).
 shared_dir: ?[]const u8 = null,
+/// Enforce the 9p share read-only on the HOST side, so the guest
+/// cannot write through it regardless of its mount options.
+share_read_only: bool = false,
 /// Suspend image to restore instead of booting (--restore).
 restore_path: ?[]const u8 = null,
 /// Where the console's suspend-and-quit command (Ctrl-B z) writes the

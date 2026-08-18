@@ -68,6 +68,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_snd = config.enable_snd,
         .forwards = forwards_buf[0..config.forward_count],
         .shared_dir = config.shared_dir,
+        .share_read_only = config.share_read_only,
         .restore_path = restore_path,
         .display_width = config.display_width,
         .display_height = config.display_height,

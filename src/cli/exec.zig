@@ -141,6 +141,7 @@ fn machineConfig(config: *const @import("Config.zig")) machine.MachineConfig {
         .disk2_read_only = config.disk2_read_only,
         .enable_net = config.enable_net,
         .shared_dir = config.shared_dir,
+        .share_read_only = config.share_read_only,
         .restore_path = config.restore_path,
     };
 }

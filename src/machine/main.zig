@@ -174,6 +174,7 @@ pub const MachineConfig = struct {
     /// Host directory exported to the guest via 9p (mount tag "host").
     /// The slice must stay valid until startSync() has initialized devices.
     shared_dir: ?[]const u8 = null,
+    share_read_only: bool = false,
 
     /// Restore machine state from this suspend image instead of booting.
     /// The rest of the config (RAM size, devices) must match the config
@@ -2735,7 +2736,7 @@ pub const Machine = struct {
         // 9p shared folder (slot after the rng) if configured.
         if (self.config.shared_dir) |dir| {
             self.p9_slot = self.rng_slot + 1;
-            self.p9 = try virtio.P9.init(self.alloc, "host", dir);
+            self.p9 = try virtio.P9.init(self.alloc, "host", dir, self.config.share_read_only);
             self.registerVirtioMmioDevice(
                 self.p9_slot,
                 .{ .p9 = self.p9.? },

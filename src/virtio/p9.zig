@@ -83,7 +83,7 @@ pub const P9 = struct {
         };
     }
 
-    pub fn init(alloc: Allocator, tag: []const u8, root_path: []const u8) !*P9 {
+    pub fn init(alloc: Allocator, tag: []const u8, root_path: []const u8, read_only: bool) !*P9 {
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         const layout = try allocationLayout(tag.len, root_path.len);
@@ -111,6 +111,7 @@ pub const P9 = struct {
             .req_buf = req_buf,
             .resp_buf = resp_buf,
         };
+        dev.server.read_only = read_only;
         transport.setNotifyCallback(mmio.bindNotify(P9, dev, handleNotify));
 
         assert(dev.transport.device_id == 9);
@@ -238,7 +239,7 @@ test "P9 startup allocation profile" {
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
     const tag = "host";
     const root = ".";
-    const dev = try P9.init(counted.allocator(), tag, root);
+    const dev = try P9.init(counted.allocator(), tag, root, false);
     defer dev.deinit();
 
     try testing.expectEqual(@as(usize, 1), counted.allocations);
@@ -256,7 +257,7 @@ test "P9 device: identity, mount tag config, and a version exchange" {
     try std.Io.Dir.cwd().createDir(io, root, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
 
-    const dev = try P9.init(testing.allocator, "host", root);
+    const dev = try P9.init(testing.allocator, "host", root, false);
     defer dev.deinit();
 
     try testing.expectEqual(@as(u32, 9), dev.read(@intFromEnum(mmio.Reg.device_id)));
