@@ -1204,6 +1204,15 @@ pub const Machine = struct {
         if (!was_paused) self.pause();
         errdefer if (!was_paused) self.unpause();
 
+        // Until SMP restore lands, refuse to write an image that can
+        // never be loaded (restoreFromFileInner rejects any vcpu1
+        // section): failing at save time beats a surprise at restore.
+        var started_vcpus: u32 = 0;
+        for (self.cpu_states) |*cpu| {
+            if (cpu.vcpu != null and cpu.started.load(.acquire)) started_vcpus += 1;
+        }
+        if (started_vcpus > 1) return error.SmpSnapshotUnsupported;
+
         const state = try self.captureState(self.alloc);
         defer self.alloc.free(state);
         const ram = self.ram orelse return error.NoRam;
@@ -1278,14 +1287,20 @@ pub const Machine = struct {
             return error.BadImage;
         }
 
-        // RAM (holes read back as zeros; fresh mapping is already zero,
-        // but read the full image for simplicity/correctness).
+        // RAM. The guest mapping is freshly created (all zeros) and
+        // suspendToDisk writes zero chunks as file holes, so only the
+        // image's data regions need to be read: restore cost then scales
+        // with the guest's written working set, not with configured RAM.
+        // Fall back to reading the full logical size when the filesystem
+        // can't enumerate holes.
         const ram_base: u64 = header.len + state_len;
-        var off: usize = 0;
-        while (off < ram.len) : (off += RAM_CHUNK) {
-            const chunk = ram[off..@min(off + RAM_CHUNK, ram.len)];
-            const n = try file.readPositionalAll(io, chunk, ram_base + off);
-            if (n < chunk.len) @memset(chunk[n..], 0);
+        if (!readRamDataRegions(file, ram, ram_base)) {
+            var off: usize = 0;
+            while (off < ram.len) : (off += RAM_CHUNK) {
+                const chunk = ram[off..@min(off + RAM_CHUNK, ram.len)];
+                const n = try file.readPositionalAll(io, chunk, ram_base + off);
+                if (n < chunk.len) @memset(chunk[n..], 0);
+            }
         }
 
         // Devices + GIC.
@@ -1301,6 +1316,41 @@ pub const Machine = struct {
         var vstate: snapshot.VcpuState = undefined;
         @memcpy(std.mem.asBytes(&vstate), vdata);
         try snapshot.restoreVcpu(vcpu, &vstate);
+    }
+
+    /// Darwin lseek whence values for sparse-file traversal. This file
+    /// is Hypervisor.framework-only, so Darwin's numbering applies —
+    /// note Linux numbers the same pair the other way around.
+    const SEEK_HOLE: c_int = 3;
+    const SEEK_DATA: c_int = 4;
+
+    /// Read only the data regions of a sparse suspend image into `ram`.
+    /// Requires `ram` to be all zeros (a fresh guest mapping): skipped
+    /// holes are never written. Returns false when the filesystem cannot
+    /// enumerate holes or a read fails mid-walk; the caller's full-read
+    /// fallback overwrites everything, so a partial walk is harmless.
+    fn readRamDataRegions(file: std.Io.File, ram: []u8, ram_base: u64) bool {
+        const io = global.io();
+        const ram_end: u64 = ram_base + ram.len;
+        var pos: u64 = ram_base;
+        while (pos < ram_end) {
+            const data_rc = std.c.lseek(file.handle, @intCast(pos), SEEK_DATA);
+            if (data_rc < 0) {
+                // ENXIO: no data at or after pos — the tail is one hole.
+                return std.c.errno(@as(c_int, -1)) == .NXIO;
+            }
+            const data_start: u64 = @intCast(data_rc);
+            if (data_start >= ram_end) return true;
+            const hole_rc = std.c.lseek(file.handle, @intCast(data_start), SEEK_HOLE);
+            if (hole_rc < 0) return false;
+            const data_end: u64 = @min(@as(u64, @intCast(hole_rc)), ram_end);
+            assert(data_end > data_start);
+            const dst = ram[@intCast(data_start - ram_base)..@intCast(data_end - ram_base)];
+            const n = file.readPositionalAll(io, dst, data_start) catch return false;
+            if (n != dst.len) return false;
+            pos = data_end;
+        }
+        return true;
     }
 
     /// Kick a specific vCPU to wake it from WFI/sleep.
@@ -3388,4 +3438,77 @@ test "stop before synchronous thread entry cancels startup" {
     try testing.expectError(error.StartCancelled, machine.startSyncPrepared());
     try testing.expect(!machine.running.load(.acquire));
     try testing.expect(machine.stop_requested.load(.acquire));
+}
+
+test "readRamDataRegions reads only the data regions of a sparse image" {
+    const testing = std.testing;
+    const io = global.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Layout mirrors a suspend image: header+state bytes, then a RAM
+    // span whose zero chunks are file holes. The filesystem may round
+    // data extents up to block granularity; the walk tolerates that
+    // because the surrounding file bytes are zeros.
+    const ram_base: u64 = 100;
+    const ram_len: usize = 512 * 1024;
+    const header_bytes = [_]u8{0xEE} ** 100;
+    var region_a: [16 * 1024]u8 = @splat(0xA5);
+    var region_b: [4 * 1024]u8 = @splat(0x5A);
+
+    {
+        const out = try tmp.dir.createFile(io, "state.img", .{});
+        defer out.close(io);
+        try out.writePositionalAll(io, &header_bytes, 0);
+        try out.writePositionalAll(io, &region_a, ram_base + 64 * 1024);
+        try out.writePositionalAll(io, &region_b, ram_base + ram_len - region_b.len);
+        if (std.c.ftruncate(out.handle, @intCast(ram_base + ram_len)) != 0) {
+            return error.Truncate;
+        }
+    }
+
+    const file = try tmp.dir.openFile(io, "state.img", .{ .mode = .read_only });
+    defer file.close(io);
+
+    const ram = try testing.allocator.alloc(u8, ram_len);
+    defer testing.allocator.free(ram);
+    @memset(ram, 0);
+
+    try testing.expect(Machine.readRamDataRegions(file, ram, ram_base));
+    try testing.expect(std.mem.allEqual(u8, ram[64 * 1024 .. 80 * 1024], 0xA5));
+    try testing.expect(std.mem.allEqual(u8, ram[ram_len - region_b.len ..], 0x5A));
+    try testing.expect(std.mem.allEqual(u8, ram[0 .. 64 * 1024], 0));
+    try testing.expect(std.mem.allEqual(u8, ram[80 * 1024 .. ram_len - region_b.len], 0));
+}
+
+test "readRamDataRegions handles an image whose RAM span is one hole" {
+    const testing = std.testing;
+    const io = global.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ram_base: u64 = 64 * 1024;
+    const ram_len: usize = 256 * 1024;
+    const header_bytes = [_]u8{0xEE} ** 128;
+
+    {
+        const out = try tmp.dir.createFile(io, "hole.img", .{});
+        defer out.close(io);
+        try out.writePositionalAll(io, &header_bytes, 0);
+        if (std.c.ftruncate(out.handle, @intCast(ram_base + ram_len)) != 0) {
+            return error.Truncate;
+        }
+    }
+
+    const file = try tmp.dir.openFile(io, "hole.img", .{ .mode = .read_only });
+    defer file.close(io);
+
+    const ram = try testing.allocator.alloc(u8, ram_len);
+    defer testing.allocator.free(ram);
+    @memset(ram, 0);
+
+    // The SEEK_DATA walk must terminate cleanly via ENXIO (or an
+    // extent that ends before ram_base) and leave RAM untouched.
+    try testing.expect(Machine.readRamDataRegions(file, ram, ram_base));
+    try testing.expect(std.mem.allEqual(u8, ram, 0));
 }
