@@ -169,7 +169,3 @@ logging. `BOBRVM_LOG` accepts `true`, `false`, or backend settings such as
 ```sh
 log stream --level debug --predicate 'subsystem=="com.bobrvm.lib"'
 ```
-
-## License
-
-MIT

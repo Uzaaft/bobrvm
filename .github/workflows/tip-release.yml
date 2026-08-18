@@ -68,13 +68,23 @@ jobs:
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
           ln -s "$BOBRVM_ZIG_DIRECT_DEPS" "$ZIG_GLOBAL_CACHE_DIR/p"
 
+      - name: Show Xcode version
+        run: xcodebuild -version
+
       - name: Build app frameworks
         env:
           BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
-        run: nix develop --command zig build xcframework ghostty-lib
+        run: |
+          nix develop -c zig build \
+            xcframework \
+            ghostty-lib \
+            --system "${{ steps.deps.outputs.path }}" \
+            -Demit-macos-app=false
 
+      # The helper enters through Nix to obtain Nushell, then clears the Nix
+      # compiler environment before invoking Apple's native Xcode toolchain.
       - name: Run hosted Swift tests
-        run: nix develop --command macos/build.nu --action test
+        run: nix develop -c macos/build.nu --action test
 
   hypervisor:
     name: Bare-metal SMP integration
@@ -120,7 +130,10 @@ jobs:
       - name: Run two-vCPU Hypervisor.framework test
         env:
           BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
-        run: nix develop --command zig build test-bare-metal
+        run: |
+          nix develop -c zig build \
+            test-bare-metal \
+            --system "${{ steps.deps.outputs.path }}"
 
   release:
     name: Build and publish
@@ -172,17 +185,21 @@ jobs:
         env:
           BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
         run: |
-          nix develop --command zig build \
-              xcframework \
-              ghostty-lib \
-              -Doptimize=ReleaseFast
+          nix develop -c zig build \
+            xcframework \
+            ghostty-lib \
+            --system "${{ steps.deps.outputs.path }}" \
+            -Demit-macos-app=false \
+            -Doptimize=ReleaseFast
 
+      # Nushell scrubs the Nix compiler environment before native Swift
+      # compilation and code signing, matching Ghostty's macOS CI boundary.
       - name: Build SwiftUI app
-        run: nix develop --command macos/build.nu --configuration Release
+        run: nix develop -c macos/build.nu --configuration Release
 
       - name: Package app
         run: |
-          app="zig-out/xcode-derived-data/Build/Products/Release/Bobrvm.app"
+          app="macos/build/Release/Bobrvm.app"
           test -d "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" Bobrvm-tip-arm64.zip
 

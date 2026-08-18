@@ -8,9 +8,8 @@ def main [
     --configuration: string = "Debug" # Build configuration (Debug or Release)
     --action: string = "build"        # xcodebuild action (build, test, clean, etc.)
 ] {
-    let repository = ($env.FILE_PWD | path dirname)
     let project = ($env.FILE_PWD | path join "Bobrvm.xcodeproj")
-    let derived_data = ($repository | path join "zig-out" "xcode-derived-data")
+    let build_dir = ($env.FILE_PWD | path join "build")
 
     (^env -i
         $"HOME=($env.HOME)"
@@ -19,9 +18,8 @@ def main [
         -project $project
         -scheme $scheme
         -configuration $configuration
-        -derivedDataPath $derived_data
+        $"SYMROOT=($build_dir)"
         CODE_SIGNING_ALLOWED=YES
         ONLY_ACTIVE_ARCH=YES
-        -quiet
         $action)
 }

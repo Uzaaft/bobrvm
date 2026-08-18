@@ -30,33 +30,12 @@ pub fn create(
         .Debug => .Debug,
         else => .Release,
     };
-    const derived_data_path = b.pathFromRoot("zig-out/xcode-derived-data");
-
-    // Xcode must not inherit compiler and linker overrides from a Nix shell.
-    const env_map = b.allocator.create(std.process.Environ.Map) catch @panic("OOM");
-    env_map.* = .init(b.allocator);
-    if (b.graph.environ_map.get("HOME")) |home| {
-        env_map.put("HOME", home) catch @panic("OOM");
-    }
-    env_map.put("PATH", "/usr/bin:/bin:/usr/sbin:/sbin") catch @panic("OOM");
-
-    const build_step = RunStep.create(b, "xcodebuild");
+    const build_step = RunStep.create(b, "macos/build.nu");
     build_step.has_side_effects = true;
-    build_step.environ_map = env_map;
     build_step.addArgs(&.{
-        "xcodebuild",
-        "-project",
-        b.pathFromRoot("macos/Bobrvm.xcodeproj"),
-        "-scheme",
-        "Bobrvm",
-        "-configuration",
+        b.pathFromRoot("macos/build.nu"),
+        "--configuration",
         configuration.toString(),
-        "-derivedDataPath",
-        derived_data_path,
-        "CODE_SIGNING_ALLOWED=YES",
-        "ONLY_ACTIVE_ARCH=YES",
-        "-quiet",
-        "build",
     });
     build_step.expectExitCode(0);
     build_step.step.dependOn(&xcframework.step);
@@ -64,10 +43,10 @@ pub fn create(
     const self = b.allocator.create(XcodebuildStep) catch @panic("OOM");
     self.* = .{
         .build = build_step,
-        .app_executable = b.fmt(
-            "{s}/Build/Products/{s}/Bobrvm.app/Contents/MacOS/Bobrvm",
-            .{ derived_data_path, configuration.toString() },
-        ),
+        .app_executable = b.pathFromRoot(b.fmt(
+            "macos/build/{s}/Bobrvm.app/Contents/MacOS/Bobrvm",
+            .{configuration.toString()},
+        )),
     };
 
     return self;
