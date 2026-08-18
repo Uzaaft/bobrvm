@@ -159,6 +159,7 @@ fn printHelp() void {
         \\  disk2 = "extra.iso"        disk2-writable = false
         \\  gpu = true                 virgl = true          sound = true
         \\  net = true                 forwards = ["2222:22"]
+        \\  ssh-user = "root"          login user for bobrvm ssh
         \\  share = "dir" | false      (default: the project directory)
         \\  share-readonly = true      enforce the share read-only on the host
         \\  engine = "native" | "vz"   (vz = Virtualization.framework, lite)

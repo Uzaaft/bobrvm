@@ -37,6 +37,8 @@ forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
 forward_count: u8 = 0,
 /// Host directory shared with the guest via 9p (--share).
 shared_dir: ?[]const u8 = null,
+/// SSH login user for `bobrvm ssh` (ssh-user in bobrvm.toml).
+ssh_user: []const u8 = "root",
 /// Enforce the 9p share read-only on the HOST side, so the guest
 /// cannot write through it regardless of its mount options.
 share_read_only: bool = false,

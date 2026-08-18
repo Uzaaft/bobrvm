@@ -131,8 +131,10 @@ the project on Apple's Virtualization.framework instead of the custom VMM — a
 lighter device set with the same verbs.
 
 `bobrvm exec -- <command>` runs a command in a disposable clone of the warm
-state and prints its output, without touching the project. `bobrvm bench-warm`
-reports warm-restore latency over several trials. A `share-readonly = true`
+state and prints its output, without touching the project. `bobrvm ssh` opens
+a session to the guest through the host port forwarded to guest port 22
+(`forwards = ["2222:22"]`, `ssh-user = "root"`); the guest must run sshd.
+`bobrvm bench-warm` reports warm-restore latency over several trials. A `share-readonly = true`
 key makes the project share read-only on the host, not just in the guest
 mount — a sandbox cannot write host files through it.
 

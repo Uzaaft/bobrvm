@@ -174,6 +174,7 @@ const Key = enum {
     sound,
     net,
     share,
+    ssh_user,
     forwards,
     display,
     gpu_memory,
@@ -200,6 +201,7 @@ const key_map = std.StaticStringMap(Key).initComptime(.{
     .{ "sound", .sound },
     .{ "net", .net },
     .{ "share", .share },
+    .{ "ssh-user", .ssh_user },
     .{ "forwards", .forwards },
     .{ "display", .display },
     .{ "gpu-memory", .gpu_memory },
@@ -263,6 +265,7 @@ fn mapTable(
                     },
                 }
             },
+            .ssh_user => config.ssh_user = try wantString(key_name, value),
             .forwards => try mapForwards(&config, key_name, value),
             .display => try mapDisplay(&config, key_name, value),
             .gpu_memory => config.gpu_memory_mb = @intCast(try wantInt(key_name, value, 64, 2048)),
