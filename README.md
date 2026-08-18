@@ -99,6 +99,29 @@ Direct boot uses two KVM vCPUs by default and exposes their topology through an 
 MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable
 host-monotonic samples of VM creation and start-to-root-readiness latency.
 
+## Project workflow: `bobrvm up`
+
+A `bobrvm.toml` checked into a repository describes the VM for that project.
+`bobrvm up` finds it (searching from the current directory upward) and boots:
+
+```toml
+# bobrvm.toml
+memory = 2048
+cpus = 2
+kernel = "boot/Image"
+initrd = "boot/initrd"
+forwards = ["2222:22"]
+```
+
+Quit with <kbd>Ctrl</kbd>+<kbd>B</kbd> <kbd>z</kbd> to suspend the machine to a
+per-project warm image; the next `bobrvm up` resumes it — RAM, processes, and
+shell state intact — in tens of milliseconds instead of booting. `bobrvm up
+--fresh` discards the warm state. The project directory is shared with the
+guest over virtio-9p by default (`share = false` opts out), relative paths
+resolve against the project root, and warm state lives under
+`~/.config/bobrvm/projects/`, never in the repository. `bobrvm up --help`
+lists the full key set.
+
 ## Run a Linux guest
 
 `bobrvm run` starts a headless VM attached to the guest console. Press
