@@ -132,6 +132,7 @@ fn printUsage() void {
         \\  status           Show the project's detached runner and warm state
         \\  suspend          Save the detached runner's state and stop it
         \\  halt             Stop the project's detached runner
+        \\  bench-warm       Measure warm-restore latency over N trials
         \\  mcp              Serve sandboxes to AI agents over MCP (stdio)
         \\  vz-run           Boot on Virtualization.framework (lite engine, experimental)
         \\  run              Run a VM directly with options
