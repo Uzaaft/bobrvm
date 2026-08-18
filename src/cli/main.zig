@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 pub const Config = @import("Config.zig");
 pub const run = @import("run.zig");
 pub const up = @import("up.zig");
+pub const fork = @import("fork.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -17,6 +18,7 @@ const log = std.log.scoped(.cli);
 pub const Subcommand = enum {
     run,
     up,
+    fork,
     create,
     list,
     start,
@@ -49,6 +51,7 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
     switch (subcmd) {
         .run => try run.execute(alloc, &args),
         .up => try up.execute(alloc, &args),
+        .fork => try fork.execute(alloc, &args),
         .create => try create.execute(alloc, &args),
         .list => try list.execute(alloc),
         .start => try start.execute(alloc, &args),
@@ -68,6 +71,7 @@ fn parseSubcommand(str: []const u8) ?Subcommand {
     const map = std.StaticStringMap(Subcommand).initComptime(.{
         .{ "run", .run },
         .{ "up", .up },
+        .{ "fork", .fork },
         .{ "create", .create },
         .{ "list", .list },
         .{ "ls", .list },
@@ -92,6 +96,7 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  up               Boot the project's bobrvm.toml (resumes warm state)
+        \\  fork             Run a disposable clone of the project's warm state
         \\  run              Run a VM directly with options
         \\  create <name>    Create a named VM configuration
         \\  list, ls         List saved VM configurations
