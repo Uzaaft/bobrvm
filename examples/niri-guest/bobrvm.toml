@@ -1,0 +1,12 @@
+# Niri desktop guest — the Linux GUI/GPU-on-a-Mac beachhead.
+# Build the disk first (see README), then: bobrvm up
+name = "niri"
+memory = 8192
+cpus = 6
+kernel = "share/out/niri-Image"
+initrd = "share/out/niri-initrd"
+disk = "nixos-niri.raw"
+virgl = true
+net = true
+display = "1920x1080"
+cmdline = "console=tty0 console=hvc0 init=/nix/var/nix/profiles/system/init root=/dev/vda2 rw"

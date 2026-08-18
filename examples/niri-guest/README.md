@@ -18,14 +18,25 @@ truncate -s 40G ~/.local/share/bobrvm-niri/nixos-niri.raw
 ./build-niri-guest.sh
 ```
 
-Then boot the installed system:
+Then boot the installed system. This directory ships a `bobrvm.toml`, so from
+here you can just run the project workflow with a Venus-enabled build:
 
 ```sh
-zig build -Dgpu-venus
-BOBRVM_GUI_VENUS=1 macos/MinimalApp/build.sh
-zig-out/bin/BobrvmDisplay \
+zig build -Dgpu-venus     # builds and signs zig-out/bin/bobrvm with Venus
+bobrvm up                 # reads bobrvm.toml (virgl + net + 1920x1080 display)
+```
+
+`bobrvm up` boots headless attached to the console; quit with
+<kbd>Ctrl</kbd>+<kbd>B</kbd> <kbd>z</kbd> to save the warm state so the next
+`bobrvm up` resumes the running desktop instead of booting. For a native
+window, build and run the macOS app (`zig build run`) against the same disk.
+
+Or invoke the headless CLI directly without the project file:
+
+```sh
+zig-out/bin/bobrvm run \
   --kernel share/out/niri-Image --initrd share/out/niri-initrd \
-  --disk nixos-niri.raw --gpu3d --net --memory-mb 8192 --cpus 6 \
+  --disk nixos-niri.raw --virgl --net --memory 8192 --cpus 6 \
   --cmdline 'console=tty0 console=hvc0 init=/nix/var/nix/profiles/system/init root=/dev/vda2 rw'
 ```
 
