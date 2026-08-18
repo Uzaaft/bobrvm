@@ -39,6 +39,10 @@ forward_count: u8 = 0,
 shared_dir: ?[]const u8 = null,
 /// Suspend image to restore instead of booting (--restore).
 restore_path: ?[]const u8 = null,
+/// Where the console's suspend-and-quit command (Ctrl-B z) writes the
+/// machine state (--suspend-to). `bobrvm up` points this at the
+/// project's warm image so the next `up` resumes instead of booting.
+suspend_path: ?[]const u8 = null,
 
 pub const MAX_FORWARDS = 8;
 
@@ -136,6 +140,11 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--restore")) {
             config.restore_path = args.next() orelse {
                 log.err("--restore requires a suspend image path", .{});
+                return ParseError.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "--suspend-to")) {
+            config.suspend_path = args.next() orelse {
+                log.err("--suspend-to requires a path", .{});
                 return ParseError.InvalidArgument;
             };
         } else if (std.mem.eql(u8, arg, "--forward")) {
@@ -440,6 +449,8 @@ pub fn printOptions() void {
         \\                        (repeatable, max 8, implies --net)
         \\  --restore <path>      Resume from a suspend image, or restore a
         \\                        snapshot directory (reverts its disks!)
+        \\  --suspend-to <path>   Target for the console's suspend-and-quit
+        \\                        command (Ctrl-B z)
         \\  --display <WxH>       Initial display resolution (default: 1280x800)
         \\  --gpu-memory <MB>    Graphics memory budget (default: 512)
         \\

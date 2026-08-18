@@ -95,6 +95,8 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
 
     registerMachineForCleanup(hw);
     defer unregisterMachineForCleanup();
+    suspend_target = config.suspend_path;
+    defer suspend_target = null;
 
     hw.setConsoleOutput(consoleOutput, null);
 
@@ -599,6 +601,11 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
 
 const host_command_prefix: u8 = 0x02;
 
+/// Target for the suspend-and-quit console command; set from the
+/// config before the input thread starts (same lifetime pattern as
+/// cleanup_machine).
+var suspend_target: ?[]const u8 = null;
+
 const HostCommand = enum {
     literal_prefix,
     help,
@@ -607,6 +614,7 @@ const HostCommand = enum {
     reboot,
     sync_time,
     trim,
+    suspend_quit,
 };
 
 fn classifyHostCommand(byte: u8) ?HostCommand {
@@ -618,6 +626,7 @@ fn classifyHostCommand(byte: u8) ?HostCommand {
         'r' => .reboot,
         't' => .sync_time,
         'f' => .trim,
+        'z' => .suspend_quit,
         else => null,
     };
 }
@@ -626,7 +635,7 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
     switch (command) {
         .literal_prefix => hw.injectConsoleInput(&.{host_command_prefix}),
         .help => log.info(
-            "host commands: p=status s=shutdown r=reboot t=sync-time f=trim Ctrl-B=literal",
+            "host commands: p=status s=shutdown r=reboot t=sync-time f=trim z=suspend+quit Ctrl-B=literal",
             .{},
         ),
         .status => log.info("guest tools: {s}, capabilities=0x{x}", .{
@@ -637,6 +646,19 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
         .reboot => hw.requestGuestReboot(),
         .sync_time => hw.syncGuestTime(),
         .trim => hw.trimGuestFilesystems(),
+        .suspend_quit => {
+            const path = suspend_target orelse {
+                log.warn("no suspend target configured (--suspend-to <path>)", .{});
+                return;
+            };
+            log.info("suspending machine to {s}", .{path});
+            hw.suspendToDisk(path) catch |err| {
+                log.err("suspend failed: {}; resuming", .{err});
+                hw.unpause();
+                return;
+            };
+            hw.requestStop();
+        },
     }
 }
 
@@ -647,6 +669,7 @@ test "host console command decoder" {
     try std.testing.expectEqual(HostCommand.reboot, classifyHostCommand('r').?);
     try std.testing.expectEqual(HostCommand.sync_time, classifyHostCommand('t').?);
     try std.testing.expectEqual(HostCommand.trim, classifyHostCommand('f').?);
+    try std.testing.expectEqual(HostCommand.suspend_quit, classifyHostCommand('z').?);
     try std.testing.expectEqual(HostCommand.literal_prefix, classifyHostCommand(0x02).?);
     try std.testing.expect(classifyHostCommand('x') == null);
 }

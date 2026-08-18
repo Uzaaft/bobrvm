@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Config = @import("Config.zig");
 pub const run = @import("run.zig");
+pub const up = @import("up.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -15,6 +16,7 @@ const log = std.log.scoped(.cli);
 
 pub const Subcommand = enum {
     run,
+    up,
     create,
     list,
     start,
@@ -46,6 +48,7 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
 
     switch (subcmd) {
         .run => try run.execute(alloc, &args),
+        .up => try up.execute(alloc, &args),
         .create => try create.execute(alloc, &args),
         .list => try list.execute(alloc),
         .start => try start.execute(alloc, &args),
@@ -64,6 +67,7 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
 fn parseSubcommand(str: []const u8) ?Subcommand {
     const map = std.StaticStringMap(Subcommand).initComptime(.{
         .{ "run", .run },
+        .{ "up", .up },
         .{ "create", .create },
         .{ "list", .list },
         .{ "ls", .list },
@@ -87,6 +91,7 @@ fn printUsage() void {
         \\Usage: bobrvm <command> [options]
         \\
         \\Commands:
+        \\  up               Boot the project's bobrvm.toml (resumes warm state)
         \\  run              Run a VM directly with options
         \\  create <name>    Create a named VM configuration
         \\  list, ls         List saved VM configurations
@@ -96,6 +101,7 @@ fn printUsage() void {
         \\  version          Show version information
         \\
         \\Examples:
+        \\  bobrvm up
         \\  bobrvm run --memory 1024 --disk root.raw
         \\  bobrvm create myvm --memory 2048 --disk vm.raw
         \\  bobrvm start myvm
