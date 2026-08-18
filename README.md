@@ -122,10 +122,16 @@ resolve against the project root, and warm state lives under
 `~/.config/bobrvm/projects/`, never in the repository. `bobrvm up --help`
 lists the full key set.
 
-`bobrvm up --detach` runs the project in the background; `bobrvm status`,
-`bobrvm suspend`, and `bobrvm halt` manage it. `engine = "vz"` runs the
-project on Apple's Virtualization.framework instead of the custom VMM — a
+A `provision = ["cmd", ...]` list in `bobrvm.toml` runs shell commands once
+on the first cold boot; save the result with <kbd>Ctrl</kbd>+<kbd>B</kbd>
+<kbd>z</kbd> and every later `up` and `fork` starts from the provisioned
+state. `bobrvm up --detach` runs the project in the background; `bobrvm
+status`, `bobrvm suspend`, and `bobrvm halt` manage it. `engine = "vz"` runs
+the project on Apple's Virtualization.framework instead of the custom VMM — a
 lighter device set with the same verbs.
+
+`bobrvm exec -- <command>` runs a command in a disposable clone of the warm
+state and prints its output, without touching the project.
 
 ### Disposable sandboxes
 

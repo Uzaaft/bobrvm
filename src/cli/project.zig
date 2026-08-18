@@ -176,6 +176,7 @@ const Key = enum {
     forwards,
     display,
     gpu_memory,
+    provision,
 };
 
 const key_map = std.StaticStringMap(Key).initComptime(.{
@@ -200,6 +201,7 @@ const key_map = std.StaticStringMap(Key).initComptime(.{
     .{ "forwards", .forwards },
     .{ "display", .display },
     .{ "gpu-memory", .gpu_memory },
+    .{ "provision", .provision },
 });
 
 fn mapTable(
@@ -261,6 +263,13 @@ fn mapTable(
             .forwards => try mapForwards(&config, key_name, value),
             .display => try mapDisplay(&config, key_name, value),
             .gpu_memory => config.gpu_memory_mb = @intCast(try wantInt(key_name, value, 64, 2048)),
+            .provision => {
+                if (value != .string_array) {
+                    log.warn("{s}: 'provision' must be an array of shell commands", .{FILE_NAME});
+                    return error.ProjectFileInvalid;
+                }
+                config.provision_steps = value.string_array;
+            },
         }
     }
 
@@ -392,6 +401,7 @@ test "project: maps the full schema onto a config" {
         \\forwards = ["2222:22", "8080:80"]
         \\display = "1920x1080"
         \\gpu-memory = 1024
+        \\provision = ["apk add git", "git config --global init.defaultBranch main"]
         \\
     ;
     var table = try toml.parse(arena, text, null);
@@ -413,6 +423,8 @@ test "project: maps the full schema onto a config" {
     try testing.expectEqual(@as(u16, 80), config.forwards[1].guest_port);
     try testing.expectEqual(@as(u32, 1920), config.display_width);
     try testing.expectEqual(@as(u64, 1024), config.gpu_memory_mb);
+    try testing.expectEqual(@as(usize, 2), config.provision_steps.len);
+    try testing.expectEqualStrings("apk add git", config.provision_steps[0]);
     // Project dir shared by default.
     try testing.expectEqualStrings("/proj", config.shared_dir.?);
 }

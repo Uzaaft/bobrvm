@@ -161,6 +161,7 @@ fn printHelp() void {
         \\  net = true                 forwards = ["2222:22"]
         \\  share = "dir" | false      (default: the project directory)
         \\  engine = "native" | "vz"   (vz = Virtualization.framework, lite)
+        \\  provision = ["cmd", ...]   run once on first cold boot
         \\  display = "1280x800"       gpu-memory = 512
         \\
         \\Relative paths resolve against the project root. Warm state is

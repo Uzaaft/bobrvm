@@ -43,6 +43,10 @@ restore_path: ?[]const u8 = null,
 /// machine state (--suspend-to). `bobrvm up` points this at the
 /// project's warm image so the next `up` resumes instead of booting.
 suspend_path: ?[]const u8 = null,
+/// Shell commands run once, over the guest console, on the first cold
+/// boot (not on a warm restore). Set from `provision` in bobrvm.toml;
+/// `bobrvm up` saves the provisioned state as the warm image.
+provision_steps: []const []const u8 = &.{},
 
 pub const MAX_FORWARDS = 8;
 
