@@ -9,6 +9,7 @@ pub const run = @import("run.zig");
 pub const up = @import("up.zig");
 pub const fork = @import("fork.zig");
 pub const mcp = @import("mcp.zig");
+pub const vz = @import("vz.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -21,6 +22,7 @@ pub const Subcommand = enum {
     up,
     fork,
     mcp,
+    vz_run,
     create,
     list,
     start,
@@ -55,6 +57,7 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
         .up => try up.execute(alloc, &args),
         .fork => try fork.execute(alloc, &args),
         .mcp => try mcp.execute(alloc, &args, minimal.environ),
+        .vz_run => try vz.execute(alloc, &args),
         .create => try create.execute(alloc, &args),
         .list => try list.execute(alloc),
         .start => try start.execute(alloc, &args),
@@ -76,6 +79,7 @@ fn parseSubcommand(str: []const u8) ?Subcommand {
         .{ "up", .up },
         .{ "fork", .fork },
         .{ "mcp", .mcp },
+        .{ "vz-run", .vz_run },
         .{ "create", .create },
         .{ "list", .list },
         .{ "ls", .list },
@@ -102,6 +106,7 @@ fn printUsage() void {
         \\  up               Boot the project's bobrvm.toml (resumes warm state)
         \\  fork             Run a disposable clone of the project's warm state
         \\  mcp              Serve sandboxes to AI agents over MCP (stdio)
+        \\  vz-run           Boot on Virtualization.framework (lite engine, experimental)
         \\  run              Run a VM directly with options
         \\  create <name>    Create a named VM configuration
         \\  list, ls         List saved VM configurations

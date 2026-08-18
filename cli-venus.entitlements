@@ -8,6 +8,8 @@
 	     dylibs and let MoltenVK/KosmicKrisp JIT Metal shaders. -->
 	<key>com.apple.security.hypervisor</key>
 	<true/>
+	<key>com.apple.security.virtualization</key>
+	<true/>
 	<key>com.apple.security.cs.disable-library-validation</key>
 	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
