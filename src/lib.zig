@@ -78,6 +78,7 @@ test {
     _ = @import("cli/mcp.zig");
     _ = @import("cli/console_exec.zig");
     _ = @import("cli/exec.zig");
+    _ = @import("cli/bench.zig");
     _ = @import("compat/file.zig");
     _ = @import("compat/net.zig");
     _ = @import("compat/thread.zig");

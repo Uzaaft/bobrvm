@@ -12,6 +12,7 @@ pub const mcp = @import("mcp.zig");
 pub const vz = @import("vz.zig");
 pub const ctl = @import("ctl.zig");
 pub const exec = @import("exec.zig");
+pub const bench = @import("bench.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -24,6 +25,7 @@ pub const Subcommand = enum {
     up,
     fork,
     exec,
+    bench_warm,
     mcp,
     vz_run,
     status,
@@ -63,6 +65,7 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
         .up => try up.execute(alloc, &args, minimal.environ),
         .fork => try fork.execute(alloc, &args),
         .exec => try exec.execute(alloc, &args),
+        .bench_warm => try bench.execute(alloc, &args),
         .mcp => try mcp.execute(alloc, &args, minimal.environ),
         .vz_run => try vz.execute(alloc, &args),
         .status => try ctl.execute(alloc, .status),
@@ -89,6 +92,7 @@ fn parseSubcommand(str: []const u8) ?Subcommand {
         .{ "up", .up },
         .{ "fork", .fork },
         .{ "exec", .exec },
+        .{ "bench-warm", .bench_warm },
         .{ "mcp", .mcp },
         .{ "vz-run", .vz_run },
         .{ "status", .status },

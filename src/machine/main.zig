@@ -1038,6 +1038,12 @@ pub const Machine = struct {
         }
     }
 
+    /// True once startup (including any restore) has finished and the
+    /// vCPUs are entering the run loop. Used to time warm restore.
+    pub fn isRunning(self: *const Machine) bool {
+        return self.running.load(.acquire);
+    }
+
     pub fn stop(self: *Machine) void {
         self.stop_requested.store(true, .release);
         if (!self.running.load(.acquire)) return;

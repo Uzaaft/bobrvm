@@ -138,11 +138,13 @@ pub const Session = struct {
     /// provisioning do not race the boot. Re-probes on a short cadence:
     /// a single injection can be lost if it lands mid-restore (restore
     /// overwrites the console's receive queue), so one long wait would
-    /// hang forever. Returns false on timeout.
+    /// hang forever. The 150 ms probe interval keeps the lost-probe
+    /// penalty small, so the measured time stays close to the real
+    /// restore-to-responsive latency. Returns false on timeout.
     pub fn waitForPrompt(self: *Session, alloc: Allocator, timeout_ms: u32) bool {
         var waited_ms: u32 = 0;
-        while (waited_ms < timeout_ms) : (waited_ms += 500) {
-            if (self.run(alloc, "true", 500)) |probe| {
+        while (waited_ms < timeout_ms) : (waited_ms += 150) {
+            if (self.run(alloc, "true", 150)) |probe| {
                 alloc.free(probe.output);
                 return true;
             } else |_| {}
