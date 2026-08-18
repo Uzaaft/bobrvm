@@ -114,6 +114,15 @@ pub fn setReuseAddr(sockfd: posix.socket_t) void {
     _ = std.c.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
 }
 
+/// Arm kernel TCP keepalive probes. Used on sockets whose flows are
+/// exempt from application-level idle reaping, so a peer that vanished
+/// without a FIN/RST still surfaces as a socket error eventually
+/// (default kernel probe timing applies).
+pub fn setKeepAlive(sockfd: posix.socket_t) void {
+    const one: c_int = 1;
+    _ = std.c.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &one, @sizeOf(c_int));
+}
+
 pub const ShutdownHow = enum { recv, send, both };
 
 pub fn shutdown(sockfd: posix.socket_t, how: ShutdownHow) Error!void {
