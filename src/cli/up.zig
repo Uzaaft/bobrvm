@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const global = @import("../global.zig");
 const project = @import("project.zig");
 const runner = @import("runner.zig");
+const vz = @import("vz.zig");
 
 const log = std.log.scoped(.cli);
 
@@ -69,6 +70,12 @@ pub fn execute(
     }
 
     if (detach) return detachedUp(alloc, arena, &proj, environ);
+
+    if (proj.engine == .vz) {
+        global.state.init();
+        defer global.state.deinit();
+        return vz.upProject(arena, &proj);
+    }
 
     if (project.fileExists(proj.warm_image)) {
         proj.config.restore_path = proj.warm_image;
@@ -153,6 +160,7 @@ fn printHelp() void {
         \\  gpu = true                 virgl = true          sound = true
         \\  net = true                 forwards = ["2222:22"]
         \\  share = "dir" | false      (default: the project directory)
+        \\  engine = "native" | "vz"   (vz = Virtualization.framework, lite)
         \\  display = "1280x800"       gpu-memory = 512
         \\
         \\Relative paths resolve against the project root. Warm state is

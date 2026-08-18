@@ -28,9 +28,14 @@ pub const Error = error{
     OutOfMemory,
 };
 
+pub const Engine = enum { native, vz };
+
 pub const Project = struct {
     /// Absolute project root (the directory holding bobrvm.toml).
     root: []const u8,
+    /// Which engine runs this project: the custom Hypervisor.framework
+    /// machine (default) or the Virtualization.framework lite engine.
+    engine: Engine = .native,
     /// Absolute path of the project file.
     file_path: []const u8,
     /// Per-project state directory.
@@ -100,14 +105,22 @@ pub fn load(arena: Allocator, root: []const u8) Error!Project {
         },
     };
 
-    var config = try mapTable(arena, root, &table);
+    var engine: Engine = .native;
+    var config = try mapTable(arena, root, &table, &engine);
     if (config.name.len == 0) {
         config.name = arena.dupe(u8, std.fs.path.basename(root)) catch
             return error.OutOfMemory;
     }
 
     const state_dir = try stateDir(arena, root);
-    const warm_image = std.fs.path.join(arena, &.{ state_dir, "warm.img" }) catch
+    // The engines' state formats differ, so the images get distinct
+    // names — switching engines boots cold rather than feeding one
+    // engine the other's state.
+    const warm_name = switch (engine) {
+        .native => "warm.img",
+        .vz => "warm.vzstate",
+    };
+    const warm_image = std.fs.path.join(arena, &.{ state_dir, warm_name }) catch
         return error.OutOfMemory;
     // The console's suspend-and-quit command writes the warm image, so
     // the next `up` resumes instead of booting.
@@ -115,6 +128,7 @@ pub fn load(arena: Allocator, root: []const u8) Error!Project {
 
     return .{
         .root = root,
+        .engine = engine,
         .file_path = file_path,
         .state_dir = state_dir,
         .warm_image = warm_image,
@@ -141,6 +155,7 @@ pub fn ensureStateDir(project: *const Project) !void {
 }
 
 const Key = enum {
+    engine,
     name,
     memory,
     cpus,
@@ -164,6 +179,7 @@ const Key = enum {
 };
 
 const key_map = std.StaticStringMap(Key).initComptime(.{
+    .{ "engine", .engine },
     .{ "name", .name },
     .{ "memory", .memory },
     .{ "cpus", .cpus },
@@ -186,7 +202,12 @@ const key_map = std.StaticStringMap(Key).initComptime(.{
     .{ "gpu-memory", .gpu_memory },
 });
 
-fn mapTable(arena: Allocator, root: []const u8, table: *const toml.Table) Error!Config {
+fn mapTable(
+    arena: Allocator,
+    root: []const u8,
+    table: *const toml.Table,
+    engine_out: *Engine,
+) Error!Config {
     var config = Config{};
     var share_set = false;
 
@@ -199,6 +220,13 @@ fn mapTable(arena: Allocator, root: []const u8, table: *const toml.Table) Error!
             return error.ProjectFileInvalid;
         };
         switch (key) {
+            .engine => {
+                const text = try wantString(key_name, value);
+                engine_out.* = std.meta.stringToEnum(Engine, text) orelse {
+                    log.warn("{s}: engine must be \"native\" or \"vz\"", .{FILE_NAME});
+                    return error.ProjectFileInvalid;
+                };
+            },
             .name => config.name = try wantString(key_name, value),
             .memory => config.memory_mb = @intCast(try wantInt(key_name, value, 1, 1024 * 1024)),
             .cpus => config.vcpu_count = @intCast(try wantInt(key_name, value, 1, 255)),
@@ -242,6 +270,30 @@ fn mapTable(arena: Allocator, root: []const u8, table: *const toml.Table) Error!
     }
     if (config.enable_virgl) config.enable_gpu = true;
     if (config.forward_count > 0) config.enable_net = true;
+
+    // The lite engine's device set is much smaller; reject what it
+    // cannot match rather than silently degrading.
+    if (engine_out.* == .vz) {
+        if (config.enable_gpu or config.enable_snd or config.enable_net or
+            config.forward_count > 0 or config.disk_path != null or
+            config.disk2_path != null or config.firmware_path != null)
+        {
+            log.warn(
+                "{s}: gpu/sound/net/forwards/disks/firmware are not supported on the vz engine yet",
+                .{FILE_NAME},
+            );
+            return error.ProjectFileInvalid;
+        }
+        if (share_set and config.shared_dir != null) {
+            log.warn("{s}: 'share' is not supported on the vz engine yet", .{FILE_NAME});
+            return error.ProjectFileInvalid;
+        }
+        config.shared_dir = null;
+        if (config.kernel_path == null) {
+            log.warn("{s}: the vz engine requires 'kernel'", .{FILE_NAME});
+            return error.ProjectFileInvalid;
+        }
+    }
 
     config.validate() catch return error.ProjectFileInvalid;
     return config;
@@ -343,7 +395,8 @@ test "project: maps the full schema onto a config" {
         \\
     ;
     var table = try toml.parse(arena, text, null);
-    const config = try mapTable(arena, "/proj", &table);
+    var engine: Engine = .native;
+    const config = try mapTable(arena, "/proj", &table, &engine);
 
     try testing.expectEqualStrings("webapp", config.name);
     try testing.expectEqual(@as(u64, 2048), config.memory_mb);
@@ -370,17 +423,18 @@ test "project: share=false opts out and unknown keys fail loudly" {
     const arena = arena_state.allocator();
 
     var opted_out = try toml.parse(arena, "share = false\n", null);
-    const config = try mapTable(arena, "/proj", &opted_out);
+    var engine: Engine = .native;
+    const config = try mapTable(arena, "/proj", &opted_out, &engine);
     try testing.expectEqual(@as(?[]const u8, null), config.shared_dir);
 
     var unknown = try toml.parse(arena, "memroy = 2048\n", null);
-    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &unknown));
+    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &unknown, &engine));
 
     var bad_forward = try toml.parse(arena, "forwards = [\"22\"]\n", null);
-    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bad_forward));
+    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bad_forward, &engine));
 
     var bad_type = try toml.parse(arena, "memory = \"lots\"\n", null);
-    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bad_type));
+    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bad_type, &engine));
 }
 
 test "project: findRoot walks up and load wires the warm image" {
@@ -419,4 +473,26 @@ test "project: findRoot walks up and load wires the warm image" {
     try testing.expectEqualStrings(project.warm_image, project.config.suspend_path.?);
     // State dir is keyed by the absolute root path.
     try testing.expect(std.mem.indexOf(u8, project.state_dir, "/projects/repo-") != null);
+}
+
+test "project: vz engine parses and rejects unsupported devices" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var engine: Engine = .native;
+
+    var minimal = try toml.parse(arena, "engine = \"vz\"\nkernel = \"Image\"\n", null);
+    const config = try mapTable(arena, "/proj", &minimal, &engine);
+    try testing.expectEqual(Engine.vz, engine);
+    // No 9p device on the lite engine: the default project share is off.
+    try testing.expectEqual(@as(?[]const u8, null), config.shared_dir);
+
+    var gpu = try toml.parse(arena, "engine = \"vz\"\nkernel = \"Image\"\ngpu = true\n", null);
+    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &gpu, &engine));
+
+    var no_kernel = try toml.parse(arena, "engine = \"vz\"\n", null);
+    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &no_kernel, &engine));
+
+    var bogus = try toml.parse(arena, "engine = \"qemu\"\n", null);
+    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bogus, &engine));
 }

@@ -13,8 +13,66 @@ const Allocator = std.mem.Allocator;
 
 const global = @import("../global.zig");
 const linux_vz = @import("../runtime/linux_vz.zig");
+const os = @import("../os/main.zig");
+const project = @import("project.zig");
 
 const log = std.log.scoped(.cli);
+
+/// Run a project on the lite engine (the `engine = "vz"` path of
+/// `bobrvm up`): resume the warm state when it exists, and answer
+/// SIGUSR1 (`bobrvm suspend`, also sent by the detached-runner verbs)
+/// by saving it and quitting. The guest console uses stdin/stdout.
+pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
+    const config = &proj.config;
+    const machine_id = try std.fmt.allocPrintSentinel(arena, "{s}/machine.id", .{
+        proj.state_dir,
+    }, 0);
+    const warm = try arena.dupeZ(u8, proj.warm_image);
+
+    var machine = try linux_vz.Machine.init(&.{
+        .kernel_path = try arena.dupeZ(u8, config.kernel_path.?),
+        .initrd_path = if (config.initrd_path) |path| try arena.dupeZ(u8, path) else null,
+        .cmdline = try arena.dupeZ(u8, config.cmdline),
+        .memory_bytes = config.memory_mb * 1024 * 1024,
+        .vcpu_count = config.vcpu_count,
+        .console_in = std.posix.STDIN_FILENO,
+        .console_out = std.posix.STDOUT_FILENO,
+        .machine_id_path = machine_id,
+    });
+    defer machine.deinit();
+
+    const start_ms = nowMs();
+    if (project.fileExists(proj.warm_image)) {
+        try machine.restoreFrom(warm);
+        try machine.resumeVM();
+        log.info("up: {s} — resuming warm state (vz engine, {d} ms)", .{
+            config.name, nowMs() - start_ms,
+        });
+    } else {
+        try machine.start();
+        log.info("up: {s} — cold boot (vz engine, {d} ms)", .{
+            config.name, nowMs() - start_ms,
+        });
+    }
+
+    os.signal.registerSuspendRequest();
+    while (true) {
+        linux_vz.pump();
+        switch (machine.state()) {
+            .stopped, .@"error" => break,
+            else => {},
+        }
+        if (os.signal.takeSuspendRequest()) {
+            const t0 = nowMs();
+            try machine.pause();
+            try machine.saveTo(warm);
+            log.info("vz: suspended to warm state in {d} ms", .{nowMs() - t0});
+            try machine.stop();
+            break;
+        }
+    }
+    log.info("vz: machine stopped", .{});
+}
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(

@@ -32,6 +32,10 @@ pub const Clone = struct {
 /// write to cloned disks, no suspend target, no host port forwards
 /// (concurrent forks would collide on the ports).
 pub fn prepare(arena: Allocator, proj: *const project.Project) !Clone {
+    if (proj.engine != .native) {
+        log.err("fork and mcp sandboxes need the native engine (this project sets engine = \"vz\")", .{});
+        return error.UnsupportedEngine;
+    }
     if (!project.fileExists(proj.warm_image)) {
         log.err(
             "no warm state for {s}: run bobrvm up, then quit with Ctrl-B z first",
