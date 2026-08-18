@@ -131,7 +131,10 @@ the project on Apple's Virtualization.framework instead of the custom VMM — a
 lighter device set with the same verbs.
 
 `bobrvm exec -- <command>` runs a command in a disposable clone of the warm
-state and prints its output, without touching the project.
+state and prints its output, without touching the project. `bobrvm bench-warm`
+reports warm-restore latency over several trials. A `share-readonly = true`
+key makes the project share read-only on the host, not just in the guest
+mount — a sandbox cannot write host files through it.
 
 ### Disposable sandboxes
 
