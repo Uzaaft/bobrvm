@@ -122,6 +122,22 @@ resolve against the project root, and warm state lives under
 `~/.config/bobrvm/projects/`, never in the repository. `bobrvm up --help`
 lists the full key set.
 
+`bobrvm up --detach` runs the project in the background; `bobrvm status`,
+`bobrvm suspend`, and `bobrvm halt` manage it. `engine = "vz"` runs the
+project on Apple's Virtualization.framework instead of the custom VMM — a
+lighter device set with the same verbs.
+
+### Disposable sandboxes
+
+`bobrvm fork` runs a throwaway clone of the warm state: copy-on-write copies
+of the warm image and writable disks, deleted on exit, with the originals
+never touched — any number of forks resume from exactly the same moment.
+`bobrvm mcp` serves those sandboxes to AI agents over the Model Context
+Protocol: add `{"mcpServers": {"bobrvm": {"command": "bobrvm", "args":
+["mcp"]}}}` to an agent's MCP config and it gets `sandbox_start`,
+`sandbox_exec` (console-based, no guest agent needed), `sandbox_output`,
+`sandbox_list`, and `sandbox_stop`.
+
 ## Run a Linux guest
 
 `bobrvm run` starts a headless VM attached to the guest console. Press
