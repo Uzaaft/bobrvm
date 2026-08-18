@@ -431,6 +431,15 @@ pub fn printOptions() void {
         \\  -k, --kernel <path>   Kernel image (direct boot)
         \\  -i, --initrd <path>   Initrd image
         \\  --cmdline <str>       Kernel command line
+        \\  --gpu                 Attach a virtio-gpu display device
+        \\  --virgl               Accelerated 3D graphics (implies --gpu)
+        \\  --sound               Attach a virtio-snd playback device
+        \\  --net                 Attach a virtio-net adapter (user-mode NAT)
+        \\  --share <dir>         Export a host directory over virtio-9p (tag "host")
+        \\  --forward <h:g>       Forward host TCP port h to guest port g
+        \\                        (repeatable, max 8, implies --net)
+        \\  --restore <path>      Resume from a suspend image, or restore a
+        \\                        snapshot directory (reverts its disks!)
         \\  --display <WxH>       Initial display resolution (default: 1280x800)
         \\  --gpu-memory <MB>    Graphics memory budget (default: 512)
         \\
