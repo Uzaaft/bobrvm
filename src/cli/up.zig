@@ -45,6 +45,9 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
 
     var proj = try project.load(arena, root);
     try project.ensureStateDir(&proj);
+    log.info("project {s} ({s}); state in {s}", .{
+        proj.config.name, proj.file_path, proj.state_dir,
+    });
 
     if (fresh) {
         var path_buf: [1024:0]u8 = undefined;

@@ -280,6 +280,7 @@ fn SnapshotSection(
 /// descriptor here.
 const snapshot_sections = .{
     SnapshotSection("gic", "gic_device", snapshot.GicCodec),
+    SnapshotSection("icc", "icc_handler", snapshot.IccCodec),
     SnapshotSection("console", "console", snapshot.ConsoleCodec),
     SnapshotSection("blk1", "block", snapshot.BlockCodec),
     SnapshotSection("blk2", "block2", snapshot.BlockCodec),
@@ -1389,6 +1390,7 @@ pub const Machine = struct {
     /// enumerate holes or a read fails mid-walk; the caller's full-read
     /// fallback overwrites everything, so a partial walk is harmless.
     fn readRamDataRegions(file: std.Io.File, ram: []u8, ram_base: u64) bool {
+        if (std.c.getenv("BOBRVM_NO_SPARSE_RESTORE") != null) return false;
         const io = global.io();
         const ram_end: u64 = ram_base + ram.len;
         var pos: u64 = ram_base;

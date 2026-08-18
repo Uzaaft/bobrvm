@@ -21,6 +21,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const hypervisor = @import("../hypervisor/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
+const icc_mod = @import("../gic/icc.zig");
 const mmio = @import("../virtio/mmio.zig");
 const snapshot_container = @import("snapshot_container.zig");
 
@@ -31,6 +32,7 @@ pub const VERSION = snapshot_container.VERSION;
 const block_section_scratch_bytes = 128;
 const console_section_scratch_bytes = 512;
 const gic_section_scratch_bytes = 2 * 1024;
+const icc_section_scratch_bytes = 512;
 const input_section_scratch_bytes = 128;
 const net_section_scratch_bytes = 128;
 const p9_section_scratch_bytes = 256;
@@ -744,7 +746,73 @@ pub fn DeviceCodec(
     };
 }
 
+/// Emulated GICv3 CPU-interface state, per vCPU. Without this section
+/// a restored guest never accepts another interrupt (igrpen resets to
+/// disabled) and the periodic vtimer turns into a silent exit storm.
+pub fn serializeIcc(alloc: Allocator, handler: *const icc_mod.IccHandler) ![]u8 {
+    const per_cpu_bytes = 5 * @sizeOf(u8) + @sizeOf(u32);
+    const serialized_bytes = @sizeOf(u8) + per_cpu_bytes * handler.states.len;
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try out.int(u8, @intCast(handler.states.len));
+    for (handler.states) |*state| {
+        try out.int(u8, state.pmr);
+        try out.int(u8, state.bpr0);
+        try out.int(u8, state.bpr1);
+        const flags: u8 = @as(u8, @intFromBool(state.igrpen0)) |
+            (@as(u8, @intFromBool(state.igrpen1)) << 1);
+        try out.int(u8, flags);
+        try out.int(u8, state.running_priority);
+        try out.int(u32, state.ctlr);
+    }
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendIccSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    name: []const u8,
+    handler: *const icc_mod.IccHandler,
+) !void {
+    assert(handler.states.len > 0);
+    var stack_allocator = std.heap.stackFallback(icc_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeIcc(scratch_alloc, handler);
+    defer scratch_alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializeIcc(_: Allocator, handler: *icc_mod.IccHandler, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    const count = try cur.int(u8);
+    for (0..count) |i| {
+        const pmr = try cur.int(u8);
+        const bpr0 = try cur.int(u8);
+        const bpr1 = try cur.int(u8);
+        const flags = try cur.int(u8);
+        const running_priority = try cur.int(u8);
+        const ctlr = try cur.int(u32);
+        // Images from a larger machine: extra CPUs have no target.
+        if (i >= handler.states.len) continue;
+        handler.states[i] = .{
+            .pmr = pmr,
+            .bpr0 = bpr0,
+            .bpr1 = bpr1,
+            .igrpen0 = flags & 1 != 0,
+            .igrpen1 = flags & 2 != 0,
+            .running_priority = running_priority,
+            .ctlr = ctlr,
+        };
+    }
+}
+
 pub const GicCodec = DeviceCodec(gic_mod.Gic, appendGicSection, deserializeGic);
+pub const IccCodec = DeviceCodec(icc_mod.IccHandler, appendIccSection, deserializeIcc);
 pub const ConsoleCodec = DeviceCodec(virtio.Console, appendConsoleSection, deserializeConsole);
 pub const BlockCodec = DeviceCodec(virtio.Block, appendBlockSection, deserializeBlock);
 pub const RngCodec = DeviceCodec(virtio.Rng, appendRngSection, deserializeRng);
@@ -758,6 +826,44 @@ pub const GpuCodec = DeviceCodec(virtio.Gpu, appendGpuSection, deserializeGpu);
 // =============================================================================
 
 const testing = std.testing;
+
+test "snapshot: ICC CPU-interface state roundtrips" {
+    var states = [_]icc_mod.IccState{
+        .{
+            .pmr = 0xF0,
+            .bpr0 = 2,
+            .bpr1 = 3,
+            .igrpen0 = false,
+            .igrpen1 = true,
+            .running_priority = 0x80,
+            .ctlr = 0x2,
+        },
+        .{}, // secondary CPU still at reset defaults
+    };
+    var handler = icc_mod.IccHandler{ .gic = undefined, .states = &states };
+
+    const data = try serializeIcc(testing.allocator, &handler);
+    defer testing.allocator.free(data);
+
+    var restored_states = [_]icc_mod.IccState{ .{}, .{} };
+    var restored = icc_mod.IccHandler{ .gic = undefined, .states = &restored_states };
+    try deserializeIcc(testing.allocator, &restored, data);
+
+    try testing.expectEqual(states[0], restored_states[0]);
+    try testing.expectEqual(states[1], restored_states[1]);
+
+    // An image from a bigger machine restores the CPUs that exist.
+    var one_state = [_]icc_mod.IccState{.{}};
+    var smaller = icc_mod.IccHandler{ .gic = undefined, .states = &one_state };
+    try deserializeIcc(testing.allocator, &smaller, data);
+    try testing.expectEqual(states[0], one_state[0]);
+
+    // Truncated payloads error instead of half-applying.
+    try testing.expectError(
+        error.Truncated,
+        deserializeIcc(testing.allocator, &restored, data[0 .. data.len - 1]),
+    );
+}
 
 test "snapshot: container roundtrip and unknown sections" {
     var b = try Builder.init(testing.allocator);
