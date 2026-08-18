@@ -352,6 +352,12 @@ pub const Machine = struct {
     /// Pflash VARS region (UEFI variables, host-mapped).
     pflash_vars: ?[]align(4096) u8 = null,
 
+    /// CNTVOFF applied to every vCPU (guest CNTVCT_EL0 =
+    /// mach_absolute_time() - vtimer_offset). Zero on a fresh boot;
+    /// set by restore so the guest's monotonic clock continues from
+    /// the capture point instead of jumping by the suspend gap.
+    vtimer_offset: u64 = 0,
+
     /// Virtio console device.
     console: ?*virtio.Console = null,
 
@@ -1125,7 +1131,36 @@ pub const Machine = struct {
             try Section.capture(self, alloc, &builder);
         }
 
+        // Guest virtual counter at capture, so restore can resume the
+        // guest's monotonic clock exactly where it stopped.
+        var vtimer_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &vtimer_bytes, machTicks() -% self.vtimer_offset, .little);
+        try builder.section("vtimer", &vtimer_bytes);
+
+        // UEFI variable store (firmware boots): the mapping is not part
+        // of guest RAM, so vars written since boot would otherwise be
+        // lost on restore. Trailing erased flash (0xFF) is trimmed.
+        if (self.pflash_vars) |vars| {
+            try builder.section("pflash_vars", vars[0..trimErasedFlash(vars)]);
+        }
+
         return try builder.finish();
+    }
+
+    extern "c" fn mach_absolute_time() u64;
+
+    /// Host tick counter in CNTVCT units (Apple Silicon's
+    /// mach_absolute_time is the physical counter).
+    fn machTicks() u64 {
+        return mach_absolute_time();
+    }
+
+    /// Length of the flash content up to the last programmed byte;
+    /// everything after reads back as erased (0xFF).
+    fn trimErasedFlash(flash: []const u8) usize {
+        var len = flash.len;
+        while (len > 0 and flash[len - 1] == 0xFF) len -= 1;
+        return len;
     }
 
     /// Apply a captured state to a freshly-initialized, paused machine
@@ -1362,6 +1397,26 @@ pub const Machine = struct {
         // Devices + GIC.
         const reader = try snapshot.Reader.init(state);
 
+        // Guest clock: resume CNTVCT from the capture point so the
+        // guest's monotonic time never jumps (or runs backward after a
+        // host reboot). Must be computed before secondaries spawn —
+        // they apply the same offset on their own threads.
+        if (reader.section("vtimer")) |data| {
+            if (data.len != 8) return error.BadImage;
+            const guest_counter = std.mem.readInt(u64, data[0..8], .little);
+            self.vtimer_offset = machTicks() -% guest_counter;
+            try vcpu.setVTimerOffset(self.vtimer_offset);
+        }
+
+        // UEFI variable store: what the guest programmed since boot,
+        // with the trimmed tail reading back as erased flash.
+        if (reader.section("pflash_vars")) |data| {
+            const vars = self.pflash_vars orelse return error.BadImage;
+            if (data.len > vars.len) return error.BadImage;
+            @memcpy(vars[0..data.len], data);
+            @memset(vars[data.len..], 0xFF);
+        }
+
         // Secondary vCPUs: each captured CPU gets its own thread (HVF
         // requires create+run on the owning thread) which applies its
         // registers and then waits for the machine to start. CPUs the
@@ -1461,6 +1516,14 @@ pub const Machine = struct {
             state.started.store(false, .release);
             return;
         };
+        // The clock offset was computed before this thread spawned.
+        if (self.vtimer_offset != 0) {
+            vcpu.setVTimerOffset(self.vtimer_offset) catch |err| {
+                log.err("cpu {}: vtimer offset failed: {}", .{ cpu_id, err });
+                state.started.store(false, .release);
+                return;
+            };
+        }
         state.vcpu = vcpu;
         state.restore_ready.store(true, .release);
 
@@ -3610,6 +3673,14 @@ test "stop before synchronous thread entry cancels startup" {
     try testing.expectError(error.StartCancelled, machine.startSyncPrepared());
     try testing.expect(!machine.running.load(.acquire));
     try testing.expect(machine.stop_requested.load(.acquire));
+}
+
+test "trimErasedFlash keeps content up to the last programmed byte" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 0), Machine.trimErasedFlash(&.{}));
+    try testing.expectEqual(@as(usize, 0), Machine.trimErasedFlash(&.{ 0xFF, 0xFF }));
+    try testing.expectEqual(@as(usize, 3), Machine.trimErasedFlash(&.{ 0xFF, 0x00, 0x01, 0xFF }));
+    try testing.expectEqual(@as(usize, 2), Machine.trimErasedFlash(&.{ 0x00, 0x00 }));
 }
 
 test "readRamDataRegions reads only the data regions of a sparse image" {

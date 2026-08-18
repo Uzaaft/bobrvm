@@ -396,6 +396,15 @@ pub const Vcpu = struct {
         try c.check(ret);
     }
 
+    /// Set CNTVOFF: the guest sees
+    /// CNTVCT_EL0 = mach_absolute_time() - offset.
+    /// Owning-thread-only, like all register access.
+    pub fn setVTimerOffset(self: *Vcpu, offset: u64) Error!void {
+        assert(self.created);
+        const ret = c.hv_vcpu_set_vtimer_offset(self.handle, offset);
+        try c.check(ret);
+    }
+
     /// Get program counter.
     pub fn getPC(self: *Vcpu) Error!u64 {
         return self.getReg(.pc);

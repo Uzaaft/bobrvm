@@ -311,6 +311,12 @@ pub extern "Hypervisor" fn hv_vcpu_set_vtimer_mask(
     masked: bool,
 ) callconv(.c) hv_return_t;
 
+/// CNTVCT_EL0 = mach_absolute_time() - vtimer_offset.
+pub extern "Hypervisor" fn hv_vcpu_set_vtimer_offset(
+    vcpu: hv_vcpu_t,
+    vtimer_offset: u64,
+) callconv(.c) hv_return_t;
+
 // =============================================================================
 // vCPU Exit (force exit from another thread)
 // =============================================================================

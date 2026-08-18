@@ -43,7 +43,7 @@ rm -rf "$HOME"/.config/bobrvm/projects/proj-*
 
 echo "=== RUN A: cold boot, tick loop, suspend at t+25s ==="
 cd "$PROJ"
-( sleep 8; printf 'i=0; while true; do i=$((i+1)); echo TICK $i; sleep 1; done\n'; sleep 37 ) \
+( sleep 8; printf 'i=0; while true; do i=$((i+1)); set -- $(cat /proc/uptime); echo TICK $i UP ${1%%.*}; sleep 1; done\n'; sleep 37 ) \
   | BOBRVM_LOG=stderr=true BOBRVM_TEST_SUSPEND=25:"$PROJ/suspend.img" "$BIN" up \
   > "$LOG_A" 2>&1
 echo "run A exit: $?"
@@ -58,6 +58,10 @@ fi
 mkdir -p "$WARM_DIR"
 mv "$PROJ/suspend.img" "$WARM_DIR/warm.img"
 
+# Deliberate gap: without the restored vtimer offset the guest's
+# monotonic clock (and /proc/uptime) would jump forward by this much.
+sleep 10
+
 echo "=== RUN B: warm up (must resume the tick loop) ==="
 ( sleep 12 ) | BOBRVM_LOG=stderr=true BOBRVM_EXIT_ON_EOF=1 "$BIN" up \
   > "$LOG_B" 2>&1
@@ -66,10 +70,21 @@ echo "run B exit: $?"
 grep -q "resuming warm state" "$LOG_B" || { echo "FAIL: run B did not restore"; exit 1; }
 B_FIRST=$(grep -o 'TICK [0-9]*' "$LOG_B" | head -1 | awk '{print $2}')
 echo "run A last tick: $A_LAST, run B first tick: ${B_FIRST:-none}"
-if [ -n "${B_FIRST:-}" ] && [ "$B_FIRST" -gt "$A_LAST" ] && [ "$B_FIRST" -le $((A_LAST + 3)) ]; then
-  echo "UP-WARM: PASS (guest resumed with tick continuity)"
-  rm -rf "$WORK"
-else
+if [ -z "${B_FIRST:-}" ] || [ "$B_FIRST" -le "$A_LAST" ] || [ "$B_FIRST" -gt $((A_LAST + 3)) ]; then
   echo "FAIL: tick continuity not proven (see $LOG_B)"
   exit 1
 fi
+
+# Guest clock continuity: /proc/uptime rides the virtual counter, so
+# it must continue from the capture point rather than absorbing the
+# 10 s suspend gap.
+A_UP=$(grep -o 'UP [0-9]*' "$LOG_A" | tail -1 | awk '{print $2}')
+B_UP=$(grep -o 'UP [0-9]*' "$LOG_B" | head -1 | awk '{print $2}')
+echo "run A last uptime: ${A_UP:-none}s, run B first uptime: ${B_UP:-none}s"
+if [ -z "${A_UP:-}" ] || [ -z "${B_UP:-}" ] || [ $((B_UP - A_UP)) -gt 5 ]; then
+  echo "FAIL: guest clock jumped across restore (see $LOG_B)"
+  exit 1
+fi
+
+echo "UP-WARM: PASS (tick continuity + guest clock continuity)"
+rm -rf "$WORK"
