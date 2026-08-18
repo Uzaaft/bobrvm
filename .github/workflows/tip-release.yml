@@ -32,6 +32,12 @@ jobs:
       - name: Run Zig unit tests, property fuzzing, and build integration guest
         run: nix build --print-build-logs .#test
 
+      # Catches Linux-only compile rot (code referenced solely by the
+      # x86 machine) from the macOS runner: full semantic analysis of
+      # the Linux test graph, no linking.
+      - name: Analyze the Linux test graph
+        run: nix develop -c zig build check-linux
+
   swift:
     name: Swift contract tests
     runs-on: macos-15
