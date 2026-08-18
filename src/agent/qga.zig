@@ -36,11 +36,39 @@ pub const Qga = struct {
     /// Guest IPv4 addresses reported by guest-network-get-interfaces
     /// (comma-separated, lo excluded).
     guest_ips: std.ArrayListUnmanaged(u8) = .empty,
+    /// pid returned by the last guest-exec spawn; -1 = none yet.
+    /// Written on the vCPU thread before its watched response becomes
+    /// ready, so a waiter that observes readiness also sees the pid.
+    exec_pid: std.atomic.Value(i64) = std.atomic.Value(i64).init(-1),
+    /// Last guest-exec-status payload plus its decoded output streams.
+    /// Valid once the matching watched response is ready; the buffers
+    /// are reused by the next poll.
+    exec_status: ExecStatus = .{},
+    exec_out: std.ArrayListUnmanaged(u8) = .empty,
+    exec_err: std.ArrayListUnmanaged(u8) = .empty,
 
-    pub const LINE_MAX: usize = 64 * 1024;
+    /// Line-buffer bound. Sized so a full guest-exec-status response
+    /// fits: qemu-ga caps each captured stream at 16 MiB by default,
+    /// which is ~21.4 MiB once base64-encoded. Grown on demand, never
+    /// preallocated, so ordinary responses cost nothing extra.
+    pub const LINE_MAX: usize = 24 * 1024 * 1024;
     const parse_scratch_bytes = 8 * 1024;
     pub const WatchedRequest = struct {
         id: u64,
+    };
+
+    pub const ExecStatus = struct {
+        exited: bool = false,
+        exit_code: ?i64 = null,
+        signal: ?i64 = null,
+        out_truncated: bool = false,
+        err_truncated: bool = false,
+    };
+
+    pub const ExecResult = struct {
+        status: ExecStatus,
+        out: []const u8,
+        err: []const u8,
     };
 
     pub fn init(alloc: Allocator, sender: Send) Qga {
@@ -50,6 +78,8 @@ pub const Qga = struct {
     pub fn deinit(self: *Qga) void {
         self.line_buf.deinit(self.alloc);
         self.guest_ips.deinit(self.alloc);
+        self.exec_out.deinit(self.alloc);
+        self.exec_err.deinit(self.alloc);
     }
 
     fn send(self: *Qga, json: []const u8) void {
@@ -130,6 +160,75 @@ pub const Qga = struct {
         return self.sendWatched("guest-fsfreeze-thaw");
     }
 
+    /// Spawn a program in the guest via guest-exec with output capture.
+    /// argv[0] is the program path. The pid arrives in execPid() once
+    /// the watched response is ready; poll completion through
+    /// execStatusRequest(). The guest must allow the RPC
+    /// (automation.enable in the guest module).
+    pub fn exec(self: *Qga, argv: []const []const u8) !WatchedRequest {
+        if (argv.len == 0) return error.InvalidArgument;
+        const request_id = self.next_request_id.fetchAdd(1, .monotonic);
+        self.watched_request_id.store(request_id, .release);
+        self.exec_pid.store(-1, .release);
+
+        // Serialized through std.json so arbitrary argv bytes (quotes,
+        // backslashes, control characters) are escaped correctly.
+        const Payload = struct {
+            execute: []const u8,
+            arguments: struct {
+                path: []const u8,
+                arg: []const []const u8,
+                @"capture-output": bool,
+            },
+            id: u64,
+        };
+        const json = try std.json.Stringify.valueAlloc(self.alloc, Payload{
+            .execute = "guest-exec",
+            .arguments = .{
+                .path = argv[0],
+                .arg = argv[1..],
+                .@"capture-output" = true,
+            },
+            .id = request_id,
+        }, .{});
+        defer self.alloc.free(json);
+        const line = try std.mem.concat(self.alloc, u8, &.{ json, "\n" });
+        defer self.alloc.free(line);
+        self.send(line);
+        return .{ .id = request_id };
+    }
+
+    /// Poll a spawned process; the payload lands in execResult() once
+    /// the watched response is ready.
+    pub fn execStatusRequest(self: *Qga, pid: i64) WatchedRequest {
+        const request_id = self.next_request_id.fetchAdd(1, .monotonic);
+        self.watched_request_id.store(request_id, .release);
+        var buffer: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "{{\"execute\":\"guest-exec-status\",\"arguments\":{{\"pid\":{d}}},\"id\":{d}}}\n",
+            .{ pid, request_id },
+        ) catch unreachable;
+        self.send(message);
+        return .{ .id = request_id };
+    }
+
+    pub fn execPid(self: *const Qga) ?i64 {
+        const pid = self.exec_pid.load(.acquire);
+        return if (pid < 0) null else pid;
+    }
+
+    /// Valid only after the corresponding execStatusRequest's watched
+    /// response is ready; the slices alias buffers reused by the next
+    /// poll — copy before issuing another request.
+    pub fn execResult(self: *const Qga) ExecResult {
+        return .{
+            .status = self.exec_status,
+            .out = self.exec_out.items,
+            .err = self.exec_err.items,
+        };
+    }
+
     /// Feed guest→host bytes (console port output). Called on the vCPU
     /// thread; parses complete newline-terminated JSON responses.
     pub fn feed(self: *Qga, data: []const u8) void {
@@ -183,7 +282,6 @@ pub const Qga = struct {
         const root = parsed.value;
         if (root != .object) return;
         self.connected.store(true, .release);
-        self.recordWatchedResponse(root, root.object.get("error") != null);
 
         if (root.object.get("error")) |err| {
             self.responses_seen += 1;
@@ -192,22 +290,74 @@ pub const Qga = struct {
                     if (desc == .string) log.warn("guest agent error: {s}", .{desc.string});
                 }
             }
+            self.recordWatchedResponse(root, true);
             return;
         }
 
-        const ret = root.object.get("return") orelse return;
-        self.responses_seen += 1;
-
-        switch (ret) {
-            // guest-sync echoes the id.
-            .integer => |id| {
-                self.last_sync_id = id;
-                log.info("guest agent sync id={d}", .{id});
-            },
-            // guest-network-get-interfaces returns an array of interfaces.
-            .array => |ifaces| self.parseInterfaces(ifaces),
-            else => log.debug("guest agent response ok", .{}),
+        if (root.object.get("return")) |ret| {
+            self.responses_seen += 1;
+            switch (ret) {
+                // guest-sync echoes the id.
+                .integer => |id| {
+                    self.last_sync_id = id;
+                    log.info("guest agent sync id={d}", .{id});
+                },
+                // guest-network-get-interfaces returns an array of interfaces.
+                .array => |ifaces| self.parseInterfaces(ifaces),
+                // guest-exec / guest-exec-status return objects.
+                .object => |obj| self.parseExecObject(obj),
+                else => log.debug("guest agent response ok", .{}),
+            }
         }
+
+        // Signal readiness only after the payload above is stored, so a
+        // waiter that observes the watched id also sees the parsed data.
+        self.recordWatchedResponse(root, false);
+    }
+
+    /// guest-exec returns {"pid":N}; guest-exec-status returns
+    /// {"exited":bool, ...} with optional base64 output streams.
+    fn parseExecObject(self: *Qga, obj: std.json.ObjectMap) void {
+        if (obj.get("pid")) |pid| {
+            if (pid == .integer and pid.integer >= 0) {
+                self.exec_pid.store(pid.integer, .release);
+            }
+            return;
+        }
+        const exited = obj.get("exited") orelse return;
+        if (exited != .bool) return;
+        self.exec_status = .{ .exited = exited.bool };
+        if (obj.get("exitcode")) |value| {
+            if (value == .integer) self.exec_status.exit_code = value.integer;
+        }
+        if (obj.get("signal")) |value| {
+            if (value == .integer) self.exec_status.signal = value.integer;
+        }
+        if (obj.get("out-truncated")) |value| {
+            if (value == .bool) self.exec_status.out_truncated = value.bool;
+        }
+        if (obj.get("err-truncated")) |value| {
+            if (value == .bool) self.exec_status.err_truncated = value.bool;
+        }
+        self.decodeExecData(obj, "out-data", &self.exec_out);
+        self.decodeExecData(obj, "err-data", &self.exec_err);
+    }
+
+    fn decodeExecData(
+        self: *Qga,
+        obj: std.json.ObjectMap,
+        field: []const u8,
+        dst: *std.ArrayListUnmanaged(u8),
+    ) void {
+        dst.clearRetainingCapacity();
+        const value = obj.get(field) orelse return;
+        if (value != .string) return;
+        const decoder = std.base64.standard.Decoder;
+        const size = decoder.calcSizeForSlice(value.string) catch return;
+        dst.resize(self.alloc, size) catch return;
+        decoder.decode(dst.items, value.string) catch {
+            dst.clearRetainingCapacity();
+        };
     }
 
     fn sendWatched(self: *Qga, command: []const u8) WatchedRequest {
@@ -358,6 +508,80 @@ test "qga: sync response JSON parse allocation profile" {
     try testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     try testing.expectEqual(@as(usize, 0), counted.resize_index);
     try testing.expectEqual(@as(i64, 42), qga.last_sync_id.?);
+}
+
+test "qga: guest-exec serializes argv with JSON escaping" {
+    defer {
+        test_sent.deinit(testing.allocator);
+        test_sent = .empty;
+        test_send_calls = 0;
+    }
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
+    defer qga.deinit();
+
+    _ = try qga.exec(&.{ "/bin/sh", "-c", "echo \"hi\"" });
+    const expected =
+        "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/sh\"," ++
+        "\"arg\":[\"-c\",\"echo \\\"hi\\\"\"],\"capture-output\":true},\"id\":1}\n";
+    try testing.expectEqualStrings(expected, test_sent.items);
+}
+
+test "qga: guest-exec pid and status round-trip" {
+    defer {
+        test_sent.deinit(testing.allocator);
+        test_sent = .empty;
+        test_send_calls = 0;
+    }
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
+    defer qga.deinit();
+
+    const spawn = try qga.exec(&.{"/bin/true"});
+    try testing.expectEqual(@as(?i64, null), qga.execPid());
+    qga.feed("{\"return\":{\"pid\":123},\"id\":1}\n");
+    try testing.expect(qga.watchedResponseReady(spawn));
+    try testing.expect(!qga.watchedResponseFailed(spawn));
+    try testing.expectEqual(@as(i64, 123), qga.execPid().?);
+
+    // Still-running poll: exited=false, no output.
+    const running = qga.execStatusRequest(123);
+    qga.feed("{\"return\":{\"exited\":false},\"id\":2}\n");
+    try testing.expect(qga.watchedResponseReady(running));
+    try testing.expect(!qga.execResult().status.exited);
+
+    // Completed poll: exit code plus base64 stdout/stderr and a
+    // truncation flag ("hello\n" / "boom").
+    const done = qga.execStatusRequest(123);
+    qga.feed("{\"return\":{\"exited\":true,\"exitcode\":2," ++
+        "\"out-data\":\"aGVsbG8K\",\"err-data\":\"Ym9vbQ==\"," ++
+        "\"out-truncated\":true},\"id\":3}\n");
+    try testing.expect(qga.watchedResponseReady(done));
+    const result = qga.execResult();
+    try testing.expect(result.status.exited);
+    try testing.expectEqual(@as(i64, 2), result.status.exit_code.?);
+    try testing.expectEqual(@as(?i64, null), result.status.signal);
+    try testing.expect(result.status.out_truncated);
+    try testing.expect(!result.status.err_truncated);
+    try testing.expectEqualStrings("hello\n", result.out);
+    try testing.expectEqualStrings("boom", result.err);
+}
+
+test "qga: guest-exec rejects an empty argv and bad base64" {
+    defer {
+        test_sent.deinit(testing.allocator);
+        test_sent = .empty;
+        test_send_calls = 0;
+    }
+    var qga = Qga.init(testing.allocator, Send.initRaw(testSend, null));
+    defer qga.deinit();
+
+    try testing.expectError(error.InvalidArgument, qga.exec(&.{}));
+
+    _ = qga.execStatusRequest(5);
+    qga.feed("{\"return\":{\"exited\":true,\"exitcode\":0," ++
+        "\"out-data\":\"@@not base64@@\"},\"id\":1}\n");
+    // Undecodable output is dropped rather than half-written.
+    try testing.expect(qga.execResult().status.exited);
+    try testing.expectEqualStrings("", qga.execResult().out);
 }
 
 test "qga: guest-network-get-interfaces parses ipv4 addresses" {

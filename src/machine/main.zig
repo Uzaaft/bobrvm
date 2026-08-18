@@ -851,6 +851,65 @@ pub const Machine = struct {
         if (self.qga) |q| q.queryNetworkInterfaces();
     }
 
+    pub const GuestExecResult = struct {
+        exit_code: i64,
+        signal: ?i64,
+        stdout: []u8,
+        stderr: []u8,
+        out_truncated: bool,
+        err_truncated: bool,
+
+        pub fn deinit(self: *GuestExecResult, alloc: Allocator) void {
+            alloc.free(self.stdout);
+            alloc.free(self.stderr);
+        }
+    };
+
+    /// Run a program in the guest via qemu-guest-agent and wait for it
+    /// to exit. Output is capped by the agent (16 MiB per stream by
+    /// default) and the returned buffers are owned by the caller. The
+    /// guest must allow guest-exec (automation.enable in the guest
+    /// module). Watched qga requests are single-slot, so callers must
+    /// not interleave this with other watched operations (snapshots).
+    pub fn guestExec(
+        self: *Machine,
+        argv: []const []const u8,
+        timeout_ms: u32,
+    ) !GuestExecResult {
+        const qga = self.qga orelse return error.AgentUnavailable;
+        if (!qga.isConnected()) return error.AgentUnavailable;
+
+        const spawn = try qga.exec(argv);
+        try self.waitForQgaResponse(qga, spawn);
+        const pid = qga.execPid() orelse return error.AgentRejected;
+
+        var waited_ms: u32 = 0;
+        while (true) {
+            const poll = qga.execStatusRequest(pid);
+            try self.waitForQgaResponse(qga, poll);
+            const result = qga.execResult();
+            if (result.status.exited) {
+                const stdout_copy = try self.alloc.dupe(u8, result.out);
+                errdefer self.alloc.free(stdout_copy);
+                const stderr_copy = try self.alloc.dupe(u8, result.err);
+                return .{
+                    .exit_code = result.status.exit_code orelse -1,
+                    .signal = result.status.signal,
+                    .stdout = stdout_copy,
+                    .stderr = stderr_copy,
+                    .out_truncated = result.status.out_truncated,
+                    .err_truncated = result.status.err_truncated,
+                };
+            }
+            if (waited_ms >= timeout_ms) return error.ExecTimeout;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 20 * std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+            waited_ms += 20;
+        }
+    }
+
     /// Request a live guest display resolution change (host window resized).
     /// Thread-safe: takes the machine lock, which serializes against all GPU
     /// MMIO/queue processing on the vCPU thread. Lock order (machine_lock ->
