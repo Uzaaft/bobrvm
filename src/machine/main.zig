@@ -3684,3 +3684,16 @@ test "readRamDataRegions handles an image whose RAM span is one hole" {
     try testing.expect(Machine.readRamDataRegions(file, ram, ram_base));
     try testing.expect(std.mem.allEqual(u8, ram, 0));
 }
+
+test "snapshot section registry stays analyzable" {
+    // Mirrors the x86 machine's registry test: force analysis of every
+    // section codec so codec rot is a compile error on all hosts. The
+    // comptime gate keeps Hypervisor.framework analysis out of Linux
+    // test builds.
+    if (builtin.os.tag == .macos) {
+        inline for (snapshot_sections) |Section| {
+            _ = &Section.capture;
+            _ = &Section.restore;
+        }
+    }
+}
