@@ -3,30 +3,31 @@ import SwiftUI
 struct VMLibraryHomeView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Environment(\.openWindow) private var openWindow
+    let searchText: String
+    let select: (VMInstance) -> Void
+
     @State private var startError: String?
     @State private var vmToEdit: VMInstance?
 
     private let columns = [
-        GridItem(.adaptive(minimum: 260, maximum: 340), spacing: 16)
+        GridItem(.adaptive(minimum: 290, maximum: 380), spacing: 18)
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
+        Group {
             if vmManager.vms.isEmpty {
                 emptyLibrary
+            } else if filteredVMs.isEmpty {
+                ContentUnavailableView.search(text: searchText)
             } else {
-                vmGrid
+                libraryGrid
             }
         }
         .navigationTitle("Library")
+        .navigationSubtitle(librarySubtitle)
         .alert(
             "Unable to Start Virtual Machine",
-            isPresented: Binding(
-                get: { startError != nil },
-                set: { if !$0 { startError = nil } }
-            )
+            isPresented: startErrorPresented
         ) {
             Button("OK") { startError = nil }
         } message: {
@@ -37,37 +38,15 @@ struct VMLibraryHomeView: View {
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "square.stack.3d.up.fill")
-                .font(.system(size: 30))
-                .foregroundStyle(Color.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Virtual Machine Library")
-                    .font(.title2.bold())
-                Text("Choose a virtual machine or create a new one.")
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button {
-                vmManager.showingCreateVM = true
-            } label: {
-                Label("New Virtual Machine…", systemImage: "plus")
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(24)
-    }
-
-    private var vmGrid: some View {
+    private var libraryGrid: some View {
         ScrollView {
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-                ForEach(vmManager.vms) { vm in
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 18) {
+                ForEach(filteredVMs) { vm in
                     VMLibraryCard(
                         vmInstance: vm,
-                        start: { start(vm) },
+                        showDetails: { select(vm) },
+                        open: { open(vm) },
                         pause: { vm.pause() },
-                        resume: { vm.resume() },
                         stop: { vm.stop() },
                         edit: { vmToEdit = vm }
                     )
@@ -78,28 +57,236 @@ struct VMLibraryHomeView: View {
     }
 
     private var emptyLibrary: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "shippingbox")
-                .font(.system(size: 52))
-                .foregroundStyle(.secondary)
-            Text("No Virtual Machines")
-                .font(.title2.bold())
-            Text("Create a virtual machine from an ISO image or attach an existing disk.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Create Virtual Machine…") {
+        ContentUnavailableView {
+            Label("No Virtual Machines", systemImage: "shippingbox")
+        } description: {
+            Text("Create a virtual machine from an image or attach an existing disk.")
+        } actions: {
+            Button {
                 vmManager.showingCreateVM = true
+            } label: {
+                Label("New Virtual Machine", systemImage: "plus")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(32)
     }
 
-    private func start(_ vm: VMInstance) {
+    private var filteredVMs: [VMInstance] {
+        guard !searchText.isEmpty else { return vmManager.vms }
+        return vmManager.vms.filter {
+            $0.name.localizedStandardContains(searchText)
+                || $0.guestSystem.displayName.localizedStandardContains(searchText)
+        }
+    }
+
+    private var librarySubtitle: String {
+        let count = vmManager.vms.count
+        return count == 1 ? "1 virtual machine" : "\(count) virtual machines"
+    }
+
+    private var startErrorPresented: Binding<Bool> {
+        Binding(
+            get: { startError != nil },
+            set: { if !$0 { startError = nil } }
+        )
+    }
+
+    private func open(_ vm: VMInstance) {
         do {
-            try vm.start()
+            if vm.state == .stopped {
+                try vm.start()
+            } else if vm.state == .paused {
+                vm.resume()
+            }
             openWindow(id: "vm-display", value: vm.id)
+        } catch {
+            startError = error.localizedDescription
+        }
+    }
+}
+
+struct VMOverviewView: View {
+    @ObservedObject var vmInstance: VMInstance
+    @Environment(\.openWindow) private var openWindow
+    @State private var isEditing = false
+    @State private var startError: String?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                overviewHeader
+                detailsGrid
+            }
+            .padding(28)
+            .frame(maxWidth: 920, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .navigationTitle(vmInstance.name)
+        .navigationSubtitle(vmInstance.guestSystem.displayName)
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    isEditing = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .help("Virtual machine settings")
+            }
+            ToolbarSpacer(.fixed)
+            ToolbarItemGroup(placement: .primaryAction) {
+                lifecycleToolbarItems
+            }
+        }
+        .sheet(isPresented: $isEditing) {
+            EditVMView(vmInstance: vmInstance)
+        }
+        .alert(
+            "Unable to Start Virtual Machine",
+            isPresented: startErrorPresented
+        ) {
+            Button("OK") { startError = nil }
+        } message: {
+            Text(startError ?? "An unknown error occurred.")
+        }
+        .focusedSceneValue(\.vmID, vmInstance.id)
+    }
+
+    private var overviewHeader: some View {
+        HStack(alignment: .center, spacing: 18) {
+            GuestSystemIcon(system: vmInstance.guestSystem, size: 72)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(vmInstance.name)
+                    .font(.largeTitle.weight(.semibold))
+                    .lineLimit(2)
+                HStack(spacing: 10) {
+                    VMStateBadge(state: vmInstance.state)
+                    Text("\(vmInstance.guestSystem.displayName) virtual machine")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var detailsGrid: some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 18) {
+            GridRow {
+                DetailPanel(title: "Hardware", systemImage: "cpu") {
+                    DetailRow(label: "Processors", value: "\(vmInstance.config.vcpuCount) cores")
+                    DetailRow(label: "Memory", value: memoryText)
+                    DetailRow(label: "Graphics", value: graphicsText)
+                }
+                DetailPanel(title: "Display", systemImage: "display") {
+                    DetailRow(label: "Maximum resolution", value: displayText)
+                    DetailRow(
+                        label: "Retina",
+                        value: vmInstance.retinaEnabled ? "Full resolution" : "Standard scale"
+                    )
+                    DetailRow(
+                        label: "Network",
+                        value: vmInstance.config.networkEnabled ? "Connected" : "Disconnected"
+                    )
+                }
+            }
+
+            GridRow {
+                DetailPanel(title: "Storage", systemImage: "internaldrive") {
+                    DetailRow(label: "Disk", value: diskText)
+                    DetailRow(label: "Installation media", value: opticalDriveText)
+                }
+                DetailPanel(title: "Identity", systemImage: "info.circle") {
+                    DetailRow(label: "Guest", value: vmInstance.guestSystem.displayName)
+                    DetailRow(label: "Identifier", value: shortIdentifier)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var lifecycleToolbarItems: some View {
+        switch vmInstance.state {
+        case .stopped:
+            Button(action: primaryAction) {
+                Label("Start", systemImage: "play.fill")
+            }
+        case .paused:
+            Button(action: primaryAction) {
+                Label("Resume", systemImage: "play.fill")
+            }
+            Button(role: .destructive) {
+                vmInstance.stop()
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+            }
+        case .running:
+            Button {
+                openWindow(id: "vm-display", value: vmInstance.id)
+            } label: {
+                Label("Open Display", systemImage: "macwindow")
+            }
+            Button {
+                vmInstance.pause()
+            } label: {
+                Label("Pause", systemImage: "pause.fill")
+            }
+            Button(role: .destructive) {
+                vmInstance.stop()
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+            }
+        }
+    }
+
+    private var memoryText: String {
+        let bytesPerGB = UInt64(1024 * 1024 * 1024)
+        return "\(vmInstance.config.memoryBytes / bytesPerGB) GB"
+    }
+
+    private var graphicsText: String {
+        if vmInstance.guestSystem == .macOS {
+            return "Apple accelerated"
+        }
+        return "\(vmInstance.vramMB) MB shared memory"
+    }
+
+    private var displayText: String {
+        "\(vmInstance.config.displayWidth) × \(vmInstance.config.displayHeight)"
+    }
+
+    private var diskText: String {
+        guard let path = vmInstance.config.diskPath else { return "None" }
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        guard let size = DiskManager.sizeGB(path: path) else { return name }
+        return "\(name) · \(size) GB"
+    }
+
+    private var opticalDriveText: String {
+        if vmInstance.guestSystem == .macOS { return "Apple restore image" }
+        guard let path = vmInstance.isoPath else { return "Empty" }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private var shortIdentifier: String {
+        String(vmInstance.id.uuidString.prefix(8)).uppercased()
+    }
+
+    private var startErrorPresented: Binding<Bool> {
+        Binding(
+            get: { startError != nil },
+            set: { if !$0 { startError = nil } }
+        )
+    }
+
+    private func primaryAction() {
+        do {
+            if vmInstance.state == .stopped {
+                try vmInstance.start()
+            } else if vmInstance.state == .paused {
+                vmInstance.resume()
+            }
+            openWindow(id: "vm-display", value: vmInstance.id)
         } catch {
             startError = error.localizedDescription
         }
@@ -108,108 +295,138 @@ struct VMLibraryHomeView: View {
 
 private struct VMLibraryCard: View {
     @ObservedObject var vmInstance: VMInstance
-    let start: () -> Void
+    let showDetails: () -> Void
+    let open: () -> Void
     let pause: () -> Void
-    let resume: () -> Void
     let stop: () -> Void
     let edit: () -> Void
 
+    @State private var isHovered = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top) {
-                Image(systemName: "desktopcomputer")
-                    .font(.title2)
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 34, height: 34)
-                    .background(Color.accentColor.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(vmInstance.name)
-                        .font(.headline)
-                        .lineLimit(1)
-                    Text("\(vmInstance.guestSystem.displayName) virtual machine")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                StateBadge(state: vmInstance.state)
-            }
+        VStack(alignment: .leading, spacing: 16) {
+            cardHeader
             Divider()
-            HStack(spacing: 18) {
-                MetricLabel(
-                    icon: "cpu",
-                    value: "\(vmInstance.config.vcpuCount) cores"
-                )
-                MetricLabel(
-                    icon: "memorychip",
-                    value: memoryText
-                )
-            }
-            HStack(spacing: 18) {
-                MetricLabel(
-                    icon: "internaldrive",
-                    value: diskText
-                )
-                MetricLabel(
-                    icon: "display",
-                    value: displayText
-                )
-            }
-            MetricLabel(
-                icon: "opticaldisc",
-                value: opticalDriveText
-            )
-            HStack {
-                ControlButton(title: "Settings", icon: "gearshape", action: edit)
-                Spacer()
-                controls
-            }
+            metrics
+            Spacer(minLength: 0)
+            controls
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.secondary.opacity(0.2))
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 12))
-        .contextMenu {
-            contextMenuItems
+        .padding(18)
+        .frame(maxWidth: .infinity, minHeight: 224, alignment: .topLeading)
+        .background(.regularMaterial, in: .rect(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(borderColor, lineWidth: isHovered ? 1.5 : 1)
+        }
+        .shadow(color: .black.opacity(isHovered ? 0.12 : 0.05), radius: 12, y: 5)
+        .contentShape(.rect(cornerRadius: 18))
+        .onTapGesture(perform: showDetails)
+        .onHover { isHovered = $0 }
+        .animation(.easeOut(duration: 0.16), value: isHovered)
+        .contextMenu { contextMenuItems }
+        .accessibilityElement(children: .contain)
+        .accessibilityAction(named: "Show Details", showDetails)
+    }
+
+    private var cardHeader: some View {
+        HStack(alignment: .top, spacing: 12) {
+            GuestSystemIcon(system: vmInstance.guestSystem, size: 44)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(vmInstance.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(vmInstance.guestSystem.displayName)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            VMStateBadge(state: vmInstance.state)
         }
     }
 
-    @ViewBuilder
+    private var metrics: some View {
+        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+            GridRow {
+                MetricLabel(icon: "cpu", value: "\(vmInstance.config.vcpuCount) cores")
+                MetricLabel(icon: "memorychip", value: memoryText)
+            }
+            GridRow {
+                MetricLabel(icon: "internaldrive", value: diskText)
+                MetricLabel(icon: "display", value: displayText)
+            }
+            GridRow {
+                MetricLabel(icon: "opticaldisc", value: opticalDriveText)
+                    .gridCellColumns(2)
+            }
+        }
+    }
+
     private var controls: some View {
-        switch vmInstance.state {
-        case .stopped:
-            ControlButton(title: "Start", icon: "play.fill", action: start)
-        case .paused:
-            ControlButton(title: "Resume", icon: "play.fill", action: resume)
-        case .running:
-            ControlButton(title: "Pause", icon: "pause.fill", action: pause)
-            ControlButton(title: "Stop", icon: "stop.fill", role: .destructive, action: stop)
+        GlassEffectContainer(spacing: 8) {
+            HStack(spacing: 8) {
+                Button(action: edit) {
+                    Label("Settings", systemImage: "gearshape")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.glass)
+                .help("Virtual machine settings")
+
+                Spacer()
+
+                if vmInstance.state == .running {
+                    Button(action: pause) {
+                        Label("Pause", systemImage: "pause.fill")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.glass)
+                    .help("Pause")
+                }
+
+                if vmInstance.state != .stopped {
+                    Button(role: .destructive, action: stop) {
+                        Label("Stop", systemImage: "stop.fill")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.glass)
+                    .help("Stop")
+                }
+
+                Button(action: open) {
+                    Label(primaryTitle, systemImage: primaryIcon)
+                }
+                .buttonStyle(.glassProminent)
+            }
         }
     }
 
     @ViewBuilder
     private var contextMenuItems: some View {
-        switch vmInstance.state {
-        case .stopped:
-            Button("Start", systemImage: "play.fill", action: start)
-        case .paused:
-            Button("Resume", systemImage: "play.fill", action: resume)
-        case .running:
+        Button(primaryTitle, systemImage: primaryIcon, action: open)
+        if vmInstance.state == .running {
             Button("Pause", systemImage: "pause.fill", action: pause)
+        }
+        if vmInstance.state != .stopped {
             Button("Stop", systemImage: "stop.fill", role: .destructive, action: stop)
         }
-
         Divider()
         if vmInstance.guestSystem != .macOS {
             ISOMediaActions(vmInstance: vmInstance)
             Divider()
         }
+        Button("Show Details", systemImage: "sidebar.right", action: showDetails)
         Button("Settings…", systemImage: "gearshape", action: edit)
+    }
+
+    private var primaryTitle: String {
+        switch vmInstance.state {
+        case .stopped: return "Start"
+        case .paused: return "Resume"
+        case .running: return "Open"
+        }
+    }
+
+    private var primaryIcon: String {
+        vmInstance.state == .running ? "macwindow" : "play.fill"
     }
 
     private var memoryText: String {
@@ -227,31 +444,53 @@ private struct VMLibraryCard: View {
     }
 
     private var displayText: String {
-        "Up to \(vmInstance.config.displayWidth) × \(vmInstance.config.displayHeight)"
+        "\(vmInstance.config.displayWidth) × \(vmInstance.config.displayHeight)"
     }
 
     private var opticalDriveText: String {
         if vmInstance.guestSystem == .macOS { return "Apple Virtualization" }
         guard let path = vmInstance.isoPath else { return "CD/DVD: Empty" }
-        return "CD/DVD: \(URL(fileURLWithPath: path).lastPathComponent)"
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private var borderColor: Color {
+        isHovered ? .accentColor.opacity(0.42) : .primary.opacity(0.08)
     }
 }
 
-private struct ControlButton: View {
+private struct DetailPanel<Content: View>: View {
     let title: String
-    let icon: String
-    var role: ButtonRole? = nil
-    let action: () -> Void
+    let systemImage: String
+    @ViewBuilder let content: Content
 
     var body: some View {
-        Button(role: role, action: action) {
-            Image(systemName: icon)
-                .frame(width: 16, height: 16)
+        VStack(alignment: .leading, spacing: 14) {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+            Divider()
+            content
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .help(title)
-        .accessibilityLabel(title)
+        .padding(18)
+        .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)
+        .background(.regularMaterial, in: .rect(cornerRadius: 16))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.primary.opacity(0.08))
+        }
+    }
+}
+
+private struct DetailRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        LabeledContent(label) {
+            Text(value)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
     }
 }
 
@@ -267,16 +506,57 @@ private struct MetricLabel: View {
     }
 }
 
-private struct StateBadge: View {
+struct VMStateBadge: View {
     let state: VMState
 
     var body: some View {
-        Text(state.presentationName)
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(state.presentationColor)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(state.presentationColor.opacity(0.12))
-            .clipShape(Capsule())
+        Label {
+            Text(state.presentationName)
+                .foregroundStyle(.primary)
+        } icon: {
+            Image(systemName: state.presentationIcon)
+                .foregroundStyle(state.presentationColor)
+        }
+        .font(.caption.weight(.medium))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(.secondary.opacity(0.1), in: Capsule())
+        .overlay {
+            Capsule()
+                .strokeBorder(state.presentationColor.opacity(0.28))
+        }
+        .accessibilityLabel("Status: \(state.presentationName)")
+    }
+}
+
+struct GuestSystemIcon: View {
+    let system: GuestSystem
+    let size: CGFloat
+
+    var body: some View {
+        Image(systemName: system.presentationIcon)
+            .font(.system(size: size * 0.42, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background(system.presentationColor.gradient, in: .rect(cornerRadius: size * 0.24))
+            .accessibilityHidden(true)
+    }
+}
+
+extension GuestSystem {
+    var presentationIcon: String {
+        switch self {
+        case .linux: return "terminal.fill"
+        case .macOS: return "apple.logo"
+        case .windows: return "rectangle.split.2x2.fill"
+        }
+    }
+
+    var presentationColor: Color {
+        switch self {
+        case .linux: return .orange
+        case .macOS: return .blue
+        case .windows: return .indigo
+        }
     }
 }

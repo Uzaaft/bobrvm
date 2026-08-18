@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) !void {
             .cpu_arch = target.query.cpu_arch orelse builtin.target.cpu.arch,
             .os_tag = .macos,
             .os_version_min = .{ .semver = .{
-                .major = 13,
+                .major = 26,
                 .minor = 0,
                 .patch = 0,
             } },

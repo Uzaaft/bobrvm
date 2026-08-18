@@ -28,10 +28,10 @@ brew install --cask bobrvm
 
 ## Requirements
 
-- Apple Silicon Mac running macOS 13 or later
+- Apple Silicon Mac running macOS 26 or later
 - Or x86-64 Linux with KVM, GTK 4, and Libadwaita 1.5 or later
 - Nix for the Zig core
-- Xcode and the Swift toolchain for the macOS app
+- Xcode 26 or later and its Swift toolchain for the macOS app
 
 ## Build
 

@@ -51,315 +51,288 @@ struct EditVMView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if isRunning {
-                RunningVMBanner(state: vmInstance.state)
-            }
-
-            Form {
-                Section("General") {
-                    TextField("Name", text: $name)
-                        .onChange(of: name) { _ in hasChanges = true }
-
-                    LabeledContent("Status") {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(vmInstance.state.presentationColor)
-                                .frame(width: 8, height: 8)
-                            Text(vmInstance.state.presentationName)
-                        }
-                    }
-                }
-
-                Section {
-                    if let diskPath = vmInstance.config.diskPath {
-                        LabeledContent("Disk Image") {
-                            VStack(alignment: .trailing, spacing: 4) {
-                                Text(URL(fileURLWithPath: diskPath).lastPathComponent)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-
-                                if let capacity = DiskManager.logicalSize(path: diskPath) {
-                                    let allocated =
-                                        DiskManager.allocatedSize(path: diskPath) ?? capacity
-                                    Text(
-                                        "\(formatBytes(allocated)) used of \(formatBytes(capacity))"
-                                    )
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-
-                        if canGrowDisk && !isRunning {
-                            SettingSlider(
-                                title: "Maximum disk size",
-                                valueText: "\(Int(diskSizeGB)) GB",
-                                value: $diskSizeGB,
-                                range: Double(
-                                    currentDiskSizeGB)...Double(max(1024, currentDiskSizeGB)),
-                                step: 1,
-                                footer: "The disk can grow, but cannot be safely shrunk."
-                            )
-                            .onChange(of: diskSizeGB) { _ in hasChanges = true }
-                        }
-                    }
-
-                    if vmInstance.guestSystem != .macOS {
-                        FilePickerField(
-                            label: "CD/DVD Image",
-                            path: $isoPath,
-                            types: [.iso]
-                        )
-                        .disabled(isRunning)
-                        .onChange(of: isoPath) { _ in hasChanges = true }
-
-                        FilePickerField(
-                            label: "Shared Folder",
-                            path: $sharedFolderPath,
-                            types: [],
-                            selectDirectories: true
-                        )
-                        .disabled(isRunning)
-                        .onChange(of: sharedFolderPath) { _ in hasChanges = true }
-                    }
-                } header: {
-                    Text("Storage")
-                } footer: {
-                    Text(
-                        storageFooter
-                    )
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                }
-
+        NavigationStack {
+            VStack(spacing: 0) {
                 if isRunning {
-                    Section {
-                        ReadOnlyConfigRow(
-                            label: "Memory",
-                            value: "\(Int(memoryGB)) GB",
-                            icon: "memorychip"
-                        )
-
-                        ReadOnlyConfigRow(
-                            label: "CPU Cores",
-                            value: "\(Int(vcpuCount))",
-                            icon: "cpu"
-                        )
-                    } header: {
-                        HStack {
-                            Text("CPU & Memory")
-                            Spacer()
-                            LockedBadge()
-                        }
-                    }
-                } else {
-                    Section {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Memory")
-                                Spacer()
-                                Text("\(Int(memoryGB)) GB")
-                                    .foregroundColor(.secondary)
-                            }
-                            Slider(
-                                value: $memoryGB, in: 1...Double(systemInfo.maxMemoryGB), step: 1
-                            )
-                            .onChange(of: memoryGB) { _ in hasChanges = true }
-                            Text("\(systemInfo.totalMemoryGB) GB total on this Mac")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("CPU Cores")
-                                Spacer()
-                                Text("\(Int(vcpuCount))")
-                                    .foregroundColor(.secondary)
-                            }
-                            Slider(value: $vcpuCount, in: 1...Double(systemInfo.cpuCount), step: 1)
-                                .onChange(of: vcpuCount) { _ in hasChanges = true }
-                            Text("\(systemInfo.cpuCount) cores available")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    } header: {
-                        Text("CPU & Memory")
-                    }
+                    RunningVMBanner(state: vmInstance.state)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 12)
                 }
 
-                if isRunning {
-                    Section {
-                        if vmInstance.guestSystem == .macOS {
-                            ReadOnlyConfigRow(
-                                label: "Graphics",
-                                value: "Apple accelerated graphics",
-                                icon: "gpu"
-                            )
-                        } else {
-                            ReadOnlyConfigRow(
-                                label: "Shared Graphics Memory",
-                                value: "\(Int(vramMB)) MB",
-                                icon: "gpu"
-                            )
-                        }
-                        if vmInstance.guestSystem == .macOS {
-                            ReadOnlyConfigRow(
-                                label: "Maximum Resolution",
-                                value: resolution.label,
-                                icon: "display"
-                            )
-                            ReadOnlyConfigRow(
-                                label: "Retina Resolution",
-                                value: retinaEnabled ? "Full" : "Standard",
-                                icon: "display.2"
-                            )
-                        } else {
-                            Picker("Maximum Guest Resolution", selection: $resolution) {
-                                ForEach(DisplayResolution.presets) { preset in
-                                    Text(preset.label).tag(preset)
-                                }
-                            }
-                            .onChange(of: resolution) { _ in hasChanges = true }
-
-                            Toggle(
-                                "Use full resolution for Retina display",
-                                isOn: $retinaEnabled
-                            )
-                            .onChange(of: retinaEnabled) { _ in hasChanges = true }
-                        }
-                    } header: {
-                        HStack {
-                            Text("Graphics")
-                            if vmInstance.guestSystem == .macOS {
-                                Spacer()
-                                LockedBadge()
-                            }
-                        }
-                    } footer: {
-                        Text(graphicsFooter)
-                    }
-                } else {
-                    Section {
-                        if vmInstance.guestSystem == .macOS {
-                            LabeledContent("Graphics") {
-                                Text("Apple accelerated graphics")
-                                    .foregroundColor(.secondary)
-                            }
-                        } else {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("Shared Graphics Memory")
-                                    Spacer()
-                                    Text("\(Int(vramMB)) MB")
-                                        .foregroundColor(.secondary)
-                                }
-                                Slider(value: $vramMB, in: 64...2048, step: 64)
-                                    .onChange(of: vramMB) { _ in hasChanges = true }
-                            }
-                        }
-
-                        Picker("Maximum Guest Resolution", selection: $resolution) {
-                            ForEach(DisplayResolution.presets) { preset in
-                                Text(preset.label).tag(preset)
-                            }
-                        }
-                        .onChange(of: resolution) { _ in hasChanges = true }
-
-                        Toggle("Use full resolution for Retina display", isOn: $retinaEnabled)
-                            .onChange(of: retinaEnabled) { _ in hasChanges = true }
-                    } header: {
-                        Text("Graphics")
-                    }
+                Form {
+                    generalSection
+                    storageSection
+                    resourcesSection
+                    graphicsSection
+                    networkSection
+                    informationSection
                 }
-
-                Section {
-                    Toggle("Connect Network Adapter", isOn: $networkEnabled)
-                        .disabled(isRunning)
-                        .onChange(of: networkEnabled) { _ in hasChanges = true }
-
-                    LabeledContent("Network") {
-                        Text("Share with my Mac")
-                            .foregroundColor(.secondary)
-                    }
-                } header: {
-                    HStack {
-                        Text("Network Adapter")
-                        if isRunning {
-                            Spacer()
-                            LockedBadge()
-                        }
-                    }
-                } footer: {
-                    Text(
-                        isRunning
-                            ? "Stop the VM to connect or disconnect its network adapter."
-                            : "Uses Bobrvm’s built-in NAT to share the Mac’s "
-                                + "internet connection."
-                    )
-                }
-
-                Section("Information") {
-                    LabeledContent("VM ID") {
-                        Text(vmInstance.id.uuidString)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .foregroundColor(.secondary)
-                    }
-
-                    if let diskPath = vmInstance.config.diskPath {
-                        LabeledContent("Disk Path") {
-                            Text(diskPath)
-                                .font(.system(.caption2, design: .monospaced))
-                                .lineLimit(2)
-                                .textSelection(.enabled)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-            }
-            .formStyle(.grouped)
-            .disabled(isSaving)
-
-            Divider()
-
-            HStack {
-                Button("Cancel") {
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
+                .formStyle(.grouped)
                 .disabled(isSaving)
-
-                Spacer()
-
-                if isSaving {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                        .padding(.trailing, 8)
+            }
+            .navigationTitle("Virtual Machine Settings")
+            .navigationSubtitle(vmInstance.name)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", role: .cancel) {
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isSaving)
                 }
 
-                if isRunning {
-                    Button("Apply") {
+                ToolbarItemGroup(placement: .confirmationAction) {
+                    if isSaving {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("Saving changes")
+                    }
+
+                    Button(saveButtonTitle) {
                         saveChanges()
                     }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!hasChanges || !isValid || isSaving)
-                } else {
-                    Button("Save") {
-                        saveChanges()
-                    }
+                    .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!hasChanges || !isValid || isSaving)
                 }
             }
-            .padding()
         }
-        .frame(width: 520, height: isRunning ? 640 : 720)
+        .frame(
+            minWidth: 560,
+            idealWidth: 620,
+            minHeight: 580,
+            idealHeight: isRunning ? 660 : 740
+        )
         .alert("Error", isPresented: $showingError) {
             Button("OK") {}
         } message: {
             Text(errorMessage)
+        }
+    }
+
+    private var saveButtonTitle: String {
+        isRunning ? "Apply" : "Save"
+    }
+
+    private var generalSection: some View {
+        Section("General") {
+            TextField("Name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: name) { hasChanges = true }
+
+            LabeledContent("Status") {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(vmInstance.state.presentationColor)
+                        .frame(width: 8, height: 8)
+                        .accessibilityHidden(true)
+                    Text(vmInstance.state.presentationName)
+                }
+                .accessibilityElement(children: .combine)
+            }
+        }
+    }
+
+    private var storageSection: some View {
+        Section {
+            if let diskPath = vmInstance.config.diskPath {
+                diskImageRow(path: diskPath)
+
+                if canGrowDisk && !isRunning {
+                    SettingSlider(
+                        title: "Maximum disk size",
+                        valueText: "\(Int(diskSizeGB)) GB",
+                        value: $diskSizeGB,
+                        range: Double(currentDiskSizeGB)...Double(max(1024, currentDiskSizeGB)),
+                        step: 1,
+                        footer: "The disk can grow, but cannot be safely shrunk."
+                    )
+                    .onChange(of: diskSizeGB) { hasChanges = true }
+                }
+            }
+
+            if vmInstance.guestSystem != .macOS {
+                FilePickerField(label: "CD/DVD image", path: $isoPath, types: [.iso])
+                    .disabled(isRunning)
+                    .onChange(of: isoPath) { hasChanges = true }
+
+                FilePickerField(
+                    label: "Shared folder",
+                    path: $sharedFolderPath,
+                    types: [],
+                    selectDirectories: true
+                )
+                .disabled(isRunning)
+                .onChange(of: sharedFolderPath) { hasChanges = true }
+            }
+        } header: {
+            Text("Storage")
+        } footer: {
+            Text(storageFooter)
+        }
+    }
+
+    private var resourcesSection: some View {
+        Section {
+            if isRunning {
+                ReadOnlyConfigRow(
+                    label: "Memory",
+                    value: "\(Int(memoryGB)) GB",
+                    icon: "memorychip"
+                )
+                ReadOnlyConfigRow(
+                    label: "CPU cores",
+                    value: "\(Int(vcpuCount))",
+                    icon: "cpu"
+                )
+            } else {
+                SettingSlider(
+                    title: "Memory",
+                    valueText: "\(Int(memoryGB)) GB",
+                    value: $memoryGB,
+                    range: memoryRangeGB,
+                    step: 1,
+                    footer: "\(systemInfo.totalMemoryGB) GB installed on this Mac."
+                )
+                .onChange(of: memoryGB) { hasChanges = true }
+
+                SettingSlider(
+                    title: "CPU cores",
+                    valueText: "\(Int(vcpuCount))",
+                    value: $vcpuCount,
+                    range: vcpuRange,
+                    step: 1,
+                    footer: "\(systemInfo.cpuCount) cores available on this Mac."
+                )
+                .onChange(of: vcpuCount) { hasChanges = true }
+            }
+        } header: {
+            LockableSectionHeader(title: "CPU & Memory", isLocked: isRunning)
+        }
+    }
+
+    private var graphicsSection: some View {
+        Section {
+            graphicsMemoryRow
+            displayControls
+        } header: {
+            LockableSectionHeader(
+                title: "Graphics",
+                isLocked: isRunning && vmInstance.guestSystem == .macOS
+            )
+        } footer: {
+            if isRunning {
+                Text(graphicsFooter)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var graphicsMemoryRow: some View {
+        if vmInstance.guestSystem == .macOS {
+            LabeledContent("Graphics") {
+                Text("Apple accelerated graphics")
+                    .foregroundStyle(.secondary)
+            }
+        } else if isRunning {
+            ReadOnlyConfigRow(
+                label: "Shared graphics memory",
+                value: "\(Int(vramMB)) MB",
+                icon: "gpu"
+            )
+        } else {
+            SettingSlider(
+                title: "Shared graphics memory",
+                valueText: "\(Int(vramMB)) MB",
+                value: $vramMB,
+                range: vramRangeMB,
+                step: 64,
+                footer: "Memory reserved for the virtual graphics device."
+            )
+            .onChange(of: vramMB) { hasChanges = true }
+        }
+    }
+
+    @ViewBuilder
+    private var displayControls: some View {
+        if isRunning && vmInstance.guestSystem == .macOS {
+            ReadOnlyConfigRow(
+                label: "Maximum resolution",
+                value: resolution.label,
+                icon: "display"
+            )
+            ReadOnlyConfigRow(
+                label: "Retina resolution",
+                value: retinaEnabled ? "Full" : "Standard",
+                icon: "display.2"
+            )
+        } else {
+            Picker("Maximum guest resolution", selection: $resolution) {
+                ForEach(DisplayResolution.presets) { preset in
+                    Text(preset.label).tag(preset)
+                }
+            }
+            .pickerStyle(.menu)
+            .onChange(of: resolution) { hasChanges = true }
+
+            Toggle("Use full resolution on Retina displays", isOn: $retinaEnabled)
+                .onChange(of: retinaEnabled) { hasChanges = true }
+        }
+    }
+
+    private var networkSection: some View {
+        Section {
+            Toggle("Connect network adapter", isOn: $networkEnabled)
+                .disabled(isRunning)
+                .onChange(of: networkEnabled) { hasChanges = true }
+
+            LabeledContent("Connection") {
+                Text("Share with my Mac")
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            LockableSectionHeader(title: "Network", isLocked: isRunning)
+        } footer: {
+            Text(networkFooter)
+        }
+    }
+
+    private var informationSection: some View {
+        Section("Information") {
+            LabeledContent("VM ID") {
+                Text(vmInstance.id.uuidString)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            if let diskPath = vmInstance.config.diskPath {
+                LabeledContent("Disk path") {
+                    Text(diskPath)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private func diskImageRow(path: String) -> some View {
+        LabeledContent("Disk image") {
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(URL(fileURLWithPath: path).lastPathComponent)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                if let capacity = DiskManager.logicalSize(path: path) {
+                    let allocated = DiskManager.allocatedSize(path: path) ?? capacity
+                    Text("\(formatBytes(allocated)) used of \(formatBytes(capacity))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -377,9 +350,27 @@ struct EditVMView: View {
         } ?? false
     }
 
+    private var memoryRangeGB: ClosedRange<Double> {
+        let configuredGB = Double(vmInstance.config.memoryBytes) / (1024 * 1024 * 1024)
+        return min(1, configuredGB)...max(Double(systemInfo.maxMemoryGB), configuredGB)
+    }
+
+    private var vcpuRange: ClosedRange<Double> {
+        let configured = Double(vmInstance.config.vcpuCount)
+        return min(1, configured)...max(Double(systemInfo.cpuCount), configured)
+    }
+
+    private var vramRangeMB: ClosedRange<Double> {
+        let configuredMB = Double(vmInstance.vramMB)
+        return min(64, configuredMB)...max(2048, configuredMB)
+    }
+
     private var storageFooter: String {
+        if vmInstance.guestSystem == .macOS {
+            return "Bobrvm doesn’t currently support changing storage for macOS virtual machines."
+        }
         if isRunning {
-            return "Stop the VM to attach or detach an ISO image."
+            return "Stop the VM to change attached storage or shared folders."
         }
         if canGrowDisk {
             return "Raw disk capacity may only be increased while the VM is stopped."
@@ -393,6 +384,13 @@ struct EditVMView: View {
         }
         return "Resolution and Retina scaling apply immediately. "
             + "Stop the VM to change graphics memory."
+    }
+
+    private var networkFooter: String {
+        if isRunning {
+            return "Stop the VM to connect or disconnect its network adapter."
+        }
+        return "Uses Bobrvm’s built-in NAT to share this Mac’s internet connection."
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
@@ -436,49 +434,56 @@ struct EditVMView: View {
     }
 }
 
-// MARK: - Running VM Banner
-
-struct RunningVMBanner: View {
+private struct RunningVMBanner: View {
     let state: VMState
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: state == .paused ? "pause.circle.fill" : "play.circle.fill")
+            Image(systemName: symbolName)
                 .font(.title2)
-                .foregroundColor(state == .paused ? .orange : .green)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(state == .paused ? "VM is Paused" : "VM is Running")
+                Text(title)
                     .font(.headline)
 
                 Text("Live-safe settings remain editable; stop the VM to change hardware.")
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
 
             Image(systemName: "lock.fill")
-                .foregroundColor(.secondary)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
         }
-        .padding()
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(state == .paused ? Color.orange.opacity(0.1) : Color.green.opacity(0.1))
-        )
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(
-                    state == .paused ? Color.orange.opacity(0.3) : Color.green.opacity(0.3),
-                    lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(tint.opacity(0.25), lineWidth: 1)
         )
-        .padding()
+        .accessibilityElement(children: .combine)
+    }
+
+    private var symbolName: String {
+        state == .paused ? "pause.circle.fill" : "play.circle.fill"
+    }
+
+    private var title: String {
+        state == .paused ? "VM is paused" : "VM is running"
+    }
+
+    private var tint: Color {
+        state == .paused ? .orange : .green
     }
 }
 
-// MARK: - Read-Only Config Row
-
-struct ReadOnlyConfigRow: View {
+private struct ReadOnlyConfigRow: View {
     let label: String
     let value: String
     let icon: String
@@ -486,35 +491,41 @@ struct ReadOnlyConfigRow: View {
     var body: some View {
         LabeledContent {
             Text(value)
-                .foregroundColor(.primary)
                 .fontWeight(.medium)
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: icon)
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
                     .frame(width: 20)
+                    .accessibilityHidden(true)
                 Text(label)
             }
         }
     }
 }
 
-// MARK: - Locked Badge
+private struct LockableSectionHeader: View {
+    let title: String
+    let isLocked: Bool
 
-struct LockedBadge: View {
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "lock.fill")
-                .font(.caption2)
-            Text("Locked")
-                .font(.caption2)
+        HStack {
+            Text(title)
+            if isLocked {
+                Spacer()
+                LockedBadge()
+            }
         }
-        .foregroundColor(.secondary)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(
-            Capsule()
-                .fill(Color.secondary.opacity(0.15))
-        )
+    }
+}
+
+private struct LockedBadge: View {
+    var body: some View {
+        Label("Locked", systemImage: "lock.fill")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(.quaternary, in: Capsule())
     }
 }

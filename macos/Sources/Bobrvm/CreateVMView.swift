@@ -5,6 +5,8 @@ import UniformTypeIdentifiers
 struct CreateVMView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("defaultMemoryGB") private var defaultMemoryGB = 4
+    @AppStorage("defaultVCPUs") private var defaultVCPUs = 2
 
     @State private var step = CreationStep.operatingSystem
     @State private var operatingSystem: CreationOperatingSystem?
@@ -23,33 +25,49 @@ struct CreateVMView: View {
     @State private var isCreating = false
     @State private var installationProgress = 0.0
     @State private var errorMessage: String?
+    @State private var didApplyDefaults = false
 
     private let systemInfo = SystemInfo()
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                CreationStepSidebar(step: step)
-                    .frame(width: 180)
-                Divider()
+        HStack(spacing: 0) {
+            CreationStepSidebar(step: step)
+                .frame(width: 228)
+                .padding(12)
+            Divider()
+            VStack(spacing: 0) {
                 stepContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                footer
             }
-            Divider()
-            footer
         }
-        .frame(width: 720, height: 540)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(
+            minWidth: 760,
+            idealWidth: 860,
+            maxWidth: 1040,
+            minHeight: 580,
+            idealHeight: 660,
+            maxHeight: 820
+        )
+        .presentationSizing(.fitted)
+        .interactiveDismissDisabled(isCreating)
         .disabled(isCreating)
-        .onChange(of: operatingSystem) { selected in
+        .onAppear(perform: applyDefaults)
+        .onChange(of: operatingSystem) { _, selected in
             guard let selected else { return }
             switch selected {
             case .linux:
                 source = .installFromISO
                 updateDefaultName(to: selected)
             case .macOS:
+                guard systemInfo.supportsMacOSGuest else {
+                    operatingSystem = nil
+                    return
+                }
                 source = .installMacOS
                 updateDefaultName(to: selected)
-                memoryGB = max(memoryGB, 8)
+                memoryGB = min(max(memoryGB, 8), Double(systemInfo.maxMemoryGB))
                 vcpuCount = max(vcpuCount, 4)
                 diskSizeGB = max(diskSizeGB, 80)
             case .windows:
@@ -77,7 +95,7 @@ struct CreateVMView: View {
     private var stepContent: some View {
         switch step {
         case .operatingSystem:
-            OperatingSystemStepView(selection: $operatingSystem)
+            OperatingSystemStepView(selection: $operatingSystem, systemInfo: systemInfo)
         case .installation:
             InstallationStepView(
                 operatingSystem: operatingSystem ?? .linux,
@@ -123,44 +141,99 @@ struct CreateVMView: View {
     }
 
     private var footer: some View {
-        HStack {
-            Button("Cancel") { dismiss() }
-                .keyboardShortcut(.cancelAction)
-            Spacer()
-            if step != .operatingSystem {
-                Button("Back") { step = step.previous }
-            }
+        VStack(alignment: .trailing, spacing: 12) {
             if isCreating {
-                if source == .installMacOS {
-                    Text(installationProgress < 0.70 ? "Downloading macOS" : "Installing macOS")
-                        .foregroundStyle(.secondary)
-                    ProgressView(value: installationProgress)
-                        .frame(width: 160)
-                    Text("\(Int(installationProgress * 100))%")
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                } else {
-                    ProgressView().controlSize(.small)
+                creationProgress
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                GlassEffectContainer(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button("Cancel") { dismiss() }
+                            .keyboardShortcut(.cancelAction)
+                            .buttonStyle(.glass)
+                        Spacer(minLength: 24)
+                        if step != .operatingSystem {
+                            Button {
+                                step = step.previous
+                            } label: {
+                                Label("Back", systemImage: "chevron.left")
+                            }
+                            .buttonStyle(.glass)
+                            .accessibilityHint("Returns to \(step.previous.title)")
+                        }
+                        Button {
+                            advance()
+                        } label: {
+                            Label(
+                                step == .summary ? "Create" : "Continue",
+                                systemImage: step == .summary ? "checkmark" : "chevron.right"
+                            )
+                            .labelStyle(.titleAndIcon)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!canContinue)
+                    }
                 }
             }
-            Button(step == .summary ? "Create" : "Continue") {
-                if step == .summary {
-                    createVM()
-                } else {
-                    step = step.next
-                }
-            }
-            .keyboardShortcut(.defaultAction)
-            .disabled(!canContinue)
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+    }
+
+    @ViewBuilder
+    private var creationProgress: some View {
+        if isCreating {
+            if source == .installMacOS {
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(
+                            installationProgress < 0.70
+                                ? "Downloading macOS"
+                                : "Installing macOS"
+                        )
+                        Text("\(Int(installationProgress * 100))%")
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    ProgressView(value: installationProgress)
+                        .frame(width: 172)
+                }
+                .accessibilityElement(children: .combine)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Creating virtual machine")
+            }
+        }
+    }
+
+    private func advance() {
+        if step == .summary {
+            createVM()
+        } else {
+            step = step.next
+        }
+    }
+
+    private func applyDefaults() {
+        guard !didApplyDefaults else { return }
+        didApplyDefaults = true
+        let memoryDefaultGB = systemInfo.clampDefaultMemoryGB(defaultMemoryGB)
+        let vcpuDefault = systemInfo.clampDefaultVCPUCount(defaultVCPUs)
+        defaultMemoryGB = memoryDefaultGB
+        defaultVCPUs = vcpuDefault
+        memoryGB = Double(memoryDefaultGB)
+        vcpuCount = Double(vcpuDefault)
     }
 
     private var canContinue: Bool {
         if isCreating { return false }
         switch step {
         case .operatingSystem:
-            return operatingSystem != nil
+            return operatingSystem.map(systemInfo.supports) ?? false
         case .installation:
             switch source {
             case .installFromISO: return !isoPath.isEmpty
@@ -374,49 +447,122 @@ private struct CreationStepSidebar: View {
     let step: CreationStep
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("New Virtual Machine")
-                .font(.headline)
-                .padding(.bottom, 16)
-            ForEach(CreationStep.allCases, id: \.rawValue) { item in
-                HStack(spacing: 10) {
-                    Image(systemName: item.icon)
-                        .frame(width: 20)
-                    Text(item.title)
-                    Spacer()
+        VStack(alignment: .leading, spacing: 0) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("New Virtual Machine")
+                        .font(.headline)
+                    Text("Setup Assistant")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(item.rawValue <= step.rawValue ? .primary : .secondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(item == step ? Color.accentColor.opacity(0.14) : .clear)
-                .clipShape(RoundedRectangle(cornerRadius: 7))
+            } icon: {
+                Image(systemName: "desktopcomputer")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                    .frame(width: 32, height: 32)
             }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 18)
+
+            VStack(spacing: 6) {
+                ForEach(CreationStep.allCases, id: \.rawValue) { item in
+                    stepRow(item)
+                }
+            }
+
             Spacer()
+
+            Text("Step \(step.rawValue + 1) of \(CreationStep.allCases.count)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .padding(.horizontal, 8)
         }
-        .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .padding(14)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    private func stepRow(_ item: CreationStep) -> some View {
+        HStack(spacing: 11) {
+            Image(systemName: indicatorIcon(for: item))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(indicatorColor(for: item))
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title)
+                    .fontWeight(item == step ? .semibold : .regular)
+                if item == step {
+                    Text("Current step")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(item.rawValue <= step.rawValue ? .primary : .secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background {
+            if item == step {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.14))
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(item.title), \(accessibilityState(for: item))")
+    }
+
+    private func indicatorIcon(for item: CreationStep) -> String {
+        if item.rawValue < step.rawValue {
+            return "checkmark.circle.fill"
+        }
+        return item == step ? "circle.inset.filled" : "circle"
+    }
+
+    private func indicatorColor(for item: CreationStep) -> Color {
+        item.rawValue <= step.rawValue ? .accentColor : .secondary
+    }
+
+    private func accessibilityState(for item: CreationStep) -> String {
+        if item.rawValue < step.rawValue {
+            return "completed"
+        }
+        return item == step ? "current step" : "not yet completed"
     }
 }
 
 private struct OperatingSystemStepView: View {
     @Binding var selection: CreationOperatingSystem?
+    let systemInfo: SystemInfo
 
     var body: some View {
         WizardPage(
             title: "Choose an operating system",
             subtitle: "Select the operating system for this virtual machine."
         ) {
-            ForEach(CreationOperatingSystem.allCases) { operatingSystem in
-                SourceCard(
-                    title: operatingSystem.title,
-                    detail: operatingSystem.detail,
-                    icon: operatingSystem.icon,
-                    selected: selection == operatingSystem
-                ) {
-                    selection = operatingSystem
+            VStack(spacing: 12) {
+                ForEach(CreationOperatingSystem.allCases) { operatingSystem in
+                    SourceCard(
+                        title: operatingSystem.title,
+                        detail: detail(for: operatingSystem),
+                        icon: operatingSystem.icon,
+                        selected: selection == operatingSystem,
+                        badge: systemInfo.supports(operatingSystem) ? nil : "Unavailable",
+                        enabled: systemInfo.supports(operatingSystem)
+                    ) {
+                        selection = operatingSystem
+                    }
                 }
             }
         }
+    }
+
+    private func detail(for operatingSystem: CreationOperatingSystem) -> String {
+        guard operatingSystem == .macOS, !systemInfo.supportsMacOSGuest else {
+            return operatingSystem.detail
+        }
+        return "Requires at least 12 GB of installed memory."
     }
 }
 
@@ -434,84 +580,114 @@ private struct InstallationStepView: View {
             title: "Choose an installation method",
             subtitle: installationSubtitle
         ) {
-            if operatingSystem == .macOS {
-                VStack(alignment: .leading, spacing: 10) {
-                    Picker("macOS Version", selection: $macOSRestoreSource) {
-                        Text("Download latest supported macOS").tag(MacOSRestoreSource.latest)
-                        Text("Use a local IPSW").tag(MacOSRestoreSource.local)
-                    }
-                    if macOSRestoreSource == .local {
-                        FilePickerField(
-                            label: "Restore Image",
-                            path: $ipswPath,
-                            types: [.ipsw]
-                        )
-                    }
-                    Text(
-                        macOSRestoreSource == .latest
-                            ? "Apple’s restore image is roughly 15–25 GB and is cached after "
-                                + "download."
-                            : "Select an Apple restore image compatible with this Mac."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    Text("Installation can take an hour and the VM must remain open.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                SourceCard(
-                    title: "Install from ISO image",
-                    detail: "Create a new disk and boot from installation media.",
-                    icon: "opticaldisc",
-                    selected: source == .installFromISO
-                ) { source = .installFromISO }
-                if source == .installFromISO {
-                    VStack(alignment: .leading, spacing: 10) {
-                        FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
-                        if operatingSystem == .windows {
-                            Button {
-                                showingWindowsDownloader = true
-                            } label: {
-                                Label(
-                                    "Download Windows 11 from Microsoft…",
-                                    systemImage: "arrow.down.circle"
-                                )
-                            }
-                        }
-                    }
-                    .padding(.leading, 44)
-                }
-                SourceCard(
-                    title: "Use an existing virtual disk",
-                    detail: "Boot a raw or QCOW2 disk that already contains "
-                        + "\(operatingSystem.title).",
-                    icon: "externaldrive",
-                    selected: source == .existingDisk
-                ) { source = .existingDisk }
-                if source == .existingDisk {
-                    FilePickerField(
-                        label: "Virtual Disk",
-                        path: $existingDiskPath,
-                        types: [.rawDisk, .qcow2, .diskImage]
-                    )
-                    .padding(.leading, 44)
-                }
-                if operatingSystem == .windows {
-                    Label(
-                        "Windows installation media must support Arm64.",
-                        systemImage: "info.circle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-            }
+            installationOptions
         }
         .sheet(isPresented: $showingWindowsDownloader) {
             WindowsMediaDownloadView { url in
                 isoPath = url.path
             }
         }
+    }
+
+    @ViewBuilder
+    private var installationOptions: some View {
+        if operatingSystem == .macOS {
+            macOSInstallationOptions
+        } else {
+            diskInstallationOptions
+        }
+    }
+
+    private var macOSInstallationOptions: some View {
+        SettingsGroup(title: "Restore Image", systemImage: "shippingbox") {
+            Picker("macOS Version", selection: $macOSRestoreSource) {
+                Text("Download latest supported macOS").tag(MacOSRestoreSource.latest)
+                Text("Use a local IPSW").tag(MacOSRestoreSource.local)
+            }
+            .pickerStyle(.radioGroup)
+            if macOSRestoreSource == .local {
+                Divider()
+                FilePickerField(label: "Restore Image", path: $ipswPath, types: [.ipsw])
+            }
+            Divider()
+            InformationLabel(text: macOSRestoreDescription)
+        }
+    }
+
+    private var diskInstallationOptions: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(spacing: 12) {
+                isoInstallationOption
+                existingDiskOption
+            }
+            if operatingSystem == .windows {
+                InformationLabel(text: "Windows installation media must support Arm64.")
+            }
+        }
+    }
+
+    private var isoInstallationOption: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SourceCard(
+                title: "Install from ISO image",
+                detail: "Create a new disk and boot from installation media.",
+                icon: "opticaldisc",
+                selected: source == .installFromISO
+            ) { source = .installFromISO }
+            if source == .installFromISO {
+                VStack(alignment: .leading, spacing: 12) {
+                    FilePickerField(label: "ISO Image", path: $isoPath, types: [.iso])
+                    windowsDownloadButton
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 4)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var windowsDownloadButton: some View {
+        if operatingSystem == .windows {
+            Button {
+                showingWindowsDownloader = true
+            } label: {
+                Label(
+                    "Download Windows 11 from Microsoft…",
+                    systemImage: "arrow.down.circle"
+                )
+            }
+            .buttonStyle(.glass)
+        }
+    }
+
+    private var existingDiskOption: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SourceCard(
+                title: "Use an existing virtual disk",
+                detail: "Boot a raw or QCOW2 disk that already contains "
+                    + "\(operatingSystem.title).",
+                icon: "externaldrive",
+                selected: source == .existingDisk
+            ) { source = .existingDisk }
+            if source == .existingDisk {
+                FilePickerField(
+                    label: "Virtual Disk",
+                    path: $existingDiskPath,
+                    types: [.rawDisk, .qcow2, .diskImage]
+                )
+                .padding(.horizontal, 16)
+                .padding(.bottom, 4)
+            }
+        }
+    }
+
+    private var macOSRestoreDescription: String {
+        if macOSRestoreSource == .latest {
+            return "Apple’s restore image is roughly 15–25 GB and is cached after download. "
+                + "Installation can take up to an hour and the VM must remain open."
+        }
+        return "Choose an Apple restore image compatible with this Mac. Installation can take "
+            + "up to an hour and the VM must remain open."
     }
 
     private var installationSubtitle: String {
@@ -540,6 +716,13 @@ private struct HardwareStepView: View {
             title: "Configure virtual hardware",
             subtitle: "These settings can be changed later while the virtual machine is stopped."
         ) {
+            performanceSettings
+            displaySettings
+        }
+    }
+
+    private var performanceSettings: some View {
+        SettingsGroup(title: "Performance", systemImage: "cpu") {
             SettingSlider(
                 title: "Processor cores",
                 valueText: "\(Int(vcpuCount))",
@@ -548,6 +731,7 @@ private struct HardwareStepView: View {
                 step: 1,
                 footer: "\(systemInfo.cpuCount) cores available"
             )
+            Divider()
             SettingSlider(
                 title: "Memory",
                 valueText: "\(Int(memoryGB)) GB",
@@ -557,6 +741,7 @@ private struct HardwareStepView: View {
                 footer: "\(systemInfo.totalMemoryGB) GB installed on this Mac"
             )
             if guestSystem != .macOS {
+                Divider()
                 SettingSlider(
                     title: "Shared graphics memory",
                     valueText: "\(Int(vramMB)) MB",
@@ -565,34 +750,41 @@ private struct HardwareStepView: View {
                     step: 128,
                     footer: "Reserved from host memory for the virtual GPU"
                 )
-            } else {
+            }
+        }
+    }
+
+    private var displaySettings: some View {
+        SettingsGroup(title: "Display", systemImage: "display") {
+            if guestSystem == .macOS {
                 Label("Apple accelerated graphics", systemImage: "gpu")
                     .foregroundStyle(.secondary)
+                Divider()
             }
-            Divider()
-            HStack {
-                Text("Maximum guest resolution")
-                Spacer()
+            LabeledContent("Maximum guest resolution") {
                 Picker("Maximum guest resolution", selection: $resolution) {
                     ForEach(DisplayResolution.presets) { preset in
                         Text(preset.label).tag(preset)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 160)
+                .frame(width: 168)
             }
             Text("The guest display follows the VM window up to this framebuffer size.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Divider()
             Toggle("Use full resolution for Retina display", isOn: $retinaEnabled)
-            Text(
-                retinaEnabled
-                    ? "Renders one guest pixel per Retina pixel for sharper output."
-                    : "Renders at standard scale to reduce GPU and memory use."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            Text(retinaDescription)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
+    }
+
+    private var retinaDescription: String {
+        retinaEnabled
+            ? "Renders one guest pixel per Retina pixel for sharper output."
+            : "Renders at standard scale to reduce GPU and memory use."
     }
 }
 
@@ -608,29 +800,32 @@ private struct StorageStepView: View {
                 ? "The disk is sparse and consumes space only as data is written."
                 : "Bobrvm will attach the selected disk without changing its contents."
         ) {
-            if source != .existingDisk {
-                SettingSlider(
-                    title: "Maximum disk size",
-                    valueText: "\(Int(diskSizeGB)) GB",
-                    value: $diskSizeGB,
-                    range: 8...512,
-                    step: 1,
-                    footer: "You can grow this disk later, but it cannot be shrunk safely."
-                )
-                Label(
-                    "A sparse raw disk will be stored in Bobrvm’s Application Support folder.",
-                    systemImage: "internaldrive"
-                )
-                .foregroundStyle(.secondary)
-            } else {
-                SummaryRow(
-                    label: "Virtual disk",
-                    value: URL(fileURLWithPath: existingDiskPath).lastPathComponent
-                )
-                Text(existingDiskPath)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+            SettingsGroup(title: "Virtual Disk", systemImage: "internaldrive") {
+                if source != .existingDisk {
+                    SettingSlider(
+                        title: "Maximum disk size",
+                        valueText: "\(Int(diskSizeGB)) GB",
+                        value: $diskSizeGB,
+                        range: 8...512,
+                        step: 1,
+                        footer: "You can grow this disk later, but it cannot be shrunk safely."
+                    )
+                    Divider()
+                    InformationLabel(
+                        text: "A sparse raw disk will be stored in Bobrvm’s Application "
+                            + "Support folder.",
+                        systemImage: "internaldrive"
+                    )
+                } else {
+                    SummaryRow(
+                        label: "Virtual disk",
+                        value: URL(fileURLWithPath: existingDiskPath).lastPathComponent
+                    )
+                    Text(existingDiskPath)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
             }
         }
     }
@@ -656,31 +851,47 @@ private struct SummaryStepView: View {
             title: "Ready to create",
             subtitle: "Review the configuration, then create the virtual machine."
         ) {
-            LabeledContent("Name") {
-                TextField("Virtual machine name", text: $name)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 240)
+            SettingsGroup(title: "Identity", systemImage: "text.cursor") {
+                LabeledContent("Name") {
+                    TextField("Virtual machine name", text: $name)
+                        .multilineTextAlignment(.trailing)
+                        .frame(minWidth: 180, idealWidth: 240, maxWidth: 280)
+                        .accessibilityHint("Used in the virtual machine library and disk name")
+                }
             }
-            Divider()
-            SummaryRow(label: "Operating System", value: operatingSystem.title)
-            SummaryRow(label: "Processors & Memory", value: "\(vcpuCount) cores, \(memoryGB) GB")
-            SummaryRow(
-                label: "Graphics",
-                value: source == .installMacOS
-                    ? "Apple accelerated, \(resolution.label)"
-                    : "\(vramMB) MB, \(resolution.label)"
-            )
-            SummaryRow(label: "Retina", value: retinaEnabled ? "Full resolution" : "Standard scale")
-            SummaryRow(
-                label: "Disk",
-                value: source != .existingDisk
-                    ? "\(diskSizeGB) GB sparse disk"
-                    : URL(fileURLWithPath: existingDiskPath).lastPathComponent
-            )
-            SummaryRow(
-                label: source == .installMacOS ? "Restore Image" : "CD/DVD",
-                value: installationMediaName
-            )
+            SettingsGroup(title: "Configuration", systemImage: "gearshape") {
+                SummaryRow(label: "Operating System", value: operatingSystem.title)
+                Divider()
+                SummaryRow(
+                    label: "Processors & Memory",
+                    value: "\(vcpuCount) cores, \(memoryGB) GB"
+                )
+                Divider()
+                SummaryRow(
+                    label: "Graphics",
+                    value: source == .installMacOS
+                        ? "Apple accelerated, \(resolution.label)"
+                        : "\(vramMB) MB, \(resolution.label)"
+                )
+                Divider()
+                SummaryRow(
+                    label: "Retina",
+                    value: retinaEnabled ? "Full resolution" : "Standard scale"
+                )
+                Divider()
+                SummaryRow(
+                    label: "Disk",
+                    value: source != .existingDisk
+                        ? "\(diskSizeGB) GB sparse disk"
+                        : URL(fileURLWithPath: existingDiskPath).lastPathComponent
+                )
+            }
+            SettingsGroup(title: "Installation Media", systemImage: "opticaldisc") {
+                SummaryRow(
+                    label: source == .installMacOS ? "Restore Image" : "CD/DVD",
+                    value: installationMediaName
+                )
+            }
         }
     }
 
@@ -705,14 +916,28 @@ private struct WizardPage<Content: View>: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Text(title).font(.title2.bold())
-                Text(subtitle).foregroundStyle(.secondary)
-                content
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(title)
+                        .font(.title)
+                        .fontWeight(.semibold)
+                        .accessibilityAddTraits(.isHeader)
+                    Text(subtitle)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                VStack(alignment: .leading, spacing: 18) {
+                    content
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Spacer(minLength: 0)
             }
-            .padding(28)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: 680, alignment: .leading)
+            .padding(.horizontal, 36)
+            .padding(.top, 34)
+            .padding(.bottom, 28)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
     }
 }
@@ -728,13 +953,22 @@ private struct SourceCard: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 14) {
-                Image(systemName: icon).font(.title2).frame(width: 30)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).fontWeight(.medium)
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 16) {
+                Image(systemName: icon)
+                    .font(.title2)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(selected ? Color.accentColor : Color.primary)
+                    .frame(width: 34, height: 34)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.body.weight(.medium))
+                    Text(detail)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer()
+                Spacer(minLength: 12)
                 if let badge {
                     Text(badge)
                         .font(.caption.weight(.medium))
@@ -745,19 +979,70 @@ private struct SourceCard: View {
                 } else {
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(selected ? Color.accentColor : .secondary)
+                        .accessibilityHidden(true)
                 }
             }
             .contentShape(Rectangle())
-            .padding(12)
-            .background(selected ? Color.accentColor.opacity(0.08) : .clear)
-            .overlay(
-                RoundedRectangle(cornerRadius: 9)
-                    .stroke(selected ? Color.accentColor : Color.secondary.opacity(0.25))
-            )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(.regularMaterial)
+                if selected {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.12))
+                }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(
+                        selected ? Color.accentColor : Color(nsColor: .separatorColor),
+                        lineWidth: selected ? 1.5 : 1
+                    )
+            }
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.62)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title). \(detail)")
+        .accessibilityValue(selected ? "Selected" : "Not selected")
+    }
+}
+
+private struct SettingsGroup<Content: View>: View {
+    let title: String
+    let systemImage: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 14) {
+                content
+            }
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+        }
+    }
+}
+
+private struct InformationLabel: View {
+    let text: String
+    var systemImage = "info.circle"
+
+    var body: some View {
+        Label {
+            Text(text)
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: systemImage)
+                .symbolRenderingMode(.hierarchical)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
     }
 }
 
@@ -773,11 +1058,18 @@ struct SettingSlider: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(title)
+                    .fontWeight(.medium)
                 Spacer()
-                Text(valueText).monospacedDigit().foregroundStyle(.secondary)
+                Text(valueText)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
             }
             Slider(value: $value, in: range, step: step)
-            Text(footer).font(.caption).foregroundStyle(.secondary)
+                .accessibilityLabel(title)
+                .accessibilityValue(valueText)
+            Text(footer)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -899,11 +1191,31 @@ struct SystemInfo {
     let maxMemoryGB: Int
     let cpuCount: Int
 
+    var defaultMemoryOptionsGB: [Int] {
+        [1, 2, 4, 8, 16, 32, 64, 128].filter { $0 <= maxMemoryGB }
+    }
+
+    var supportsMacOSGuest: Bool {
+        maxMemoryGB >= 8
+    }
+
     init() {
         let processInfo = ProcessInfo.processInfo
         totalMemoryGB = Int(processInfo.physicalMemory / (1024 * 1024 * 1024))
         maxMemoryGB = max(1, totalMemoryGB - 4)
         cpuCount = max(1, processInfo.processorCount)
+    }
+
+    func clampDefaultMemoryGB(_ value: Int) -> Int {
+        defaultMemoryOptionsGB.last(where: { $0 <= value }) ?? defaultMemoryOptionsGB[0]
+    }
+
+    func clampDefaultVCPUCount(_ value: Int) -> Int {
+        min(max(1, value), cpuCount)
+    }
+
+    fileprivate func supports(_ operatingSystem: CreationOperatingSystem) -> Bool {
+        operatingSystem != .macOS || supportsMacOSGuest
     }
 }
 
@@ -915,11 +1227,12 @@ struct FilePickerField: View {
 
     var body: some View {
         LabeledContent(label) {
-            HStack {
+            HStack(spacing: 8) {
                 Text(path.isEmpty ? "None selected" : URL(fileURLWithPath: path).lastPathComponent)
                     .foregroundStyle(path.isEmpty ? .secondary : .primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(path)
                 if !path.isEmpty {
                     Button {
                         path = ""
@@ -929,14 +1242,20 @@ struct FilePickerField: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .help("Clear selection")
+                    .accessibilityLabel("Clear \(label) selection")
                 }
                 Button("Choose…", action: selectFile)
+                    .buttonStyle(.glass)
+                    .accessibilityLabel("Choose \(label)")
             }
         }
+        .accessibilityValue(path.isEmpty ? "No file selected" : path)
     }
 
     private func selectFile() {
         let panel = NSOpenPanel()
+        panel.title = "Choose \(label)"
+        panel.prompt = "Choose"
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = selectDirectories
         panel.canChooseFiles = !selectDirectories
