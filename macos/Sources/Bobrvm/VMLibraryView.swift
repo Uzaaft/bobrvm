@@ -546,11 +546,15 @@ struct GuestSystemIcon: View {
 
     var body: some View {
         system.presentationImage
-            .font(.system(size: size * 0.42, weight: .semibold))
+            .font(.system(size: size * glyphScale, weight: .semibold))
             .foregroundStyle(glyphColor)
             .frame(width: size, height: size)
             .background(tileColor.gradient, in: .rect(cornerRadius: size * 0.24))
             .accessibilityHidden(true)
+    }
+
+    private var glyphScale: CGFloat {
+        system == .linux ? 0.52 : 0.42
     }
 
     // The macOS and Windows marks invert in dark mode: the brand color

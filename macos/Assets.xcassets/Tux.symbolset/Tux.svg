@@ -115,10 +115,22 @@
       />
     </g>
     <g id="Regular-S" transform="matrix(1 0 0 1 1405.73 696)">
-      <use xlink:href="#tux-source"/>
+      <use
+        xlink:href="#tux-source"
+        fill="black"
+        stroke="black"
+        stroke-width="10"
+        stroke-linejoin="round"
+      />
     </g>
     <g id="Black-S" transform="matrix(1 0 0 1 2294.23 696)">
-      <use xlink:href="#tux-source"/>
+      <use
+        xlink:href="#tux-source"
+        fill="black"
+        stroke="black"
+        stroke-width="30"
+        stroke-linejoin="round"
+      />
     </g>
   </g>
 </svg>
