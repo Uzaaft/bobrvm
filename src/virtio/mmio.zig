@@ -367,16 +367,13 @@ pub const Transport = struct {
         // Firmware can reset a device without first acknowledging its interrupt.
         // Drop the level before clearing the status so the next driver receives
         // a fresh edge when the machine routes legacy PCI interrupts through a PIC.
-        if (@as(u32, @bitCast(self.interrupt_status)) != 0) {
-            if (self.irq) |irq| irq.call(false);
-        }
+        if (self.irq) |irq| irq.call(false);
         self.status = .{};
         self.driver_features = 0;
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
         self.queue_sel = 0;
         self.interrupt_status = .{};
-        if (self.irq) |irq| irq.call(false);
 
         for (self.queues) |*q| {
             q.* = QueueConfig{};
@@ -464,6 +461,27 @@ test "Transport reset deasserts a pending interrupt" {
 
     try std.testing.expect(!line.level);
     try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(transport.interrupt_status)));
+}
+
+test "Transport reset deasserts the interrupt line once" {
+    const transport = try Transport.init(std.testing.allocator, 3, 0, 1);
+    defer transport.deinit(std.testing.allocator);
+
+    const Line = struct {
+        calls: usize = 0,
+
+        fn cb(_: bool, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.calls += 1;
+        }
+    };
+    var line = Line{};
+    transport.setIrqCallback(Irq.initRaw(Line.cb, &line));
+
+    transport.signalUsedBuffer();
+    transport.reset();
+
+    try std.testing.expectEqual(@as(usize, 2), line.calls);
 }
 
 test "Transport config change raises and ack clears the interrupt line" {

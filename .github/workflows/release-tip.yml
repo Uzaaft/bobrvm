@@ -1,0 +1,123 @@
+name: Tip release
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tip-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build and publish
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+
+    steps:
+      - name: Check out tested source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.REVISION }}
+
+      - name: Restore Zig cache
+        uses: actions/cache@v4
+        env:
+          DEPS: ${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig.zon.nix') }}
+        with:
+          path: |
+            .zig-cache/global
+            .zig-cache/local
+            .zig-cache/ghostty
+          key: bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS }}-${{ env.REVISION }}
+          restore-keys: |
+            bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS }}-
+            bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore Xcode compilation cache
+        uses: actions/cache@v4
+        env:
+          XCODE_HASH: ${{ hashFiles('macos/Bobrvm.xcodeproj/project.pbxproj') }}
+        with:
+          path: ${{ runner.temp }}/bobrvm-xcode-cache
+          key: bobrvm-xcode-macos-15-${{ env.XCODE_HASH }}-${{ env.REVISION }}
+          restore-keys: |
+            bobrvm-xcode-macos-15-${{ env.XCODE_HASH }}-
+            bobrvm-xcode-macos-15-
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Restore and save Nix artifacts
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+
+      - name: Build Zig dependency directory
+        id: deps
+        run: |
+          path=$(nix build --no-link --print-out-paths .#deps)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build release frameworks
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
+        run: |
+          nix develop -c zig build \
+            xcframework \
+            ghostty-lib \
+            --system "${{ steps.deps.outputs.path }}" \
+            -Demit-macos-app=false \
+            -Doptimize=ReleaseFast
+
+      # Keep the native toolchain outside `nix develop`; only the Zig
+      # framework preparation above uses the Nix environment.
+      - name: Build SwiftUI app
+        run: |
+          xcodebuild \
+            -project macos/Bobrvm.xcodeproj \
+            -scheme Bobrvm \
+            -configuration Release \
+            "SYMROOT=$PWD/macos/build" \
+            CODE_SIGNING_ALLOWED=YES \
+            ONLY_ACTIVE_ARCH=YES \
+            "COMPILATION_CACHE_CAS_PATH=$RUNNER_TEMP/bobrvm-xcode-cache" \
+            COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES \
+            build
+
+      - name: Package app
+        run: |
+          app="macos/build/Release/Bobrvm.app"
+          test -d "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" Bobrvm-tip-arm64.zip
+
+      - name: Publish tip release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        with:
+          name: Tip
+          prerelease: true
+          tag_name: tip
+          target_commitish: ${{ env.REVISION }}
+          files: Bobrvm-tip-arm64.zip

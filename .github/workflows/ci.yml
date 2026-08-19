@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zig:
+    name: Zig and Nix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Restore and save Nix artifacts
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+
+      - name: Check Nix formatting
+        run: nix develop -c alejandra --check flake.nix nix/*.nix
+
+      - name: Check Zig formatting
+        run: nix develop -c zig fmt --check .
+
+      - name: Evaluate the flake
+        run: nix flake check --no-build
+
+      - name: Build and test Zig
+        run: nix build --print-build-logs .#checks.x86_64-linux.test
+
+  swift:
+    name: Swift and Xcode
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Restore Zig cache
+        uses: actions/cache@v4
+        env:
+          DEPS_HASH: ${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig.zon.nix') }}
+        with:
+          path: |
+            .zig-cache/global
+            .zig-cache/local
+            .zig-cache/ghostty
+          key: bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS_HASH }}-${{ github.sha }}
+          restore-keys: |
+            bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS_HASH }}-
+            bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore Xcode compilation cache
+        uses: actions/cache@v4
+        env:
+          XCODE_HASH: ${{ hashFiles('macos/Bobrvm.xcodeproj/project.pbxproj') }}
+        with:
+          path: ${{ runner.temp }}/bobrvm-xcode-cache
+          key: bobrvm-xcode-macos-15-${{ env.XCODE_HASH }}-${{ github.sha }}
+          restore-keys: |
+            bobrvm-xcode-macos-15-${{ env.XCODE_HASH }}-
+            bobrvm-xcode-macos-15-
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Restore and save Nix artifacts
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+
+      - name: Build Zig dependency directory
+        id: deps
+        run: |
+          path=$(nix build --no-link --print-out-paths .#deps)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      # Zig owns the C ABI and framework. Xcode is invoked separately below so
+      # Nix's compiler environment never leaks into the native Swift build.
+      - name: Build app frameworks
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
+        run: |
+          nix develop -c zig build \
+            xcframework \
+            ghostty-lib \
+            --system "${{ steps.deps.outputs.path }}" \
+            -Demit-macos-app=false
+
+      - name: Run Swift tests
+        run: |
+          xcodebuild \
+            -project macos/Bobrvm.xcodeproj \
+            -scheme Bobrvm \
+            -configuration Debug \
+            "SYMROOT=$PWD/macos/build" \
+            CODE_SIGNING_ALLOWED=YES \
+            ONLY_ACTIVE_ARCH=YES \
+            "COMPILATION_CACHE_CAS_PATH=$RUNNER_TEMP/bobrvm-xcode-cache" \
+            COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES \
+            test
+
+  hypervisor:
+    name: Hypervisor integration
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, bobrvm-hypervisor]
+    timeout-minutes: 30
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Restore Zig cache
+        uses: actions/cache@v4
+        env:
+          DEPS_HASH: ${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig.zon.nix') }}
+        with:
+          path: |
+            .zig-cache/global
+            .zig-cache/local
+          key: bobrvm-hvf-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS_HASH }}-${{ github.sha }}
+          restore-keys: |
+            bobrvm-hvf-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS_HASH }}-
+            bobrvm-hvf-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Restore and save Nix artifacts
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+
+      - name: Build Zig dependency directory
+        id: deps
+        run: |
+          path=$(nix build --no-link --print-out-paths .#deps)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Run two-vCPU Hypervisor.framework test
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
+        run: |
+          nix develop -c zig build \
+            test-bare-metal \
+            --system "${{ steps.deps.outputs.path }}"
+
+  required:
+    name: "Required Checks: CI"
+    if: always()
+    needs: [zig, swift, hypervisor]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check required jobs
+        env:
+          HYPERVISOR_RESULT: ${{ needs.hypervisor.result }}
+          SWIFT_RESULT: ${{ needs.swift.result }}
+          ZIG_RESULT: ${{ needs.zig.result }}
+        run: |
+          test "$ZIG_RESULT" = success
+          test "$SWIFT_RESULT" = success
+          test "$HYPERVISOR_RESULT" = success || test "$HYPERVISOR_RESULT" = skipped

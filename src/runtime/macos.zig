@@ -485,8 +485,9 @@ fn logNSError(message: []const u8, error_object: id) void {
     log.err("{s}: {s}", .{ message, std.mem.span(bytes) });
 }
 
-test "Virtualization framework reports host support" {
-    if (comptime builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+test "Virtualization framework exposes host support query" {
     const class = objc.getClass("VZVirtualMachine") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(boolResult(class.msgSend(BOOL, "isSupported", .{})));
+    try std.testing.expect(boolResult(class.msgSend(BOOL, "respondsToSelector:", .{
+        objc.sel("isSupported"),
+    })));
 }

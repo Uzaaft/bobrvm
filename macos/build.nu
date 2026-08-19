@@ -10,6 +10,8 @@ def main [
 ] {
     let project = ($env.FILE_PWD | path join "Bobrvm.xcodeproj")
     let build_dir = ($env.FILE_PWD | path join "build")
+    let xcode_cache = ($env.HOME |
+        path join "Library/Developer/Xcode/DerivedData/CompilationCache.noindex")
 
     (^env -i
         $"HOME=($env.HOME)"
@@ -21,5 +23,7 @@ def main [
         $"SYMROOT=($build_dir)"
         CODE_SIGNING_ALLOWED=YES
         ONLY_ACTIVE_ARCH=YES
+        $"COMPILATION_CACHE_CAS_PATH=($xcode_cache)"
+        COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
         $action)
 }

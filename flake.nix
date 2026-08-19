@@ -58,7 +58,6 @@
           default = bobrvm;
 
           deps = zigDeps;
-          framework-deps = bobrvm.zigDeps;
 
           test = pkgs.callPackage ./nix/test.nix {inherit zig;};
         }

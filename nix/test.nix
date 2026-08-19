@@ -51,15 +51,29 @@ stdenv.mkDerivation (finalAttrs: {
     }
     done
     zig build bare-metal-test
-    zig build test-fuzz-virtqueue --fuzz=100K
-    zig build test-fuzz-virgl-decoder --fuzz=100K
-    zig build test-fuzz-agent-protocol --fuzz=100K
-    zig build test-fuzz-snapshot-container --fuzz=100K
-    zig build test-fuzz-p9 --fuzz=100K
-    zig build test-fuzz-virtio-mmio --fuzz=100K
-    zig build test-fuzz-pci --fuzz=100K
-    zig build test-fuzz-gic --fuzz=100K
-    zig build test-fuzz-tgsi --fuzz=100K
+    run_fuzz() {
+      local step="$1"
+      local log="$TMPDIR/$step.log"
+
+      zig build "$step" --fuzz=100K 2>&1 | tee "$log"
+      local status="''${PIPESTATUS[0]}"
+      if [[ "$status" -ne 0 ]] ||
+        grep -Fq "run test failure" "$log" ||
+        grep -Fq "input saved to" "$log"
+      then
+        echo "$step found a failing input" >&2
+        return 1
+      fi
+    }
+    run_fuzz test-fuzz-virtqueue
+    run_fuzz test-fuzz-virgl-decoder
+    run_fuzz test-fuzz-agent-protocol
+    run_fuzz test-fuzz-snapshot-container
+    run_fuzz test-fuzz-p9
+    run_fuzz test-fuzz-virtio-mmio
+    run_fuzz test-fuzz-pci
+    run_fuzz test-fuzz-gic
+    run_fuzz test-fuzz-tgsi
     runHook postBuild
   '';
 
