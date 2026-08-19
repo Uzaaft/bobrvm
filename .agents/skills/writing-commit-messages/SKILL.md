@@ -8,13 +8,12 @@ description: >-
 
 # Writing Commit Messages
 
-Write commit messages that follow bobrvm's commit style, and apply them
-with Jujutsu. This repository is jj-colocated: never use `git commit`.
+Write commit messages that follow commit style guidelines for the project.
 
 ## Format
 
 ```
-<type>(<scope>): <summary>
+<subsystem>: <summary>
 
 <reference issues/PRs/etc.>
 
@@ -25,11 +24,8 @@ with Jujutsu. This repository is jj-colocated: never use `git commit`.
 
 ### Subject line
 
-- **Type**: one of `feat`, `fix`, `build`, `docs`, `test`, `perf`,
-  `refactor`, `ci`, `chore`. Bare `<scope>: <summary>` (no type) also
-  appears in history and is acceptable for small mechanical changes;
-  prefer the typed form.
-- **Scope**: the subsystem, determined from the changed file paths:
+
+- **Subsystem**: the subsystem, determined from the changed file paths:
   `hypervisor`, `virtio`, `pci`, `gic`, `gpu`, `renderer`, `net`,
   `machine`, `snapshot`, `cli`, `agent`, `guest-tools`, `p9`,
   `runtime`, `apprt`, `console`. Changes to the macOS app use `macos`,
@@ -58,29 +54,11 @@ with Jujutsu. This repository is jj-colocated: never use `git commit`.
 
 ## Workflow
 
-Use `jj` for every step. The colocated git repo is written by jj's
-export; commits made with `git commit` get clobbered when jj exports
-its working-copy change over git HEAD.
-
-- `jj st` and `jj diff` to see what the working-copy change contains.
-- Identify the scope from the changed file paths.
-- Identify any referenced issues/PRs from the diff context.
-- Draft the message following the format above.
-- Apply it to the working-copy change, one `-m` per paragraph:
-
-  ```sh
-  jj describe -m "type(scope): summary" -m "long form paragraph"
-  ```
-
-- Start the next change with `jj new`.
-- Don't push; leave that to the user.
-
-### Pitfalls
-
-- Never put backticks in `-m` arguments — the shell runs them as a
-  subshell and the words vanish. Reword, or single-quote the argument.
-- Do not fall back to `git commit`, even with signing disabled: 1Password
-  commit signing fails in non-interactive shells, and jj's export will
-  reset git HEAD over the commit anyway.
-- `jj` auto-snapshots the working copy; there is no staging step and
-  nothing to `git add`.
+- If `.jj` is present, use `jj` instead of `git` for all commands.
+- Run a diff to see what changes are present since the last commit.
+- Identify the subsystem from the changed file paths.
+- Identify any referenced issues/PRs from the diff context or
+  branch name.
+- Draft the commit message following the format above.
+- Apply the commit
+- Don't push the commit; leave that to the user.
