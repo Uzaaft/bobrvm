@@ -174,6 +174,18 @@ zig build cli -- run --kernel Image --initrd initrd \
   --cmdline 'console=hvc0 ...'
 ```
 
+Set `BOBRVM_BENCHMARK_STARTUP=1` to stop after host-side VM and primary-vCPU
+setup and emit phase timings. The same variable makes `vz-run` stop after
+Virtualization.framework completes its asynchronous start, so the two engines
+can be profiled without waiting for a guest shutdown:
+
+```sh
+BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm run \
+  --kernel Image --initrd initrd
+BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm vz-run \
+  --kernel Image --initrd initrd
+```
+
 ## Guest tools
 
 The flake exports `packages.aarch64-linux.bobrvm-tools` and

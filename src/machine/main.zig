@@ -44,6 +44,46 @@ const enable_debug_logs = builtin.mode == .Debug;
 // all vCPU threads for guest memory access.
 var current_machine: ?*Machine = null;
 
+const StartupProfile = struct {
+    hypervisor_ns: u64 = 0,
+    firmware_ns: u64 = 0,
+    ram_ns: u64 = 0,
+    dtb_ns: u64 = 0,
+    gic_ns: u64 = 0,
+    devices_ns: u64 = 0,
+    vcpu_create_ns: u64 = 0,
+    vcpu_setup_ns: u64 = 0,
+    restore_ns: u64 = 0,
+    total_ns: u64 = 0,
+};
+
+const PflashEraseJob = struct {
+    code: []u8,
+    vars: []u8,
+    start: usize,
+    end: usize,
+
+    fn run(self: *const PflashEraseJob) void {
+        if (self.start < self.code.len) {
+            @memset(self.code[self.start..@min(self.end, self.code.len)], 0xFF);
+        }
+        if (self.end > self.code.len) {
+            const vars_start = self.start -| self.code.len;
+            @memset(self.vars[vars_start .. self.end - self.code.len], 0xFF);
+        }
+    }
+};
+
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
+fn finishStartupStep(field: *u64, step_started_ns: *u64) void {
+    const now_ns = monotonicNs();
+    field.* = now_ns - step_started_ns.*;
+    step_started_ns.* = now_ns;
+}
+
 fn withGicSystemRegisters(pfr0: u64) u64 {
     return (pfr0 & ~ID_AA64PFR0_GIC_MASK) | (@as(u64, 1) << ID_AA64PFR0_GIC_SHIFT);
 }
@@ -1614,7 +1654,30 @@ pub const Machine = struct {
     /// Perform every startup step through primary vCPU register setup, then return.
     pub fn benchmarkStartupSync(self: *Machine) Error!void {
         self.prepareStart();
-        return self.startSyncPreparedMode(.setup_only);
+        var profile = StartupProfile{};
+        try self.startSyncPreparedMode(.setup_only, &profile);
+        log.info(
+            "startup profile (Hypervisor.framework): total={}us hv={}us firmware={}us " ++
+                "ram={}us dtb={}us gic={}us devices={}us",
+            .{
+                profile.total_ns / std.time.ns_per_us,
+                profile.hypervisor_ns / std.time.ns_per_us,
+                profile.firmware_ns / std.time.ns_per_us,
+                profile.ram_ns / std.time.ns_per_us,
+                profile.dtb_ns / std.time.ns_per_us,
+                profile.gic_ns / std.time.ns_per_us,
+                profile.devices_ns / std.time.ns_per_us,
+            },
+        );
+        log.info(
+            "startup profile (Hypervisor.framework): vcpu-create={}us vcpu-setup={}us " ++
+                "restore={}us",
+            .{
+                profile.vcpu_create_ns / std.time.ns_per_us,
+                profile.vcpu_setup_ns / std.time.ns_per_us,
+                profile.restore_ns / std.time.ns_per_us,
+            },
+        );
     }
 
     pub fn prepareStart(self: *Machine) void {
@@ -1625,14 +1688,20 @@ pub const Machine = struct {
     }
 
     pub fn startSyncPrepared(self: *Machine) Error!void {
-        return self.startSyncPreparedMode(.run);
+        return self.startSyncPreparedMode(.run, null);
     }
 
     const SyncStartMode = enum { run, setup_only };
 
-    fn startSyncPreparedMode(self: *Machine, mode: SyncStartMode) Error!void {
+    fn startSyncPreparedMode(
+        self: *Machine,
+        mode: SyncStartMode,
+        profile: ?*StartupProfile,
+    ) Error!void {
         assert(!self.running.load(.acquire));
         assert(self.hv_vm == null);
+        const startup_started_ns = if (profile != null) monotonicNs() else 0;
+        var step_started_ns = startup_started_ns;
         try self.checkStartupCancelled();
         log.info("starting machine (sync)", .{});
 
@@ -1640,6 +1709,7 @@ pub const Machine = struct {
         self.hv_vm = try hypervisor.VM.create(self.alloc);
         errdefer self.cleanupHypervisor();
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.hypervisor_ns, &step_started_ns);
 
         const vm = self.hv_vm.?;
 
@@ -1653,10 +1723,12 @@ pub const Machine = struct {
             try self.loadFirmware();
             try self.checkStartupCancelled();
         }
+        if (profile) |value| finishStartupStep(&value.firmware_ns, &step_started_ns);
 
         // Map guest RAM
         try self.mapGuestRam(vm);
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.ram_ns, &step_started_ns);
         log.debug("mapped RAM: 0x{x} - 0x{x}", .{
             MemoryLayout.RAM_BASE,
             MemoryLayout.RAM_BASE + self.config.ram_size,
@@ -1669,26 +1741,31 @@ pub const Machine = struct {
             try self.generateDtb();
             try self.checkStartupCancelled();
         }
+        if (profile) |value| finishStartupStep(&value.dtb_ns, &step_started_ns);
 
         // Initialize GIC (interrupt controller)
         try self.initGic();
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.gic_ns, &step_started_ns);
 
         // Initialize virtio devices
         try self.initVirtioDevices();
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.devices_ns, &step_started_ns);
 
         // Set current machine for guest memory access
         current_machine = self;
 
         // Create vCPU on THIS thread (required by Apple Hypervisor)
         const vcpu = try vm.createVcpu();
+        if (profile) |value| finishStartupStep(&value.vcpu_create_ns, &step_started_ns);
         log.debug("created vCPU on main thread", .{});
 
         // Set up initial vCPU state (as vCPU 0 - the boot CPU)
         try self.setupVcpuState(vcpu, 0);
         self.cpu_states[0].vcpu = vcpu;
         self.cpu_states[0].started.store(true, .release);
+        if (profile) |value| finishStartupStep(&value.vcpu_setup_ns, &step_started_ns);
 
         // Restoring: we ARE vCPU 0's owning thread here, so registers,
         // RAM, and device state can be applied directly before running.
@@ -1702,6 +1779,10 @@ pub const Machine = struct {
             };
         }
         try self.checkStartupCancelled();
+        if (profile) |value| {
+            finishStartupStep(&value.restore_ns, &step_started_ns);
+            value.total_ns = monotonicNs() - startup_started_ns;
+        }
 
         self.running.store(true, .release);
         log.info("machine started, running vCPU loop", .{});
@@ -2331,6 +2412,55 @@ pub const Machine = struct {
             MemoryLayout.PFLASH_VARS_BASE,
             MemoryLayout.PFLASH_VARS_BASE + MemoryLayout.PFLASH_VARS_SIZE,
         });
+
+        self.erasePflash();
+    }
+
+    fn erasePflash(self: *Machine) void {
+        const code = self.pflash_code.?;
+        const vars = self.pflash_vars.?;
+        const worker_count_max = 8;
+        const worker_count = @min(
+            std.Thread.getCpuCount() catch 4,
+            worker_count_max,
+        );
+        assert(worker_count > 0);
+        const total_bytes = code.len + vars.len;
+        const chunk_bytes_unaligned = std.math.divCeil(
+            usize,
+            total_bytes,
+            worker_count,
+        ) catch unreachable;
+        const chunk_bytes = std.mem.alignForward(
+            usize,
+            chunk_bytes_unaligned,
+            std.heap.pageSize(),
+        );
+        var jobs: [worker_count_max]PflashEraseJob = undefined;
+        var threads: [worker_count_max - 1]?std.Thread = @splat(null);
+
+        // Anonymous mappings start at zero, but flash must read as erased
+        // (0xFF). Fault the independent banks in parallel; serial first-touch
+        // dominates UEFI host startup on large QEMU-compatible flash windows.
+        for (0..worker_count) |index| {
+            jobs[index] = .{
+                .code = code,
+                .vars = vars,
+                .start = index * chunk_bytes,
+                .end = @min((index + 1) * chunk_bytes, total_bytes),
+            };
+        }
+        for (threads[0 .. worker_count - 1], jobs[0 .. worker_count - 1]) |*thread, *job| {
+            thread.* = std.Thread.spawn(
+                .{ .stack_size = 64 * 1024 },
+                PflashEraseJob.run,
+                .{job},
+            ) catch null;
+        }
+        jobs[worker_count - 1].run();
+        for (threads[0 .. worker_count - 1], jobs[0 .. worker_count - 1]) |thread, *job| {
+            if (thread) |worker| worker.join() else job.run();
+        }
     }
 
     fn loadFirmware(self: *Machine) !void {
@@ -2350,9 +2480,6 @@ pub const Machine = struct {
 
         const pflash = self.pflash_code.?;
 
-        // Zero-fill the pflash region first (firmware may be smaller than region)
-        @memset(pflash, 0xFF); // Flash is typically 0xFF when erased
-
         // Read firmware into pflash CODE region (bounded to the file's own
         // size — see loadKernel for why we don't pass the whole region).
         const bytes_read = try file.readPositionalAll(global.io(), pflash[0..firmware_size], 0);
@@ -2364,9 +2491,6 @@ pub const Machine = struct {
 
     fn loadOrCreateVars(self: *Machine) !void {
         const pflash_vars = self.pflash_vars.?;
-
-        // Initialize VARS region to 0xFF (erased flash)
-        @memset(pflash_vars, 0xFF);
 
         // If vars_path is specified, try to load existing vars
         if (self.config.vars_path) |vars_path| {
@@ -3611,6 +3735,24 @@ test "withGicSystemRegisters advertises GICv3 without changing other features" {
 
     try std.testing.expectEqual(@as(u64, 1), (updated & ID_AA64PFR0_GIC_MASK) >> 24);
     try std.testing.expectEqual(pfr0 & ~ID_AA64PFR0_GIC_MASK, updated & ~ID_AA64PFR0_GIC_MASK);
+}
+
+test "pflash erase job handles a bank boundary without touching adjacent bytes" {
+    var code: [8]u8 = @splat(0);
+    var vars: [8]u8 = @splat(0);
+    const job = PflashEraseJob{
+        .code = &code,
+        .vars = &vars,
+        .start = 4,
+        .end = 12,
+    };
+
+    job.run();
+
+    try std.testing.expect(std.mem.allEqual(u8, code[0..4], 0));
+    try std.testing.expect(std.mem.allEqual(u8, code[4..], 0xFF));
+    try std.testing.expect(std.mem.allEqual(u8, vars[0..4], 0xFF));
+    try std.testing.expect(std.mem.allEqual(u8, vars[4..], 0));
 }
 
 test "MachineConfig.isFirmwareBoot" {

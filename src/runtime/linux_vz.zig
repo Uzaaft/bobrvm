@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const objc = @import("objc");
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 
 const Object = objc.Object;
 const id = objc.c.id;
@@ -60,6 +61,20 @@ pub const State = enum(NSInteger) {
 
 pub const Machine = struct {
     vm: Object,
+    startup_started_ns: u64,
+    startup_profile: StartupProfile,
+
+    const StartupProfile = struct {
+        boot_loader_ns: u64 = 0,
+        configuration_ns: u64 = 0,
+        console_ns: u64 = 0,
+        platform_ns: u64 = 0,
+        validation_ns: u64 = 0,
+        save_restore_validation_ns: u64 = 0,
+        vm_ns: u64 = 0,
+        start_ns: u64 = 0,
+        total_ns: u64 = 0,
+    };
 
     pub const InitError = error{
         UnsupportedHost,
@@ -74,19 +89,27 @@ pub const Machine = struct {
 
     pub fn init(config: *const Config) InitError!Machine {
         if (comptime builtin.cpu.arch != .aarch64) return error.UnsupportedHost;
+        const startup_started_ns = monotonicNs();
+        var profile = StartupProfile{};
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
-        const configuration = try createConfiguration(config);
+        const configuration = try createConfiguration(config, &profile);
         defer configuration.release();
 
+        const vm_started_ns = monotonicNs();
         const vm = (try allocObject("VZVirtualMachine")).msgSend(
             Object,
             "initWithConfiguration:",
             .{configuration.value},
         );
         if (vm.value == null) return error.FrameworkObjectCreationFailed;
-        return .{ .vm = vm };
+        profile.vm_ns = monotonicNs() - vm_started_ns;
+        return .{
+            .vm = vm,
+            .startup_started_ns = startup_started_ns,
+            .startup_profile = profile,
+        };
     }
 
     pub fn deinit(self: *Machine) void {
@@ -99,7 +122,37 @@ pub const Machine = struct {
     }
 
     pub fn start(self: *Machine) !void {
+        const started_ns = monotonicNs();
         try self.performFlag("startWithCompletionHandler:", .{});
+        const finished_ns = monotonicNs();
+        self.startup_profile.start_ns = finished_ns - started_ns;
+        self.startup_profile.total_ns = finished_ns - self.startup_started_ns;
+    }
+
+    pub fn logStartupProfile(self: *const Machine) void {
+        const profile = self.startup_profile;
+        log.info(
+            "startup profile (Virtualization.framework): total={}us boot-loader={}us " ++
+                "configuration={}us console={}us platform={}us",
+            .{
+                profile.total_ns / std.time.ns_per_us,
+                profile.boot_loader_ns / std.time.ns_per_us,
+                profile.configuration_ns / std.time.ns_per_us,
+                profile.console_ns / std.time.ns_per_us,
+                profile.platform_ns / std.time.ns_per_us,
+            },
+        );
+        log.info(
+            "startup profile (Virtualization.framework): validate={}us " ++
+                "save-restore-validate={}us " ++
+                "vm={}us start={}us",
+            .{
+                profile.validation_ns / std.time.ns_per_us,
+                profile.save_restore_validation_ns / std.time.ns_per_us,
+                profile.vm_ns / std.time.ns_per_us,
+                profile.start_ns / std.time.ns_per_us,
+            },
+        );
     }
 
     pub fn pause(self: *Machine) !void {
@@ -151,10 +204,24 @@ pub fn pump() void {
     _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1);
 }
 
-fn createConfiguration(config: *const Config) Machine.InitError!Object {
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
+fn finishStartupStep(field: *u64, step_started_ns: *u64) void {
+    const now_ns = monotonicNs();
+    field.* = now_ns - step_started_ns.*;
+    step_started_ns.* = now_ns;
+}
+
+fn createConfiguration(
+    config: *const Config,
+    profile: *Machine.StartupProfile,
+) Machine.InitError!Object {
     if (config.memory_bytes == 0 or config.vcpu_count == 0) {
         return error.ConfigurationValidationFailed;
     }
+    var step_started_ns = monotonicNs();
 
     const boot_loader = try initObject(
         "VZLinuxBootLoader",
@@ -165,11 +232,13 @@ fn createConfiguration(config: *const Config) Machine.InitError!Object {
     if (config.initrd_path) |initrd| {
         boot_loader.msgSend(void, "setInitialRamdiskURL:", .{(try fileURL(initrd)).value});
     }
+    finishStartupStep(&profile.boot_loader_ns, &step_started_ns);
 
     const configuration = try newObject("VZVirtualMachineConfiguration");
     configuration.msgSend(void, "setBootLoader:", .{boot_loader.value});
     configuration.msgSend(void, "setCPUCount:", .{@as(NSUInteger, config.vcpu_count)});
     configuration.msgSend(void, "setMemorySize:", .{config.memory_bytes});
+    finishStartupStep(&profile.configuration_ns, &step_started_ns);
 
     // Guest console on host file descriptors: the attachment reads
     // guest input from console_in and writes guest output to
@@ -192,6 +261,7 @@ fn createConfiguration(config: *const Config) Machine.InitError!Object {
     const console = try newObject("VZVirtioConsoleDeviceSerialPortConfiguration");
     console.msgSend(void, "setAttachment:", .{attachment.value});
     configuration.msgSend(void, "setSerialPorts:", .{array(&.{console}).value});
+    finishStartupStep(&profile.console_ns, &step_started_ns);
 
     configuration.msgSend(void, "setEntropyDevices:", .{
         array(&.{try newObject("VZVirtioEntropyDeviceConfiguration")}).value,
@@ -204,12 +274,14 @@ fn createConfiguration(config: *const Config) Machine.InitError!Object {
         });
         configuration.msgSend(void, "setPlatform:", .{platform.value});
     }
+    finishStartupStep(&profile.platform_ns, &step_started_ns);
 
     var error_object: id = null;
     if (!boolResult(configuration.msgSend(BOOL, "validateWithError:", .{&error_object}))) {
         logNSError("VZ configuration validation failed", error_object);
         return error.ConfigurationValidationFailed;
     }
+    finishStartupStep(&profile.validation_ns, &step_started_ns);
     // Save/restore support depends on the device set; surface problems
     // at configuration time rather than at the first save.
     if (!boolResult(configuration.msgSend(
@@ -219,6 +291,7 @@ fn createConfiguration(config: *const Config) Machine.InitError!Object {
     ))) {
         logNSError("VZ save/restore unsupported for this configuration", error_object);
     }
+    finishStartupStep(&profile.save_restore_validation_ns, &step_started_ns);
     return configuration.retain();
 }
 
