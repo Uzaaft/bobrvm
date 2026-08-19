@@ -38,7 +38,7 @@ jobs:
         run: nix develop -c alejandra --check flake.nix nix/*.nix
 
       - name: Check Zig formatting
-        run: nix develop -c zig fmt --check .
+        run: nix develop -c zig fmt --check build.zig src tests tools
 
       - name: Evaluate the flake
         run: nix flake check --no-build
