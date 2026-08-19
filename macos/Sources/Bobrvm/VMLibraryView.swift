@@ -1,10 +1,12 @@
+import AppKit
 import SwiftUI
 
 struct VMLibraryHomeView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Environment(\.openWindow) private var openWindow
     let searchText: String
-    let select: (VMInstance) -> Void
+    @Binding var selectedVMID: UUID?
+    let showDetails: (VMInstance) -> Void
 
     @State private var startError: String?
 
@@ -40,7 +42,9 @@ struct VMLibraryHomeView: View {
                 ForEach(filteredVMs) { vm in
                     VMLibraryCard(
                         vmInstance: vm,
-                        showDetails: { select(vm) },
+                        isSelected: selectedVMID == vm.id,
+                        select: { selectedVMID = vm.id },
+                        showDetails: { showDetails(vm) },
                         open: { open(vm) },
                         pause: { vm.pause() },
                         stop: { vm.stop() },
@@ -50,6 +54,8 @@ struct VMLibraryHomeView: View {
             }
             .padding(24)
         }
+        .contentShape(Rectangle())
+        .onTapGesture { selectedVMID = nil }
     }
 
     private var emptyLibrary: some View {
@@ -288,6 +294,8 @@ struct VMOverviewView: View {
 
 private struct VMLibraryCard: View {
     @ObservedObject var vmInstance: VMInstance
+    let isSelected: Bool
+    let select: () -> Void
     let showDetails: () -> Void
     let open: () -> Void
     let pause: () -> Void
@@ -295,7 +303,7 @@ private struct VMLibraryCard: View {
     let edit: () -> Void
 
     var body: some View {
-        Button(action: showDetails) {
+        Button(action: handleActivation) {
             VStack(alignment: .leading, spacing: 16) {
                 cardHeader
                 Divider()
@@ -308,14 +316,32 @@ private struct VMLibraryCard: View {
             .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: 18))
             .overlay {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(Color(nsColor: .separatorColor))
+                    .strokeBorder(
+                        isSelected ? Color.accentColor : Color(nsColor: .separatorColor),
+                        lineWidth: isSelected ? 2 : 1
+                    )
             }
             .contentShape(.rect(cornerRadius: 18))
         }
         .buttonStyle(.plain)
         .contextMenu { contextMenuItems }
         .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityAction(named: "Show Details", showDetails)
+    }
+
+    // SwiftUI's TapGesture(count: 2) never fires when layered on a Button,
+    // so double-clicks are detected from AppKit's own click counting.
+    private func handleActivation() {
+        let event = NSApp.currentEvent
+        if let event,
+            event.type == .leftMouseUp || event.type == .leftMouseDown,
+            event.clickCount >= 2
+        {
+            open()
+        } else {
+            select()
+        }
     }
 
     private var cardHeader: some View {

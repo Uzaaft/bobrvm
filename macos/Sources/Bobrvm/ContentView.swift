@@ -67,6 +67,7 @@ struct ContentView: View {
     @EnvironmentObject private var vmManager: VMManager
     @State private var selection: LibrarySelection? = .library
     @State private var searchText = ""
+    @State private var libraryVMSelection: UUID?
 
     var body: some View {
         NavigationSplitView {
@@ -98,6 +99,9 @@ struct ContentView: View {
         .frame(minWidth: 780, minHeight: 520)
         .focusedSceneObject(selectedVM)
         .onChange(of: visibleVMIDs) { _, ids in
+            if let id = libraryVMSelection, !ids.contains(id) {
+                libraryVMSelection = nil
+            }
             guard case .virtualMachine(let id) = selection, !ids.contains(id) else {
                 return
             }
@@ -122,13 +126,19 @@ struct ContentView: View {
     private var library: some View {
         VMLibraryHomeView(
             searchText: searchText,
-            select: { selection = .virtualMachine($0.id) }
+            selectedVMID: $libraryVMSelection,
+            showDetails: { selection = .virtualMachine($0.id) }
         )
     }
 
     private var selectedVM: VMInstance? {
-        guard case .virtualMachine(let id) = selection else { return nil }
-        return vmManager.vms.first { $0.id == id }
+        switch selection {
+        case .virtualMachine(let id):
+            return vmManager.vms.first { $0.id == id }
+        case .library, nil:
+            guard let id = libraryVMSelection else { return nil }
+            return vmManager.vms.first { $0.id == id }
+        }
     }
 
     private var visibleVMIDs: [UUID] {
