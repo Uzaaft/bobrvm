@@ -539,6 +539,7 @@ private struct OperatingSystemStepView: View {
                         title: operatingSystem.title,
                         detail: detail(for: operatingSystem),
                         icon: operatingSystem.icon,
+                        customIcon: operatingSystem == .linux ? "Tux" : nil,
                         selected: selection == operatingSystem,
                         badge: systemInfo.supports(operatingSystem) ? nil : "Unavailable",
                         enabled: systemInfo.supports(operatingSystem)
@@ -937,6 +938,7 @@ private struct SourceCard: View {
     let title: String
     let detail: String
     let icon: String
+    var customIcon: String? = nil
     let selected: Bool
     var badge: String? = nil
     var enabled = true
@@ -945,7 +947,7 @@ private struct SourceCard: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 16) {
-                Image(systemName: icon)
+                iconImage
                     .font(.title2)
                     .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(selected ? Color.accentColor : Color.primary)
@@ -998,6 +1000,15 @@ private struct SourceCard: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title). \(detail)")
         .accessibilityValue(selected ? "Selected" : "Not selected")
+    }
+
+    @ViewBuilder
+    private var iconImage: some View {
+        if let customIcon {
+            Image(customIcon)
+        } else {
+            Image(systemName: icon)
+        }
     }
 }
 

@@ -379,7 +379,7 @@ struct VMListRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: vmInstance.guestSystem.presentationIcon)
+            vmInstance.guestSystem.presentationImage
                 .foregroundStyle(vmInstance.guestSystem.symbolColor)
                 .frame(width: 22)
                 .accessibilityHidden(true)
@@ -459,7 +459,11 @@ struct VMDetailView: View {
             }
         } else {
             ContentUnavailableView {
-                Label(vmInstance.name, systemImage: vmInstance.guestSystem.presentationIcon)
+                Label {
+                    Text(vmInstance.name)
+                } icon: {
+                    vmInstance.guestSystem.presentationImage
+                }
             } description: {
                 Text("Start this virtual machine to open its display.")
             } actions: {

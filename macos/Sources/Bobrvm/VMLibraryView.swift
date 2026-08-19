@@ -545,7 +545,7 @@ struct GuestSystemIcon: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        Image(systemName: system.presentationIcon)
+        system.presentationImage
             .font(.system(size: size * 0.42, weight: .semibold))
             .foregroundStyle(glyphColor)
             .frame(width: size, height: size)
@@ -569,11 +569,12 @@ struct GuestSystemIcon: View {
 }
 
 extension GuestSystem {
-    var presentationIcon: String {
+    @ViewBuilder
+    var presentationImage: some View {
         switch self {
-        case .linux: return "terminal.fill"
-        case .macOS: return "apple.logo"
-        case .windows: return "rectangle.split.2x2.fill"
+        case .linux: Image("Tux")
+        case .macOS: Image(systemName: "apple.logo")
+        case .windows: Image(systemName: "rectangle.split.2x2.fill")
         }
     }
 
