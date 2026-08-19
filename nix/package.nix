@@ -46,6 +46,10 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-8Jxd6eCAVre82oRiAkAh0jS7AxBFTGXMEIhHxDJhupI=";
   };
 
+  passthru = {
+    inherit (finalAttrs) zigDeps;
+  };
+
   nativeBuildInputs =
     [
       pkg-config

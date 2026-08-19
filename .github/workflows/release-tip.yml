@@ -28,8 +28,6 @@ jobs:
     timeout-minutes: 60
     env:
       REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
 
     steps:
       - name: Check out tested source
@@ -37,19 +35,12 @@ jobs:
         with:
           ref: ${{ env.REVISION }}
 
-      - name: Restore Zig cache
-        uses: actions/cache@v4
-        env:
-          DEPS: ${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig.zon.nix') }}
+      - name: Set up Zig with Nix
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
-          path: |
-            .zig-cache/global
-            .zig-cache/local
-            .zig-cache/ghostty
-          key: bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS }}-${{ env.REVISION }}
-          restore-keys: |
-            bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-${{ env.DEPS }}-
-            bobrvm-fw-${{ runner.os }}-${{ runner.arch }}-
+          cache-scope: release
+          revision: ${{ env.REVISION }}
 
       - name: Restore Xcode compilation cache
         uses: actions/cache@v4
@@ -57,38 +48,21 @@ jobs:
           XCODE_HASH: ${{ hashFiles('macos/Bobrvm.xcodeproj/project.pbxproj') }}
         with:
           path: ${{ runner.temp }}/bobrvm-xcode-cache
-          key: bobrvm-xcode-macos-15-${{ env.XCODE_HASH }}-${{ env.REVISION }}
+          key: bobrvm-xcode-release-macos-15-${{ env.XCODE_HASH }}-${{ env.REVISION }}
           restore-keys: |
-            bobrvm-xcode-macos-15-${{ env.XCODE_HASH }}-
-            bobrvm-xcode-macos-15-
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-        with:
-          determinate: true
-
-      - name: Restore and save Nix artifacts
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-flakehub: false
-
-      - name: Build Zig dependency directory
-        id: deps
-        run: |
-          path=$(nix build --no-link --print-out-paths .#deps)
-          echo "path=$path" >> "$GITHUB_OUTPUT"
+            bobrvm-xcode-release-macos-15-${{ env.XCODE_HASH }}-
+            bobrvm-xcode-release-macos-15-
 
       - name: Show Xcode version
         run: xcodebuild -version
 
       - name: Build release frameworks
         env:
-          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.deps.outputs.path }}
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.zig.outputs.system-deps }}
         run: |
           nix develop -c zig build \
             xcframework \
             ghostty-lib \
-            --system "${{ steps.deps.outputs.path }}" \
             -Demit-macos-app=false \
             -Doptimize=ReleaseFast
 

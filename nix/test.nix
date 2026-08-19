@@ -9,7 +9,27 @@ stdenv.mkDerivation (finalAttrs: {
   pname = "bobrvm-test";
   version = "0.1.0";
 
-  src = lib.cleanSource ../.;
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset =
+      lib.fileset.intersection
+      (lib.fileset.fromSource (lib.sources.cleanSource ../.))
+      (lib.fileset.unions [
+        ../build.zig
+        ../build.zig.zon
+        ../include
+        ../LICENSE
+        ../linux
+        ../macos/Assets.xcassets/AppIcon.appiconset/AppIcon-256.png
+        ../src
+        ../tests
+        ../third_party
+        ../tools
+        ../cli.entitlements
+        ../cli-venus.entitlements
+        ../venus.entitlements
+      ]);
+  };
 
   zigDeps = zig.fetchDeps {
     inherit (finalAttrs) pname version src;
