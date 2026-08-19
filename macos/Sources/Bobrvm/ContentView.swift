@@ -92,6 +92,9 @@ struct ContentView: View {
         .sheet(isPresented: $vmManager.showingCreateVM) {
             CreateVMView()
         }
+        .sheet(item: $vmManager.vmPendingEdit) { vm in
+            EditVMView(vmInstance: vm)
+        }
         .frame(minWidth: 780, minHeight: 520)
         .focusedSceneObject(selectedVM)
         .onChange(of: visibleVMIDs) { _, ids in
@@ -143,7 +146,6 @@ struct VMListView: View {
     @Binding var selection: LibrarySelection?
     @Binding var searchText: String
     @State private var vmToDelete: VMInstance?
-    @State private var vmToEdit: VMInstance?
 
     var body: some View {
         List(selection: $selection) {
@@ -159,7 +161,7 @@ struct VMListView: View {
                         .contextMenu {
                             VMContextMenu(
                                 vmInstance: vm,
-                                onEdit: { vmToEdit = vm },
+                                onEdit: { vmManager.vmPendingEdit = vm },
                                 onDelete: { vmToDelete = vm }
                             )
                         }
@@ -191,9 +193,6 @@ struct VMListView: View {
             }
         } message: { _ in
             Text("The saved configuration will be removed. Disk images remain on this Mac.")
-        }
-        .sheet(item: $vmToEdit) { vm in
-            EditVMView(vmInstance: vm)
         }
     }
 
@@ -457,7 +456,7 @@ struct VMDetailView: View {
                 Button(action: start) {
                     Label("Start", systemImage: "play.fill")
                 }
-                .buttonStyle(.glassProminent)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.large)
             }
         }
@@ -727,30 +726,6 @@ struct VMConsoleWindowView: View {
             return "Console access is not available for macOS virtual machines."
         }
         return "Start the virtual machine to open its console."
-    }
-}
-
-struct VMSettingsWindowView: View {
-    @EnvironmentObject private var vmManager: VMManager
-    let vmID: UUID
-
-    var body: some View {
-        Group {
-            if let vm = vmInstance {
-                EditVMView(vmInstance: vm)
-            } else {
-                ContentUnavailableView(
-                    "Virtual Machine Not Found",
-                    systemImage: "gearshape",
-                    description: Text("This virtual machine is no longer in the library.")
-                )
-            }
-        }
-        .focusedSceneObject(vmInstance)
-    }
-
-    private var vmInstance: VMInstance? {
-        vmManager.vms.first { $0.id == vmID }
     }
 }
 

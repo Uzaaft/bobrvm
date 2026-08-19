@@ -46,22 +46,6 @@ struct BobrvmApp: SwiftUI.App {
             BobrvmCommands(vmManager: appDelegate.vmManager)
         }
 
-        WindowGroup(
-            "Virtual Machine Settings",
-            id: "vm-settings",
-            for: UUID.self
-        ) { $vmID in
-            if let vmID {
-                VMSettingsWindowView(vmID: vmID)
-                    .environmentObject(appDelegate.vmManager)
-            }
-        }
-        .windowToolbarStyle(.unified)
-        .defaultSize(width: 620, height: 740)
-        .commands {
-            BobrvmCommands(vmManager: appDelegate.vmManager)
-        }
-
         Settings {
             SettingsView()
         }
@@ -123,67 +107,69 @@ private struct MachineCommands: Commands {
 
             Divider()
             configurationCommands
+            Divider()
             lifecycleCommands
+            Divider()
             integrationCommands
         }
     }
 
     @ViewBuilder
     private var configurationCommands: some View {
-        if let vm = focusedVM {
-            Button {
-                openWindow(id: "vm-settings", value: vm.id)
-            } label: {
-                Label("Virtual Machine Settings…", systemImage: "gearshape")
-            }
-
-            if vm.guestSystem != .macOS {
-                Menu {
-                    Button {
-                        attachISO(to: vm)
-                    } label: {
-                        Label("Attach ISO…", systemImage: "opticaldisc.badge.plus")
-                    }
-                    .disabled(vm.state != .stopped)
-
-                    if vm.isoPath != nil {
-                        Button {
-                            updateISO(vm, path: nil, action: "detach")
-                        } label: {
-                            Label("Detach ISO", systemImage: "eject.fill")
-                        }
-                        .disabled(vm.state != .stopped)
-                    }
-                } label: {
-                    Label("CD/DVD", systemImage: "opticaldisc")
-                }
-            }
-
-            Divider()
+        Button {
+            guard let vm = focusedVM else { return }
+            openWindow(id: "library")
+            vmManager.vmPendingEdit = vm
+        } label: {
+            Label("Virtual Machine Settings…", systemImage: "gearshape")
         }
+        .disabled(focusedVM == nil)
+
+        Button {
+            guard let vm = focusedVM else { return }
+            attachISO(to: vm)
+        } label: {
+            Label("Attach ISO…", systemImage: "opticaldisc.badge.plus")
+        }
+        .disabled(!canChangeISO)
+
+        Button {
+            guard let vm = focusedVM else { return }
+            updateISO(vm, path: nil, action: "detach")
+        } label: {
+            Label("Detach ISO", systemImage: "eject.fill")
+        }
+        .disabled(!canChangeISO || focusedVM?.isoPath == nil)
+    }
+
+    private var canChangeISO: Bool {
+        guard let vm = focusedVM else { return false }
+        return vm.guestSystem != .macOS && vm.state == .stopped
     }
 
     @ViewBuilder
     private var integrationCommands: some View {
-        if let vm = focusedVM {
-            if vm.state == .running, vm.guestSystem != .macOS {
-                Menu {
-                    guestToolsCommands(for: vm)
-                } label: {
-                    Label("Guest Tools", systemImage: "wrench.and.screwdriver")
-                }
+        Menu {
+            if let vm = focusedVM {
+                guestToolsCommands(for: vm)
             }
-
-            if let runtimeVM = vm.runtimeVM {
-                Divider()
-                Button(role: .destructive) {
-                    runtimeVM.clearConsoleOutput()
-                } label: {
-                    Label("Clear Console", systemImage: "trash")
-                }
-                .keyboardShortcut("k", modifiers: .command)
-            }
+        } label: {
+            Label("Guest Tools", systemImage: "wrench.and.screwdriver")
         }
+        .disabled(!guestToolsAvailable)
+
+        Button {
+            focusedVM?.runtimeVM?.clearConsoleOutput()
+        } label: {
+            Label("Clear Console", systemImage: "trash")
+        }
+        .keyboardShortcut("k", modifiers: .command)
+        .disabled(focusedVM?.runtimeVM == nil)
+    }
+
+    private var guestToolsAvailable: Bool {
+        guard let vm = focusedVM else { return false }
+        return vm.state == .running && vm.guestSystem != .macOS
     }
 
     @ViewBuilder
@@ -220,47 +206,38 @@ private struct MachineCommands: Commands {
 
     @ViewBuilder
     private var lifecycleCommands: some View {
-        if let vm = focusedVM {
-            switch vm.state {
-            case .stopped:
-                Button {
-                    start(vm)
-                } label: {
-                    Label("Start", systemImage: "play.fill")
-                }
-                .keyboardShortcut("r", modifiers: .command)
-            case .paused:
-                Button {
-                    vm.resume()
-                    openWindow(id: "vm-display", value: vm.id)
-                } label: {
-                    Label("Resume", systemImage: "play.fill")
-                }
-                Button(role: .destructive) {
-                    vm.stop()
-                } label: {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .keyboardShortcut(".", modifiers: .command)
-            case .running:
-                Button {
-                    vm.pause()
-                } label: {
-                    Label("Pause", systemImage: "pause.fill")
-                }
-                Button(role: .destructive) {
-                    vm.stop()
-                } label: {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .keyboardShortcut(".", modifiers: .command)
-            }
-        } else {
-            Button {} label: {
-                Label("Start", systemImage: "play.fill")
-            }
-            .disabled(true)
+        Button {
+            guard let vm = focusedVM else { return }
+            start(vm)
+        } label: {
+            Label("Start", systemImage: "play.fill")
         }
+        .keyboardShortcut("r", modifiers: .command)
+        .disabled(focusedVM?.state != .stopped)
+
+        Button {
+            guard let vm = focusedVM else { return }
+            vm.resume()
+            openWindow(id: "vm-display", value: vm.id)
+        } label: {
+            Label("Resume", systemImage: "play.fill")
+        }
+        .disabled(focusedVM?.state != .paused)
+
+        Button {
+            focusedVM?.pause()
+        } label: {
+            Label("Pause", systemImage: "pause.fill")
+        }
+        .disabled(focusedVM?.state != .running)
+
+        Button {
+            focusedVM?.stop()
+        } label: {
+            Label("Stop", systemImage: "stop.fill")
+        }
+        .keyboardShortcut(".", modifiers: .command)
+        .disabled(focusedVM == nil || focusedVM?.state == .stopped)
     }
 
     private func start(_ vm: VMInstance) {

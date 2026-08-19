@@ -91,7 +91,7 @@ struct EditVMView: View {
                     Button(saveButtonTitle) {
                         saveChanges()
                     }
-                    .buttonStyle(.glassProminent)
+                    .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!hasChanges || !isValid || isSaving)
                 }

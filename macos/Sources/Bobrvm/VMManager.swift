@@ -11,6 +11,7 @@ public final class VMManager: ObservableObject {
 
     @Published public var vms: [VMInstance] = []
     @Published public var showingCreateVM = false
+    @Published public var vmPendingEdit: VMInstance?
 
     weak var app: App?
 

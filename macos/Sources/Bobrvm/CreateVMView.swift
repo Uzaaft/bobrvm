@@ -26,6 +26,7 @@ struct CreateVMView: View {
     @State private var installationProgress = 0.0
     @State private var errorMessage: String?
     @State private var didApplyDefaults = false
+    @State private var creationTask: Task<Void, Never>?
 
     private let systemInfo = SystemInfo()
 
@@ -33,11 +34,11 @@ struct CreateVMView: View {
         HStack(spacing: 0) {
             CreationStepSidebar(step: step)
                 .frame(width: 228)
-                .padding(12)
             Divider()
             VStack(spacing: 0) {
                 stepContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .disabled(isCreating)
                 footer
             }
         }
@@ -52,7 +53,6 @@ struct CreateVMView: View {
         )
         .presentationSizing(.fitted)
         .interactiveDismissDisabled(isCreating)
-        .disabled(isCreating)
         .onAppear(perform: applyDefaults)
         .onChange(of: operatingSystem) { _, selected in
             guard let selected else { return }
@@ -141,45 +141,34 @@ struct CreateVMView: View {
     }
 
     private var footer: some View {
-        VStack(alignment: .trailing, spacing: 12) {
+        HStack(spacing: 12) {
+            Button("Cancel", action: cancel)
+                .keyboardShortcut(.cancelAction)
+            Spacer(minLength: 24)
             if isCreating {
                 creationProgress
-                    .frame(maxWidth: .infinity, alignment: .trailing)
             } else {
-                GlassEffectContainer(spacing: 12) {
-                    HStack(spacing: 12) {
-                        Button("Cancel") { dismiss() }
-                            .keyboardShortcut(.cancelAction)
-                            .buttonStyle(.glass)
-                        Spacer(minLength: 24)
-                        if step != .operatingSystem {
-                            Button {
-                                step = step.previous
-                            } label: {
-                                Label("Back", systemImage: "chevron.left")
-                            }
-                            .buttonStyle(.glass)
-                            .accessibilityHint("Returns to \(step.previous.title)")
-                        }
-                        Button {
-                            advance()
-                        } label: {
-                            Label(
-                                step == .summary ? "Create" : "Continue",
-                                systemImage: step == .summary ? "checkmark" : "chevron.right"
-                            )
-                            .labelStyle(.titleAndIcon)
-                        }
-                        .buttonStyle(.glassProminent)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(!canContinue)
-                    }
+                if step != .operatingSystem {
+                    Button("Back") { step = step.previous }
+                        .accessibilityHint("Returns to \(step.previous.title)")
                 }
+                Button(step == .summary ? "Create" : "Continue") {
+                    advance()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canContinue)
             }
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
         .padding(.bottom, 16)
+    }
+
+    private func cancel() {
+        creationTask?.cancel()
+        creationTask = nil
+        dismiss()
     }
 
     @ViewBuilder
@@ -253,7 +242,7 @@ struct CreateVMView: View {
         installationProgress = 0
 
         if source == .installMacOS {
-            Task { @MainActor in
+            creationTask = Task { @MainActor in
                 do {
                     try await vmManager.createMacOSVM(
                         name: name.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -267,10 +256,13 @@ struct CreateVMView: View {
                         progress: { installationProgress = $0 }
                     )
                     dismiss()
+                } catch is CancellationError {
+                    // The user cancelled; the manager removes partial assets.
                 } catch {
                     errorMessage = error.localizedDescription
                     isCreating = false
                 }
+                creationTask = nil
             }
             return
         }
@@ -479,8 +471,8 @@ private struct CreationStepSidebar: View {
                 .monospacedDigit()
                 .padding(.horizontal, 8)
         }
-        .padding(14)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(16)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     private func stepRow(_ item: CreationStep) -> some View {
@@ -656,7 +648,6 @@ private struct InstallationStepView: View {
                     systemImage: "arrow.down.circle"
                 )
             }
-            .buttonStyle(.glass)
         }
     }
 
@@ -987,7 +978,7 @@ private struct SourceCard: View {
             .padding(.vertical, 14)
             .background {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(.regularMaterial)
+                    .fill(Color(nsColor: .controlBackgroundColor))
                 if selected {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color.accentColor.opacity(0.12))
@@ -1245,7 +1236,6 @@ struct FilePickerField: View {
                     .accessibilityLabel("Clear \(label) selection")
                 }
                 Button("Choose…", action: selectFile)
-                    .buttonStyle(.glass)
                     .accessibilityLabel("Choose \(label)")
             }
         }

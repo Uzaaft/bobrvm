@@ -36,10 +36,11 @@ struct WindowsMediaDownloadView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close", role: .cancel) { dismiss() }
-                        .keyboardShortcut(.cancelAction)
-                        .disabled(isDownloading)
-                        .help(isDownloading ? "Wait for the download to finish" : "Close")
+                    Button(isDownloading ? "Cancel Download" : "Close", role: .cancel) {
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .help(isDownloading ? "Stop the download and close" : "Close")
                 }
             }
         }

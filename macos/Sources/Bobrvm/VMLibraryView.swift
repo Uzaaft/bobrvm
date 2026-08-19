@@ -7,7 +7,6 @@ struct VMLibraryHomeView: View {
     let select: (VMInstance) -> Void
 
     @State private var startError: String?
-    @State private var vmToEdit: VMInstance?
 
     private let columns = [
         GridItem(.adaptive(minimum: 290, maximum: 380), spacing: 18)
@@ -33,9 +32,6 @@ struct VMLibraryHomeView: View {
         } message: {
             Text(startError ?? "An unknown error occurred.")
         }
-        .sheet(item: $vmToEdit) { vm in
-            EditVMView(vmInstance: vm)
-        }
     }
 
     private var libraryGrid: some View {
@@ -48,7 +44,7 @@ struct VMLibraryHomeView: View {
                         open: { open(vm) },
                         pause: { vm.pause() },
                         stop: { vm.stop() },
-                        edit: { vmToEdit = vm }
+                        edit: { vmManager.vmPendingEdit = vm }
                     )
                 }
             }
@@ -67,7 +63,7 @@ struct VMLibraryHomeView: View {
             } label: {
                 Label("New Virtual Machine", systemImage: "plus")
             }
-            .buttonStyle(.glassProminent)
+            .buttonStyle(.borderedProminent)
             .controlSize(.large)
         }
     }
@@ -108,8 +104,8 @@ struct VMLibraryHomeView: View {
 
 struct VMOverviewView: View {
     @ObservedObject var vmInstance: VMInstance
+    @EnvironmentObject private var vmManager: VMManager
     @Environment(\.openWindow) private var openWindow
-    @State private var isEditing = false
     @State private var startError: String?
 
     var body: some View {
@@ -127,7 +123,7 @@ struct VMOverviewView: View {
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 Button {
-                    isEditing = true
+                    vmManager.vmPendingEdit = vmInstance
                 } label: {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -137,9 +133,6 @@ struct VMOverviewView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 lifecycleToolbarItems
             }
-        }
-        .sheet(isPresented: $isEditing) {
-            EditVMView(vmInstance: vmInstance)
         }
         .alert(
             "Unable to Start Virtual Machine",
@@ -301,28 +294,25 @@ private struct VMLibraryCard: View {
     let stop: () -> Void
     let edit: () -> Void
 
-    @State private var isHovered = false
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            cardHeader
-            Divider()
-            metrics
-            Spacer(minLength: 0)
-            controls
+        Button(action: showDetails) {
+            VStack(alignment: .leading, spacing: 16) {
+                cardHeader
+                Divider()
+                metrics
+                Spacer(minLength: 0)
+                controls
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, minHeight: 224, alignment: .topLeading)
+            .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: 18))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(Color(nsColor: .separatorColor))
+            }
+            .contentShape(.rect(cornerRadius: 18))
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, minHeight: 224, alignment: .topLeading)
-        .background(.regularMaterial, in: .rect(cornerRadius: 18))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(borderColor, lineWidth: isHovered ? 1.5 : 1)
-        }
-        .shadow(color: .black.opacity(isHovered ? 0.12 : 0.05), radius: 12, y: 5)
-        .contentShape(.rect(cornerRadius: 18))
-        .onTapGesture(perform: showDetails)
-        .onHover { isHovered = $0 }
-        .animation(.easeOut(duration: 0.16), value: isHovered)
+        .buttonStyle(.plain)
         .contextMenu { contextMenuItems }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: "Show Details", showDetails)
@@ -362,40 +352,38 @@ private struct VMLibraryCard: View {
     }
 
     private var controls: some View {
-        GlassEffectContainer(spacing: 8) {
-            HStack(spacing: 8) {
-                Button(action: edit) {
-                    Label("Settings", systemImage: "gearshape")
+        HStack(spacing: 8) {
+            Button(action: edit) {
+                Label("Settings", systemImage: "gearshape")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.bordered)
+            .help("Virtual machine settings")
+
+            Spacer()
+
+            if vmInstance.state == .running {
+                Button(action: pause) {
+                    Label("Pause", systemImage: "pause.fill")
                         .labelStyle(.iconOnly)
                 }
-                .buttonStyle(.glass)
-                .help("Virtual machine settings")
-
-                Spacer()
-
-                if vmInstance.state == .running {
-                    Button(action: pause) {
-                        Label("Pause", systemImage: "pause.fill")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonStyle(.glass)
-                    .help("Pause")
-                }
-
-                if vmInstance.state != .stopped {
-                    Button(role: .destructive, action: stop) {
-                        Label("Stop", systemImage: "stop.fill")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonStyle(.glass)
-                    .help("Stop")
-                }
-
-                Button(action: open) {
-                    Label(primaryTitle, systemImage: primaryIcon)
-                }
-                .buttonStyle(.glassProminent)
+                .buttonStyle(.bordered)
+                .help("Pause")
             }
+
+            if vmInstance.state != .stopped {
+                Button(action: stop) {
+                    Label("Stop", systemImage: "stop.fill")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.bordered)
+                .help("Stop")
+            }
+
+            Button(action: open) {
+                Label(primaryTitle, systemImage: primaryIcon)
+            }
+            .buttonStyle(.bordered)
         }
     }
 
@@ -452,10 +440,6 @@ private struct VMLibraryCard: View {
         guard let path = vmInstance.isoPath else { return "CD/DVD: Empty" }
         return URL(fileURLWithPath: path).lastPathComponent
     }
-
-    private var borderColor: Color {
-        isHovered ? .accentColor.opacity(0.42) : .primary.opacity(0.08)
-    }
 }
 
 private struct DetailPanel<Content: View>: View {
@@ -472,10 +456,10 @@ private struct DetailPanel<Content: View>: View {
         }
         .padding(18)
         .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)
-        .background(.regularMaterial, in: .rect(cornerRadius: 16))
+        .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: 16))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.primary.opacity(0.08))
+                .strokeBorder(Color(nsColor: .separatorColor))
         }
     }
 }
