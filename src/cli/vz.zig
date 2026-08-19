@@ -76,7 +76,7 @@ pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(
-        std.Io.Clock.real.now(global.io()).nanoseconds,
+        std.Io.Clock.awake.now(global.io()).nanoseconds,
         std.time.ns_per_ms,
     ));
 }
@@ -127,6 +127,7 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
 
     global.state.init();
     defer global.state.deinit();
+    const startup_benchmark = std.c.getenv("BOBRVM_BENCHMARK_STARTUP") != null;
 
     var machine = try linux_vz.Machine.init(&.{
         .kernel_path = kernel_path,
@@ -148,6 +149,11 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     } else {
         try machine.start();
         log.info("vz: started in {d} ms", .{nowMs() - start_ms});
+    }
+    if (startup_benchmark) {
+        machine.logStartupProfile();
+        try machine.stop();
+        return;
     }
 
     // Scripted suspend hook, mirroring BOBRVM_TEST_SUSPEND on the

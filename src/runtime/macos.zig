@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const objc = @import("objc");
 const runtime = @import("Runtime.zig");
 const assert = @import("../quirks.zig").inlineAssert;
+const global = @import("../global.zig");
 
 const Object = objc.Object;
 const id = objc.c.id;
@@ -33,6 +34,21 @@ pub const Backend = struct {
     vm: Object,
     view: Object,
     installer: ?Object = null,
+    startup_started_ns: u64,
+    startup_profile: StartupProfile,
+
+    const StartupProfile = extern struct {
+        platform_ns: u64 = 0,
+        configuration_ns: u64 = 0,
+        storage_graphics_ns: u64 = 0,
+        input_network_ns: u64 = 0,
+        audio_ns: u64 = 0,
+        validation_ns: u64 = 0,
+        vm_ns: u64 = 0,
+        view_ns: u64 = 0,
+        start_ns: u64 = 0,
+        total_ns: u64 = 0,
+    };
 
     pub const Config = MacOSConfig;
     pub const InitError = error{
@@ -46,6 +62,11 @@ pub const Backend = struct {
     pub const InstallCallback = *const fn (?*anyopaque, bool) callconv(.c) void;
 
     const CompletionBlock = objc.Block(struct {}, .{id}, void);
+    const StartCompletionBlock = objc.Block(struct {
+        startup_started_ns: u64,
+        start_started_ns: u64,
+        profile: StartupProfile,
+    }, .{id}, void);
     const InstallCompletionBlock = objc.Block(struct {
         userdata: ?*anyopaque,
         callback: InstallCallback,
@@ -53,22 +74,27 @@ pub const Backend = struct {
 
     pub fn init(config: *const Config) InitError!Backend {
         if (comptime builtin.cpu.arch != .aarch64) return error.UnsupportedHost;
+        const startup_started_ns = monotonicNs();
+        var profile = StartupProfile{};
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
-        const configuration = createConfiguration(config) catch |err| {
+        const configuration = createConfiguration(config, &profile) catch |err| {
             log.err("configuration creation failed: {s}", .{@errorName(err)});
             return err;
         };
         defer configuration.release();
 
+        const vm_started_ns = monotonicNs();
         const vm_alloc = try allocObject("VZVirtualMachine");
         const vm = vm_alloc.msgSend(Object, "initWithConfiguration:", .{configuration.value});
         if (vm.value == null) {
             log.err("VZVirtualMachine initialization returned nil", .{});
             return error.FrameworkObjectCreationFailed;
         }
+        profile.vm_ns = monotonicNs() - vm_started_ns;
 
+        const view_started_ns = monotonicNs();
         const view_alloc = try allocObject("VZVirtualMachineView");
         const view = view_alloc.msgSend(Object, "init", .{});
         if (view.value == null) {
@@ -82,8 +108,14 @@ pub const Backend = struct {
         }))) {
             view.msgSend(void, "setAutomaticallyReconfiguresDisplay:", .{boolParam(true)});
         }
+        profile.view_ns = monotonicNs() - view_started_ns;
 
-        return .{ .vm = vm, .view = view };
+        return .{
+            .vm = vm,
+            .view = view,
+            .startup_started_ns = startup_started_ns,
+            .startup_profile = profile,
+        };
     }
 
     pub fn deinit(self: *Backend) void {
@@ -103,7 +135,12 @@ pub const Backend = struct {
             });
             return error.InvalidState;
         }
-        self.perform("startWithCompletionHandler:", .running);
+        var block = StartCompletionBlock.init(.{
+            .startup_started_ns = self.startup_started_ns,
+            .start_started_ns = monotonicNs(),
+            .profile = self.startup_profile,
+        }, startCompletion);
+        self.vm.msgSend(void, "startWithCompletionHandler:", .{&block});
     }
 
     pub fn requestStop(self: *Backend) void {
@@ -171,6 +208,21 @@ pub const Backend = struct {
         if (error_object != null) logNSError("VM lifecycle operation failed", error_object);
     }
 
+    fn startCompletion(
+        block: *const StartCompletionBlock.Context,
+        error_object: id,
+    ) callconv(.c) void {
+        if (error_object != null) {
+            logNSError("VM start failed", error_object);
+            return;
+        }
+        const finished_ns = monotonicNs();
+        var profile = block.profile;
+        profile.start_ns = finished_ns - block.start_started_ns;
+        profile.total_ns = finished_ns - block.startup_started_ns;
+        logStartupProfile(profile);
+    }
+
     fn installCompletion(block: *const InstallCompletionBlock.Context, error_object: id) callconv(.c) void {
         block.callback(block.userdata, error_object == null);
     }
@@ -178,25 +230,70 @@ pub const Backend = struct {
 
 pub const MacRuntime = runtime.Runtime(Backend);
 
-fn createConfiguration(config: *const MacOSConfig) Backend.InitError!Object {
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
+fn finishStartupStep(field: *u64, step_started_ns: *u64) void {
+    const now_ns = monotonicNs();
+    field.* = now_ns - step_started_ns.*;
+    step_started_ns.* = now_ns;
+}
+
+fn createConfiguration(
+    config: *const MacOSConfig,
+    profile: *Backend.StartupProfile,
+) Backend.InitError!Object {
     if (config.memory_bytes == 0 or config.vcpu_count == 0) return error.InvalidConfig;
     if (config.display_width == 0 or config.display_height == 0) return error.InvalidConfig;
+    var step_started_ns = monotonicNs();
 
     const platform = try createPlatform(config);
+    finishStartupStep(&profile.platform_ns, &step_started_ns);
     const configuration = try newObject("VZVirtualMachineConfiguration");
     configuration.msgSend(void, "setBootLoader:", .{(try newObject("VZMacOSBootLoader")).value});
     configuration.msgSend(void, "setPlatform:", .{platform.value});
     configureCompute(configuration, config);
+    finishStartupStep(&profile.configuration_ns, &step_started_ns);
     try configureStorageAndGraphics(configuration, config);
+    finishStartupStep(&profile.storage_graphics_ns, &step_started_ns);
     try configureInputAndNetwork(configuration, config);
+    finishStartupStep(&profile.input_network_ns, &step_started_ns);
     try configureAudio(configuration);
+    finishStartupStep(&profile.audio_ns, &step_started_ns);
 
     var error_object: id = null;
     if (!boolResult(configuration.msgSend(BOOL, "validateWithError:", .{&error_object}))) {
         logNSError("configuration validation failed", error_object);
         return error.ConfigurationValidationFailed;
     }
+    finishStartupStep(&profile.validation_ns, &step_started_ns);
     return configuration.retain();
+}
+
+fn logStartupProfile(profile: Backend.StartupProfile) void {
+    log.info(
+        "startup profile (Virtualization.framework/macOS): total={}us platform={}us " ++
+            "configuration={}us storage-graphics={}us input-network={}us",
+        .{
+            profile.total_ns / std.time.ns_per_us,
+            profile.platform_ns / std.time.ns_per_us,
+            profile.configuration_ns / std.time.ns_per_us,
+            profile.storage_graphics_ns / std.time.ns_per_us,
+            profile.input_network_ns / std.time.ns_per_us,
+        },
+    );
+    log.info(
+        "startup profile (Virtualization.framework/macOS): audio={}us validate={}us " ++
+            "vm={}us view={}us start={}us",
+        .{
+            profile.audio_ns / std.time.ns_per_us,
+            profile.validation_ns / std.time.ns_per_us,
+            profile.vm_ns / std.time.ns_per_us,
+            profile.view_ns / std.time.ns_per_us,
+            profile.start_ns / std.time.ns_per_us,
+        },
+    );
 }
 
 fn createPlatform(config: *const MacOSConfig) Backend.InitError!Object {
