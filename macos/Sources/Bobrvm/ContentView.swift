@@ -380,7 +380,7 @@ struct VMListRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: vmInstance.guestSystem.presentationIcon)
-                .foregroundStyle(vmInstance.guestSystem.presentationColor)
+                .foregroundStyle(vmInstance.guestSystem.symbolColor)
                 .frame(width: 22)
                 .accessibilityHidden(true)
 

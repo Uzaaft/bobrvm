@@ -542,14 +542,29 @@ struct VMStateBadge: View {
 struct GuestSystemIcon: View {
     let system: GuestSystem
     let size: CGFloat
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Image(systemName: system.presentationIcon)
             .font(.system(size: size * 0.42, weight: .semibold))
-            .foregroundStyle(.white)
+            .foregroundStyle(glyphColor)
             .frame(width: size, height: size)
-            .background(system.presentationColor.gradient, in: .rect(cornerRadius: size * 0.24))
+            .background(tileColor.gradient, in: .rect(cornerRadius: size * 0.24))
             .accessibilityHidden(true)
+    }
+
+    // The macOS and Windows marks invert in dark mode: the brand color
+    // moves to the glyph on a white tile so it stays legible on dark cards.
+    private var isInverted: Bool {
+        colorScheme == .dark && (system == .macOS || system == .windows)
+    }
+
+    private var glyphColor: Color {
+        isInverted ? system.presentationColor : .white
+    }
+
+    private var tileColor: Color {
+        isInverted ? .white : system.presentationColor
     }
 }
 
@@ -565,8 +580,14 @@ extension GuestSystem {
     var presentationColor: Color {
         switch self {
         case .linux: return .orange
-        case .macOS: return .blue
-        case .windows: return .indigo
+        case .macOS: return .black
+        case .windows: return .blue
         }
+    }
+
+    // Sidebar glyphs are tinted directly, where black would disappear in
+    // dark mode; the icon tile handles dark mode by inverting instead.
+    var symbolColor: Color {
+        self == .macOS ? .primary : presentationColor
     }
 }
