@@ -11,6 +11,7 @@ public final class VMManager: ObservableObject {
 
     @Published public var vms: [VMInstance] = []
     @Published public var showingCreateVM = false
+    @Published public var vmPendingEdit: VMInstance?
 
     weak var app: App?
 
@@ -205,6 +206,56 @@ public final class VMManager: ObservableObject {
         Self.logger.info("Updated ISO media for VM: \(instance.name)")
     }
 
+    public func updateLiveSettings(
+        _ instance: VMInstance,
+        name: String,
+        displayWidth: UInt32,
+        displayHeight: UInt32,
+        retinaEnabled: Bool
+    ) throws {
+        guard instance.state != .stopped else {
+            throw BobrvmError.invalidState
+        }
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty,
+            displayWidth > 0,
+            displayHeight > 0
+        else {
+            throw BobrvmError.invalidArgument
+        }
+
+        if instance.guestSystem == .macOS,
+            (displayWidth != instance.config.displayWidth
+                || displayHeight != instance.config.displayHeight
+                || retinaEnabled != instance.retinaEnabled)
+        {
+            throw BobrvmError.invalidState
+        }
+
+        let previousName = instance.name
+        let previousConfig = instance.config
+        let previousRetinaEnabled = instance.retinaEnabled
+        instance.applyLiveSettings(
+            name: name,
+            displayWidth: displayWidth,
+            displayHeight: displayHeight,
+            retinaEnabled: retinaEnabled
+        )
+
+        do {
+            try VMStorage.saveVM(instance)
+        } catch {
+            instance.restoreLiveSettings(
+                name: previousName,
+                config: previousConfig,
+                retinaEnabled: previousRetinaEnabled
+            )
+            throw error
+        }
+
+        objectWillChange.send()
+        Self.logger.info("Updated live settings for VM: \(instance.name)")
+    }
+
     private func replaceVM(
         _ instance: VMInstance,
         name: String,
@@ -271,12 +322,12 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         hasher.combine(id)
     }
     public let id: UUID
-    public let name: String
-    public let config: VMConfig
+    @Published public private(set) var name: String
+    @Published public private(set) var config: VMConfig
     private let app: App
     private var vm: VM?
     public let isoPath: String?
-    public let retinaEnabled: Bool
+    @Published public private(set) var retinaEnabled: Bool
     public let guestSystem: GuestSystem
     let macOSPlatform: MacOSPlatformMetadata?
 
@@ -418,6 +469,24 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     public func requireVM() throws -> VM {
         guard let vm else { throw BobrvmError.invalidState }
         return vm
+    }
+
+    func applyLiveSettings(
+        name: String,
+        displayWidth: UInt32,
+        displayHeight: UInt32,
+        retinaEnabled: Bool
+    ) {
+        self.name = name
+        config.displayWidth = displayWidth
+        config.displayHeight = displayHeight
+        self.retinaEnabled = retinaEnabled
+    }
+
+    func restoreLiveSettings(name: String, config: VMConfig, retinaEnabled: Bool) {
+        self.name = name
+        self.config = config
+        self.retinaEnabled = retinaEnabled
     }
 
     public func destroy() {

@@ -37,8 +37,21 @@ forwards: [MAX_FORWARDS]PortForward = @splat(.{}),
 forward_count: u8 = 0,
 /// Host directory shared with the guest via 9p (--share).
 shared_dir: ?[]const u8 = null,
+/// SSH login user for `bobrvm ssh` (ssh-user in bobrvm.toml).
+ssh_user: []const u8 = "root",
+/// Enforce the 9p share read-only on the HOST side, so the guest
+/// cannot write through it regardless of its mount options.
+share_read_only: bool = false,
 /// Suspend image to restore instead of booting (--restore).
 restore_path: ?[]const u8 = null,
+/// Where the console's suspend-and-quit command (Ctrl-B z) writes the
+/// machine state (--suspend-to). `bobrvm up` points this at the
+/// project's warm image so the next `up` resumes instead of booting.
+suspend_path: ?[]const u8 = null,
+/// Shell commands run once, over the guest console, on the first cold
+/// boot (not on a warm restore). Set from `provision` in bobrvm.toml;
+/// `bobrvm up` saves the provisioned state as the warm image.
+provision_steps: []const []const u8 = &.{},
 
 pub const MAX_FORWARDS = 8;
 
@@ -136,6 +149,11 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--restore")) {
             config.restore_path = args.next() orelse {
                 log.err("--restore requires a suspend image path", .{});
+                return ParseError.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "--suspend-to")) {
+            config.suspend_path = args.next() orelse {
+                log.err("--suspend-to requires a path", .{});
                 return ParseError.InvalidArgument;
             };
         } else if (std.mem.eql(u8, arg, "--forward")) {
@@ -431,6 +449,17 @@ pub fn printOptions() void {
         \\  -k, --kernel <path>   Kernel image (direct boot)
         \\  -i, --initrd <path>   Initrd image
         \\  --cmdline <str>       Kernel command line
+        \\  --gpu                 Attach a virtio-gpu display device
+        \\  --virgl               Accelerated 3D graphics (implies --gpu)
+        \\  --sound               Attach a virtio-snd playback device
+        \\  --net                 Attach a virtio-net adapter (user-mode NAT)
+        \\  --share <dir>         Export a host directory over virtio-9p (tag "host")
+        \\  --forward <h:g>       Forward host TCP port h to guest port g
+        \\                        (repeatable, max 8, implies --net)
+        \\  --restore <path>      Resume from a suspend image, or restore a
+        \\                        snapshot directory (reverts its disks!)
+        \\  --suspend-to <path>   Target for the console's suspend-and-quit
+        \\                        command (Ctrl-B z)
         \\  --display <WxH>       Initial display resolution (default: 1280x800)
         \\  --gpu-memory <MB>    Graphics memory budget (default: 512)
         \\

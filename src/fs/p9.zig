@@ -92,6 +92,11 @@ pub const P9Server = struct {
     root: []u8,
     fids: std.AutoHashMap(u32, Fid),
     msize: u32 = MSIZE_MAX,
+    /// Host-side read-only enforcement. When set, every mutating
+    /// 9p2000.L request is rejected, so a guest (or a sandbox) cannot
+    /// write through a share the host declared read-only. The guest
+    /// mount option is advisory; this is the real boundary.
+    read_only: bool = false,
 
     pub fn init(alloc: Allocator, root_path: []const u8) !P9Server {
         const root = try alloc.dupe(u8, root_path);
@@ -472,7 +477,20 @@ pub const P9Server = struct {
         return self.fids.getPtr(id) orelse error.BadFid;
     }
 
+    /// Requests that create, modify, or delete filesystem content.
+    /// Tlopen is checked separately (only write-intent opens mutate).
+    fn isMutating(msg_type: u8) bool {
+        return switch (msg_type) {
+            Tlcreate, Tsetattr, Tmkdir, Tunlinkat, Twrite, Tremove => true,
+            else => false,
+        };
+    }
+
     fn dispatch(self: *P9Server, msg_type: u8, tag: u16, r: *Reader, w: *Writer) Error!usize {
+        // Host-side read-only enforcement: reject mutating requests
+        // before touching the filesystem. error.Access maps to EACCES,
+        // which the guest surfaces on the write/create/unlink.
+        if (self.read_only and isMutating(msg_type)) return error.Access;
         switch (msg_type) {
             Tversion => {
                 const client_msize = try r.u32v();
@@ -561,6 +579,14 @@ pub const P9Server = struct {
             Tlopen => {
                 const fid_id = try r.u32v();
                 const flags = try r.u32v();
+                // On a read-only share, refuse to open for writing (or
+                // to truncate) so the write is denied at open, matching
+                // a real read-only mount.
+                if (self.read_only and
+                    (flags & (L_O_WRONLY | L_O_RDWR | L_O_TRUNC | L_O_CREAT)) != 0)
+                {
+                    return error.Access;
+                }
                 const fid = try self.getFid(fid_id);
                 var path_storage: [std.fs.max_path_bytes]u8 = undefined;
                 const path = try self.hostPathInto(fid.rel, &path_storage);
@@ -1228,4 +1254,89 @@ test "p9: request parsing is bounded by the declared message size" {
     std.mem.writeInt(u32, request[0..4], @intCast(request.len + 1), .little);
     _ = server.handle(request, &response);
     try testing.expectEqual(L_EINVAL, std.mem.readInt(u32, response[7..11], .little));
+}
+
+test "p9: read-only share rejects mutating requests but allows reads" {
+    const io = @import("../global.zig").io();
+    const root = ".zig-cache/p9-ro-test-root";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDir(io, root, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, root ++ "/data.txt", .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, "host content", 0);
+    }
+
+    var srv = try P9Server.init(testing.allocator, root);
+    srv.read_only = true;
+    defer srv.deinit();
+    var resp: [MSIZE_MAX]u8 = undefined;
+
+    {
+        var p = TestPayload{};
+        const req = try tmsg(testing.allocator, Tversion, 0xFFFF, p.u32v(65536).str("9P2000.L").slice());
+        defer testing.allocator.free(req);
+        _ = srv.handle(req, &resp);
+    }
+    {
+        var p = TestPayload{};
+        const req = try tmsg(testing.allocator, Tattach, 1, p.u32v(1).u32v(0xFFFF_FFFF).str("u").str("").u32v(0).slice());
+        defer testing.allocator.free(req);
+        try expectRType(resp[0..srv.handle(req, &resp)], Tattach + 1);
+    }
+
+    const expectEacces = struct {
+        fn check(server: *P9Server, buf: []u8, req: []const u8) !void {
+            _ = server.handle(req, buf);
+            try testing.expectEqual(@as(u8, Tlerror + 1), buf[4]);
+            try testing.expectEqual(L_EACCES, std.mem.readInt(u32, buf[7..11], .little));
+        }
+    }.check;
+
+    // Every mutating request is refused with EACCES.
+    {
+        var p = TestPayload{};
+        const req = try tmsg(testing.allocator, Tlcreate, 3, p.u32v(1).str("new.txt").u32v(0o101101).u32v(0o644).u32v(0).slice());
+        defer testing.allocator.free(req);
+        try expectEacces(&srv, &resp, req);
+    }
+    {
+        var p = TestPayload{};
+        const req = try tmsg(testing.allocator, Tmkdir, 4, p.u32v(1).str("dir").u32v(0o755).u32v(0).slice());
+        defer testing.allocator.free(req);
+        try expectEacces(&srv, &resp, req);
+    }
+    {
+        var p = TestPayload{};
+        const req = try tmsg(testing.allocator, Tremove, 5, p.u32v(1).slice());
+        defer testing.allocator.free(req);
+        try expectEacces(&srv, &resp, req);
+    }
+    // Opening the existing file for writing is refused at open, but a
+    // read-only open still works.
+    {
+        var p = TestPayload{};
+        const walk = try tmsg(testing.allocator, Twalk, 6, p.u32v(1).u32v(7).u16v(1).str("data.txt").slice());
+        defer testing.allocator.free(walk);
+        try expectRType(resp[0..srv.handle(walk, &resp)], Twalk + 1);
+
+        var pw = TestPayload{};
+        const open_w = try tmsg(testing.allocator, Tlopen, 7, pw.u32v(7).u32v(L_O_WRONLY).slice());
+        defer testing.allocator.free(open_w);
+        try expectEacces(&srv, &resp, open_w);
+
+        var pr = TestPayload{};
+        const open_r = try tmsg(testing.allocator, Tlopen, 8, pr.u32v(7).u32v(0).slice());
+        defer testing.allocator.free(open_r);
+        try expectRType(resp[0..srv.handle(open_r, &resp)], Tlopen + 1);
+    }
+
+    // The host file is untouched and no stray files were created.
+    const f = try std.Io.Dir.cwd().openFile(io, root ++ "/data.txt", .{});
+    defer f.close(io);
+    var got: [32]u8 = undefined;
+    const got_n = try f.readPositionalAll(io, &got, 0);
+    try testing.expectEqualStrings("host content", got[0..got_n]);
+    try testing.expect(std.Io.Dir.cwd().access(io, root ++ "/new.txt", .{}) == error.FileNotFound);
 }

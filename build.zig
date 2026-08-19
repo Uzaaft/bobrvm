@@ -142,8 +142,17 @@ pub fn build(b: *std.Build) !void {
     ) orelse default_virgl_prefix;
     const virgl_lib = b.fmt("{s}/lib", .{virgl_prefix});
 
+    const gpu_virglrenderer = b.option(
+        bool,
+        "gpu-virglrenderer",
+        "Back the Linux-host GPU with the system virglrenderer",
+    ) orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "gpu_venus", gpu_venus);
+    // Consumed by virtio/gpu.zig on Linux hosts; without a definition
+    // here the Linux graph cannot even be analyzed.
+    build_options.addOption(bool, "gpu_virglrenderer", gpu_virglrenderer);
     // Carried into venus.zig so it can self-configure the render-server binary +
     // KosmicKrisp ICD paths from this install prefix (no manual env needed).
     build_options.addOption([]const u8, "virgl_prefix", virgl_prefix);
@@ -412,6 +421,33 @@ pub fn build(b: *std.Build) !void {
     const run_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Semantic analysis of the whole test graph for the Linux host,
+    // without linking (macOS-only externs cannot link for that
+    // target). This is what catches Linux-only compile rot — code
+    // referenced solely by the x86 machine — from a macOS checkout:
+    // an unrun addTest defaults to -fno-emit-bin, so this stops after
+    // analysis. CI runs `zig build check-linux`.
+    const linux_check_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .gnu,
+        }),
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linux_check_module.addOptions("build_options", build_options);
+    const linux_check = b.addTest(.{
+        .name = "bobrvm-linux-analysis",
+        .root_module = linux_check_module,
+    });
+    const check_linux_step = b.step(
+        "check-linux",
+        "Analyze the Linux test graph without linking",
+    );
+    check_linux_step.dependOn(&linux_check.step);
 
     const c_api_smoke_module = b.createModule(.{
         .target = target,

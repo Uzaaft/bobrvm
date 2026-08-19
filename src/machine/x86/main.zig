@@ -3558,3 +3558,15 @@ test "PCI chipset identifies i440FX and PIIX3 bridges" {
         std.mem.readInt(u32, config[1][piix4_pm_function][0..4], .little),
     );
 }
+
+test "snapshot section registry stays analyzable" {
+    // The registry is a private const referencing codecs nothing else
+    // on a macOS host uses; Zig's lazy analysis let a merge delete two
+    // of them without any build or test noticing. Taking the function
+    // pointers forces full analysis on every host that compiles this
+    // file's tests.
+    inline for (snapshot_sections) |Section| {
+        _ = &Section.capture;
+        _ = &Section.restore;
+    }
+}

@@ -6,6 +6,14 @@ const Allocator = std.mem.Allocator;
 
 pub const Config = @import("Config.zig");
 pub const run = @import("run.zig");
+pub const up = @import("up.zig");
+pub const fork = @import("fork.zig");
+pub const mcp = @import("mcp.zig");
+pub const vz = @import("vz.zig");
+pub const ctl = @import("ctl.zig");
+pub const exec = @import("exec.zig");
+pub const bench = @import("bench.zig");
+pub const ssh = @import("ssh.zig");
 pub const create = @import("create.zig");
 pub const list = @import("list.zig");
 pub const start = @import("start.zig");
@@ -15,6 +23,16 @@ const log = std.log.scoped(.cli);
 
 pub const Subcommand = enum {
     run,
+    up,
+    fork,
+    exec,
+    bench_warm,
+    ssh,
+    mcp,
+    vz_run,
+    status,
+    halt,
+    suspend_vm,
     create,
     list,
     start,
@@ -46,6 +64,16 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
 
     switch (subcmd) {
         .run => try run.execute(alloc, &args),
+        .up => try up.execute(alloc, &args, minimal.environ),
+        .fork => try fork.execute(alloc, &args),
+        .exec => try exec.execute(alloc, &args),
+        .bench_warm => try bench.execute(alloc, &args),
+        .ssh => try ssh.execute(alloc, &args),
+        .mcp => try mcp.execute(alloc, &args, minimal.environ),
+        .vz_run => try vz.execute(alloc, &args),
+        .status => try ctl.execute(alloc, .status),
+        .halt => try ctl.execute(alloc, .halt),
+        .suspend_vm => try ctl.execute(alloc, .@"suspend"),
         .create => try create.execute(alloc, &args),
         .list => try list.execute(alloc),
         .start => try start.execute(alloc, &args),
@@ -64,6 +92,16 @@ pub fn dispatch(alloc: Allocator, minimal: std.process.Init.Minimal) !void {
 fn parseSubcommand(str: []const u8) ?Subcommand {
     const map = std.StaticStringMap(Subcommand).initComptime(.{
         .{ "run", .run },
+        .{ "up", .up },
+        .{ "fork", .fork },
+        .{ "exec", .exec },
+        .{ "bench-warm", .bench_warm },
+        .{ "ssh", .ssh },
+        .{ "mcp", .mcp },
+        .{ "vz-run", .vz_run },
+        .{ "status", .status },
+        .{ "halt", .halt },
+        .{ "suspend", .suspend_vm },
         .{ "create", .create },
         .{ "list", .list },
         .{ "ls", .list },
@@ -87,6 +125,16 @@ fn printUsage() void {
         \\Usage: bobrvm <command> [options]
         \\
         \\Commands:
+        \\  up               Boot the project's bobrvm.toml (resumes warm state)
+        \\  fork             Run a disposable clone of the project's warm state
+        \\  exec -- <cmd>    Run a command in a disposable clone and print output
+        \\  ssh              SSH into the project's guest via a forwarded port
+        \\  status           Show the project's detached runner and warm state
+        \\  suspend          Save the detached runner's state and stop it
+        \\  halt             Stop the project's detached runner
+        \\  bench-warm       Measure warm-restore latency over N trials
+        \\  mcp              Serve sandboxes to AI agents over MCP (stdio)
+        \\  vz-run           Boot on Virtualization.framework (lite engine, experimental)
         \\  run              Run a VM directly with options
         \\  create <name>    Create a named VM configuration
         \\  list, ls         List saved VM configurations
@@ -96,6 +144,7 @@ fn printUsage() void {
         \\  version          Show version information
         \\
         \\Examples:
+        \\  bobrvm up
         \\  bobrvm run --memory 1024 --disk root.raw
         \\  bobrvm create myvm --memory 2048 --disk vm.raw
         \\  bobrvm start myvm

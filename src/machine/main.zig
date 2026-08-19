@@ -44,6 +44,46 @@ const enable_debug_logs = builtin.mode == .Debug;
 // all vCPU threads for guest memory access.
 var current_machine: ?*Machine = null;
 
+const StartupProfile = struct {
+    hypervisor_ns: u64 = 0,
+    firmware_ns: u64 = 0,
+    ram_ns: u64 = 0,
+    dtb_ns: u64 = 0,
+    gic_ns: u64 = 0,
+    devices_ns: u64 = 0,
+    vcpu_create_ns: u64 = 0,
+    vcpu_setup_ns: u64 = 0,
+    restore_ns: u64 = 0,
+    total_ns: u64 = 0,
+};
+
+const PflashEraseJob = struct {
+    code: []u8,
+    vars: []u8,
+    start: usize,
+    end: usize,
+
+    fn run(self: *const PflashEraseJob) void {
+        if (self.start < self.code.len) {
+            @memset(self.code[self.start..@min(self.end, self.code.len)], 0xFF);
+        }
+        if (self.end > self.code.len) {
+            const vars_start = self.start -| self.code.len;
+            @memset(self.vars[vars_start .. self.end - self.code.len], 0xFF);
+        }
+    }
+};
+
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
+fn finishStartupStep(field: *u64, step_started_ns: *u64) void {
+    const now_ns = monotonicNs();
+    field.* = now_ns - step_started_ns.*;
+    step_started_ns.* = now_ns;
+}
+
 fn withGicSystemRegisters(pfr0: u64) u64 {
     return (pfr0 & ~ID_AA64PFR0_GIC_MASK) | (@as(u64, 1) << ID_AA64PFR0_GIC_SHIFT);
 }
@@ -174,6 +214,7 @@ pub const MachineConfig = struct {
     /// Host directory exported to the guest via 9p (mount tag "host").
     /// The slice must stay valid until startSync() has initialized devices.
     shared_dir: ?[]const u8 = null,
+    share_read_only: bool = false,
 
     /// Restore machine state from this suspend image instead of booting.
     /// The rest of the config (RAM size, devices) must match the config
@@ -280,6 +321,7 @@ fn SnapshotSection(
 /// descriptor here.
 const snapshot_sections = .{
     SnapshotSection("gic", "gic_device", snapshot.GicCodec),
+    SnapshotSection("icc", "icc_handler", snapshot.IccCodec),
     SnapshotSection("console", "console", snapshot.ConsoleCodec),
     SnapshotSection("blk1", "block", snapshot.BlockCodec),
     SnapshotSection("blk2", "block2", snapshot.BlockCodec),
@@ -314,6 +356,10 @@ const VcpuRunState = struct {
     pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     vtimer_unmask: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by a restored secondary once its vCPU exists and its
+    /// registers are applied; the restore path serializes on this so
+    /// HVF's creation-index-derived MPIDR matches our CPU numbering.
+    restore_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     entry_point: u64 = 0,
     context_id: u64 = 0,
     thread: ?std.Thread = null,
@@ -346,6 +392,12 @@ pub const Machine = struct {
 
     /// Pflash VARS region (UEFI variables, host-mapped).
     pflash_vars: ?[]align(4096) u8 = null,
+
+    /// CNTVOFF applied to every vCPU (guest CNTVCT_EL0 =
+    /// mach_absolute_time() - vtimer_offset). Zero on a fresh boot;
+    /// set by restore so the guest's monotonic clock continues from
+    /// the capture point instead of jumping by the suspend gap.
+    vtimer_offset: u64 = 0,
 
     /// Virtio console device.
     console: ?*virtio.Console = null,
@@ -851,6 +903,65 @@ pub const Machine = struct {
         if (self.qga) |q| q.queryNetworkInterfaces();
     }
 
+    pub const GuestExecResult = struct {
+        exit_code: i64,
+        signal: ?i64,
+        stdout: []u8,
+        stderr: []u8,
+        out_truncated: bool,
+        err_truncated: bool,
+
+        pub fn deinit(self: *GuestExecResult, alloc: Allocator) void {
+            alloc.free(self.stdout);
+            alloc.free(self.stderr);
+        }
+    };
+
+    /// Run a program in the guest via qemu-guest-agent and wait for it
+    /// to exit. Output is capped by the agent (16 MiB per stream by
+    /// default) and the returned buffers are owned by the caller. The
+    /// guest must allow guest-exec (automation.enable in the guest
+    /// module). Watched qga requests are single-slot, so callers must
+    /// not interleave this with other watched operations (snapshots).
+    pub fn guestExec(
+        self: *Machine,
+        argv: []const []const u8,
+        timeout_ms: u32,
+    ) !GuestExecResult {
+        const qga = self.qga orelse return error.AgentUnavailable;
+        if (!qga.isConnected()) return error.AgentUnavailable;
+
+        const spawn = try qga.exec(argv);
+        try self.waitForQgaResponse(qga, spawn);
+        const pid = qga.execPid() orelse return error.AgentRejected;
+
+        var waited_ms: u32 = 0;
+        while (true) {
+            const poll = qga.execStatusRequest(pid);
+            try self.waitForQgaResponse(qga, poll);
+            const result = qga.execResult();
+            if (result.status.exited) {
+                const stdout_copy = try self.alloc.dupe(u8, result.out);
+                errdefer self.alloc.free(stdout_copy);
+                const stderr_copy = try self.alloc.dupe(u8, result.err);
+                return .{
+                    .exit_code = result.status.exit_code orelse -1,
+                    .signal = result.status.signal,
+                    .stdout = stdout_copy,
+                    .stderr = stderr_copy,
+                    .out_truncated = result.status.out_truncated,
+                    .err_truncated = result.status.err_truncated,
+                };
+            }
+            if (waited_ms >= timeout_ms) return error.ExecTimeout;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 20 * std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+            waited_ms += 20;
+        }
+    }
+
     /// Request a live guest display resolution change (host window resized).
     /// Thread-safe: takes the machine lock, which serializes against all GPU
     /// MMIO/queue processing on the vCPU thread. Lock order (machine_lock ->
@@ -967,6 +1078,12 @@ pub const Machine = struct {
         }
     }
 
+    /// True once startup (including any restore) has finished and the
+    /// vCPUs are entering the run loop. Used to time warm restore.
+    pub fn isRunning(self: *const Machine) bool {
+        return self.running.load(.acquire);
+    }
+
     pub fn stop(self: *Machine) void {
         self.stop_requested.store(true, .release);
         if (!self.running.load(.acquire)) return;
@@ -1061,7 +1178,36 @@ pub const Machine = struct {
             try Section.capture(self, alloc, &builder);
         }
 
+        // Guest virtual counter at capture, so restore can resume the
+        // guest's monotonic clock exactly where it stopped.
+        var vtimer_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &vtimer_bytes, machTicks() -% self.vtimer_offset, .little);
+        try builder.section("vtimer", &vtimer_bytes);
+
+        // UEFI variable store (firmware boots): the mapping is not part
+        // of guest RAM, so vars written since boot would otherwise be
+        // lost on restore. Trailing erased flash (0xFF) is trimmed.
+        if (self.pflash_vars) |vars| {
+            try builder.section("pflash_vars", vars[0..trimErasedFlash(vars)]);
+        }
+
         return try builder.finish();
+    }
+
+    extern "c" fn mach_absolute_time() u64;
+
+    /// Host tick counter in CNTVCT units (Apple Silicon's
+    /// mach_absolute_time is the physical counter).
+    fn machTicks() u64 {
+        return mach_absolute_time();
+    }
+
+    /// Length of the flash content up to the last programmed byte;
+    /// everything after reads back as erased (0xFF).
+    fn trimErasedFlash(flash: []const u8) usize {
+        var len = flash.len;
+        while (len > 0 and flash[len - 1] == 0xFF) len -= 1;
+        return len;
     }
 
     /// Apply a captured state to a freshly-initialized, paused machine
@@ -1240,8 +1386,9 @@ pub const Machine = struct {
     }
 
     /// Restore state from a suspend image. Runs on vCPU 0's owning
-    /// thread (called from startSync before the run loop), so registers
-    /// apply directly. Single-vCPU images only for now.
+    /// thread (called from startSync before the run loop), so its
+    /// registers apply directly; captured secondaries are spawned onto
+    /// their own threads.
     fn restoreFromFile(self: *Machine, path: []const u8, vcpu: *hypervisor.Vcpu) Error!void {
         const io = global.io();
         const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch {
@@ -1278,19 +1425,64 @@ pub const Machine = struct {
             return error.BadImage;
         }
 
-        // RAM (holes read back as zeros; fresh mapping is already zero,
-        // but read the full image for simplicity/correctness).
+        // RAM. The guest mapping is freshly created (all zeros) and
+        // suspendToDisk writes zero chunks as file holes, so only the
+        // image's data regions need to be read: restore cost then scales
+        // with the guest's written working set, not with configured RAM.
+        // Fall back to reading the full logical size when the filesystem
+        // can't enumerate holes.
         const ram_base: u64 = header.len + state_len;
-        var off: usize = 0;
-        while (off < ram.len) : (off += RAM_CHUNK) {
-            const chunk = ram[off..@min(off + RAM_CHUNK, ram.len)];
-            const n = try file.readPositionalAll(io, chunk, ram_base + off);
-            if (n < chunk.len) @memset(chunk[n..], 0);
+        if (!readRamDataRegions(file, ram, ram_base)) {
+            var off: usize = 0;
+            while (off < ram.len) : (off += RAM_CHUNK) {
+                const chunk = ram[off..@min(off + RAM_CHUNK, ram.len)];
+                const n = try file.readPositionalAll(io, chunk, ram_base + off);
+                if (n < chunk.len) @memset(chunk[n..], 0);
+            }
         }
 
         // Devices + GIC.
         const reader = try snapshot.Reader.init(state);
-        if (reader.section("vcpu1")) |_| return error.SmpRestoreUnsupported;
+
+        // Guest clock: resume CNTVCT from the capture point so the
+        // guest's monotonic time never jumps (or runs backward after a
+        // host reboot). Must be computed before secondaries spawn —
+        // they apply the same offset on their own threads.
+        if (reader.section("vtimer")) |data| {
+            if (data.len != 8) return error.BadImage;
+            const guest_counter = std.mem.readInt(u64, data[0..8], .little);
+            self.vtimer_offset = machTicks() -% guest_counter;
+            try vcpu.setVTimerOffset(self.vtimer_offset);
+        }
+
+        // UEFI variable store: what the guest programmed since boot,
+        // with the trimmed tail reading back as erased flash.
+        if (reader.section("pflash_vars")) |data| {
+            const vars = self.pflash_vars orelse return error.BadImage;
+            if (data.len > vars.len) return error.BadImage;
+            @memcpy(vars[0..data.len], data);
+            @memset(vars[data.len..], 0xFF);
+        }
+
+        // Secondary vCPUs: each captured CPU gets its own thread (HVF
+        // requires create+run on the owning thread) which applies its
+        // registers and then waits for the machine to start. CPUs the
+        // image doesn't carry stay offline, matching the captured
+        // guest. An image with MORE CPUs than this machine cannot
+        // restore faithfully.
+        for (1..self.cpu_states.len) |i| {
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "vcpu{d}", .{i}) catch unreachable;
+            const data = reader.section(name) orelse continue;
+            if (data.len != @sizeOf(snapshot.VcpuState)) return error.BadImage;
+            try self.spawnRestoredSecondary(@intCast(i), data);
+        }
+        {
+            var name_buf: [8]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "vcpu{d}", .{self.cpu_states.len}) catch unreachable;
+            if (reader.section(name)) |_| return error.VcpuCountMismatch;
+        }
+
         inline for (snapshot_sections) |Section| {
             try Section.restore(self, self.alloc, &reader);
         }
@@ -1301,6 +1493,140 @@ pub const Machine = struct {
         var vstate: snapshot.VcpuState = undefined;
         @memcpy(std.mem.asBytes(&vstate), vdata);
         try snapshot.restoreVcpu(vcpu, &vstate);
+    }
+
+    /// Register state handed to a restored secondary's thread; the
+    /// thread owns and frees it (the suspend-image buffer it was
+    /// copied from dies with restoreFromFileInner).
+    const SecondaryRestore = struct {
+        vstate: snapshot.VcpuState,
+    };
+
+    /// Spawn one restored secondary vCPU and wait until its vCPU
+    /// exists with registers applied. The wait serializes creations so
+    /// HVF's creation-index-derived MPIDR matches our CPU numbering.
+    fn spawnRestoredSecondary(self: *Machine, cpu_id: u8, data: []const u8) !void {
+        const state = &self.cpu_states[cpu_id];
+        assert(!state.started.load(.acquire));
+        assert(data.len == @sizeOf(snapshot.VcpuState));
+
+        const boot = try self.alloc.create(SecondaryRestore);
+        @memcpy(std.mem.asBytes(&boot.vstate), data);
+
+        state.restore_ready.store(false, .release);
+        state.started.store(true, .release);
+        state.thread = std.Thread.spawn(
+            .{},
+            restoredSecondaryVcpuMain,
+            .{ self, cpu_id, boot },
+        ) catch {
+            state.started.store(false, .release);
+            self.alloc.destroy(boot);
+            return error.RestoreFailed;
+        };
+
+        var waited_ms: u32 = 0;
+        while (!state.restore_ready.load(.acquire)) {
+            if (!state.started.load(.acquire)) return error.RestoreFailed;
+            if (waited_ms >= 2000) return error.RestoreFailed;
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = std.time.ns_per_ms },
+                .clock = .awake,
+            }, global.io()) catch {};
+            waited_ms += 1;
+        }
+    }
+
+    /// Entry point for a restored secondary vCPU thread: create the
+    /// vCPU here (owning thread), apply the captured registers, then
+    /// hold until the machine starts and enter the normal run loop.
+    fn restoredSecondaryVcpuMain(self: *Machine, cpu_id: u8, boot: *SecondaryRestore) void {
+        const state = &self.cpu_states[cpu_id];
+        defer self.alloc.destroy(boot);
+        const vm = self.hv_vm orelse {
+            state.started.store(false, .release);
+            return;
+        };
+
+        const vcpu = vm.createVcpu() catch |err| {
+            log.err("cpu {}: restored vCPU creation failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        setupVcpuFeatures(vcpu) catch |err| {
+            log.err("cpu {}: restored vCPU feature setup failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        snapshot.restoreVcpu(vcpu, &boot.vstate) catch |err| {
+            log.err("cpu {}: register restore failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        // The clock offset was computed before this thread spawned.
+        if (self.vtimer_offset != 0) {
+            vcpu.setVTimerOffset(self.vtimer_offset) catch |err| {
+                log.err("cpu {}: vtimer offset failed: {}", .{ cpu_id, err });
+                state.started.store(false, .release);
+                return;
+            };
+        }
+        state.vcpu = vcpu;
+        state.restore_ready.store(true, .release);
+
+        // The machine starts running after restoreFromFile returns; a
+        // failed startup sets stop_requested so this never leaks.
+        while (!self.running.load(.acquire)) {
+            if (self.stop_requested.load(.acquire)) {
+                state.started.store(false, .release);
+                return;
+            }
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 200 * std.time.ns_per_us },
+                .clock = .awake,
+            }, global.io()) catch {};
+        }
+
+        self.runVcpuLoop(vcpu, cpu_id) catch |err| {
+            log.warn("cpu {}: restored vCPU loop failed: {}", .{ cpu_id, err });
+        };
+        state.started.store(false, .release);
+    }
+
+    /// Darwin lseek whence values for sparse-file traversal. This file
+    /// is Hypervisor.framework-only, so Darwin's numbering applies —
+    /// note Linux numbers the same pair the other way around.
+    const SEEK_HOLE: c_int = 3;
+    const SEEK_DATA: c_int = 4;
+
+    /// Read only the data regions of a sparse suspend image into `ram`.
+    /// Requires `ram` to be all zeros (a fresh guest mapping): skipped
+    /// holes are never written. Returns false when the filesystem cannot
+    /// enumerate holes or a read fails mid-walk; the caller's full-read
+    /// fallback overwrites everything, so a partial walk is harmless.
+    fn readRamDataRegions(file: std.Io.File, ram: []u8, ram_base: u64) bool {
+        if (std.c.getenv("BOBRVM_NO_SPARSE_RESTORE") != null) return false;
+        const io = global.io();
+        const ram_end: u64 = ram_base + ram.len;
+        var pos: u64 = ram_base;
+        while (pos < ram_end) {
+            const data_rc = std.c.lseek(file.handle, @intCast(pos), SEEK_DATA);
+            if (data_rc < 0) {
+                // ENXIO: no data at or after pos — the tail is one hole.
+                return std.c.errno(@as(c_int, -1)) == .NXIO;
+            }
+            const data_start: u64 = @intCast(data_rc);
+            if (data_start >= ram_end) return true;
+            const hole_rc = std.c.lseek(file.handle, @intCast(data_start), SEEK_HOLE);
+            if (hole_rc < 0) return false;
+            const data_end: u64 = @min(@as(u64, @intCast(hole_rc)), ram_end);
+            assert(data_end > data_start);
+            const dst = ram[@intCast(data_start - ram_base)..@intCast(data_end - ram_base)];
+            const n = file.readPositionalAll(io, dst, data_start) catch return false;
+            if (n != dst.len) return false;
+            pos = data_end;
+        }
+        return true;
     }
 
     /// Kick a specific vCPU to wake it from WFI/sleep.
@@ -1328,7 +1654,30 @@ pub const Machine = struct {
     /// Perform every startup step through primary vCPU register setup, then return.
     pub fn benchmarkStartupSync(self: *Machine) Error!void {
         self.prepareStart();
-        return self.startSyncPreparedMode(.setup_only);
+        var profile = StartupProfile{};
+        try self.startSyncPreparedMode(.setup_only, &profile);
+        log.info(
+            "startup profile (Hypervisor.framework): total={}us hv={}us firmware={}us " ++
+                "ram={}us dtb={}us gic={}us devices={}us",
+            .{
+                profile.total_ns / std.time.ns_per_us,
+                profile.hypervisor_ns / std.time.ns_per_us,
+                profile.firmware_ns / std.time.ns_per_us,
+                profile.ram_ns / std.time.ns_per_us,
+                profile.dtb_ns / std.time.ns_per_us,
+                profile.gic_ns / std.time.ns_per_us,
+                profile.devices_ns / std.time.ns_per_us,
+            },
+        );
+        log.info(
+            "startup profile (Hypervisor.framework): vcpu-create={}us vcpu-setup={}us " ++
+                "restore={}us",
+            .{
+                profile.vcpu_create_ns / std.time.ns_per_us,
+                profile.vcpu_setup_ns / std.time.ns_per_us,
+                profile.restore_ns / std.time.ns_per_us,
+            },
+        );
     }
 
     pub fn prepareStart(self: *Machine) void {
@@ -1339,14 +1688,20 @@ pub const Machine = struct {
     }
 
     pub fn startSyncPrepared(self: *Machine) Error!void {
-        return self.startSyncPreparedMode(.run);
+        return self.startSyncPreparedMode(.run, null);
     }
 
     const SyncStartMode = enum { run, setup_only };
 
-    fn startSyncPreparedMode(self: *Machine, mode: SyncStartMode) Error!void {
+    fn startSyncPreparedMode(
+        self: *Machine,
+        mode: SyncStartMode,
+        profile: ?*StartupProfile,
+    ) Error!void {
         assert(!self.running.load(.acquire));
         assert(self.hv_vm == null);
+        const startup_started_ns = if (profile != null) monotonicNs() else 0;
+        var step_started_ns = startup_started_ns;
         try self.checkStartupCancelled();
         log.info("starting machine (sync)", .{});
 
@@ -1354,6 +1709,7 @@ pub const Machine = struct {
         self.hv_vm = try hypervisor.VM.create(self.alloc);
         errdefer self.cleanupHypervisor();
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.hypervisor_ns, &step_started_ns);
 
         const vm = self.hv_vm.?;
 
@@ -1367,10 +1723,12 @@ pub const Machine = struct {
             try self.loadFirmware();
             try self.checkStartupCancelled();
         }
+        if (profile) |value| finishStartupStep(&value.firmware_ns, &step_started_ns);
 
         // Map guest RAM
         try self.mapGuestRam(vm);
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.ram_ns, &step_started_ns);
         log.debug("mapped RAM: 0x{x} - 0x{x}", .{
             MemoryLayout.RAM_BASE,
             MemoryLayout.RAM_BASE + self.config.ram_size,
@@ -1383,33 +1741,48 @@ pub const Machine = struct {
             try self.generateDtb();
             try self.checkStartupCancelled();
         }
+        if (profile) |value| finishStartupStep(&value.dtb_ns, &step_started_ns);
 
         // Initialize GIC (interrupt controller)
         try self.initGic();
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.gic_ns, &step_started_ns);
 
         // Initialize virtio devices
         try self.initVirtioDevices();
         try self.checkStartupCancelled();
+        if (profile) |value| finishStartupStep(&value.devices_ns, &step_started_ns);
 
         // Set current machine for guest memory access
         current_machine = self;
 
         // Create vCPU on THIS thread (required by Apple Hypervisor)
         const vcpu = try vm.createVcpu();
+        if (profile) |value| finishStartupStep(&value.vcpu_create_ns, &step_started_ns);
         log.debug("created vCPU on main thread", .{});
 
         // Set up initial vCPU state (as vCPU 0 - the boot CPU)
         try self.setupVcpuState(vcpu, 0);
         self.cpu_states[0].vcpu = vcpu;
         self.cpu_states[0].started.store(true, .release);
+        if (profile) |value| finishStartupStep(&value.vcpu_setup_ns, &step_started_ns);
 
         // Restoring: we ARE vCPU 0's owning thread here, so registers,
         // RAM, and device state can be applied directly before running.
+        // Restored secondaries wait on running/stop_requested, so a
+        // failed restore must raise stop and reap them before erroring.
         if (self.config.restore_path) |path| {
-            try self.restoreFromFile(path, vcpu);
+            self.restoreFromFile(path, vcpu) catch |err| {
+                self.stop_requested.store(true, .release);
+                self.joinSecondaryVcpus();
+                return err;
+            };
         }
         try self.checkStartupCancelled();
+        if (profile) |value| {
+            finishStartupStep(&value.restore_ns, &step_started_ns);
+            value.total_ns = monotonicNs() - startup_started_ns;
+        }
 
         self.running.store(true, .release);
         log.info("machine started, running vCPU loop", .{});
@@ -2039,6 +2412,55 @@ pub const Machine = struct {
             MemoryLayout.PFLASH_VARS_BASE,
             MemoryLayout.PFLASH_VARS_BASE + MemoryLayout.PFLASH_VARS_SIZE,
         });
+
+        self.erasePflash();
+    }
+
+    fn erasePflash(self: *Machine) void {
+        const code = self.pflash_code.?;
+        const vars = self.pflash_vars.?;
+        const worker_count_max = 8;
+        const worker_count = @min(
+            std.Thread.getCpuCount() catch 4,
+            worker_count_max,
+        );
+        assert(worker_count > 0);
+        const total_bytes = code.len + vars.len;
+        const chunk_bytes_unaligned = std.math.divCeil(
+            usize,
+            total_bytes,
+            worker_count,
+        ) catch unreachable;
+        const chunk_bytes = std.mem.alignForward(
+            usize,
+            chunk_bytes_unaligned,
+            std.heap.pageSize(),
+        );
+        var jobs: [worker_count_max]PflashEraseJob = undefined;
+        var threads: [worker_count_max - 1]?std.Thread = @splat(null);
+
+        // Anonymous mappings start at zero, but flash must read as erased
+        // (0xFF). Fault the independent banks in parallel; serial first-touch
+        // dominates UEFI host startup on large QEMU-compatible flash windows.
+        for (0..worker_count) |index| {
+            jobs[index] = .{
+                .code = code,
+                .vars = vars,
+                .start = index * chunk_bytes,
+                .end = @min((index + 1) * chunk_bytes, total_bytes),
+            };
+        }
+        for (threads[0 .. worker_count - 1], jobs[0 .. worker_count - 1]) |*thread, *job| {
+            thread.* = std.Thread.spawn(
+                .{ .stack_size = 64 * 1024 },
+                PflashEraseJob.run,
+                .{job},
+            ) catch null;
+        }
+        jobs[worker_count - 1].run();
+        for (threads[0 .. worker_count - 1], jobs[0 .. worker_count - 1]) |thread, *job| {
+            if (thread) |worker| worker.join() else job.run();
+        }
     }
 
     fn loadFirmware(self: *Machine) !void {
@@ -2058,9 +2480,6 @@ pub const Machine = struct {
 
         const pflash = self.pflash_code.?;
 
-        // Zero-fill the pflash region first (firmware may be smaller than region)
-        @memset(pflash, 0xFF); // Flash is typically 0xFF when erased
-
         // Read firmware into pflash CODE region (bounded to the file's own
         // size — see loadKernel for why we don't pass the whole region).
         const bytes_read = try file.readPositionalAll(global.io(), pflash[0..firmware_size], 0);
@@ -2072,9 +2491,6 @@ pub const Machine = struct {
 
     fn loadOrCreateVars(self: *Machine) !void {
         const pflash_vars = self.pflash_vars.?;
-
-        // Initialize VARS region to 0xFF (erased flash)
-        @memset(pflash_vars, 0xFF);
 
         // If vars_path is specified, try to load existing vars
         if (self.config.vars_path) |vars_path| {
@@ -2450,7 +2866,7 @@ pub const Machine = struct {
         // 9p shared folder (slot after the rng) if configured.
         if (self.config.shared_dir) |dir| {
             self.p9_slot = self.rng_slot + 1;
-            self.p9 = try virtio.P9.init(self.alloc, "host", dir);
+            self.p9 = try virtio.P9.init(self.alloc, "host", dir, self.config.share_read_only);
             self.registerVirtioMmioDevice(
                 self.p9_slot,
                 .{ .p9 = self.p9.? },
@@ -3321,6 +3737,24 @@ test "withGicSystemRegisters advertises GICv3 without changing other features" {
     try std.testing.expectEqual(pfr0 & ~ID_AA64PFR0_GIC_MASK, updated & ~ID_AA64PFR0_GIC_MASK);
 }
 
+test "pflash erase job handles a bank boundary without touching adjacent bytes" {
+    var code: [8]u8 = @splat(0);
+    var vars: [8]u8 = @splat(0);
+    const job = PflashEraseJob{
+        .code = &code,
+        .vars = &vars,
+        .start = 4,
+        .end = 12,
+    };
+
+    job.run();
+
+    try std.testing.expect(std.mem.allEqual(u8, code[0..4], 0));
+    try std.testing.expect(std.mem.allEqual(u8, code[4..], 0xFF));
+    try std.testing.expect(std.mem.allEqual(u8, vars[0..4], 0xFF));
+    try std.testing.expect(std.mem.allEqual(u8, vars[4..], 0));
+}
+
 test "MachineConfig.isFirmwareBoot" {
     const testing = std.testing;
 
@@ -3388,4 +3822,98 @@ test "stop before synchronous thread entry cancels startup" {
     try testing.expectError(error.StartCancelled, machine.startSyncPrepared());
     try testing.expect(!machine.running.load(.acquire));
     try testing.expect(machine.stop_requested.load(.acquire));
+}
+
+test "trimErasedFlash keeps content up to the last programmed byte" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 0), Machine.trimErasedFlash(&.{}));
+    try testing.expectEqual(@as(usize, 0), Machine.trimErasedFlash(&.{ 0xFF, 0xFF }));
+    try testing.expectEqual(@as(usize, 3), Machine.trimErasedFlash(&.{ 0xFF, 0x00, 0x01, 0xFF }));
+    try testing.expectEqual(@as(usize, 2), Machine.trimErasedFlash(&.{ 0x00, 0x00 }));
+}
+
+test "readRamDataRegions reads only the data regions of a sparse image" {
+    const testing = std.testing;
+    const io = global.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Layout mirrors a suspend image: header+state bytes, then a RAM
+    // span whose zero chunks are file holes. The filesystem may round
+    // data extents up to block granularity; the walk tolerates that
+    // because the surrounding file bytes are zeros.
+    const ram_base: u64 = 100;
+    const ram_len: usize = 512 * 1024;
+    const header_bytes = [_]u8{0xEE} ** 100;
+    var region_a: [16 * 1024]u8 = @splat(0xA5);
+    var region_b: [4 * 1024]u8 = @splat(0x5A);
+
+    {
+        const out = try tmp.dir.createFile(io, "state.img", .{});
+        defer out.close(io);
+        try out.writePositionalAll(io, &header_bytes, 0);
+        try out.writePositionalAll(io, &region_a, ram_base + 64 * 1024);
+        try out.writePositionalAll(io, &region_b, ram_base + ram_len - region_b.len);
+        if (std.c.ftruncate(out.handle, @intCast(ram_base + ram_len)) != 0) {
+            return error.Truncate;
+        }
+    }
+
+    const file = try tmp.dir.openFile(io, "state.img", .{ .mode = .read_only });
+    defer file.close(io);
+
+    const ram = try testing.allocator.alloc(u8, ram_len);
+    defer testing.allocator.free(ram);
+    @memset(ram, 0);
+
+    try testing.expect(Machine.readRamDataRegions(file, ram, ram_base));
+    try testing.expect(std.mem.allEqual(u8, ram[64 * 1024 .. 80 * 1024], 0xA5));
+    try testing.expect(std.mem.allEqual(u8, ram[ram_len - region_b.len ..], 0x5A));
+    try testing.expect(std.mem.allEqual(u8, ram[0 .. 64 * 1024], 0));
+    try testing.expect(std.mem.allEqual(u8, ram[80 * 1024 .. ram_len - region_b.len], 0));
+}
+
+test "readRamDataRegions handles an image whose RAM span is one hole" {
+    const testing = std.testing;
+    const io = global.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ram_base: u64 = 64 * 1024;
+    const ram_len: usize = 256 * 1024;
+    const header_bytes = [_]u8{0xEE} ** 128;
+
+    {
+        const out = try tmp.dir.createFile(io, "hole.img", .{});
+        defer out.close(io);
+        try out.writePositionalAll(io, &header_bytes, 0);
+        if (std.c.ftruncate(out.handle, @intCast(ram_base + ram_len)) != 0) {
+            return error.Truncate;
+        }
+    }
+
+    const file = try tmp.dir.openFile(io, "hole.img", .{ .mode = .read_only });
+    defer file.close(io);
+
+    const ram = try testing.allocator.alloc(u8, ram_len);
+    defer testing.allocator.free(ram);
+    @memset(ram, 0);
+
+    // The SEEK_DATA walk must terminate cleanly via ENXIO (or an
+    // extent that ends before ram_base) and leave RAM untouched.
+    try testing.expect(Machine.readRamDataRegions(file, ram, ram_base));
+    try testing.expect(std.mem.allEqual(u8, ram, 0));
+}
+
+test "snapshot section registry stays analyzable" {
+    // Mirrors the x86 machine's registry test: force analysis of every
+    // section codec so codec rot is a compile error on all hosts. The
+    // comptime gate keeps Hypervisor.framework analysis out of Linux
+    // test builds.
+    if (builtin.os.tag == .macos) {
+        inline for (snapshot_sections) |Section| {
+            _ = &Section.capture;
+            _ = &Section.restore;
+        }
+    }
 }

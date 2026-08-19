@@ -53,6 +53,28 @@ fn installHandlers() void {
     log.debug("signal handlers installed", .{});
 }
 
+/// SIGUSR1 = "suspend and quit" for detached runners. The handler only
+/// sets a flag (nothing heavier is async-signal-safe); the runner's
+/// watcher thread performs the actual suspend.
+var suspend_flag = std.atomic.Value(bool).init(false);
+
+pub fn registerSuspendRequest() void {
+    const handler = posix.Sigaction{
+        .handler = .{ .handler = handleSuspendSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.USR1, &handler, null);
+}
+
+pub fn takeSuspendRequest() bool {
+    return suspend_flag.swap(false, .acq_rel);
+}
+
+fn handleSuspendSignal(_: posix.SIG) callconv(.c) void {
+    suspend_flag.store(true, .release);
+}
+
 fn handleSignal(sig: posix.SIG) callconv(.c) void {
     // Async-signal-safe: only call cleanup, don't log (logging isn't signal-safe)
     if (cleanup_fn) |cb| {

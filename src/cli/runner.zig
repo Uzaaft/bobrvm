@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Config = @import("Config.zig");
+const console_exec = @import("console_exec.zig");
 const global = @import("../global.zig");
 const machine = @import("../machine/main.zig");
 const mininat = @import("../net/mininat.zig");
@@ -67,6 +68,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_snd = config.enable_snd,
         .forwards = forwards_buf[0..config.forward_count],
         .shared_dir = config.shared_dir,
+        .share_read_only = config.share_read_only,
         .restore_path = restore_path,
         .display_width = config.display_width,
         .display_height = config.display_height,
@@ -95,6 +97,26 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
 
     registerMachineForCleanup(hw);
     defer unregisterMachineForCleanup();
+    suspend_target = config.suspend_path;
+    defer suspend_target = null;
+
+    // Detached runners have no console for Ctrl-B z; SIGUSR1 requests
+    // the same suspend-and-quit. The handler only sets a flag — this
+    // watcher does the heavy lifting and is joined before hw dies.
+    var suspend_watcher_stop = std.atomic.Value(bool).init(false);
+    var suspend_watcher: ?std.Thread = null;
+    defer if (suspend_watcher) |thread| {
+        suspend_watcher_stop.store(true, .release);
+        thread.join();
+    };
+    if (config.suspend_path) |path| {
+        os.signal.registerSuspendRequest();
+        suspend_watcher = std.Thread.spawn(
+            .{},
+            suspendWatcher,
+            .{ hw, path, &suspend_watcher_stop },
+        ) catch null;
+    }
 
     hw.setConsoleOutput(consoleOutput, null);
 
@@ -227,6 +249,29 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     };
     if (input_thread) |t| t.detach();
 
+    // First-boot provisioning: run the project's provision steps over
+    // the console once, on a cold boot only (a warm restore already
+    // carries the provisioned state). Runs on a side thread because
+    // startSync blocks; consoleOutput tees the guest console into the
+    // session so marker detection works alongside the live console.
+    var provision_session: console_exec.Session = undefined;
+    var provision_thread: ?std.Thread = null;
+    defer if (provision_thread) |thread| {
+        thread.join();
+        provision_active.store(false, .release);
+        provision_session.deinit();
+    };
+    if (config.restore_path == null and config.provision_steps.len > 0) {
+        provision_session = console_exec.Session.init(alloc, hw);
+        active_provision_session = &provision_session;
+        provision_active.store(true, .release);
+        provision_thread = std.Thread.spawn(
+            .{ .stack_size = input_stack_size_bytes },
+            provisionLoop,
+            .{ &provision_session, config.provision_steps },
+        ) catch null;
+    }
+
     log.info("starting VM...", .{});
     hw.startSync() catch |err| {
         log.err("failed to start VM: {}", .{err});
@@ -234,6 +279,36 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     };
 
     log.info("VM stopped", .{});
+}
+
+/// Console tee target for provisioning (see provisionLoop). Guarded by
+/// provision_active so consoleOutput only touches it while live.
+var active_provision_session: ?*console_exec.Session = null;
+var provision_active = std.atomic.Value(bool).init(false);
+
+/// Run each provision step over the guest console, in order, on the
+/// first cold boot. Logs a one-line result per step.
+fn provisionLoop(session: *console_exec.Session, steps: []const []const u8) void {
+    if (!session.waitForPrompt(session.alloc, 60_000)) {
+        log.err("provisioning: guest did not reach a shell prompt", .{});
+        return;
+    }
+    for (steps, 0..) |step, i| {
+        const result = session.run(session.alloc, step, 300_000) catch |err| {
+            log.err("provision step {d} ({s}) failed: {}", .{ i + 1, step, err });
+            return;
+        };
+        defer session.alloc.free(result.output);
+        if (result.exit_code == 0) {
+            log.info("provision step {d}/{d} ok: {s}", .{ i + 1, steps.len, step });
+        } else {
+            log.err("provision step {d}/{d} exit {d}: {s}", .{
+                i + 1, steps.len, result.exit_code, step,
+            });
+            return;
+        }
+    }
+    log.info("provisioning complete ({d} steps); save with Ctrl-B z", .{steps.len});
 }
 
 var saved_termios: ?std.posix.termios = null;
@@ -597,7 +672,34 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
     }
 }
 
+/// Service SIGUSR1 suspend requests (the flag is all the handler may
+/// touch); ends after a successful suspend or when the run finishes.
+fn suspendWatcher(
+    hw: *machine.Machine,
+    path: []const u8,
+    stop: *std.atomic.Value(bool),
+) void {
+    while (!stop.load(.acquire)) {
+        if (os.signal.takeSuspendRequest()) {
+            log.info("suspending machine to {s} (SIGUSR1)", .{path});
+            hw.suspendToDisk(path) catch |err| {
+                log.err("suspend failed: {}; resuming", .{err});
+                hw.unpause();
+                continue;
+            };
+            hw.requestStop();
+            return;
+        }
+        sleepNs(100 * std.time.ns_per_ms);
+    }
+}
+
 const host_command_prefix: u8 = 0x02;
+
+/// Target for the suspend-and-quit console command; set from the
+/// config before the input thread starts (same lifetime pattern as
+/// cleanup_machine).
+var suspend_target: ?[]const u8 = null;
 
 const HostCommand = enum {
     literal_prefix,
@@ -607,6 +709,7 @@ const HostCommand = enum {
     reboot,
     sync_time,
     trim,
+    suspend_quit,
 };
 
 fn classifyHostCommand(byte: u8) ?HostCommand {
@@ -618,6 +721,7 @@ fn classifyHostCommand(byte: u8) ?HostCommand {
         'r' => .reboot,
         't' => .sync_time,
         'f' => .trim,
+        'z' => .suspend_quit,
         else => null,
     };
 }
@@ -626,7 +730,7 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
     switch (command) {
         .literal_prefix => hw.injectConsoleInput(&.{host_command_prefix}),
         .help => log.info(
-            "host commands: p=status s=shutdown r=reboot t=sync-time f=trim Ctrl-B=literal",
+            "host commands: p=status s=shutdown r=reboot t=sync-time f=trim z=suspend+quit Ctrl-B=literal",
             .{},
         ),
         .status => log.info("guest tools: {s}, capabilities=0x{x}", .{
@@ -637,6 +741,19 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
         .reboot => hw.requestGuestReboot(),
         .sync_time => hw.syncGuestTime(),
         .trim => hw.trimGuestFilesystems(),
+        .suspend_quit => {
+            const path = suspend_target orelse {
+                log.warn("no suspend target configured (--suspend-to <path>)", .{});
+                return;
+            };
+            log.info("suspending machine to {s}", .{path});
+            hw.suspendToDisk(path) catch |err| {
+                log.err("suspend failed: {}; resuming", .{err});
+                hw.unpause();
+                return;
+            };
+            hw.requestStop();
+        },
     }
 }
 
@@ -647,6 +764,7 @@ test "host console command decoder" {
     try std.testing.expectEqual(HostCommand.reboot, classifyHostCommand('r').?);
     try std.testing.expectEqual(HostCommand.sync_time, classifyHostCommand('t').?);
     try std.testing.expectEqual(HostCommand.trim, classifyHostCommand('f').?);
+    try std.testing.expectEqual(HostCommand.suspend_quit, classifyHostCommand('z').?);
     try std.testing.expectEqual(HostCommand.literal_prefix, classifyHostCommand(0x02).?);
     try std.testing.expect(classifyHostCommand('x') == null);
 }
@@ -654,6 +772,13 @@ test "host console command decoder" {
 fn consoleOutput(data: []const u8, _: ?*anyopaque) void {
     const stdout = std.posix.STDOUT_FILENO;
     _ = std.c.write(stdout, data.ptr, data.len);
+    // Tee to the provisioning session while it is running, so its
+    // marker detection sees the same console stream the user does.
+    if (provision_active.load(.acquire)) {
+        if (active_provision_session) |session| {
+            console_exec.Session.sink(data, session);
+        }
+    }
 }
 
 var cleanup_machine: ?*machine.Machine = null;

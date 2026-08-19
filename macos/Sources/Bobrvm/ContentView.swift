@@ -2,147 +2,225 @@ import AppKit
 import Combine
 import SwiftUI
 
-// MARK: - Debug Build Warning
+enum LibrarySelection: Hashable {
+    case library
+    case virtualMachine(UUID)
+}
+
+@MainActor
+func presentNativeError(_ error: Error, title: String) {
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = title
+    alert.informativeText = error.localizedDescription
+    alert.addButton(withTitle: "OK")
+    if let window = NSApp.keyWindow {
+        alert.beginSheetModal(for: window)
+        return
+    }
+
+    let presentedError = NSError(
+        domain: Bundle.main.bundleIdentifier ?? "com.bobrvm.app",
+        code: 1,
+        userInfo: [
+            NSLocalizedDescriptionKey: title,
+            NSLocalizedRecoverySuggestionErrorKey: error.localizedDescription,
+            NSUnderlyingErrorKey: error,
+        ]
+    )
+    _ = NSApp.presentError(presentedError)
+}
 
 struct DebugBuildWarningView: View {
-    @State private var isPopover = false
+    @State private var isPopoverPresented = false
 
     var body: some View {
         Button {
-            isPopover = true
+            isPopoverPresented = true
         } label: {
-            HStack {
-                Spacer()
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.yellow)
-                Text("Debug build – performance may be degraded")
-                    .font(.callout)
-                    .padding(.vertical, 8)
-                Spacer()
-            }
+            Label("Debug Build", systemImage: "exclamationmark.triangle.fill")
         }
-        .buttonStyle(.plain)
-        .background(Color(.windowBackgroundColor).opacity(0.95))
-        .frame(maxWidth: .infinity)
-        .popover(isPresented: $isPopover, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Debug Build")
+        .buttonStyle(.glass)
+        .controlSize(.small)
+        .tint(.yellow)
+        .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Debug Build", systemImage: "hammer.fill")
                     .font(.headline)
-                Text(
-                    """
-                    Debug builds of Bobrvm include additional safety checks and logging that may \
-                    impact performance.
-
-                    For production use, build with:
-                    """)
+                Text("Safety checks and logging can reduce virtual machine performance.")
+                    .foregroundStyle(.secondary)
                 Text("zig build -Doptimize=ReleaseFast")
-                    .font(.system(.body, design: .monospaced))
-                    .padding(8)
-                    .background(Color(.textBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary, in: .rect(cornerRadius: 8))
             }
-            .padding()
-            .frame(width: 320)
+            .padding(16)
+            .frame(width: 340)
         }
-        .accessibilityLabel("Debug build warning")
-        .accessibilityHint("Shows build performance details")
+        .accessibilityHint("Shows information about debug-build performance")
     }
 }
-
-// MARK: - Content View
 
 struct ContentView: View {
-    @EnvironmentObject var vmManager: VMManager
+    @EnvironmentObject private var vmManager: VMManager
+    @State private var selection: LibrarySelection? = .library
+    @State private var searchText = ""
+    @State private var libraryVMSelection: UUID?
 
     var body: some View {
-        VStack(spacing: 0) {
-            if bobrvm_is_debug() {
-                DebugBuildWarningView()
+        NavigationSplitView {
+            VMListView(
+                selection: $selection,
+                searchText: $searchText
+            )
+            .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 300)
+        } detail: {
+            detail
+        }
+        .navigationSplitViewStyle(.balanced)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    vmManager.showingCreateVM = true
+                } label: {
+                    Label("New Virtual Machine", systemImage: "plus")
+                }
+                .help("Create a virtual machine (Command-N)")
             }
+        }
+        .sheet(isPresented: $vmManager.showingCreateVM) {
+            CreateVMView()
+        }
+        .sheet(item: $vmManager.vmPendingEdit) { vm in
+            EditVMView(vmInstance: vm)
+        }
+        .frame(minWidth: 780, minHeight: 520)
+        .focusedSceneObject(selectedVM)
+        .onChange(of: visibleVMIDs) { _, ids in
+            if let id = libraryVMSelection, !ids.contains(id) {
+                libraryVMSelection = nil
+            }
+            guard case .virtualMachine(let id) = selection, !ids.contains(id) else {
+                return
+            }
+            selection = .library
+        }
+    }
 
-            NavigationSplitView {
-                VMListView()
-                    .frame(minWidth: 200)
-            } detail: {
-                VMLibraryHomeView()
+    @ViewBuilder
+    private var detail: some View {
+        switch selection {
+        case .virtualMachine(let id):
+            if let vm = vmManager.vms.first(where: { $0.id == id }) {
+                VMOverviewView(vmInstance: vm)
+            } else {
+                library
             }
-            .sheet(isPresented: $vmManager.showingCreateVM) {
-                CreateVMView()
-            }
+        case .library, nil:
+            library
+        }
+    }
+
+    private var library: some View {
+        VMLibraryHomeView(
+            searchText: searchText,
+            selectedVMID: $libraryVMSelection,
+            showDetails: { selection = .virtualMachine($0.id) }
+        )
+    }
+
+    private var selectedVM: VMInstance? {
+        switch selection {
+        case .virtualMachine(let id):
+            return vmManager.vms.first { $0.id == id }
+        case .library, nil:
+            guard let id = libraryVMSelection else { return nil }
+            return vmManager.vms.first { $0.id == id }
+        }
+    }
+
+    private var visibleVMIDs: [UUID] {
+        guard !searchText.isEmpty else { return vmManager.vms.map(\.id) }
+        return vmManager.vms.compactMap { vm in
+            let matchesSearch = vm.name.localizedStandardContains(searchText)
+                || vm.guestSystem.displayName.localizedStandardContains(searchText)
+            return matchesSearch ? vm.id : nil
         }
     }
 }
 
-// MARK: - VM List
-
 struct VMListView: View {
-    @EnvironmentObject var vmManager: VMManager
-    @Environment(\.openWindow) private var openWindow
+    @EnvironmentObject private var vmManager: VMManager
+    @Binding var selection: LibrarySelection?
+    @Binding var searchText: String
     @State private var vmToDelete: VMInstance?
-    @State private var vmToEdit: VMInstance?
-    @State private var showDeleteConfirmation = false
-    @State private var showEditSheet = false
 
     var body: some View {
-        List(vmManager.vms) { vm in
-            VMListRow(vmInstance: vm)
-                .tag(vm)
-                .onTapGesture {
-                    openWindow(id: "vm-display", value: vm.id)
-                }
-                .contextMenu {
-                    VMContextMenu(
-                        vmInstance: vm,
-                        onEdit: {
-                            vmToEdit = vm
-                            showEditSheet = true
-                        },
-                        onDelete: {
-                            vmToDelete = vm
-                            showDeleteConfirmation = true
+        List(selection: $selection) {
+            Section {
+                Label("Library", systemImage: "square.grid.2x2")
+                    .tag(LibrarySelection.library)
+            }
+
+            Section("Virtual Machines") {
+                ForEach(filteredVMs) { vm in
+                    VMListRow(vmInstance: vm)
+                        .tag(LibrarySelection.virtualMachine(vm.id))
+                        .contextMenu {
+                            VMContextMenu(
+                                vmInstance: vm,
+                                onEdit: { vmManager.vmPendingEdit = vm },
+                                onDelete: { vmToDelete = vm }
+                            )
                         }
-                    )
                 }
+            }
         }
         .listStyle(.sidebar)
-        .navigationTitle("Virtual Machines")
-        .toolbar {
-            ToolbarItem(placement: .automatic) {
-                Button(action: { vmManager.showingCreateVM = true }) {
-                    Image(systemName: "plus")
-                }
-                .help("Create new VM")
+        .navigationTitle("Bobrvm")
+        .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
+        .safeAreaInset(edge: .bottom) {
+            if bobrvm_is_debug() {
+                DebugBuildWarningView()
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .confirmationDialog(
-            "Delete Virtual Machine",
-            isPresented: $showDeleteConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Delete", role: .destructive) {
-                if let vm = vmToDelete {
-                    vmManager.deleteVM(vm)
-                }
+            "Delete Virtual Machine?",
+            isPresented: deleteConfirmation,
+            titleVisibility: .visible,
+            presenting: vmToDelete
+        ) { vm in
+            Button("Delete \"\(vm.name)\"", role: .destructive) {
+                vmManager.deleteVM(vm)
                 vmToDelete = nil
             }
             Button("Cancel", role: .cancel) {
                 vmToDelete = nil
             }
-        } message: {
-            if let vm = vmToDelete {
-                Text(
-                    "Are you sure you want to delete \"\(vm.name)\"? This action cannot be undone.")
-            }
-        }
-        .sheet(isPresented: $showEditSheet) {
-            if let vm = vmToEdit {
-                EditVMView(vmInstance: vm)
-            }
+        } message: { _ in
+            Text("The saved configuration will be removed. Disk images remain on this Mac.")
         }
     }
-}
 
-// MARK: - Context Menu
+    private var filteredVMs: [VMInstance] {
+        guard !searchText.isEmpty else { return vmManager.vms }
+        return vmManager.vms.filter {
+            $0.name.localizedStandardContains(searchText)
+                || $0.guestSystem.displayName.localizedStandardContains(searchText)
+        }
+    }
+
+    private var deleteConfirmation: Binding<Bool> {
+        Binding(
+            get: { vmToDelete != nil },
+            set: { if !$0 { vmToDelete = nil } }
+        )
+    }
+}
 
 struct VMContextMenu: View {
     @ObservedObject var vmInstance: VMInstance
@@ -157,8 +235,7 @@ struct VMContextMenu: View {
                 switch vmInstance.state {
                 case .stopped:
                     Button {
-                        try? vmInstance.start()
-                        openWindow(id: "vm-display", value: vmInstance.id)
+                        start()
                     } label: {
                         Label("Start", systemImage: "play.fill")
                     }
@@ -182,8 +259,7 @@ struct VMContextMenu: View {
 
                     Button {
                         vmInstance.stop()
-                        try? vmInstance.start()
-                        openWindow(id: "vm-display", value: vmInstance.id)
+                        start()
                     } label: {
                         Label("Restart", systemImage: "arrow.clockwise")
                     }
@@ -204,25 +280,20 @@ struct VMContextMenu: View {
                 }
             }
 
-            Divider()
-
             Section {
                 Button {
                     onEdit()
                 } label: {
                     Label("Settings…", systemImage: "gearshape")
                 }
-                .keyboardShortcut(",", modifiers: .command)
 
-            Button {
-                duplicateVM()
+                Button {
+                    duplicateVM()
                 } label: {
                     Label("Duplicate", systemImage: "plus.square.on.square")
                 }
                 .disabled(vmInstance.state == .running || vmInstance.guestSystem == .macOS)
             }
-
-            Divider()
 
             Section {
                 if vmInstance.guestSystem != .macOS {
@@ -244,8 +315,6 @@ struct VMContextMenu: View {
                 }
             }
 
-            Divider()
-
             Section {
                 Button(role: .destructive) {
                     onDelete()
@@ -260,13 +329,26 @@ struct VMContextMenu: View {
     private func duplicateVM() {
         guard vmInstance.guestSystem != .macOS else { return }
         let newName = "\(vmInstance.name) (Copy)"
-        try? vmManager.createVM(
-            name: newName,
-            config: vmInstance.config,
-            isoPath: vmInstance.isoPath,
-            retinaEnabled: vmInstance.retinaEnabled,
-            guestSystem: vmInstance.guestSystem
-        )
+        do {
+            try vmManager.createVM(
+                name: newName,
+                config: vmInstance.config,
+                isoPath: vmInstance.isoPath,
+                retinaEnabled: vmInstance.retinaEnabled,
+                guestSystem: vmInstance.guestSystem
+            )
+        } catch {
+            presentNativeError(error, title: "Could Not Duplicate Virtual Machine")
+        }
+    }
+
+    private func start() {
+        do {
+            try vmInstance.start()
+            openWindow(id: "vm-display", value: vmInstance.id)
+        } catch {
+            presentNativeError(error, title: "Could Not Start Virtual Machine")
+        }
     }
 
     private func showInFinder(path: String) {
@@ -296,63 +378,49 @@ struct VMListRow: View {
     @ObservedObject var vmInstance: VMInstance
 
     var body: some View {
-        HStack {
-            Image(systemName: "desktopcomputer")
-                .foregroundColor(vmInstance.state.presentationColor)
+        HStack(spacing: 8) {
+            Image(systemName: vmInstance.guestSystem.presentationIcon)
+                .foregroundStyle(vmInstance.guestSystem.presentationColor)
+                .frame(width: 22)
+                .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(vmInstance.name)
-                    .font(.headline)
+            Text(vmInstance.name)
+                .lineLimit(1)
 
-                Text(vmInstance.state.presentationName)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+            Spacer(minLength: 8)
+
+            if vmInstance.state != .stopped {
+                Circle()
+                    .fill(vmInstance.state.presentationColor)
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
             }
         }
-        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(vmInstance.name)
+        .accessibilityValue(
+            "\(vmInstance.guestSystem.displayName), \(vmInstance.state.presentationName)"
+        )
     }
 }
 
-// MARK: - VM Detail
-
 struct VMDetailView: View {
     @ObservedObject var vmInstance: VMInstance
+    @State private var showingSettings = false
+    @State private var errorTitle = ""
+    @State private var errorMessage: String?
 
     var body: some View {
-        VStack(spacing: 0) {
-            if vmInstance.state == .running || vmInstance.state == .paused {
-                if vmInstance.guestSystem == .macOS,
-                    let machine = vmInstance.runtimeMacVM
-                {
-                    MacVirtualMachineView(machine: machine)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    VMSurfaceRepresentable(vmInstance: vmInstance)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            } else {
-                VStack(spacing: 16) {
-                    Image(systemName: "desktopcomputer")
-                        .font(.system(size: 64))
-                        .foregroundColor(.secondary)
-
-                    Text(vmInstance.name)
-                        .font(.title)
-
-                    Text("Click Start to boot the VM")
-                        .foregroundColor(.secondary)
-
-                    Button("Start") {
-                        try? vmInstance.start()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
+        display
         .toolbar {
             ToolbarItemGroup(placement: .automatic) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .help("Virtual machine settings")
+
                 if vmInstance.guestSystem != .macOS {
                     Menu {
                         ISOMediaActions(vmInstance: vmInstance)
@@ -361,72 +429,124 @@ struct VMDetailView: View {
                     }
                     .help(isoHelp)
                 }
-
-                switch vmInstance.state {
-                case .stopped:
-                    Button(action: { try? vmInstance.start() }) {
-                        Label("Start", systemImage: "play.fill")
-                    }
-                    .help("Start VM")
-
-                case .running:
-                    Button(action: { vmInstance.pause() }) {
-                        Label("Pause", systemImage: "pause.fill")
-                    }
-                    .help("Pause VM")
-
-                    Button(action: { vmInstance.stop() }) {
-                        Label("Stop", systemImage: "stop.fill")
-                    }
-                    .help("Stop VM")
-
-                    Menu {
-                        Text(guestToolsDescription)
-                        Divider()
-                        Button("Shut Down Guest") {
-                            vmInstance.shutdownGracefully()
-                        }
-                        .disabled(!vmInstance.isGuestManagementReady)
-                        Button("Reboot Guest") {
-                            vmInstance.rebootGuest()
-                        }
-                        .disabled(!vmInstance.isGuestManagementReady)
-                        Divider()
-                        Button("Synchronize Time") {
-                            vmInstance.synchronizeGuestTime()
-                        }
-                        .disabled(!vmInstance.isGuestManagementReady)
-                        Button("Trim Filesystems") {
-                            vmInstance.trimGuestFilesystems()
-                        }
-                        .disabled(!vmInstance.isGuestManagementReady)
-                        Button("Create Quiesced Snapshot…") {
-                            createQuiescedSnapshot()
-                        }
-                        .disabled(!vmInstance.isGuestManagementReady)
-                        Divider()
-                        Button("Send File to Guest…") {
-                            sendFileToGuest()
-                        }
-                        .disabled(!vmInstance.guestToolsStatus.supportsFileTransfer)
-                    } label: {
-                        Label("Guest Tools", systemImage: "wrench.and.screwdriver")
-                    }
-
-                case .paused:
-                    Button(action: { vmInstance.resume() }) {
-                        Label("Resume", systemImage: "play.fill")
-                    }
-                    .help("Resume VM")
-
-                    Button(action: { vmInstance.stop() }) {
-                        Label("Stop", systemImage: "stop.fill")
-                    }
-                    .help("Stop VM")
-                }
-
+            }
+            ToolbarSpacer(.fixed)
+            ToolbarItemGroup(placement: .primaryAction) {
+                lifecycleControls
             }
         }
+        .sheet(isPresented: $showingSettings) {
+            EditVMView(vmInstance: vmInstance)
+        }
+        .alert(errorTitle, isPresented: errorPresented) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "An unknown error occurred.")
+        }
+    }
+
+    @ViewBuilder
+    private var display: some View {
+        if vmInstance.state == .running || vmInstance.state == .paused {
+            if vmInstance.guestSystem == .macOS,
+                let machine = vmInstance.runtimeMacVM
+            {
+                MacVirtualMachineView(machine: machine)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                VMSurfaceRepresentable(vmInstance: vmInstance)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else {
+            ContentUnavailableView {
+                Label(vmInstance.name, systemImage: vmInstance.guestSystem.presentationIcon)
+            } description: {
+                Text("Start this virtual machine to open its display.")
+            } actions: {
+                Button(action: start) {
+                    Label("Start", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var lifecycleControls: some View {
+        switch vmInstance.state {
+        case .stopped:
+            Button(action: start) {
+                Label("Start", systemImage: "play.fill")
+            }
+            .help("Start virtual machine")
+        case .running:
+            Button {
+                vmInstance.pause()
+            } label: {
+                Label("Pause", systemImage: "pause.fill")
+            }
+            .help("Pause virtual machine")
+            Button(role: .destructive) {
+                vmInstance.stop()
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+            }
+            .help("Stop virtual machine")
+            guestToolsMenu
+        case .paused:
+            Button {
+                vmInstance.resume()
+            } label: {
+                Label("Resume", systemImage: "play.fill")
+            }
+            .help("Resume virtual machine")
+            Button(role: .destructive) {
+                vmInstance.stop()
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+            }
+            .help("Stop virtual machine")
+        }
+    }
+
+    private var guestToolsMenu: some View {
+        Menu {
+            Text(guestToolsDescription)
+            Divider()
+            Button("Shut Down Guest", systemImage: "power") {
+                vmInstance.shutdownGracefully()
+            }
+            .disabled(!vmInstance.isGuestManagementReady)
+            Button("Reboot Guest", systemImage: "arrow.clockwise") {
+                vmInstance.rebootGuest()
+            }
+            .disabled(!vmInstance.isGuestManagementReady)
+            Divider()
+            Button(
+                "Synchronize Time",
+                systemImage: "clock.arrow.trianglehead.2.counterclockwise.rotate.90"
+            ) {
+                vmInstance.synchronizeGuestTime()
+            }
+            .disabled(!vmInstance.isGuestManagementReady)
+            Button("Trim Filesystems", systemImage: "scissors") {
+                vmInstance.trimGuestFilesystems()
+            }
+            .disabled(!vmInstance.isGuestManagementReady)
+            Button("Create Quiesced Snapshot…", systemImage: "camera") {
+                createQuiescedSnapshot()
+            }
+            .disabled(!vmInstance.isGuestManagementReady)
+            Divider()
+            Button("Send File to Guest…", systemImage: "paperplane") {
+                sendFileToGuest()
+            }
+            .disabled(!vmInstance.guestToolsStatus.supportsFileTransfer)
+        } label: {
+            Label("Guest Tools", systemImage: "wrench.and.screwdriver")
+        }
+        .help("Guest integration tools")
     }
 
     private func sendFileToGuest() {
@@ -437,9 +557,7 @@ struct VMDetailView: View {
         do {
             try vmInstance.sendFileToGuest(file)
         } catch {
-            let alert = NSAlert(error: error)
-            alert.messageText = "Could Not Send File"
-            alert.runModal()
+            showError(title: "Could Not Send File", error: error)
         }
     }
 
@@ -453,11 +571,29 @@ struct VMDetailView: View {
             do {
                 try await vmInstance.snapshotQuiesced(to: directory)
             } catch {
-                let alert = NSAlert(error: error)
-                alert.messageText = "Could Not Create Snapshot"
-                alert.runModal()
+                showError(title: "Could Not Create Snapshot", error: error)
             }
         }
+    }
+
+    private var errorPresented: Binding<Bool> {
+        Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )
+    }
+
+    private func start() {
+        do {
+            try vmInstance.start()
+        } catch {
+            showError(title: "Could Not Start Virtual Machine", error: error)
+        }
+    }
+
+    private func showError(title: String, error: Error) {
+        errorTitle = title
+        errorMessage = error.localizedDescription
     }
 
     private var guestToolsDescription: String {
@@ -478,22 +614,31 @@ struct VMDetailView: View {
 struct ISOMediaActions: View {
     @ObservedObject var vmInstance: VMInstance
     @EnvironmentObject private var vmManager: VMManager
+    @State private var errorTitle = "Could Not Update ISO"
+    @State private var errorMessage: String?
 
     var body: some View {
-        Button {
-            attachISO()
-        } label: {
-            Label("Attach ISO…", systemImage: "opticaldisc.badge.plus")
-        }
-        .disabled(vmInstance.state != .stopped)
-
-        if vmInstance.isoPath != nil {
+        Group {
             Button {
-                updateISO(path: nil, action: "detach")
+                attachISO()
             } label: {
-                Label("Detach ISO", systemImage: "eject.fill")
+                Label("Attach ISO…", systemImage: "opticaldisc.badge.plus")
             }
             .disabled(vmInstance.state != .stopped)
+
+            if vmInstance.isoPath != nil {
+                Button {
+                    updateISO(path: nil, action: "detach")
+                } label: {
+                    Label("Detach ISO", systemImage: "eject.fill")
+                }
+                .disabled(vmInstance.state != .stopped)
+            }
+        }
+        .alert(errorTitle, isPresented: errorPresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(errorMessage ?? "An unknown error occurred.")
         }
     }
 
@@ -511,10 +656,16 @@ struct ISOMediaActions: View {
         do {
             try vmManager.updateISO(vmInstance, path: path)
         } catch {
-            let alert = NSAlert(error: error)
-            alert.messageText = "Could Not \(action.capitalized) ISO"
-            alert.runModal()
+            errorTitle = "Could Not \(action.capitalized) ISO"
+            errorMessage = error.localizedDescription
         }
+    }
+
+    private var errorPresented: Binding<Bool> {
+        Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )
     }
 }
 
@@ -524,21 +675,26 @@ struct VMWindowView: View {
 
     var body: some View {
         Group {
-            if let vm = vmManager.vms.first(where: { $0.id == vmID }) {
+            if let vm = vmInstance {
                 VMDetailView(vmInstance: vm)
                     .navigationTitle(vm.name)
             } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
-                    Text("Virtual Machine Not Found")
-                        .font(.title2)
+                ContentUnavailableView {
+                    Label(
+                        "Virtual Machine Not Found",
+                        systemImage: "desktopcomputer.trianglebadge.exclamationmark"
+                    )
+                } description: {
+                    Text("This virtual machine may have been removed from the library.")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .focusedSceneValue(\.vmID, vmID)
+        .focusedSceneObject(vmInstance)
+    }
+
+    private var vmInstance: VMInstance? {
+        vmManager.vms.first { $0.id == vmID }
     }
 }
 
@@ -548,55 +704,47 @@ struct VMConsoleWindowView: View {
 
     var body: some View {
         Group {
-            if let vmInstance = vmManager.vms.first(where: { $0.id == vmID }) {
+            if let vmInstance {
                 if let vm = vmInstance.runtimeVM {
                     ConsoleView(vm: vm)
                         .navigationTitle("\(vmInstance.name) Console")
                 } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "terminal")
-                            .font(.system(size: 48))
-                            .foregroundStyle(.secondary)
-                        Text("Console Unavailable")
-                            .font(.title2)
-                        Text("Start the virtual machine to open its console.")
-                            .foregroundStyle(.secondary)
+                    ContentUnavailableView {
+                        Label("Console Unavailable", systemImage: "terminal")
+                    } description: {
+                        Text(consoleUnavailableDescription(for: vmInstance))
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
-                Text("Virtual Machine Not Found")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ContentUnavailableView(
+                    "Virtual Machine Not Found",
+                    systemImage: "terminal.fill",
+                    description: Text("This virtual machine is no longer in the library.")
+                )
             }
         }
         .focusedSceneValue(\.vmID, vmID)
+        .focusedSceneObject(vmInstance)
+    }
+
+    private var vmInstance: VMInstance? {
+        vmManager.vms.first { $0.id == vmID }
+    }
+
+    private func consoleUnavailableDescription(for vm: VMInstance) -> String {
+        if vm.guestSystem == .macOS {
+            return "Console access is not available for macOS virtual machines."
+        }
+        return "Start the virtual machine to open its console."
     }
 }
-
-// MARK: - Console View
 
 struct ConsoleView: View {
     @ObservedObject var vm: VM
     @EnvironmentObject private var ghosttyRuntime: GhosttyRuntime
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Console")
-                    .font(.headline)
-
-                Spacer()
-
-                Button(action: { vm.clearConsoleOutput() }) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Clear console")
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color(.windowBackgroundColor))
-
+        Group {
             if let app = ghosttyRuntime.app {
                 GhosttyConsoleViewRepresentable(
                     app: app,
@@ -604,9 +752,21 @@ struct ConsoleView: View {
                     events: vm.consoleEventPublisher
                 )
             } else {
-                Text("Terminal renderer unavailable")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ContentUnavailableView(
+                    "Terminal Renderer Unavailable",
+                    systemImage: "terminal",
+                    description: Text("The console renderer could not be initialized.")
+                )
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(role: .destructive) {
+                    vm.clearConsoleOutput()
+                } label: {
+                    Label("Clear Console", systemImage: "trash")
+                }
+                .help("Clear console")
             }
         }
     }
@@ -629,6 +789,14 @@ extension VMState {
         case .running: return "Running"
         case .paused: return "Paused"
         case .stopped: return "Stopped"
+        }
+    }
+
+    var presentationIcon: String {
+        switch self {
+        case .running: return "play.circle.fill"
+        case .paused: return "pause.circle.fill"
+        case .stopped: return "stop.circle"
         }
     }
 

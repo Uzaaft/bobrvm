@@ -7,57 +7,83 @@ struct SettingsView: View {
     private let systemInfo = SystemInfo()
 
     var body: some View {
-        TabView {
-            GeneralSettingsView(
-                defaultMemoryGB: $defaultMemoryGB,
-                defaultVCPUs: $defaultVCPUs,
-                systemInfo: systemInfo
-            )
-            .tabItem {
-                Label("General", systemImage: "gearshape")
-            }
-        }
-        .frame(width: 450, height: 250)
+        GeneralSettingsView(
+            defaultMemoryGB: $defaultMemoryGB,
+            defaultVCPUs: $defaultVCPUs,
+            systemInfo: systemInfo
+        )
+        .frame(
+            minWidth: 500,
+            idealWidth: 540,
+            maxWidth: 640,
+            minHeight: 300,
+            idealHeight: 340,
+            maxHeight: 500
+        )
     }
 }
 
-struct GeneralSettingsView: View {
+private struct GeneralSettingsView: View {
     @Binding var defaultMemoryGB: Int
     @Binding var defaultVCPUs: Int
     let systemInfo: SystemInfo
 
     var body: some View {
         Form {
-            Section("Default VM Settings") {
-                Picker("Memory", selection: $defaultMemoryGB) {
+            Section {
+                Picker("Default memory", selection: $defaultMemoryGB) {
                     ForEach(memoryOptions, id: \.self) { gb in
                         Text("\(gb) GB").tag(gb)
                     }
                 }
+                .pickerStyle(.menu)
 
-                Picker("CPUs", selection: $defaultVCPUs) {
+                Picker("Default CPU cores", selection: $defaultVCPUs) {
                     ForEach(cpuOptions, id: \.self) { count in
-                        Text("\(count)").tag(count)
+                        Text(coreCountLabel(count)).tag(count)
                     }
                 }
+                .pickerStyle(.menu)
+            } header: {
+                Text("New Virtual Machines")
+            } footer: {
+                Text("These values are preselected when you create a virtual machine.")
             }
 
-            Section("System Information") {
-                LabeledContent("Total Memory", value: "\(systemInfo.totalMemoryGB) GB")
-                LabeledContent("CPU Cores", value: "\(systemInfo.cpuCount)")
+            Section("This Mac") {
+                LabeledContent("Installed memory") {
+                    Text("\(systemInfo.totalMemoryGB) GB")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                LabeledContent("CPU cores") {
+                    Text("\(systemInfo.cpuCount)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
         }
         .formStyle(.grouped)
-        .padding()
+        .contentMargins(.horizontal, 24, for: .scrollContent)
+        .contentMargins(.vertical, 20, for: .scrollContent)
+        .onAppear(perform: normalizeDefaults)
     }
 
     private var memoryOptions: [Int] {
-        let options = [1, 2, 4, 8, 16, 32, 64, 128]
-        return options.filter { $0 <= systemInfo.maxMemoryGB }
+        systemInfo.defaultMemoryOptionsGB
     }
 
     private var cpuOptions: [Int] {
         Array(1...systemInfo.cpuCount)
+    }
+
+    private func coreCountLabel(_ count: Int) -> String {
+        "\(count) \(count == 1 ? "core" : "cores")"
+    }
+
+    private func normalizeDefaults() {
+        defaultMemoryGB = systemInfo.clampDefaultMemoryGB(defaultMemoryGB)
+        defaultVCPUs = systemInfo.clampDefaultVCPUCount(defaultVCPUs)
     }
 }
 

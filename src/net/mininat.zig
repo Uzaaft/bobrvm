@@ -732,7 +732,19 @@ pub const MiniNat = struct {
             const key = entry.key_ptr.*;
             const flow = entry.value_ptr;
 
-            if (now - flow.last_used > TCP_IDLE_TIMEOUT_S or flow.state == .closed) {
+            // Established inbound (forwarded) flows are exempt from idle
+            // reaping: a quiet SSH session is legitimate idle, and reaping
+            // it used to wedge the guest side silently. Their accepted
+            // sockets carry SO_KEEPALIVE, so a vanished host peer still
+            // surfaces as a socket error and is reaped through the recv
+            // path below.
+            const idle = now - flow.last_used > TCP_IDLE_TIMEOUT_S;
+            const idle_exempt = flow.state == .established and isInbound(key);
+            if (flow.state == .closed or (idle and !idle_exempt)) {
+                // On idle expiry the guest still believes the connection
+                // is alive — RST it so it learns immediately instead of
+                // keeping a half-dead flow around.
+                if (flow.state != .closed) self.tcpSendRst(key, flow.rcv_nxt);
                 remove_key = key;
                 continue;
             }
@@ -848,6 +860,10 @@ pub const MiniNat = struct {
                     net_compat.socketClose(sock);
                     break;
                 }
+                // Inbound flows never idle-reap once established (see
+                // pumpTcp); kernel keepalive is what eventually detects a
+                // peer that vanished without closing.
+                net_compat.setKeepAlive(sock);
                 const key = self.allocInboundKey(l.guest_port) orelse {
                     net_compat.socketClose(sock);
                     break;
@@ -875,6 +891,14 @@ pub const MiniNat = struct {
             }
         }
         return work;
+    }
+
+    /// Inbound (port-forward) flows are keyed to the gateway address:
+    /// allocInboundKey() builds them that way, and guest-initiated SYNs
+    /// to on-net addresses are never opened (handleTcp), so no outbound
+    /// flow can ever carry it.
+    fn isInbound(key: TcpKey) bool {
+        return std.mem.eql(u8, &key.remote_ip, &GATEWAY_IP);
     }
 
     /// Pick an unused (guest_port, GATEWAY_IP, ephemeral) key for an
@@ -1859,6 +1883,116 @@ test "mininat: port forward — accept, handshake, and guest->host relay" {
     var rx: [16]u8 = undefined;
     const n = try net_compat.recv(client, &rx, 0);
     try testing.expectEqualStrings("hello", rx[0..n]);
+}
+
+test "mininat: idle outbound flow is reaped with an RST to the guest" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+        nat.listeners.deinit(testing.allocator);
+    }
+
+    const key = TcpKey{ .guest_port = 1234, .remote_ip = .{ 93, 184, 216, 34 }, .remote_port = 80 };
+    var flow = TcpFlow{
+        .socket = @as(std.posix.socket_t, -1), // reap closes it; EBADF is ignored
+        .state = .established,
+        .snd_nxt = 1000,
+        .snd_una = 1000,
+        .rcv_nxt = 5000,
+        .last_used = 0, // long past TCP_IDLE_TIMEOUT_S
+    };
+    flow.snd_buf = try TcpSendBuffer.init(testing.allocator);
+    try nat.tcp_flows.put(key, flow);
+
+    var scratch: [2048]u8 = undefined;
+    nat.flows_mutex.lockUncancelable(global.io());
+    _ = nat.pumpTcp(&scratch);
+    nat.flows_mutex.unlock(global.io());
+
+    // Flow gone, and the guest was told: the reap used to be silent,
+    // leaving the guest with a wedged half-dead connection.
+    try testing.expectEqual(@as(usize, 0), nat.tcp_flows.count());
+    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
+    const rst = test_replies.items[0];
+    try testing.expectEqual(MiniNat.TCP_RST | MiniNat.TCP_ACK, rst[47]);
+    try testing.expectEqual(@as(u32, 5000), std.mem.readInt(u32, rst[42..46], .big));
+}
+
+test "mininat: established inbound flow is exempt from idle reaping" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    defer {
+        var titer = nat.tcp_flows.valueIterator();
+        while (titer.next()) |f| f.deinit(testing.allocator);
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+        nat.listeners.deinit(testing.allocator);
+    }
+
+    // Inbound = keyed to the gateway (how allocInboundKey builds them).
+    // The send window is exactly full so the pump's relay stage doesn't
+    // touch the placeholder socket; only the reap logic is under test.
+    const key = TcpKey{ .guest_port = 22, .remote_ip = GATEWAY_IP, .remote_port = 49200 };
+    var flow = TcpFlow{
+        .socket = @as(std.posix.socket_t, -1),
+        .state = .established,
+        .snd_nxt = 0x2000 +% 65535,
+        .snd_una = 0x2000,
+        .rcv_nxt = 900,
+        .last_used = 0, // long past TCP_IDLE_TIMEOUT_S
+    };
+    flow.snd_buf = try TcpSendBuffer.init(testing.allocator);
+    try nat.tcp_flows.put(key, flow);
+
+    var scratch: [2048]u8 = undefined;
+    nat.flows_mutex.lockUncancelable(global.io());
+    _ = nat.pumpTcp(&scratch);
+    nat.flows_mutex.unlock(global.io());
+
+    // Still alive, nothing sent: an idle forwarded SSH session survives.
+    try testing.expectEqual(@as(usize, 1), nat.tcp_flows.count());
+    try testing.expectEqual(@as(usize, 0), test_replies.items.len);
+}
+
+test "mininat: inbound flow stuck in handshake still idle-reaps" {
+    test_alloc = testing.allocator;
+    defer clearReplies();
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    defer {
+        nat.udp_flows.deinit();
+        nat.tcp_flows.deinit();
+        nat.icmp_flows.deinit();
+        nat.listeners.deinit(testing.allocator);
+    }
+
+    // A guest that never answers the synthetic SYN must not leak flows;
+    // only *established* inbound flows are exempt.
+    const key = TcpKey{ .guest_port = 22, .remote_ip = GATEWAY_IP, .remote_port = 49201 };
+    var flow = TcpFlow{
+        .socket = @as(std.posix.socket_t, -1),
+        .state = .syn_to_guest,
+        .snd_nxt = 0x2001,
+        .snd_una = 0x2000,
+        .rcv_nxt = 0,
+        .last_used = 0, // long past TCP_IDLE_TIMEOUT_S
+    };
+    flow.snd_buf = try TcpSendBuffer.init(testing.allocator);
+    try nat.tcp_flows.put(key, flow);
+
+    var scratch: [2048]u8 = undefined;
+    nat.flows_mutex.lockUncancelable(global.io());
+    _ = nat.pumpTcp(&scratch);
+    nat.flows_mutex.unlock(global.io());
+
+    try testing.expectEqual(@as(usize, 0), nat.tcp_flows.count());
+    try testing.expectEqual(@as(usize, 1), test_replies.items.len);
+    try testing.expectEqual(MiniNat.TCP_RST | MiniNat.TCP_ACK, test_replies.items[0][47]);
 }
 
 test "mininat: guest ACK retires the send buffer, tracks window, fast-retransmits" {

@@ -73,6 +73,13 @@ test {
     _ = runtime;
     _ = @import("cli/Config.zig");
     _ = @import("cli/runner.zig");
+    _ = @import("cli/toml.zig");
+    _ = @import("cli/project.zig");
+    _ = @import("cli/mcp.zig");
+    _ = @import("cli/console_exec.zig");
+    _ = @import("cli/exec.zig");
+    _ = @import("cli/bench.zig");
+    _ = @import("cli/ssh.zig");
     _ = @import("compat/file.zig");
     _ = @import("compat/net.zig");
     _ = @import("compat/thread.zig");

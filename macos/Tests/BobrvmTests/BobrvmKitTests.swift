@@ -104,4 +104,61 @@ final class BobrvmKitTests: XCTestCase {
             XCTAssertNil(c.disk2_path)
         }
     }
+
+    @MainActor
+    func testLiveSettingsRejectStoppedVM() throws {
+        let app = try App()
+        let manager = VMManager()
+        let instance = VMInstance(name: "Stopped", config: VMConfig(), app: app)
+
+        do {
+            try manager.updateLiveSettings(
+                instance,
+                name: "Renamed",
+                displayWidth: 1920,
+                displayHeight: 1080,
+                retinaEnabled: true
+            )
+            XCTFail("Expected stopped VM to reject live settings")
+        } catch BobrvmError.invalidState {
+            // Expected lifecycle rejection.
+        } catch {
+            XCTFail("Expected invalidState, got \(error)")
+        }
+    }
+
+    @MainActor
+    func testVMInstanceLiveSettingsTransitionCanBeReverted() throws {
+        let app = try App()
+        let originalConfig = VMConfig(displayWidth: 1280, displayHeight: 800)
+        let instance = VMInstance(
+            name: "Original",
+            config: originalConfig,
+            app: app,
+            retinaEnabled: false
+        )
+
+        instance.applyLiveSettings(
+            name: "Renamed",
+            displayWidth: 1920,
+            displayHeight: 1080,
+            retinaEnabled: true
+        )
+
+        XCTAssertEqual(instance.name, "Renamed")
+        XCTAssertEqual(instance.config.displayWidth, 1920)
+        XCTAssertEqual(instance.config.displayHeight, 1080)
+        XCTAssertTrue(instance.retinaEnabled)
+
+        instance.restoreLiveSettings(
+            name: "Original",
+            config: originalConfig,
+            retinaEnabled: false
+        )
+
+        XCTAssertEqual(instance.name, "Original")
+        XCTAssertEqual(instance.config.displayWidth, 1280)
+        XCTAssertEqual(instance.config.displayHeight, 800)
+        XCTAssertFalse(instance.retinaEnabled)
+    }
 }

@@ -28,10 +28,10 @@ brew install --cask bobrvm
 
 ## Requirements
 
-- Apple Silicon Mac running macOS 13 or later
+- Apple Silicon Mac running macOS 13 or later (the Bobrvm app requires macOS 26 or later)
 - Or x86-64 Linux with KVM, GTK 4, and Libadwaita 1.5 or later
 - Nix for the Zig core
-- Xcode and the Swift toolchain for the macOS app
+- Xcode 26 or later and its Swift toolchain for the macOS app
 
 ## Build
 
@@ -99,6 +99,56 @@ Direct boot uses two KVM vCPUs by default and exposes their topology through an 
 MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable
 host-monotonic samples of VM creation and start-to-root-readiness latency.
 
+## Project workflow: `bobrvm up`
+
+A `bobrvm.toml` checked into a repository describes the VM for that project.
+`bobrvm up` finds it (searching from the current directory upward) and boots:
+
+```toml
+# bobrvm.toml
+memory = 2048
+cpus = 2
+kernel = "boot/Image"
+initrd = "boot/initrd"
+forwards = ["2222:22"]
+```
+
+Quit with <kbd>Ctrl</kbd>+<kbd>B</kbd> <kbd>z</kbd> to suspend the machine to a
+per-project warm image; the next `bobrvm up` resumes it — RAM, processes, and
+shell state intact — in tens of milliseconds instead of booting. `bobrvm up
+--fresh` discards the warm state. The project directory is shared with the
+guest over virtio-9p by default (`share = false` opts out), relative paths
+resolve against the project root, and warm state lives under
+`~/.config/bobrvm/projects/`, never in the repository. `bobrvm up --help`
+lists the full key set.
+
+A `provision = ["cmd", ...]` list in `bobrvm.toml` runs shell commands once
+on the first cold boot; save the result with <kbd>Ctrl</kbd>+<kbd>B</kbd>
+<kbd>z</kbd> and every later `up` and `fork` starts from the provisioned
+state. `bobrvm up --detach` runs the project in the background; `bobrvm
+status`, `bobrvm suspend`, and `bobrvm halt` manage it. `engine = "vz"` runs
+the project on Apple's Virtualization.framework instead of the custom VMM — a
+lighter device set with the same verbs.
+
+`bobrvm exec -- <command>` runs a command in a disposable clone of the warm
+state and prints its output, without touching the project. `bobrvm ssh` opens
+a session to the guest through the host port forwarded to guest port 22
+(`forwards = ["2222:22"]`, `ssh-user = "root"`); the guest must run sshd.
+`bobrvm bench-warm` reports warm-restore latency over several trials. A `share-readonly = true`
+key makes the project share read-only on the host, not just in the guest
+mount — a sandbox cannot write host files through it.
+
+### Disposable sandboxes
+
+`bobrvm fork` runs a throwaway clone of the warm state: copy-on-write copies
+of the warm image and writable disks, deleted on exit, with the originals
+never touched — any number of forks resume from exactly the same moment.
+`bobrvm mcp` serves those sandboxes to AI agents over the Model Context
+Protocol: add `{"mcpServers": {"bobrvm": {"command": "bobrvm", "args":
+["mcp"]}}}` to an agent's MCP config and it gets `sandbox_start`,
+`sandbox_exec` (console-based, no guest agent needed), `sandbox_output`,
+`sandbox_list`, and `sandbox_stop`.
+
 ## Run a Linux guest
 
 `bobrvm run` starts a headless VM attached to the guest console. Press
@@ -122,6 +172,18 @@ For a headless Linux guest:
 ```sh
 zig build cli -- run --kernel Image --initrd initrd \
   --cmdline 'console=hvc0 ...'
+```
+
+Set `BOBRVM_BENCHMARK_STARTUP=1` to stop after host-side VM and primary-vCPU
+setup and emit phase timings. The same variable makes `vz-run` stop after
+Virtualization.framework completes its asynchronous start, so the two engines
+can be profiled without waiting for a guest shutdown:
+
+```sh
+BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm run \
+  --kernel Image --initrd initrd
+BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm vz-run \
+  --kernel Image --initrd initrd
 ```
 
 ## Guest tools
@@ -169,7 +231,3 @@ logging. `BOBRVM_LOG` accepts `true`, `false`, or backend settings such as
 ```sh
 log stream --level debug --predicate 'subsystem=="com.bobrvm.lib"'
 ```
-
-## License
-
-MIT

@@ -21,7 +21,9 @@ const assert = @import("../quirks.zig").inlineAssert;
 const hypervisor = @import("../hypervisor/main.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
+const icc_mod = @import("../gic/icc.zig");
 const mmio = @import("../virtio/mmio.zig");
+const pci = @import("../pci/main.zig");
 const snapshot_container = @import("snapshot_container.zig");
 
 const log = std.log.scoped(.snapshot);
@@ -31,6 +33,7 @@ pub const VERSION = snapshot_container.VERSION;
 const block_section_scratch_bytes = 128;
 const console_section_scratch_bytes = 512;
 const gic_section_scratch_bytes = 2 * 1024;
+const icc_section_scratch_bytes = 512;
 const input_section_scratch_bytes = 128;
 const net_section_scratch_bytes = 128;
 const p9_section_scratch_bytes = 256;
@@ -744,7 +747,229 @@ pub fn DeviceCodec(
     };
 }
 
+/// Emulated GICv3 CPU-interface state, per vCPU. Without this section
+/// a restored guest never accepts another interrupt (igrpen resets to
+/// disabled) and the periodic vtimer turns into a silent exit storm.
+pub fn serializeIcc(alloc: Allocator, handler: *const icc_mod.IccHandler) ![]u8 {
+    const per_cpu_bytes = 5 * @sizeOf(u8) + @sizeOf(u32);
+    const serialized_bytes = @sizeOf(u8) + per_cpu_bytes * handler.states.len;
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try out.int(u8, @intCast(handler.states.len));
+    for (handler.states) |*state| {
+        try out.int(u8, state.pmr);
+        try out.int(u8, state.bpr0);
+        try out.int(u8, state.bpr1);
+        const flags: u8 = @as(u8, @intFromBool(state.igrpen0)) |
+            (@as(u8, @intFromBool(state.igrpen1)) << 1);
+        try out.int(u8, flags);
+        try out.int(u8, state.running_priority);
+        try out.int(u32, state.ctlr);
+    }
+    assert(out.buf.items.len == serialized_bytes);
+    assert(out.buf.items.len == out.buf.capacity);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendIccSection(
+    builder: *Builder,
+    fallback_alloc: Allocator,
+    name: []const u8,
+    handler: *const icc_mod.IccHandler,
+) !void {
+    assert(handler.states.len > 0);
+    var stack_allocator = std.heap.stackFallback(icc_section_scratch_bytes, fallback_alloc);
+    const scratch_alloc = stack_allocator.get();
+    const data = try serializeIcc(scratch_alloc, handler);
+    defer scratch_alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializeIcc(_: Allocator, handler: *icc_mod.IccHandler, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    const count = try cur.int(u8);
+    for (0..count) |i| {
+        const pmr = try cur.int(u8);
+        const bpr0 = try cur.int(u8);
+        const bpr1 = try cur.int(u8);
+        const flags = try cur.int(u8);
+        const running_priority = try cur.int(u8);
+        const ctlr = try cur.int(u32);
+        // Images from a larger machine: extra CPUs have no target.
+        if (i >= handler.states.len) continue;
+        handler.states[i] = .{
+            .pmr = pmr,
+            .bpr0 = bpr0,
+            .bpr1 = bpr1,
+            .igrpen0 = flags & 1 != 0,
+            .igrpen1 = flags & 2 != 0,
+            .running_priority = running_priority,
+            .ctlr = ctlr,
+        };
+    }
+}
+
+// =============================================================================
+// Virtio PCI transport (x86/KVM machine)
+// =============================================================================
+
+fn pciTransportSerializedBytes(device: *const pci.VirtioPciDevice) usize {
+    const transport = device.transport;
+    const queue_bytes = 2 * @sizeOf(u16) + @sizeOf(u8) + 3 * @sizeOf(u64);
+    return device.config.len + 5 * @sizeOf(u32) + 2 * @sizeOf(u64) +
+        2 * @sizeOf(u16) + 3 * @sizeOf(u8) +
+        transport.queues.len * queue_bytes + transport.device_config.len;
+}
+
+pub fn serializePciDevice(alloc: Allocator, device: *const pci.VirtioPciDevice) ![]u8 {
+    const transport = device.transport;
+    assert(transport.queues.len > 0);
+    assert(transport.queues.len <= pci.virtio_pci.VirtioPciTransport.MAX_QUEUES);
+    assert(transport.device_config.len <= std.math.maxInt(u32));
+    const serialized_bytes = pciTransportSerializedBytes(device);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try out.bytes(&device.config);
+    try out.int(u32, device.bar0_addr);
+    try out.int(u32, transport.device_id);
+    try out.int(u64, transport.device_features);
+    try out.int(u64, transport.driver_features);
+    try out.int(u32, transport.device_feature_select);
+    try out.int(u32, transport.driver_feature_select);
+    try out.int(u8, @bitCast(transport.status));
+    try out.int(u8, transport.config_generation);
+    try out.int(u16, transport.queue_select);
+    try out.int(u16, transport.num_queues);
+    try out.int(u8, @bitCast(transport.isr_status));
+    for (transport.queues) |queue| {
+        try out.int(u16, queue.size);
+        try out.int(u8, @intFromBool(queue.enable));
+        try out.int(u16, queue.notify_off);
+        try out.int(u64, queue.desc_addr);
+        try out.int(u64, queue.driver_addr);
+        try out.int(u64, queue.device_addr);
+    }
+    try out.int(u32, @intCast(transport.device_config.len));
+    try out.bytes(transport.device_config);
+    assert(out.buf.items.len == serialized_bytes);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendPciDeviceSection(
+    builder: *Builder,
+    alloc: Allocator,
+    name: []const u8,
+    device: *const pci.VirtioPciDevice,
+) !void {
+    const data = try serializePciDevice(alloc, device);
+    defer alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializePciDevice(
+    _: Allocator,
+    device: *pci.VirtioPciDevice,
+    data: []const u8,
+) !void {
+    var cur = Cursor{ .buf = data };
+    const config = try cur.bytes(device.config.len);
+    @memcpy(&device.config, config);
+    device.bar0_addr = try cur.int(u32);
+    const transport = device.transport;
+    if (try cur.int(u32) != transport.device_id) return error.Mismatch;
+    if (try cur.int(u64) != transport.device_features) return error.Mismatch;
+    transport.driver_features = try cur.int(u64);
+    transport.device_feature_select = try cur.int(u32);
+    transport.driver_feature_select = try cur.int(u32);
+    transport.status = @bitCast(try cur.int(u8));
+    transport.config_generation = try cur.int(u8);
+    transport.queue_select = try cur.int(u16);
+    const queue_count = try cur.int(u16);
+    if (queue_count != transport.num_queues or queue_count != transport.queues.len) {
+        return error.Mismatch;
+    }
+    transport.isr_status = @bitCast(try cur.int(u8));
+    for (transport.queues) |*queue| {
+        queue.size = try cur.int(u16);
+        if (queue.size > pci.virtio_pci.VirtioPciTransport.MAX_QUEUE_SIZE) {
+            return error.Mismatch;
+        }
+        queue.enable = try cur.int(u8) != 0;
+        queue.notify_off = try cur.int(u16);
+        queue.desc_addr = try cur.int(u64);
+        queue.driver_addr = try cur.int(u64);
+        queue.device_addr = try cur.int(u64);
+    }
+    const config_len = try cur.int(u32);
+    if (config_len != transport.device_config.len) return error.Mismatch;
+    @memcpy(transport.device_config, try cur.bytes(config_len));
+    if (cur.off != cur.buf.len) return error.Mismatch;
+}
+
+pub fn serializeSnd(alloc: Allocator, snd: *const virtio.Snd) ![]u8 {
+    const state = snd.snapshotState();
+    const serialized_bytes = transportSerializedBytes(snd.transport) +
+        6 * @sizeOf(u16) + 2 * @sizeOf(u32);
+    var out = Out{ .alloc = alloc };
+    errdefer out.buf.deinit(alloc);
+    try out.buf.ensureTotalCapacityPrecise(alloc, serialized_bytes);
+    try serializeTransport(&out, snd.transport);
+    try out.int(u16, state.ctrl_last_avail);
+    try out.int(u16, state.tx_last_avail);
+    try out.int(u32, state.buffer_bytes);
+    try out.int(u32, state.period_bytes);
+    try out.int(u16, state.channels);
+    try out.int(u16, state.format);
+    try out.int(u16, state.rate);
+    try out.int(u16, state.stream_state);
+    assert(out.buf.items.len == serialized_bytes);
+    const result = out.buf.items;
+    out.buf = .empty;
+    return result;
+}
+
+pub fn appendSndSection(
+    builder: *Builder,
+    alloc: Allocator,
+    name: []const u8,
+    snd: *const virtio.Snd,
+) !void {
+    const data = try serializeSnd(alloc, snd);
+    defer alloc.free(data);
+    try builder.section(name, data);
+}
+
+pub fn deserializeSnd(_: Allocator, snd: *virtio.Snd, data: []const u8) !void {
+    var cur = Cursor{ .buf = data };
+    try deserializeTransport(&cur, snd.transport);
+    const state = virtio.snd.SnapshotState{
+        .ctrl_last_avail = try cur.int(u16),
+        .tx_last_avail = try cur.int(u16),
+        .buffer_bytes = try cur.int(u32),
+        .period_bytes = try cur.int(u32),
+        .channels = @intCast(try cur.int(u16)),
+        .format = @intCast(try cur.int(u16)),
+        .rate = @intCast(try cur.int(u16)),
+        .stream_state = @intCast(try cur.int(u16)),
+    };
+    if (cur.off != cur.buf.len) return error.Mismatch;
+    try snd.restoreSnapshotState(state);
+}
+
 pub const GicCodec = DeviceCodec(gic_mod.Gic, appendGicSection, deserializeGic);
+pub const IccCodec = DeviceCodec(icc_mod.IccHandler, appendIccSection, deserializeIcc);
+pub const SndCodec = DeviceCodec(virtio.Snd, appendSndSection, deserializeSnd);
+pub const PciDeviceCodec = DeviceCodec(
+    pci.VirtioPciDevice,
+    appendPciDeviceSection,
+    deserializePciDevice,
+);
 pub const ConsoleCodec = DeviceCodec(virtio.Console, appendConsoleSection, deserializeConsole);
 pub const BlockCodec = DeviceCodec(virtio.Block, appendBlockSection, deserializeBlock);
 pub const RngCodec = DeviceCodec(virtio.Rng, appendRngSection, deserializeRng);
@@ -758,6 +983,52 @@ pub const GpuCodec = DeviceCodec(virtio.Gpu, appendGpuSection, deserializeGpu);
 // =============================================================================
 
 const testing = std.testing;
+
+test {
+    // Force analysis of every codec on all hosts. The x86/KVM machine
+    // is the only consumer of the Snd and PCI codecs, and Zig's lazy
+    // analysis let a merge delete them without any macOS build or test
+    // noticing — this makes that class of rot loud everywhere.
+    testing.refAllDecls(@This());
+}
+
+test "snapshot: ICC CPU-interface state roundtrips" {
+    var states = [_]icc_mod.IccState{
+        .{
+            .pmr = 0xF0,
+            .bpr0 = 2,
+            .bpr1 = 3,
+            .igrpen0 = false,
+            .igrpen1 = true,
+            .running_priority = 0x80,
+            .ctlr = 0x2,
+        },
+        .{}, // secondary CPU still at reset defaults
+    };
+    var handler = icc_mod.IccHandler{ .gic = undefined, .states = &states };
+
+    const data = try serializeIcc(testing.allocator, &handler);
+    defer testing.allocator.free(data);
+
+    var restored_states = [_]icc_mod.IccState{ .{}, .{} };
+    var restored = icc_mod.IccHandler{ .gic = undefined, .states = &restored_states };
+    try deserializeIcc(testing.allocator, &restored, data);
+
+    try testing.expectEqual(states[0], restored_states[0]);
+    try testing.expectEqual(states[1], restored_states[1]);
+
+    // An image from a bigger machine restores the CPUs that exist.
+    var one_state = [_]icc_mod.IccState{.{}};
+    var smaller = icc_mod.IccHandler{ .gic = undefined, .states = &one_state };
+    try deserializeIcc(testing.allocator, &smaller, data);
+    try testing.expectEqual(states[0], one_state[0]);
+
+    // Truncated payloads error instead of half-applying.
+    try testing.expectError(
+        error.Truncated,
+        deserializeIcc(testing.allocator, &restored, data[0 .. data.len - 1]),
+    );
+}
 
 test "snapshot: container roundtrip and unknown sections" {
     var b = try Builder.init(testing.allocator);
@@ -1098,7 +1369,7 @@ test "snapshot: input section assembly allocation profile" {
 }
 
 test "snapshot: P9 device roundtrip with fids" {
-    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".", false);
     defer dev.deinit();
     dev.transport.status = @bitCast(@as(u8, 0x0F));
     dev.transport.queues[0].ready = true;
@@ -1114,7 +1385,7 @@ test "snapshot: P9 device roundtrip with fids" {
     try testing.expectEqual(data.len, counted.allocated_bytes);
     try testing.expectEqual(@as(usize, 0), counted.resize_index);
 
-    const dev2 = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    const dev2 = try virtio.P9.init(testing.allocator, "hostshare", ".", false);
     defer dev2.deinit();
     try deserializeP9(testing.allocator, dev2, data);
     try testing.expectEqual(@as(u8, 0x0F), @as(u8, @bitCast(dev2.transport.status)));
@@ -1127,7 +1398,7 @@ test "snapshot: P9 device roundtrip with fids" {
 }
 
 test "snapshot: P9 section assembly allocation profile" {
-    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".");
+    const dev = try virtio.P9.init(testing.allocator, "hostshare", ".", false);
     defer dev.deinit();
     try dev.server.restoreFid(testing.allocator, 3, "src", null);
     try dev.server.restoreFid(testing.allocator, 9, "src/machine", null);

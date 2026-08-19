@@ -9,15 +9,17 @@ struct WindowsMediaDownloadView: View {
 
     @State private var downloadProgress: Double?
     @State private var errorMessage: String?
+    @State private var currentHost: String?
 
     var body: some View {
-        VStack(spacing: 0) {
+        NavigationStack {
             WindowsMediaWebView(
                 onDownloadStarted: {
                     errorMessage = nil
                     downloadProgress = 0
                 },
                 onDownloadProgress: { downloadProgress = $0 },
+                onHostChanged: { currentHost = $0 },
                 onDownloaded: { url in
                     onDownloaded(url)
                     dismiss()
@@ -27,25 +29,28 @@ struct WindowsMediaDownloadView: View {
                     errorMessage = error.localizedDescription
                 }
             )
-            Divider()
-            HStack(spacing: 12) {
-                if let downloadProgress {
-                    ProgressView(value: downloadProgress)
-                        .frame(width: 180)
-                    Text("Downloading… \(Int(downloadProgress * 100))%")
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Select an edition and language, then choose the Arm64 download.")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Close") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+            .navigationTitle("Download Windows 11")
+            .navigationSubtitle(currentHost ?? "Loading…")
+            .safeAreaInset(edge: .bottom) {
+                downloadStatus
             }
-            .padding(12)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(isDownloading ? "Cancel Download" : "Close", role: .cancel) {
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .help(isDownloading ? "Stop the download and close" : "Close")
+                }
+            }
         }
-        .frame(minWidth: 900, minHeight: 680)
+        .frame(
+            minWidth: 780,
+            idealWidth: 960,
+            minHeight: 580,
+            idealHeight: 720
+        )
+        .presentationSizing(.fitted)
         .alert(
             "Couldn’t Download Windows",
             isPresented: Binding(
@@ -57,12 +62,47 @@ struct WindowsMediaDownloadView: View {
         } message: {
             Text(errorMessage ?? "An unknown error occurred.")
         }
+        .interactiveDismissDisabled(isDownloading)
+    }
+
+    private var downloadStatus: some View {
+        GlassEffectContainer(spacing: 12) {
+            HStack(spacing: 12) {
+                if let downloadProgress {
+                    ProgressView(value: downloadProgress)
+                        .frame(width: 180)
+                    Text("Downloading… \(Int(downloadProgress * 100))%")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                } else {
+                    Label(
+                        "Choose an edition, language, and the Arm64 download.",
+                        systemImage: "checkmark.shield"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 16)
+                Label(currentHost ?? "Loading…", systemImage: "globe")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .glassEffect(.regular, in: .rect(cornerRadius: 20))
+        }
+        .padding(12)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var isDownloading: Bool {
+        downloadProgress != nil
     }
 }
 
 private struct WindowsMediaWebView: NSViewRepresentable {
     let onDownloadStarted: () -> Void
     let onDownloadProgress: (Double) -> Void
+    let onHostChanged: (String?) -> Void
     let onDownloaded: (URL) -> Void
     let onFailed: (Error) -> Void
 
@@ -70,6 +110,7 @@ private struct WindowsMediaWebView: NSViewRepresentable {
         Coordinator(
             onDownloadStarted: onDownloadStarted,
             onDownloadProgress: onDownloadProgress,
+            onHostChanged: onHostChanged,
             onDownloaded: onDownloaded,
             onFailed: onFailed
         )
@@ -100,6 +141,7 @@ private struct WindowsMediaWebView: NSViewRepresentable {
 
         private let onDownloadStarted: () -> Void
         private let onDownloadProgress: (Double) -> Void
+        private let onHostChanged: (String?) -> Void
         private let onDownloaded: (URL) -> Void
         private let onFailed: (Error) -> Void
         private var downloads: [ObjectIdentifier: DownloadState] = [:]
@@ -107,13 +149,19 @@ private struct WindowsMediaWebView: NSViewRepresentable {
         init(
             onDownloadStarted: @escaping () -> Void,
             onDownloadProgress: @escaping (Double) -> Void,
+            onHostChanged: @escaping (String?) -> Void,
             onDownloaded: @escaping (URL) -> Void,
             onFailed: @escaping (Error) -> Void
         ) {
             self.onDownloadStarted = onDownloadStarted
             self.onDownloadProgress = onDownloadProgress
+            self.onHostChanged = onHostChanged
             self.onDownloaded = onDownloaded
             self.onFailed = onFailed
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation?) {
+            onHostChanged(webView.url?.host())
         }
 
         func webView(
