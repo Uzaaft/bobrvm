@@ -54,6 +54,7 @@ with Jujutsu. This repository is jj-colocated: never use `git commit`.
 - Focus on the _why_ and _how_ rather than restating the diff.
 - Keep the tone direct and technical without filler phrases.
 - Don't exceed a handful of paragraphs; less is more.
+- Assume reader has no access to any agentic coding sessions
 
 ## Workflow
 
