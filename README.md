@@ -59,8 +59,8 @@ use the same cancellable Zig VM lifecycle and KVM device model.
 The GTK application manages a persistent VM library, installer media, sparse raw
 disks, shared folders, port forwards, memory, CPUs, networking, pause/resume,
 guest management, clipboard sharing, host-to-guest file delivery, and quiesced snapshots.
-Its Libadwaita interface provides separate Library, Display, Console, and Preferences
-destinations, persistent defaults for new VMs, and lifecycle controls in the window header:
+Its Libadwaita interface provides Machine, Display, and Console destinations, an adaptive
+preferences dialog for persistent defaults, and lifecycle controls in the window header:
 
 ```sh
 bobrvm run-kernel bzImage initrd writable-root.raw
