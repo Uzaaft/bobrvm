@@ -22,17 +22,21 @@ const c = struct {
     pub const AdwDialog = opaque {};
     pub const AdwEntryRow = opaque {};
     pub const AdwHeaderBar = opaque {};
+    pub const AdwNavigationPage = opaque {};
+    pub const AdwNavigationSplitView = opaque {};
     pub const AdwPreferencesDialog = opaque {};
     pub const AdwPreferencesGroup = opaque {};
     pub const AdwPreferencesPage = opaque {};
     pub const AdwPreferencesRow = opaque {};
     pub const AdwSpinRow = opaque {};
+    pub const AdwStatusPage = opaque {};
     pub const AdwSwitchRow = opaque {};
     pub const AdwToolbarView = opaque {};
     pub const AdwToast = opaque {};
     pub const AdwViewStack = opaque {};
     pub const AdwViewStackPage = opaque {};
     pub const AdwViewSwitcher = opaque {};
+    pub const AdwWindowTitle = opaque {};
     pub const GtkApplication = opaque {};
     pub const GtkButton = opaque {};
     pub const GtkWindow = opaque {};
@@ -48,9 +52,16 @@ const c = struct {
     pub const GtkGestureClick = opaque {};
     pub const GtkGestureSingle = opaque {};
     pub const GtkFileChooser = opaque {};
+    pub const GtkFlowBox = opaque {};
+    pub const GtkFlowBoxChild = opaque {};
     pub const GtkNativeDialog = opaque {};
     pub const GtkLabel = opaque {};
+    pub const GtkListBox = opaque {};
+    pub const GtkListBoxRow = opaque {};
+    pub const GtkImage = opaque {};
     pub const GtkScrolledWindow = opaque {};
+    pub const GtkStack = opaque {};
+    pub const GtkStackPage = opaque {};
     pub const GtkAdjustment = opaque {};
     pub const GtkWidget = opaque {};
     pub const GFile = opaque {};
@@ -75,6 +86,10 @@ const c = struct {
     pub const GTK_FILE_CHOOSER_ACTION_SAVE: c_int = 1;
     pub const GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER: c_int = 2;
     pub const GTK_RESPONSE_ACCEPT: c_int = -3;
+    pub const GTK_SELECTION_NONE: c_int = 0;
+    pub const GTK_SELECTION_SINGLE: c_int = 1;
+    pub const GTK_ALIGN_START: c_int = 1;
+    pub const GTK_ALIGN_CENTER: c_int = 3;
     pub const GDK_CONTROL_MASK: c_uint = 1 << 2;
     pub const GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES: c_uint = 3;
     pub const CAIRO_FORMAT_ARGB32: c_int = 0;
@@ -113,6 +128,7 @@ const c = struct {
         content: *GtkWidget,
     ) void;
     pub extern fn adw_action_row_new() ?*GtkWidget;
+    pub extern fn adw_action_row_add_prefix(row: *AdwActionRow, child: *GtkWidget) void;
     pub extern fn adw_action_row_add_suffix(row: *AdwActionRow, child: *GtkWidget) void;
     pub extern fn adw_action_row_set_subtitle(
         row: *AdwActionRow,
@@ -133,6 +149,31 @@ const c = struct {
     pub extern fn adw_header_bar_pack_start(
         header_bar: *AdwHeaderBar,
         child: *GtkWidget,
+    ) void;
+    pub extern fn adw_navigation_page_new(
+        child: *GtkWidget,
+        title: [*:0]const u8,
+    ) ?*AdwNavigationPage;
+    pub extern fn adw_navigation_split_view_new() ?*GtkWidget;
+    pub extern fn adw_navigation_split_view_set_sidebar(
+        split_view: *AdwNavigationSplitView,
+        sidebar: *AdwNavigationPage,
+    ) void;
+    pub extern fn adw_navigation_split_view_set_content(
+        split_view: *AdwNavigationSplitView,
+        content: *AdwNavigationPage,
+    ) void;
+    pub extern fn adw_navigation_split_view_set_show_content(
+        split_view: *AdwNavigationSplitView,
+        show_content: gboolean,
+    ) void;
+    pub extern fn adw_navigation_split_view_set_min_sidebar_width(
+        split_view: *AdwNavigationSplitView,
+        width: f64,
+    ) void;
+    pub extern fn adw_navigation_split_view_set_max_sidebar_width(
+        split_view: *AdwNavigationSplitView,
+        width: f64,
     ) void;
     pub extern fn adw_preferences_dialog_new() ?*AdwDialog;
     pub extern fn adw_preferences_dialog_add(
@@ -197,6 +238,23 @@ const c = struct {
     ) ?*GtkWidget;
     pub extern fn adw_spin_row_get_value(row: *AdwSpinRow) f64;
     pub extern fn adw_spin_row_set_value(row: *AdwSpinRow, value: f64) void;
+    pub extern fn adw_status_page_new() ?*GtkWidget;
+    pub extern fn adw_status_page_set_title(
+        status_page: *AdwStatusPage,
+        title: [*:0]const u8,
+    ) void;
+    pub extern fn adw_status_page_set_description(
+        status_page: *AdwStatusPage,
+        description: [*:0]const u8,
+    ) void;
+    pub extern fn adw_status_page_set_icon_name(
+        status_page: *AdwStatusPage,
+        icon_name: [*:0]const u8,
+    ) void;
+    pub extern fn adw_status_page_set_child(
+        status_page: *AdwStatusPage,
+        child: *GtkWidget,
+    ) void;
     pub extern fn adw_switch_row_new() ?*GtkWidget;
     pub extern fn adw_switch_row_get_active(row: *AdwSwitchRow) gboolean;
     pub extern fn adw_switch_row_set_active(row: *AdwSwitchRow, active: gboolean) void;
@@ -224,6 +282,18 @@ const c = struct {
     pub extern fn adw_view_switcher_set_stack(
         view_switcher: *AdwViewSwitcher,
         stack: *AdwViewStack,
+    ) void;
+    pub extern fn adw_window_title_new(
+        title: [*:0]const u8,
+        subtitle: [*:0]const u8,
+    ) ?*GtkWidget;
+    pub extern fn adw_window_title_set_title(
+        window_title: *AdwWindowTitle,
+        title: [*:0]const u8,
+    ) void;
+    pub extern fn adw_window_title_set_subtitle(
+        window_title: *AdwWindowTitle,
+        subtitle: [*:0]const u8,
     ) void;
     pub extern fn gtk_application_new(
         application_id: [*:0]const u8,
@@ -280,6 +350,28 @@ const c = struct {
         chooser: *GtkFileChooser,
         name: [*:0]const u8,
     ) void;
+    pub extern fn gtk_flow_box_new() ?*GtkWidget;
+    pub extern fn gtk_flow_box_append(flow_box: *GtkFlowBox, child: *GtkWidget) void;
+    pub extern fn gtk_flow_box_remove(flow_box: *GtkFlowBox, child: *GtkWidget) void;
+    pub extern fn gtk_flow_box_child_get_index(child: *GtkFlowBoxChild) c_int;
+    pub extern fn gtk_flow_box_set_activate_on_single_click(
+        flow_box: *GtkFlowBox,
+        activate: gboolean,
+    ) void;
+    pub extern fn gtk_flow_box_set_column_spacing(flow_box: *GtkFlowBox, spacing: c_uint) void;
+    pub extern fn gtk_flow_box_set_row_spacing(flow_box: *GtkFlowBox, spacing: c_uint) void;
+    pub extern fn gtk_flow_box_set_min_children_per_line(
+        flow_box: *GtkFlowBox,
+        count: c_uint,
+    ) void;
+    pub extern fn gtk_flow_box_set_max_children_per_line(
+        flow_box: *GtkFlowBox,
+        count: c_uint,
+    ) void;
+    pub extern fn gtk_flow_box_set_selection_mode(
+        flow_box: *GtkFlowBox,
+        mode: c_int,
+    ) void;
     pub extern fn gtk_native_dialog_show(dialog: *GtkNativeDialog) void;
     pub extern fn gtk_native_dialog_destroy(dialog: *GtkNativeDialog) void;
     pub extern fn gtk_label_new(text: [*:0]const u8) ?*GtkWidget;
@@ -287,6 +379,29 @@ const c = struct {
     pub extern fn gtk_label_set_text(label: *GtkLabel, text: [*:0]const u8) void;
     pub extern fn gtk_label_set_xalign(label: *GtkLabel, alignment: f32) void;
     pub extern fn gtk_label_set_yalign(label: *GtkLabel, alignment: f32) void;
+    pub extern fn gtk_image_new_from_icon_name(icon_name: [*:0]const u8) ?*GtkWidget;
+    pub extern fn gtk_image_set_pixel_size(image: *GtkImage, pixel_size: c_int) void;
+    pub extern fn gtk_list_box_new() ?*GtkWidget;
+    pub extern fn gtk_list_box_append(list_box: *GtkListBox, child: *GtkWidget) void;
+    pub extern fn gtk_list_box_remove(list_box: *GtkListBox, child: *GtkWidget) void;
+    pub extern fn gtk_list_box_get_row_at_index(
+        list_box: *GtkListBox,
+        index: c_int,
+    ) ?*GtkListBoxRow;
+    pub extern fn gtk_list_box_select_row(
+        list_box: *GtkListBox,
+        row: ?*GtkListBoxRow,
+    ) void;
+    pub extern fn gtk_list_box_unselect_all(list_box: *GtkListBox) void;
+    pub extern fn gtk_list_box_row_get_index(row: *GtkListBoxRow) c_int;
+    pub extern fn gtk_list_box_set_activate_on_single_click(
+        list_box: *GtkListBox,
+        activate: gboolean,
+    ) void;
+    pub extern fn gtk_list_box_set_selection_mode(
+        list_box: *GtkListBox,
+        mode: c_int,
+    ) void;
     pub extern fn gtk_scrolled_window_new() ?*GtkWidget;
     pub extern fn gtk_scrolled_window_set_child(
         scrolled_window: *GtkScrolledWindow,
@@ -295,6 +410,16 @@ const c = struct {
     pub extern fn gtk_scrolled_window_get_vadjustment(
         scrolled_window: *GtkScrolledWindow,
     ) *GtkAdjustment;
+    pub extern fn gtk_stack_new() ?*GtkWidget;
+    pub extern fn gtk_stack_add_named(
+        stack: *GtkStack,
+        child: *GtkWidget,
+        name: [*:0]const u8,
+    ) ?*GtkStackPage;
+    pub extern fn gtk_stack_set_visible_child_name(
+        stack: *GtkStack,
+        name: [*:0]const u8,
+    ) void;
     pub extern fn gtk_adjustment_get_upper(adjustment: *GtkAdjustment) f64;
     pub extern fn gtk_adjustment_set_value(adjustment: *GtkAdjustment, value: f64) void;
     pub extern fn gtk_event_controller_key_new() ?*GtkEventController;
@@ -315,6 +440,8 @@ const c = struct {
     pub extern fn gtk_widget_set_margin_start(widget: *GtkWidget, margin: c_int) void;
     pub extern fn gtk_widget_set_margin_end(widget: *GtkWidget, margin: c_int) void;
     pub extern fn gtk_widget_set_sensitive(widget: *GtkWidget, sensitive: gboolean) void;
+    pub extern fn gtk_widget_set_visible(widget: *GtkWidget, visible: gboolean) void;
+    pub extern fn gtk_widget_set_halign(widget: *GtkWidget, alignment: c_int) void;
     pub extern fn gtk_widget_set_focusable(widget: *GtkWidget, focusable: gboolean) void;
     pub extern fn gtk_widget_set_tooltip_text(
         widget: *GtkWidget,
@@ -328,6 +455,7 @@ const c = struct {
     pub extern fn gtk_widget_get_width(widget: *GtkWidget) c_int;
     pub extern fn gtk_widget_get_height(widget: *GtkWidget) c_int;
     pub extern fn gtk_widget_queue_draw(widget: *GtkWidget) void;
+    pub extern fn gtk_widget_get_first_child(widget: *GtkWidget) ?*GtkWidget;
     pub extern fn g_application_run(
         application: *anyopaque,
         argc: c_int,
@@ -481,6 +609,13 @@ const State = struct {
     window: ?*c.GtkWindow = null,
     preferences_dialog: ?*c.AdwPreferencesDialog = null,
     view_stack: ?*c.AdwViewStack = null,
+    navigation_split_view: ?*c.AdwNavigationSplitView = null,
+    content_title: ?*c.AdwWindowTitle = null,
+    library_list: ?*c.GtkListBox = null,
+    library_grid: ?*c.GtkFlowBox = null,
+    library_page_stack: ?*c.GtkStack = null,
+    library_count: usize = 0,
+    refreshing_library: bool = false,
     configuration_groups: [4]?*c.GtkWidget = @splat(null),
     status: ?*c.GtkLabel = null,
     console: ?*c.GtkLabel = null,
@@ -506,6 +641,7 @@ const State = struct {
     settings_memory_spin: ?*c.AdwSpinRow = null,
     settings_vcpu_spin: ?*c.AdwSpinRow = null,
     start_button: ?*c.GtkWidget = null,
+    delete_configuration_button: ?*c.GtkWidget = null,
     pause_button: ?*c.GtkWidget = null,
     stop_button: ?*c.GtkWidget = null,
     shutdown_button: ?*c.GtkWidget = null,
@@ -926,6 +1062,13 @@ const State = struct {
         self.resetConfigurationState(&defaults);
         self.resetConfigurationForm(&defaults);
         c.gtk_combo_box_set_active(@ptrCast(self.vm_selector.?), -1);
+        if (self.library_shell) {
+            self.refreshing_library = true;
+            c.gtk_list_box_unselect_all(self.library_list.?);
+            self.refreshing_library = false;
+            self.showMachinePage("New Virtual Machine", "Configure and save a new machine");
+            c.gtk_widget_set_visible(self.delete_configuration_button.?, c.FALSE);
+        }
         c.gtk_label_set_text(self.status.?, "New configuration");
     }
 
@@ -1051,7 +1194,7 @@ const State = struct {
             return self.setError(err);
         };
         self.refreshLibrary(null);
-        self.loadSelectedOrNew();
+        if (!self.library_shell) self.loadSelectedOrNew();
         c.gtk_label_set_text(self.status.?, "Configuration removed");
     }
 
@@ -1063,17 +1206,173 @@ const State = struct {
             for (names) |name| self.allocator.free(name);
             self.allocator.free(names);
         }
+        self.refreshing_library = true;
+        defer self.refreshing_library = false;
+        self.clearLibraryWidgets();
+        self.library_count = names.len;
+        if (self.library_shell) self.appendLibraryNavigationRow(
+            "Library",
+            "All virtual machines",
+            "view-grid-symbolic",
+        );
         var selected_index: c_int = -1;
         for (names, 0..) |name, index| {
             const terminated = self.allocator.dupeZ(u8, name) catch continue;
             defer self.allocator.free(terminated);
             c.gtk_combo_box_text_append_text(selector, terminated.ptr);
+            if (self.library_shell) self.appendLibraryMachine(name);
             if (selected) |wanted| {
                 if (std.mem.eql(u8, wanted, name)) selected_index = @intCast(index);
             }
         }
+        if (self.library_shell) {
+            c.gtk_stack_set_visible_child_name(
+                self.library_page_stack.?,
+                if (names.len == 0) "empty" else "cards",
+            );
+            self.selectLibraryIndex(selected_index);
+            return;
+        }
         if (selected_index < 0 and names.len > 0) selected_index = 0;
         c.gtk_combo_box_set_active(@ptrCast(selector), selected_index);
+    }
+
+    fn clearLibraryWidgets(self: *State) void {
+        if (self.library_list) |list| {
+            while (c.gtk_widget_get_first_child(@ptrCast(list))) |child| {
+                c.gtk_list_box_remove(list, child);
+            }
+        }
+        if (self.library_grid) |grid| {
+            while (c.gtk_widget_get_first_child(@ptrCast(grid))) |child| {
+                c.gtk_flow_box_remove(grid, child);
+            }
+        }
+    }
+
+    fn selectLibraryIndex(self: *State, selected_index: c_int) void {
+        const list = self.library_list.?;
+        if (selected_index >= 0) {
+            c.gtk_combo_box_set_active(@ptrCast(self.vm_selector.?), selected_index);
+            const row = c.gtk_list_box_get_row_at_index(list, selected_index + 1);
+            c.gtk_list_box_select_row(list, row);
+            self.showSelectedMachineTitle();
+            c.adw_view_stack_set_visible_child_name(self.view_stack.?, "machine");
+            c.gtk_widget_set_visible(self.delete_configuration_button.?, c.TRUE);
+        } else {
+            c.gtk_combo_box_set_active(@ptrCast(self.vm_selector.?), -1);
+            const row = c.gtk_list_box_get_row_at_index(list, 0);
+            c.gtk_list_box_select_row(list, row);
+            self.showLibraryPage();
+        }
+    }
+
+    fn showLibraryPage(self: *State) void {
+        c.adw_view_stack_set_visible_child_name(self.view_stack.?, "library");
+        c.adw_window_title_set_title(self.content_title.?, "Library");
+        var subtitle_buffer: [64]u8 = undefined;
+        const subtitle = std.fmt.bufPrintZ(
+            &subtitle_buffer,
+            "{} virtual machine{s}",
+            .{ self.library_count, if (self.library_count == 1) "" else "s" },
+        ) catch "Virtual machines";
+        c.adw_window_title_set_subtitle(self.content_title.?, subtitle.ptr);
+        c.gtk_widget_set_visible(self.start_button.?, c.FALSE);
+        c.gtk_widget_set_visible(self.pause_button.?, c.FALSE);
+        c.gtk_widget_set_visible(self.stop_button.?, c.FALSE);
+        c.gtk_widget_set_visible(self.delete_configuration_button.?, c.FALSE);
+    }
+
+    fn showMachinePage(self: *State, title: [*:0]const u8, subtitle: [*:0]const u8) void {
+        c.adw_view_stack_set_visible_child_name(self.view_stack.?, "machine");
+        c.adw_window_title_set_title(self.content_title.?, title);
+        c.adw_window_title_set_subtitle(self.content_title.?, subtitle);
+        c.gtk_widget_set_visible(self.start_button.?, c.TRUE);
+        c.gtk_widget_set_visible(self.pause_button.?, c.FALSE);
+        c.gtk_widget_set_visible(self.stop_button.?, c.FALSE);
+        c.adw_navigation_split_view_set_show_content(self.navigation_split_view.?, c.TRUE);
+    }
+
+    fn showSelectedMachineTitle(self: *State) void {
+        const name = c.gtk_combo_box_text_get_active_text(self.vm_selector.?) orelse return;
+        defer c.g_free(name);
+        self.showMachinePage(name, "Saved virtual machine");
+    }
+
+    fn openLibraryMachine(self: *State, index: c_int) void {
+        if (index < 0 or @as(usize, @intCast(index)) >= self.library_count) return;
+        c.gtk_combo_box_set_active(@ptrCast(self.vm_selector.?), index);
+        self.loadConfiguration();
+        self.showSelectedMachineTitle();
+        c.gtk_widget_set_visible(self.delete_configuration_button.?, c.TRUE);
+        c.adw_navigation_split_view_set_show_content(self.navigation_split_view.?, c.TRUE);
+    }
+
+    fn appendLibraryNavigationRow(
+        self: *State,
+        title: [*:0]const u8,
+        subtitle: [*:0]const u8,
+        icon_name: [*:0]const u8,
+    ) void {
+        const row_widget = c.adw_action_row_new() orelse return;
+        const row: *c.AdwActionRow = @ptrCast(row_widget);
+        c.adw_preferences_row_set_title(@ptrCast(row), title);
+        c.adw_action_row_set_subtitle(row, subtitle);
+        const icon = c.gtk_image_new_from_icon_name(icon_name) orelse return;
+        c.adw_action_row_add_prefix(row, icon);
+        c.gtk_list_box_append(self.library_list.?, row_widget);
+    }
+
+    fn appendLibraryMachine(self: *State, name: []const u8) void {
+        const title = self.allocator.dupeZ(u8, name) catch return;
+        defer self.allocator.free(title);
+        var subtitle_buffer: [128]u8 = undefined;
+        const subtitle = self.libraryMachineSubtitle(name, &subtitle_buffer);
+        self.appendLibraryNavigationRow(
+            title.ptr,
+            subtitle.ptr,
+            "computer-symbolic",
+        );
+        self.appendLibraryCard(title.ptr, subtitle.ptr);
+    }
+
+    fn libraryMachineSubtitle(
+        self: *State,
+        name: []const u8,
+        buffer: *[128]u8,
+    ) [:0]const u8 {
+        var loaded = SavedConfig.load(self.allocator, name) catch {
+            return std.fmt.bufPrintZ(buffer, "Saved virtual machine", .{}) catch unreachable;
+        };
+        defer loaded.deinit();
+        const config = loaded.config;
+        return std.fmt.bufPrintZ(
+            buffer,
+            "{} processors · {} MiB memory · {s}",
+            .{
+                config.vcpu_count,
+                config.memory_mb,
+                if (config.disk_path == null) "No disk" else "Disk attached",
+            },
+        ) catch std.fmt.bufPrintZ(buffer, "Saved virtual machine", .{}) catch unreachable;
+    }
+
+    fn appendLibraryCard(
+        self: *State,
+        title: [*:0]const u8,
+        subtitle: [*:0]const u8,
+    ) void {
+        const row_widget = c.adw_action_row_new() orelse return;
+        const card: *c.AdwActionRow = @ptrCast(row_widget);
+        c.adw_preferences_row_set_title(@ptrCast(card), title);
+        c.adw_action_row_set_subtitle(card, subtitle);
+        const icon = c.gtk_image_new_from_icon_name("computer-symbolic") orelse return;
+        c.gtk_image_set_pixel_size(@ptrCast(icon), 48);
+        c.adw_action_row_add_prefix(card, icon);
+        const arrow = c.gtk_image_new_from_icon_name("go-next-symbolic") orelse return;
+        c.adw_action_row_add_suffix(card, arrow);
+        const card_widget = createLibraryCardContainer(row_widget, 300) orelse return;
+        c.gtk_flow_box_append(self.library_grid.?, card_widget);
     }
 
     fn stop(self: *State) void {
@@ -1526,10 +1825,16 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     state.view_stack = view_stack;
     const header_widget = c.adw_header_bar_new() orelse return;
     const header: *c.AdwHeaderBar = @ptrCast(header_widget);
-    const switcher_widget = c.adw_view_switcher_new() orelse return;
-    const switcher: *c.AdwViewSwitcher = @ptrCast(switcher_widget);
-    c.adw_view_switcher_set_stack(switcher, view_stack);
-    c.adw_header_bar_set_title_widget(header, switcher_widget);
+    if (state.library_shell) {
+        const title_widget = c.adw_window_title_new("Library", "Virtual machines") orelse return;
+        state.content_title = @ptrCast(title_widget);
+        c.adw_header_bar_set_title_widget(header, title_widget);
+    } else {
+        const switcher_widget = c.adw_view_switcher_new() orelse return;
+        const switcher: *c.AdwViewSwitcher = @ptrCast(switcher_widget);
+        c.adw_view_switcher_set_stack(switcher, view_stack);
+        c.adw_header_bar_set_title_widget(header, switcher_widget);
+    }
     c.adw_toolbar_view_add_top_bar(toolbar, header_widget);
     if (builtin.mode == .Debug) {
         const banner = c.adw_banner_new("Debug build — performance may be degraded") orelse return;
@@ -1545,37 +1850,17 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     c.adw_preferences_page_set_icon_name(configuration, "computer-symbolic");
     const library_group = addPreferencesGroup(
         configuration,
-        "Virtual Machines",
-        "Open a saved configuration or name and save a new one",
+        "Virtual Machine",
+        "Name this machine and manage its saved configuration",
     ) orelse return;
     state.configuration_groups[0] = @ptrCast(library_group);
-    const saved_row = addActionRow(
-        library_group,
-        "Saved Machine",
-        "Select a configuration from the local library",
-    ) orelse return;
     const selector_widget = c.gtk_combo_box_text_new() orelse return;
     state.vm_selector = @ptrCast(selector_widget);
-    c.adw_action_row_add_suffix(saved_row, selector_widget);
-    _ = addRowButton(
-        saved_row,
-        "document-open-symbolic",
-        "Load",
-        &loadClicked,
-        state,
-    ) orelse return;
     state.vm_name_entry = addEntryRow(library_group, state, "Name", null) orelse return;
     const configuration_actions = addActionRow(
         library_group,
         "Configuration",
         "Create, save, or remove a virtual machine configuration",
-    ) orelse return;
-    _ = addRowButton(
-        configuration_actions,
-        "document-new-symbolic",
-        "New",
-        &newClicked,
-        state,
     ) orelse return;
     _ = addRowButton(
         configuration_actions,
@@ -1591,6 +1876,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         &deleteClicked,
         state,
     ) orelse return;
+    state.delete_configuration_button = delete_button;
     c.gtk_widget_add_css_class(delete_button, "destructive-action");
     const storage_group = addPreferencesGroup(
         configuration,
@@ -1966,6 +2252,25 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         state,
     ) orelse return;
     c.adw_header_bar_pack_end(header, preferences_button);
+    if (state.library_shell) {
+        const new_button = createIconButton(
+            "list-add-symbolic",
+            "New Virtual Machine",
+            &newClicked,
+            state,
+        ) orelse return;
+        c.gtk_widget_add_css_class(new_button, "suggested-action");
+        c.adw_header_bar_pack_end(header, new_button);
+    }
+    if (state.library_shell) {
+        const library_widget = createLibraryPage(state) orelse return;
+        _ = c.adw_view_stack_add_titled(
+            view_stack,
+            library_widget,
+            "library",
+            "Library",
+        ) orelse return;
+    }
     const library_page = c.adw_view_stack_add_titled(
         view_stack,
         configuration_widget,
@@ -1973,22 +2278,29 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
         "Machine",
     ) orelse return;
     c.adw_view_stack_page_set_icon_name(library_page, "computer-symbolic");
-    const display_page = c.adw_view_stack_add_titled(
-        view_stack,
-        display_box_widget,
-        "display",
-        "Display",
-    ) orelse return;
-    c.adw_view_stack_page_set_icon_name(display_page, "video-display-symbolic");
-    const console_page = c.adw_view_stack_add_titled(
-        view_stack,
-        console_box_widget,
-        "console",
-        "Console",
-    ) orelse return;
-    c.adw_view_stack_page_set_icon_name(console_page, "utilities-terminal-symbolic");
+    if (!state.library_shell) {
+        const display_page = c.adw_view_stack_add_titled(
+            view_stack,
+            display_box_widget,
+            "display",
+            "Display",
+        ) orelse return;
+        c.adw_view_stack_page_set_icon_name(display_page, "video-display-symbolic");
+        const console_page = c.adw_view_stack_add_titled(
+            view_stack,
+            console_box_widget,
+            "console",
+            "Console",
+        ) orelse return;
+        c.adw_view_stack_page_set_icon_name(console_page, "utilities-terminal-symbolic");
+    }
     c.adw_toolbar_view_set_content(toolbar, view_stack_widget);
-    c.adw_application_window_set_content(application_window, toolbar_widget);
+    if (state.library_shell) {
+        const split_view = createLibrarySplitView(state, toolbar_widget) orelse return;
+        c.adw_application_window_set_content(application_window, split_view);
+    } else {
+        c.adw_application_window_set_content(application_window, toolbar_widget);
+    }
     const keys = c.gtk_event_controller_key_new() orelse return;
     _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&keyPressed), state, null, 0);
     _ = c.g_signal_connect_data(keys, "key-released", @ptrCast(&keyReleased), state, null, 0);
@@ -2019,7 +2331,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     );
     state.setRunningControls(false);
     state.refreshLibrary(null);
-    if (state.load_saved_configuration) state.loadSelectedOrNew();
+    if (state.load_saved_configuration and !state.library_shell) state.loadSelectedOrNew();
     c.gtk_window_present(window);
     state.registry.claimClipboard(state);
     if (state.kernel_path != null or state.firmware_path != null or
@@ -2027,6 +2339,124 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     {
         state.start();
     }
+}
+
+fn createLibraryPage(state: *State) ?*c.GtkWidget {
+    const stack_widget = c.gtk_stack_new() orelse return null;
+    const stack: *c.GtkStack = @ptrCast(stack_widget);
+    state.library_page_stack = stack;
+    c.gtk_widget_set_hexpand(stack_widget, c.TRUE);
+    c.gtk_widget_set_vexpand(stack_widget, c.TRUE);
+    const empty_widget = createEmptyLibraryPage(state) orelse return null;
+    const cards_widget = createLibraryCardsPage(state) orelse return null;
+    _ = c.gtk_stack_add_named(stack, empty_widget, "empty") orelse return null;
+    _ = c.gtk_stack_add_named(stack, cards_widget, "cards") orelse return null;
+    c.gtk_stack_set_visible_child_name(stack, "empty");
+    return stack_widget;
+}
+
+fn createEmptyLibraryPage(state: *State) ?*c.GtkWidget {
+    const page_widget = c.adw_status_page_new() orelse return null;
+    const page: *c.AdwStatusPage = @ptrCast(page_widget);
+    c.adw_status_page_set_icon_name(page, "computer-symbolic");
+    c.adw_status_page_set_title(page, "No Virtual Machines");
+    c.adw_status_page_set_description(
+        page,
+        "Create a virtual machine from an image or attach an existing disk.",
+    );
+    const button = c.gtk_button_new_with_label("New Virtual Machine") orelse return null;
+    c.gtk_widget_add_css_class(button, "suggested-action");
+    c.gtk_widget_set_halign(button, c.GTK_ALIGN_CENTER);
+    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&newClicked), state, null, 0);
+    c.adw_status_page_set_child(page, button);
+    return page_widget;
+}
+
+fn createLibraryCardsPage(state: *State) ?*c.GtkWidget {
+    const scrolled_widget = c.gtk_scrolled_window_new() orelse return null;
+    const scrolled: *c.GtkScrolledWindow = @ptrCast(scrolled_widget);
+    c.gtk_widget_set_hexpand(scrolled_widget, c.TRUE);
+    c.gtk_widget_set_vexpand(scrolled_widget, c.TRUE);
+    const grid_widget = c.gtk_flow_box_new() orelse return null;
+    const grid: *c.GtkFlowBox = @ptrCast(grid_widget);
+    state.library_grid = grid;
+    c.gtk_flow_box_set_activate_on_single_click(grid, c.TRUE);
+    c.gtk_flow_box_set_selection_mode(grid, c.GTK_SELECTION_NONE);
+    c.gtk_flow_box_set_min_children_per_line(grid, 1);
+    c.gtk_flow_box_set_max_children_per_line(grid, 3);
+    c.gtk_flow_box_set_column_spacing(grid, 18);
+    c.gtk_flow_box_set_row_spacing(grid, 18);
+    c.gtk_widget_set_hexpand(grid_widget, c.TRUE);
+    c.gtk_widget_set_margin_top(grid_widget, 24);
+    c.gtk_widget_set_margin_bottom(grid_widget, 24);
+    c.gtk_widget_set_margin_start(grid_widget, 24);
+    c.gtk_widget_set_margin_end(grid_widget, 24);
+    _ = c.g_signal_connect_data(
+        grid,
+        "child-activated",
+        @ptrCast(&libraryCardActivated),
+        state,
+        null,
+        0,
+    );
+    c.gtk_scrolled_window_set_child(scrolled, grid_widget);
+    return scrolled_widget;
+}
+
+fn createLibraryCardContainer(row: *c.GtkWidget, width_min: c_int) ?*c.GtkWidget {
+    const card_widget = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0) orelse return null;
+    c.gtk_widget_add_css_class(card_widget, "card");
+    c.gtk_widget_set_size_request(card_widget, width_min, 112);
+    c.gtk_widget_set_halign(card_widget, c.GTK_ALIGN_START);
+    c.gtk_widget_set_hexpand(row, c.TRUE);
+    c.gtk_widget_set_vexpand(row, c.TRUE);
+    c.gtk_box_append(@ptrCast(card_widget), row);
+    return card_widget;
+}
+
+fn createLibrarySplitView(state: *State, content: *c.GtkWidget) ?*c.GtkWidget {
+    const sidebar_widget = createLibrarySidebar(state) orelse return null;
+    const sidebar_page = c.adw_navigation_page_new(sidebar_widget, "bobrvm") orelse return null;
+    const content_page = c.adw_navigation_page_new(content, "Virtual Machines") orelse return null;
+    const split_widget = c.adw_navigation_split_view_new() orelse return null;
+    const split: *c.AdwNavigationSplitView = @ptrCast(split_widget);
+    state.navigation_split_view = split;
+    c.adw_navigation_split_view_set_sidebar(split, sidebar_page);
+    c.adw_navigation_split_view_set_content(split, content_page);
+    c.adw_navigation_split_view_set_min_sidebar_width(split, 220);
+    c.adw_navigation_split_view_set_max_sidebar_width(split, 300);
+    c.adw_navigation_split_view_set_show_content(split, c.TRUE);
+    return split_widget;
+}
+
+fn createLibrarySidebar(state: *State) ?*c.GtkWidget {
+    const toolbar_widget = c.adw_toolbar_view_new() orelse return null;
+    const toolbar: *c.AdwToolbarView = @ptrCast(toolbar_widget);
+    c.gtk_widget_add_css_class(toolbar_widget, "sidebar");
+    const header_widget = c.adw_header_bar_new() orelse return null;
+    const header: *c.AdwHeaderBar = @ptrCast(header_widget);
+    const title_widget = c.adw_window_title_new("bobrvm", "Virtual machines") orelse return null;
+    c.adw_header_bar_set_title_widget(header, title_widget);
+    c.adw_toolbar_view_add_top_bar(toolbar, header_widget);
+    const scrolled_widget = c.gtk_scrolled_window_new() orelse return null;
+    const scrolled: *c.GtkScrolledWindow = @ptrCast(scrolled_widget);
+    const list_widget = c.gtk_list_box_new() orelse return null;
+    const list: *c.GtkListBox = @ptrCast(list_widget);
+    state.library_list = list;
+    c.gtk_widget_add_css_class(list_widget, "navigation-sidebar");
+    c.gtk_list_box_set_activate_on_single_click(list, c.TRUE);
+    c.gtk_list_box_set_selection_mode(list, c.GTK_SELECTION_SINGLE);
+    _ = c.g_signal_connect_data(
+        list,
+        "row-selected",
+        @ptrCast(&libraryRowSelected),
+        state,
+        null,
+        0,
+    );
+    c.gtk_scrolled_window_set_child(scrolled, list_widget);
+    c.adw_toolbar_view_set_content(toolbar, scrolled_widget);
+    return toolbar_widget;
 }
 
 fn addPathRow(
@@ -2405,9 +2835,36 @@ fn hostClipboardRead(
     if (state.vm) |vm| vm.sendHostClipboard(bytes);
 }
 
-fn loadClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
+fn libraryRowSelected(
+    _: *c.GtkListBox,
+    row: ?*c.GtkListBoxRow,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
     const state: *State = @ptrCast(@alignCast(userdata orelse return));
-    state.loadConfiguration();
+    if (state.refreshing_library) return;
+    const index = c.gtk_list_box_row_get_index(row orelse return);
+    if (index == 0) {
+        c.gtk_combo_box_set_active(@ptrCast(state.vm_selector.?), -1);
+        state.showLibraryPage();
+        c.adw_navigation_split_view_set_show_content(state.navigation_split_view.?, c.TRUE);
+        return;
+    }
+    state.openLibraryMachine(index - 1);
+}
+
+fn libraryCardActivated(
+    _: *c.GtkFlowBox,
+    child: *c.GtkFlowBoxChild,
+    userdata: ?*anyopaque,
+) callconv(.c) void {
+    const state: *State = @ptrCast(@alignCast(userdata orelse return));
+    const index = c.gtk_flow_box_child_get_index(child);
+    if (index < 0 or @as(usize, @intCast(index)) >= state.library_count) return;
+    state.refreshing_library = true;
+    const row = c.gtk_list_box_get_row_at_index(state.library_list.?, index + 1);
+    c.gtk_list_box_select_row(state.library_list.?, row);
+    state.refreshing_library = false;
+    state.openLibraryMachine(index);
 }
 
 fn newClicked(_: *c.GtkButton, userdata: ?*anyopaque) callconv(.c) void {
