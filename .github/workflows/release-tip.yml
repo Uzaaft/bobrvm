@@ -124,18 +124,43 @@ jobs:
             COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES \
             build
 
+      - name: Select signing mode
+        id: signing
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.PROD_MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.PROD_MACOS_CERTIFICATE_PWD }}
+          MACOS_CI_KEYCHAIN_PWD: ${{ secrets.PROD_MACOS_CI_KEYCHAIN_PWD }}
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+        run: |
+          if [[ -z "$MACOS_CERTIFICATE" ]]; then
+            if [[ -n "$MACOS_CERTIFICATE_NAME$MACOS_CERTIFICATE_PWD$MACOS_CI_KEYCHAIN_PWD" ]]; then
+              echo "Developer ID certificate secrets are only partially configured" >&2
+              exit 1
+            fi
+            echo "developer-id=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Publishing an ad-hoc signed build; Developer ID certificate is absent"
+            exit 0
+          fi
+
+          : "${MACOS_CERTIFICATE_NAME:?PROD_MACOS_CERTIFICATE_NAME is not configured}"
+          : "${MACOS_CERTIFICATE_PWD:?PROD_MACOS_CERTIFICATE_PWD is not configured}"
+          : "${MACOS_CI_KEYCHAIN_PWD:?PROD_MACOS_CI_KEYCHAIN_PWD is not configured}"
+          : "${APPLE_NOTARIZATION_ISSUER:?APPLE_NOTARIZATION_ISSUER is not configured}"
+          : "${APPLE_NOTARIZATION_KEY:?APPLE_NOTARIZATION_KEY is not configured}"
+          : "${APPLE_NOTARIZATION_KEY_ID:?APPLE_NOTARIZATION_KEY_ID is not configured}"
+          echo "developer-id=true" >> "$GITHUB_OUTPUT"
+
       - name: Import Developer ID certificate
+        if: steps.signing.outputs.developer-id == 'true'
         env:
           MACOS_CERTIFICATE: ${{ secrets.PROD_MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.PROD_MACOS_CERTIFICATE_PWD }}
           MACOS_CI_KEYCHAIN_PWD: ${{ secrets.PROD_MACOS_CI_KEYCHAIN_PWD }}
         run: |
-          : "${MACOS_CERTIFICATE:?PROD_MACOS_CERTIFICATE is not configured}"
-          : "${MACOS_CERTIFICATE_NAME:?PROD_MACOS_CERTIFICATE_NAME is not configured}"
-          : "${MACOS_CERTIFICATE_PWD:?PROD_MACOS_CERTIFICATE_PWD is not configured}"
-          : "${MACOS_CI_KEYCHAIN_PWD:?PROD_MACOS_CI_KEYCHAIN_PWD is not configured}"
-
           certificate_path="$RUNNER_TEMP/bobrvm-certificate.p12"
           keychain_path="$RUNNER_TEMP/bobrvm-signing.keychain-db"
           printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate_path"
@@ -156,6 +181,7 @@ jobs:
           echo "BOBRVM_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
 
       - name: Sign app
+        if: steps.signing.outputs.developer-id == 'true'
         env:
           MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
         run: |
@@ -170,9 +196,21 @@ jobs:
             "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
 
-      - name: Create signed disk image
-        env:
-          MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
+      - name: Ad-hoc sign app
+        if: steps.signing.outputs.developer-id != 'true'
+        run: |
+          app="macos/build/Release/Bobrvm.app"
+          test -d "$app"
+          codesign \
+            --force \
+            --deep \
+            --options runtime \
+            --sign - \
+            --entitlements macos/Bobrvm.entitlements \
+            "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: Create disk image
         run: |
           app="macos/build/Release/Bobrvm.app"
           staging="$RUNNER_TEMP/bobrvm-dmg"
@@ -185,6 +223,12 @@ jobs:
             -ov \
             -format UDZO \
             Bobrvm-tip-arm64.dmg
+
+      - name: Sign disk image
+        if: steps.signing.outputs.developer-id == 'true'
+        env:
+          MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
+        run: |
           codesign \
             --force \
             --timestamp \
@@ -192,15 +236,12 @@ jobs:
             Bobrvm-tip-arm64.dmg
 
       - name: Notarize and staple
+        if: steps.signing.outputs.developer-id == 'true'
         env:
           APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
           APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
           APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
         run: |
-          : "${APPLE_NOTARIZATION_ISSUER:?APPLE_NOTARIZATION_ISSUER is not configured}"
-          : "${APPLE_NOTARIZATION_KEY:?APPLE_NOTARIZATION_KEY is not configured}"
-          : "${APPLE_NOTARIZATION_KEY_ID:?APPLE_NOTARIZATION_KEY_ID is not configured}"
-
           key_path="$RUNNER_TEMP/bobrvm-notarization-key.p8"
           printf '%s' "$APPLE_NOTARIZATION_KEY" > "$key_path"
           xcrun notarytool submit Bobrvm-tip-arm64.dmg \
