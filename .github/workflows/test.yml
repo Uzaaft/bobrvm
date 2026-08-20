@@ -13,30 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  zig:
-    name: Zig tests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
-        with:
-          determinate: true
-
-      - name: Restore and save Nix artifacts
-        uses: DeterminateSystems/magic-nix-cache-action@55718cd9ebf1737a061487d5ada21abf31e99a98
-        with:
-          use-flakehub: false
-
-      - name: Run Zig tests
-        run: nix build --print-build-logs .#checks.x86_64-linux.test
-
   macos:
-    name: macOS compile
+    name: macOS tests and compile
     runs-on: macos-26
     timeout-minutes: 45
     env:
@@ -100,6 +78,11 @@ jobs:
 
       - name: Show Xcode version
         run: xcodebuild -version
+
+      - name: Run Zig tests
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.zig-deps.outputs.system }}
+        run: nix develop -c zig build test --summary all
 
       - name: Build app frameworks
         env:

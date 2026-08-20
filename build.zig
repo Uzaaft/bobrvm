@@ -64,10 +64,13 @@ pub fn build(b: *std.Build) !void {
     // while the development shell can build frameworks for the native app.
     const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
     const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
-    const objc_dependency = b.dependency("zig_objc", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const objc_dependency = if (target.result.os.tag == .macos)
+        b.dependency("zig_objc", .{
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        null;
 
     const emit_xcframework = b.option(
         bool,
@@ -192,7 +195,7 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (target.result.os.tag == .macos) {
-        root_module.addImport("objc", objc_dependency.module("objc"));
+        root_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -243,7 +246,7 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (target.result.os.tag == .macos) {
-        cli_module.addImport("objc", objc_dependency.module("objc"));
+        cli_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -398,7 +401,7 @@ pub fn build(b: *std.Build) !void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
-        test_module.addImport("objc", objc_dependency.module("objc"));
+        test_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
