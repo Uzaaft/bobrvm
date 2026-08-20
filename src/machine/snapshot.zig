@@ -901,7 +901,7 @@ pub fn deserializePciDevice(
     transport.isr_status = @bitCast(try cur.int(u8));
     for (transport.queues) |*queue| {
         queue.size = try cur.int(u16);
-        if (queue.size > pci.virtio_pci.VirtioPciTransport.MAX_QUEUE_SIZE) {
+        if (queue.size > queue.size_max) {
             return error.Mismatch;
         }
         queue.enable = try cur.int(u8) != 0;
