@@ -7,6 +7,45 @@ enum LibrarySelection: Hashable {
     case virtualMachine(UUID)
 }
 
+enum VMSortOrder: String, CaseIterable, Identifiable {
+    case date
+    case name
+
+    var id: Self { self }
+
+    var displayName: String {
+        switch self {
+        case .date: return "Date Created"
+        case .name: return "Name"
+        }
+    }
+
+    var menuDescription: String {
+        switch self {
+        case .date: return "Date Created — Newest First"
+        case .name: return "Name — A to Z"
+        }
+    }
+
+    @MainActor
+    func sorted(_ vms: [VMInstance]) -> [VMInstance] {
+        vms.sorted { lhs, rhs in
+            switch self {
+            case .date:
+                if lhs.creationDate != rhs.creationDate {
+                    return lhs.creationDate > rhs.creationDate
+                }
+            case .name:
+                let comparison = lhs.name.localizedStandardCompare(rhs.name)
+                if comparison != .orderedSame {
+                    return comparison == .orderedAscending
+                }
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+}
+
 @MainActor
 func presentNativeError(_ error: Error, title: String) {
     let alert = NSAlert()
@@ -69,12 +108,14 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var libraryVMSelection: UUID?
     @State private var vmToDelete: VMInstance?
+    @AppStorage("vmSortOrder") private var sortOrder: VMSortOrder = .date
 
     var body: some View {
         NavigationSplitView {
             VMListView(
                 selection: $selection,
                 searchText: $searchText,
+                sortOrder: sortOrder,
                 requestDelete: { vmToDelete = $0 }
             )
             .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 300)
@@ -83,7 +124,22 @@ struct ContentView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Menu {
+                    // Inline, not the default menu style: a nested picker would
+                    // put the orders behind a "Sort by" submenu, and the menu
+                    // holds nothing they need to be distinguished from.
+                    Picker("Sort by", selection: $sortOrder) {
+                        ForEach(VMSortOrder.allCases) { option in
+                            Text(option.menuDescription).tag(option)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    Label("Sort by \(sortOrder.displayName)", systemImage: "arrow.up.arrow.down")
+                }
+                .help("Sort virtual machines by \(sortOrder.displayName.lowercased())")
+
                 Button {
                     vmManager.showingCreateVM = true
                 } label: {
@@ -145,6 +201,7 @@ struct ContentView: View {
         VMLibraryHomeView(
             searchText: searchText,
             selectedVMID: $libraryVMSelection,
+            sortOrder: sortOrder,
             showDetails: { selection = .virtualMachine($0.id) },
             delete: { vmToDelete = $0 }
         )
@@ -188,6 +245,7 @@ struct VMListView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Binding var selection: LibrarySelection?
     @Binding var searchText: String
+    let sortOrder: VMSortOrder
     let requestDelete: (VMInstance) -> Void
 
     var body: some View {
@@ -224,11 +282,12 @@ struct VMListView: View {
     }
 
     private var filteredVMs: [VMInstance] {
-        guard !searchText.isEmpty else { return vmManager.vms }
-        return vmManager.vms.filter {
-            $0.name.localizedStandardContains(searchText)
+        let matches = vmManager.vms.filter {
+            guard !searchText.isEmpty else { return true }
+            return $0.name.localizedStandardContains(searchText)
                 || $0.guestSystem.displayName.localizedStandardContains(searchText)
         }
+        return sortOrder.sorted(matches)
     }
 
 }

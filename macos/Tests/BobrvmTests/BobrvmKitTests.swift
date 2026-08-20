@@ -181,6 +181,26 @@ final class BobrvmKitTests: XCTestCase {
     }
 
     @MainActor
+    func testVMSortOrderSupportsNameAndCreationDate() throws {
+        let app = try App()
+        let older = VMInstance(
+            name: "Alpha",
+            config: VMConfig(),
+            app: app,
+            creationDate: Date(timeIntervalSince1970: 100)
+        )
+        let newer = VMInstance(
+            name: "Zulu",
+            config: VMConfig(),
+            app: app,
+            creationDate: Date(timeIntervalSince1970: 200)
+        )
+
+        XCTAssertEqual(VMSortOrder.name.sorted([newer, older]).map(\.name), ["Alpha", "Zulu"])
+        XCTAssertEqual(VMSortOrder.date.sorted([older, newer]).map(\.name), ["Zulu", "Alpha"])
+    }
+
+    @MainActor
     func testVirtualizationMACAddressIsStableAndLocallyAdministered() {
         let id = UUID(uuidString: "83BD9E0C-D6A6-414A-81F2-53A70C013DFC")!
         let first = LinuxVirtualMachine.macAddress(for: id)

@@ -41,6 +41,7 @@ public final class VMManager: ObservableObject {
                 retinaEnabled: stored.retinaEnabled ?? true,
                 guestSystem: stored.effectiveGuestSystem,
                 backend: stored.effectiveBackend,
+                creationDate: stored.effectiveCreationDate,
                 macOSPlatform: stored.macOSPlatform
             )
             vms.append(instance)
@@ -297,6 +298,7 @@ public final class VMManager: ObservableObject {
             retinaEnabled: retinaEnabled,
             guestSystem: instance.guestSystem,
             backend: backend,
+            creationDate: instance.creationDate,
             macOSPlatform: instance.macOSPlatform
         )
 
@@ -343,6 +345,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     @Published public private(set) var retinaEnabled: Bool
     public let guestSystem: GuestSystem
     public let backend: VMBackend
+    public let creationDate: Date
     let macOSPlatform: MacOSPlatformMetadata?
 
     @Published public var surface: Surface?
@@ -363,6 +366,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         retinaEnabled: Bool = true,
         guestSystem: GuestSystem = .linux,
         backend: VMBackend? = nil,
+        creationDate: Date = Date(),
         macOSPlatform: MacOSPlatformMetadata? = nil
     ) {
         self.id = id
@@ -374,6 +378,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         self.retinaEnabled = retinaEnabled
         self.guestSystem = guestSystem
         self.backend = backend ?? VMBackend.defaultValue(for: guestSystem)
+        self.creationDate = creationDate
         self.macOSPlatform = macOSPlatform
 
         observeVM()
@@ -603,6 +608,7 @@ enum VMStorage {
         let sharedFolderPath: String?
         let guestSystem: GuestSystem?
         let backend: VMBackend?
+        var createdAt: Date?
         let macOSPlatform: MacOSPlatformMetadata?
 
         var effectiveGuestSystem: GuestSystem {
@@ -611,6 +617,10 @@ enum VMStorage {
 
         var effectiveBackend: VMBackend {
             backend ?? VMBackend.defaultValue(for: effectiveGuestSystem)
+        }
+
+        var effectiveCreationDate: Date {
+            createdAt ?? .distantPast
         }
 
         var vmConfig: VMConfig {
@@ -682,6 +692,7 @@ enum VMStorage {
             self.sharedFolderPath = instance.config.sharedFolderPath
             self.guestSystem = instance.guestSystem
             self.backend = instance.backend
+            self.createdAt = instance.creationDate
             self.macOSPlatform = instance.macOSPlatform
         }
     }
@@ -710,16 +721,26 @@ enum VMStorage {
         var results: [StoredVM] = []
 
         guard
-            let files = try? fm.contentsOfDirectory(at: configDir, includingPropertiesForKeys: nil)
+            let files = try? fm.contentsOfDirectory(
+                at: configDir,
+                includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey]
+            )
         else {
             return []
         }
 
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
-                let stored = try? JSONDecoder().decode(StoredVM.self, from: data)
+                var stored = try? JSONDecoder().decode(StoredVM.self, from: data)
             else {
                 continue
+            }
+
+            if stored.createdAt == nil {
+                let values = try? file.resourceValues(
+                    forKeys: [.creationDateKey, .contentModificationDateKey]
+                )
+                stored.createdAt = values?.creationDate ?? values?.contentModificationDate
             }
 
             if let diskPath = stored.diskPath, !fm.fileExists(atPath: diskPath) {
@@ -729,9 +750,7 @@ enum VMStorage {
             results.append(stored)
         }
 
-        return results.sorted {
-            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
+        return results
     }
 
     static func deleteVM(id: UUID) {

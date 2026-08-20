@@ -6,6 +6,7 @@ struct VMLibraryHomeView: View {
     @Environment(\.openWindow) private var openWindow
     let searchText: String
     @Binding var selectedVMID: UUID?
+    let sortOrder: VMSortOrder
     let showDetails: (VMInstance) -> Void
     let delete: (VMInstance) -> Void
 
@@ -77,11 +78,12 @@ struct VMLibraryHomeView: View {
     }
 
     private var filteredVMs: [VMInstance] {
-        guard !searchText.isEmpty else { return vmManager.vms }
-        return vmManager.vms.filter {
-            $0.name.localizedStandardContains(searchText)
+        let matches = vmManager.vms.filter {
+            guard !searchText.isEmpty else { return true }
+            return $0.name.localizedStandardContains(searchText)
                 || $0.guestSystem.displayName.localizedStandardContains(searchText)
         }
+        return sortOrder.sorted(matches)
     }
 
     private var librarySubtitle: String {
@@ -206,6 +208,7 @@ struct VMOverviewView: View {
                 DetailPanel(title: "Identity", systemImage: "info.circle") {
                     DetailRow(label: "Guest", value: vmInstance.guestSystem.displayName)
                     DetailRow(label: "Backend", value: vmInstance.backend.displayName)
+                    DetailRow(label: "Created", value: creationDateText)
                     DetailRow(label: "Identifier", value: shortIdentifier)
                 }
             }
@@ -278,6 +281,10 @@ struct VMOverviewView: View {
 
     private var shortIdentifier: String {
         String(vmInstance.id.uuidString.prefix(8)).uppercased()
+    }
+
+    private var creationDateText: String {
+        vmInstance.creationDate.formatted(date: .abbreviated, time: .omitted)
     }
 
     private var startErrorPresented: Binding<Bool> {
