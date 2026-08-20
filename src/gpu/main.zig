@@ -1,6 +1,7 @@
 //! Translates guest virgl and Venus command streams to Metal.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
@@ -1215,6 +1216,7 @@ pub const GpuDevice = struct {
 // =============================================================================
 
 test "GpuDevice init and context creation" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     var gpu = GpuDevice.init(std.testing.allocator);
     defer gpu.deinit();
 
@@ -1223,6 +1225,7 @@ test "GpuDevice init and context creation" {
 }
 
 test "createResourceRecord backs a buffer on the GPU and round-trips upload" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -1254,6 +1257,7 @@ test "createResourceRecord backs a buffer on the GPU and round-trips upload" {
 }
 
 test "GpuDevice renders with translated guest shaders end to end" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -1397,6 +1401,7 @@ test "GpuDevice renders with translated guest shaders end to end" {
 }
 
 test "GpuDevice draws indexed with uniform constants (buffer(1) binding)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -1568,6 +1573,7 @@ test "GpuDevice draws indexed with uniform constants (buffer(1) binding)" {
 }
 
 test "GpuDevice samples a guest texture through TEX (fragment texturing)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -1733,6 +1739,7 @@ test "GpuDevice samples a guest texture through TEX (fragment texturing)" {
 }
 
 test "GpuDevice depth-tests draws (far fragment loses to near)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -1918,6 +1925,7 @@ test "GpuDevice depth-tests draws (far fragment loses to near)" {
 }
 
 test "GpuDevice executes TGSI control flow (IF on a uniform)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2057,6 +2065,7 @@ test "GpuDevice executes TGSI control flow (IF on a uniform)" {
 }
 
 test "GpuDevice applies guest blend state (additive over)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2223,6 +2232,7 @@ test "GpuDevice applies guest blend state (additive over)" {
 }
 
 test "GpuDevice renders to two color attachments (MRT)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2366,6 +2376,7 @@ test "GpuDevice renders to two color attachments (MRT)" {
 }
 
 test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2503,6 +2514,7 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
 }
 
 test "GpuDevice honors primitive restart in indexed triangle strips" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2672,6 +2684,7 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
 }
 
 test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2827,6 +2840,7 @@ test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
 }
 
 test "GpuDevice captures shader TGSI text and binds by stage" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -2880,6 +2894,7 @@ test "GpuDevice captures shader TGSI text and binds by stage" {
 }
 
 test "GpuDevice routes a guest draw_vbo command stream to Metal" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -3004,6 +3019,7 @@ test "GpuDevice routes a guest draw_vbo command stream to Metal" {
 }
 
 test "GpuDevice routes a guest clear command stream to Metal" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var gpu = GpuDevice.init(alloc);
     defer gpu.deinit();
@@ -3084,6 +3100,7 @@ test "GpuDevice routes a guest clear command stream to Metal" {
 }
 
 test {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     _ = virgl;
     _ = metal;
     _ = @import("iosurface.zig");

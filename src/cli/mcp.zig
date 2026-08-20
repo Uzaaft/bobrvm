@@ -22,12 +22,6 @@ const project = @import("project.zig");
 
 const log = std.log.scoped(.mcp);
 
-// Hypervisor.framework allows one VM per process, so each sandbox is a
-// `bobrvm fork` child process (the same signed binary, so the
-// hypervisor entitlement carries): its stdin/stdout pipes ARE the
-// guest console.
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
-
 const LINE_MAX: usize = 256 * 1024;
 /// Per-sandbox console history cap; the oldest bytes fall off.
 const OUTPUT_CAP: usize = 1024 * 1024;
@@ -124,9 +118,9 @@ pub const Server = struct {
         } else return error.TooManySandboxes;
 
         var exe_buf: [1024]u8 = undefined;
-        var exe_len: u32 = exe_buf.len;
-        if (_NSGetExecutablePath(&exe_buf, &exe_len) != 0) return error.Unexpected;
-        const exe = std.mem.sliceTo(exe_buf[0..exe_len], 0);
+        const exe_len = std.process.executablePath(global.io(), &exe_buf) catch
+            return error.Unexpected;
+        const exe = exe_buf[0..exe_len];
 
         const sandbox = try self.alloc.create(Sandbox);
         errdefer self.alloc.destroy(sandbox);

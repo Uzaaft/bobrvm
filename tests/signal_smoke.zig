@@ -20,7 +20,7 @@ fn runChild() !void {
 fn runUnregisterChild() !void {
     const host = std.posix.Sigaction{
         .handler = .{ .handler = hostHandler },
-        .mask = 0,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(.TERM, &host, null);

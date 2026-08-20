@@ -11,6 +11,7 @@
 //! back. No guest required — the translator is driven directly by tests.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const metal = @import("../metal.zig");
 const proto = @import("protocol.zig");
@@ -1028,6 +1029,7 @@ pub const Renderer = struct {
 // =============================================================================
 
 test "fan index growth does not allocate CPU staging memory" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         if (err == Error.NoMetalDevice) return error.SkipZigTest;
@@ -1049,6 +1051,7 @@ test "fan index growth does not allocate CPU staging memory" {
 }
 
 test "clear render target produces exact pixels" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         // On a machine without a usable Metal device (unlikely on macOS),
@@ -1086,6 +1089,7 @@ test "clear render target produces exact pixels" {
 }
 
 test "BGRA render target is IOSurface-backed and presents without readback" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         if (err == Error.NoMetalDevice) return error.SkipZigTest;
@@ -1122,6 +1126,7 @@ test "BGRA render target is IOSurface-backed and presents without readback" {
 }
 
 test "draw triangle renders geometry through a Metal pipeline" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         if (err == Error.NoMetalDevice) return error.SkipZigTest;
@@ -1159,6 +1164,7 @@ test "draw triangle renders geometry through a Metal pipeline" {
 }
 
 test "draw triangle from an uploaded vertex buffer" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         if (err == Error.NoMetalDevice) return error.SkipZigTest;
@@ -1197,6 +1203,7 @@ test "draw triangle from an uploaded vertex buffer" {
 }
 
 test "TGSI texture sampling variants (TXB/TXL/TXF) compile on Metal" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;
     defer r.deinit();
@@ -1226,6 +1233,7 @@ test "TGSI texture sampling variants (TXB/TXL/TXF) compile on Metal" {
 }
 
 test "TGSI integer/bitwise opcodes compile on Metal" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;
     defer r.deinit();
@@ -1264,6 +1272,7 @@ test "TGSI integer/bitwise opcodes compile on Metal" {
 }
 
 test "TGSI ALU opcodes (XPD/NRM/DST/LIT/CEIL) compile on Metal" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;
     defer r.deinit();
@@ -1295,6 +1304,7 @@ test "TGSI ALU opcodes (XPD/NRM/DST/LIT/CEIL) compile on Metal" {
 }
 
 test "TGSI control flow and extended opcodes compile on Metal" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch return error.SkipZigTest;
     defer r.deinit();
@@ -1335,6 +1345,7 @@ test "TGSI control flow and extended opcodes compile on Metal" {
 }
 
 test "TGSI→MSL output compiles on a real Metal device" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         if (err == Error.NoMetalDevice) return error.SkipZigTest;
@@ -1407,6 +1418,7 @@ test "TGSI→MSL output compiles on a real Metal device" {
 }
 
 test "translated shaders build a real pipeline and draw a triangle" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var r = Renderer.init(alloc) catch |err| {
         if (err == Error.NoMetalDevice) return error.SkipZigTest;

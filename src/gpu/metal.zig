@@ -1,6 +1,7 @@
 //! Dependency-free Metal bindings using direct Objective-C message dispatch.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 
 pub const id = *anyopaque;
@@ -1414,20 +1415,24 @@ pub const FrameRenderer = struct {
 // =============================================================================
 
 test "MTLClearColor default" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const color = MTLClearColor{};
     try std.testing.expectEqual(@as(f64, 0.0), color.red);
     try std.testing.expectEqual(@as(f64, 1.0), color.alpha);
 }
 
 test "MTLViewport size" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(MTLViewport));
 }
 
 test "MTLPixelFormat values" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     try std.testing.expectEqual(@as(NSUInteger, 80), @intFromEnum(MTLPixelFormat.bgra8Unorm));
 }
 
 test "IOSurface-backed texture aliases CPU writes (zero-copy scanout)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const iosurface = @import("iosurface.zig");
     const device = Device.createSystemDefault() orelse return error.SkipZigTest;
 

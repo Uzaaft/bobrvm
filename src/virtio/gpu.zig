@@ -2540,6 +2540,7 @@ test "Gpu rejects 2D resources above configured memory" {
 test "virgl capset info and submit decode" {
     const gpu = try Gpu.init(testing.allocator, true);
     defer gpu.deinit();
+    if (!gpu.virgl_enabled) return error.SkipZigTest;
 
     // Capset info for index 1 (virgl2)
     const info_req = GetCapsetInfo{
@@ -2728,6 +2729,7 @@ test "transfer_to_host_2d full-width fast path matches guest backing" {
 test "transfer_to_host_3d uploads guest TEXTURE data via replaceRegion" {
     const gpu = try Gpu.init(testing.allocator, true);
     defer gpu.deinit();
+    if (!gpu.virgl_enabled) return error.SkipZigTest;
 
     // A 2x2 BGRA texture: 4 distinct pixels.
     const nbytes: u32 = 2 * 2 * 4;
@@ -2891,6 +2893,7 @@ test "strided fragmented texture upload retains compact staging" {
 test "transfer_to_host_3d uploads guest vertex data into the resource's MTLBuffer" {
     const gpu = try Gpu.init(testing.allocator, true);
     defer gpu.deinit();
+    if (!gpu.virgl_enabled) return error.SkipZigTest;
 
     const nbytes: u32 = 24; // 3 vertices * float2
 

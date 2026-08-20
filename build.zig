@@ -55,10 +55,13 @@ pub fn build(b: *std.Build) !void {
     // while the development shell can build frameworks for the native app.
     const in_nix_shell = environmentVariable(b, "IN_NIX_SHELL") != null;
     const is_nix_build = environmentVariable(b, "NIX_BUILD_TOP") != null and !in_nix_shell;
-    const objc_dependency = b.dependency("zig_objc", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const objc_dependency = if (target.result.os.tag == .macos)
+        b.dependency("zig_objc", .{
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        null;
 
     const emit_xcframework = b.option(
         bool,
@@ -181,7 +184,7 @@ pub fn build(b: *std.Build) !void {
     });
 
     if (target.result.os.tag == .macos) {
-        root_module.addImport("objc", objc_dependency.module("objc"));
+        root_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -216,7 +219,7 @@ pub fn build(b: *std.Build) !void {
         .linkage = .static,
     });
 
-    b.installArtifact(lib);
+    if (target.result.os.tag == .macos) b.installArtifact(lib);
 
     b.installDirectory(.{
         .source_dir = b.path("include"),
@@ -225,14 +228,17 @@ pub fn build(b: *std.Build) !void {
     });
 
     const cli_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(if (target.result.os.tag == .linux)
+            "src/main_linux.zig"
+        else
+            "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
     if (target.result.os.tag == .macos) {
-        cli_module.addImport("objc", objc_dependency.module("objc"));
+        cli_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -259,6 +265,10 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
+    if (target.result.os.tag == .linux) {
+        cli_module.linkSystemLibrary("alsa", .{});
+        if (gpu_virglrenderer) cli_module.linkSystemLibrary("virglrenderer", .{});
+    }
 
     const cli_exe = b.addExecutable(.{
         .name = "bobrvm",
@@ -267,6 +277,26 @@ pub fn build(b: *std.Build) !void {
 
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
+
+    if (target.result.os.tag == .linux) {
+        const gtk_module = b.createModule(.{
+            .root_source_file = b.path("src/main_gtk.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
+        gtk_module.linkSystemLibrary("adwaita-1", .{});
+        gtk_module.linkSystemLibrary("gtk-4", .{});
+        gtk_module.linkSystemLibrary("alsa", .{});
+        if (gpu_virglrenderer) gtk_module.linkSystemLibrary("virglrenderer", .{});
+
+        const gtk_exe = b.addExecutable(.{
+            .name = "bobrvm-gtk",
+            .root_module = gtk_module,
+        });
+        b.installArtifact(gtk_exe);
+    }
 
     // Code-sign the installed CLI with hypervisor entitlement (macOS only)
     if (target.result.os.tag == .macos and !is_nix_build) {
@@ -376,7 +406,10 @@ pub fn build(b: *std.Build) !void {
 
     // Test module
     const test_module = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
+        .root_source_file = b.path(if (target.result.os.tag == .linux)
+            "src/linux_test.zig"
+        else
+            "src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -387,7 +420,7 @@ pub fn build(b: *std.Build) !void {
     // Metal-backed tests (virgl renderer) can create a real device: the
     // SDK library path is what lets -lobjc resolve.
     if (target.result.os.tag == .macos) {
-        test_module.addImport("objc", objc_dependency.module("objc"));
+        test_module.addImport("objc", objc_dependency.?.module("objc"));
         if (environmentVariable(b, "SDKROOT")) |sdk| {
             const framework_path = b.fmt("{s}/System/Library/Frameworks", .{sdk});
             const include_path = b.fmt("{s}/usr/include", .{sdk});
@@ -447,18 +480,18 @@ pub fn build(b: *std.Build) !void {
     );
     check_linux_step.dependOn(&linux_check.step);
 
-    const c_api_smoke_module = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_api_smoke_module.addCSourceFile(.{
-        .file = b.path("tests/c_api_smoke.c"),
-        .flags = &.{"-std=c11"},
-    });
-    c_api_smoke_module.addIncludePath(b.path("include"));
-    c_api_smoke_module.linkLibrary(lib);
     if (target.result.os.tag == .macos) {
+        const c_api_smoke_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        c_api_smoke_module.addCSourceFile(.{
+            .file = b.path("tests/c_api_smoke.c"),
+            .flags = &.{"-std=c11"},
+        });
+        c_api_smoke_module.addIncludePath(b.path("include"));
+        c_api_smoke_module.linkLibrary(lib);
         const sdk = environmentVariable(b, "SDKROOT") orelse std.mem.trim(
             u8,
             b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }),
@@ -470,27 +503,27 @@ pub fn build(b: *std.Build) !void {
             .cwd_relative = b.fmt("{s}/usr/include", .{sdk}),
         });
         c_api_smoke_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+
+        const c_api_smoke = b.addExecutable(.{
+            .name = "c_api_smoke",
+            .root_module = c_api_smoke_module,
+        });
+        const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
+        test_step.dependOn(&run_c_api_smoke.step);
+
+        const cli_smoke_module = b.createModule(.{
+            .root_source_file = b.path("tests/cli_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const cli_smoke = b.addExecutable(.{
+            .name = "cli_smoke",
+            .root_module = cli_smoke_module,
+        });
+        const run_cli_smoke = b.addRunArtifact(cli_smoke);
+        run_cli_smoke.addArtifactArg(cli_exe);
+        test_step.dependOn(&run_cli_smoke.step);
     }
-
-    const c_api_smoke = b.addExecutable(.{
-        .name = "c_api_smoke",
-        .root_module = c_api_smoke_module,
-    });
-    const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
-    test_step.dependOn(&run_c_api_smoke.step);
-
-    const cli_smoke_module = b.createModule(.{
-        .root_source_file = b.path("tests/cli_smoke.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const cli_smoke = b.addExecutable(.{
-        .name = "cli_smoke",
-        .root_module = cli_smoke_module,
-    });
-    const run_cli_smoke = b.addRunArtifact(cli_smoke);
-    run_cli_smoke.addArtifactArg(cli_exe);
-    test_step.dependOn(&run_cli_smoke.step);
 
     const signal_smoke_signal_module = b.createModule(.{
         .root_source_file = b.path("src/os/signal.zig"),

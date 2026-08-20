@@ -823,7 +823,7 @@ pub const Machine = struct {
     ) AttachShareError!void {
         std.debug.assert(self.share == null);
         std.debug.assert(self.pci_share == null);
-        const share = try virtio.P9.init(allocator, "host", path);
+        const share = try virtio.P9.init(allocator, "host", path, false);
         errdefer share.deinit();
         share.setGuestMemory(GuestMemory.bind(Machine, self, getGuestMemory));
         share.setIrqCallback(virtio.mmio.Irq.initRaw(shareIrq, self));
