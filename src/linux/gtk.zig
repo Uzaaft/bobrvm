@@ -442,6 +442,7 @@ const c = struct {
     pub extern fn gtk_widget_set_sensitive(widget: *GtkWidget, sensitive: gboolean) void;
     pub extern fn gtk_widget_set_visible(widget: *GtkWidget, visible: gboolean) void;
     pub extern fn gtk_widget_set_halign(widget: *GtkWidget, alignment: c_int) void;
+    pub extern fn gtk_widget_set_valign(widget: *GtkWidget, alignment: c_int) void;
     pub extern fn gtk_widget_set_focusable(widget: *GtkWidget, focusable: gboolean) void;
     pub extern fn gtk_widget_set_tooltip_text(
         widget: *GtkWidget,
@@ -1308,6 +1309,25 @@ const State = struct {
         c.adw_navigation_split_view_set_show_content(self.navigation_split_view.?, c.TRUE);
     }
 
+    fn startFromKeyboard(self: *State) bool {
+        if (self.vm != null) return false;
+        if (self.library_shell) {
+            const selected = c.gtk_combo_box_text_get_active_text(self.vm_selector.?);
+            if (selected) |name| {
+                c.g_free(name);
+            } else {
+                if (self.library_count != 1) return false;
+                self.refreshing_library = true;
+                const row = c.gtk_list_box_get_row_at_index(self.library_list.?, 1);
+                c.gtk_list_box_select_row(self.library_list.?, row);
+                self.refreshing_library = false;
+                self.openLibraryMachine(0);
+            }
+        }
+        self.startFromForm();
+        return true;
+    }
+
     fn appendLibraryNavigationRow(
         self: *State,
         title: [*:0]const u8,
@@ -2056,7 +2076,7 @@ fn activate(app: *c.GtkApplication, userdata: ?*anyopaque) callconv(.c) void {
     ) orelse return;
     const start_button = createIconButton(
         "media-playback-start-symbolic",
-        "Start Virtual Machine",
+        "Start Virtual Machine (Ctrl+Enter)",
         &startClicked,
         state,
     ) orelse return;
@@ -2408,8 +2428,8 @@ fn createLibraryCardContainer(row: *c.GtkWidget, width_min: c_int) ?*c.GtkWidget
     c.gtk_widget_add_css_class(card_widget, "card");
     c.gtk_widget_set_size_request(card_widget, width_min, 112);
     c.gtk_widget_set_halign(card_widget, c.GTK_ALIGN_START);
+    c.gtk_widget_set_valign(card_widget, c.GTK_ALIGN_START);
     c.gtk_widget_set_hexpand(row, c.TRUE);
-    c.gtk_widget_set_vexpand(row, c.TRUE);
     c.gtk_box_append(@ptrCast(card_widget), row);
     return card_widget;
 }
@@ -3163,6 +3183,11 @@ fn keyPressed(
     userdata: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const state: *State = @ptrCast(@alignCast(userdata orelse return c.FALSE));
+    if (modifiers & c.GDK_CONTROL_MASK != 0 and
+        (keyval == 0xff0d or keyval == 0xff8d) and state.startFromKeyboard())
+    {
+        return c.TRUE;
+    }
     if (modifiers & c.GDK_CONTROL_MASK != 0 and keyval == ',') {
         state.preferences_shortcut_pressed = true;
         c.adw_dialog_present(@ptrCast(state.preferences_dialog.?), @ptrCast(state.window.?));
