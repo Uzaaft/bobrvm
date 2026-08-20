@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A11000000000000000000001 /* BobrvmKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11000000000000000000002 /* BobrvmKitTests.swift */; };
+		A1100000000000000000001C /* TerminalEmulatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1100000000000000000001D /* TerminalEmulatorTests.swift */; };
 		8C0A30A63E02459EA9C8A11B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F4A5E5F7B684F5F9D1D3B2C /* AppDelegate.swift */; };
 		4C1634DDC4C8428890A068BE /* BobrvmApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C89AC307D3CA49F98C93FE8C /* BobrvmApp.swift */; };
 		666F50031EA548DCA6611421 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AE23A7114FB4192922CFF95 /* ContentView.swift */; };
@@ -19,13 +20,13 @@
 		B0B000000000000000000005 /* VMLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000006 /* VMLibraryView.swift */; };
 		763CCC85691B452497100414 /* BobrvmKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = F676F6AC49154476B8CBB58B /* BobrvmKit.swift */; };
 		08FEA81F40114C27A1A9251A /* BobrvmKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 27F916698DB04C12B429214A /* BobrvmKit.xcframework */; };
-		A1B2C3D4E5F60718293A4B5C /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* GhosttyKit.xcframework */; };
-		C3F4A6D2B1CC4E2893A3E0A4 /* GhosttyInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D1B1CC4E2893A3E0A3 /* GhosttyInput.swift */; };
-		C3F4A6D4B1CC4E2893A3E0A6 /* GhosttyRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */; };
-		C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */; };
+		A1B2C3D4E5F60718293A4B5C /* ghostty-vt.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* ghostty-vt.xcframework */; };
+		C3F4A6D2B1CC4E2893A3E0A4 /* TerminalEmulator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D1B1CC4E2893A3E0A3 /* TerminalEmulator.swift */; };
+		C3F4A6D4B1CC4E2893A3E0A6 /* TerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D3B1CC4E2893A3E0A5 /* TerminalView.swift */; };
 		1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */; };
 		A6B7C8D9E0F1122334455601 /* Virtualization.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455602 /* Virtualization.framework */; };
 		A6B7C8D9E0F1122334455603 /* MacVirtualMachine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */; };
+		A6B7C8D9E0F1122334455610 /* VMBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1122334455611 /* VMBackend.swift */; };
 		B0B000000000000000000007 /* WindowsMediaDownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000008 /* WindowsMediaDownloadView.swift */; };
 		UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000002 /* QEMU_EFI.fd */; };
 		UEFI00000000000000000004 /* QEMU_VARS.fd in Resources */ = {isa = PBXBuildFile; fileRef = UEFI00000000000000000005 /* QEMU_VARS.fd */; };
@@ -34,6 +35,7 @@
 
 /* Begin PBXFileReference section */
 		A11000000000000000000002 /* BobrvmKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmKitTests.swift; sourceTree = "<group>"; };
+		A1100000000000000000001D /* TerminalEmulatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalEmulatorTests.swift; sourceTree = "<group>"; };
 		A11000000000000000000003 /* BobrvmTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BobrvmTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2F4A5E5F7B684F5F9D1D3B2C /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		9E5220B2D8584C4D9D4E7F3D /* Bobrvm.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Bobrvm.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -42,20 +44,20 @@
 		696CE6917C14425EB2E8448C /* CreateVMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreateVMView.swift; sourceTree = "<group>"; };
 		C32412F2F9AB4F54828570C1 /* EditVMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditVMView.swift; sourceTree = "<group>"; };
 		B4B19DFF60E047A291BD2726 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
-		C3F4A6D1B1CC4E2893A3E0A3 /* GhosttyInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyInput.swift; sourceTree = "<group>"; };
-		C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyRuntime.swift; sourceTree = "<group>"; };
-		C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttySurfaceView.swift; sourceTree = "<group>"; };
+		C3F4A6D1B1CC4E2893A3E0A3 /* TerminalEmulator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalEmulator.swift; sourceTree = "<group>"; };
+		C3F4A6D3B1CC4E2893A3E0A5 /* TerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalView.swift; sourceTree = "<group>"; };
 		B2E99685B82E41398008A70C /* VMManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMManager.swift; sourceTree = "<group>"; };
 		016570CA1164450690E721F4 /* VMSurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMSurfaceView.swift; sourceTree = "<group>"; };
 		B0B000000000000000000006 /* VMLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMLibraryView.swift; sourceTree = "<group>"; };
 		F676F6AC49154476B8CBB58B /* BobrvmKit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmKit.swift; sourceTree = "<group>"; };
 		27F916698DB04C12B429214A /* BobrvmKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = BobrvmKit.xcframework; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4B5D /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = GhosttyKit.xcframework; path = "../zig-out/GhosttyKit.xcframework"; sourceTree = SOURCE_ROOT; };
+		A1B2C3D4E5F60718293A4B5D /* ghostty-vt.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = "ghostty-vt.xcframework"; path = "../zig-out/ghostty-vt.xcframework"; sourceTree = SOURCE_ROOT; };
 		56F95697E6344228A7F9BA1B /* Bobrvm.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Bobrvm.entitlements; sourceTree = "<group>"; };
 		8260A68E8A704D57966124E6 /* Bobrvm-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Bobrvm-Bridging-Header.h"; sourceTree = "<group>"; };
 		0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Hypervisor.framework; path = System/Library/Frameworks/Hypervisor.framework; sourceTree = SDKROOT; };
 		A6B7C8D9E0F1122334455602 /* Virtualization.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Virtualization.framework; path = System/Library/Frameworks/Virtualization.framework; sourceTree = SDKROOT; };
 		A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacVirtualMachine.swift; sourceTree = "<group>"; };
+		A6B7C8D9E0F1122334455611 /* VMBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMBackend.swift; sourceTree = "<group>"; };
 		B0B000000000000000000008 /* WindowsMediaDownloadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowsMediaDownloadView.swift; sourceTree = "<group>"; };
 		UEFI00000000000000000002 /* QEMU_EFI.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_EFI.fd; sourceTree = "<group>"; };
 		UEFI00000000000000000005 /* QEMU_VARS.fd */ = {isa = PBXFileReference; lastKnownFileType = file; path = QEMU_VARS.fd; sourceTree = "<group>"; };
@@ -78,7 +80,7 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			files = (
 				08FEA81F40114C27A1A9251A /* BobrvmKit.xcframework in Frameworks */,
-				A1B2C3D4E5F60718293A4B5C /* GhosttyKit.xcframework in Frameworks */,
+				A1B2C3D4E5F60718293A4B5C /* ghostty-vt.xcframework in Frameworks */,
 				1AA74B3B3EAA4047AFD94AF5 /* Hypervisor.framework in Frameworks */,
 				A6B7C8D9E0F1122334455601 /* Virtualization.framework in Frameworks */,
 			);
@@ -110,10 +112,10 @@
 				9AE23A7114FB4192922CFF95 /* ContentView.swift */,
 				696CE6917C14425EB2E8448C /* CreateVMView.swift */,
 				C32412F2F9AB4F54828570C1 /* EditVMView.swift */,
-				C3F4A6D1B1CC4E2893A3E0A3 /* GhosttyInput.swift */,
-				C3F4A6D3B1CC4E2893A3E0A5 /* GhosttyRuntime.swift */,
-				C3F4A6D5B1CC4E2893A3E0A7 /* GhosttySurfaceView.swift */,
+				C3F4A6D1B1CC4E2893A3E0A3 /* TerminalEmulator.swift */,
+				C3F4A6D3B1CC4E2893A3E0A5 /* TerminalView.swift */,
 				A6B7C8D9E0F1122334455604 /* MacVirtualMachine.swift */,
+				A6B7C8D9E0F1122334455611 /* VMBackend.swift */,
 				B4B19DFF60E047A291BD2726 /* SettingsView.swift */,
 				B2E99685B82E41398008A70C /* VMManager.swift */,
 				B0B000000000000000000006 /* VMLibraryView.swift */,
@@ -136,7 +138,7 @@
 			isa = PBXGroup;
 			children = (
 				27F916698DB04C12B429214A /* BobrvmKit.xcframework */,
-				A1B2C3D4E5F60718293A4B5D /* GhosttyKit.xcframework */,
+				A1B2C3D4E5F60718293A4B5D /* ghostty-vt.xcframework */,
 				0A4FA3BB0B6442DF8B8DB63E /* Hypervisor.framework */,
 				A6B7C8D9E0F1122334455602 /* Virtualization.framework */,
 			);
@@ -164,6 +166,7 @@
 			isa = PBXGroup;
 			children = (
 				A11000000000000000000002 /* BobrvmKitTests.swift */,
+				A1100000000000000000001D /* TerminalEmulatorTests.swift */,
 			);
 			path = Tests/BobrvmTests;
 			sourceTree = "<group>";
@@ -278,6 +281,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A11000000000000000000001 /* BobrvmKitTests.swift in Sources */,
+				A1100000000000000000001C /* TerminalEmulatorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -291,14 +295,14 @@
 				666F50031EA548DCA6611421 /* ContentView.swift in Sources */,
 				2D542ACE334845D3AF20CC3E /* CreateVMView.swift in Sources */,
 				CD90210F6B3A466388014E3A /* EditVMView.swift in Sources */,
-				C3F4A6D2B1CC4E2893A3E0A4 /* GhosttyInput.swift in Sources */,
-				C3F4A6D4B1CC4E2893A3E0A6 /* GhosttyRuntime.swift in Sources */,
-				C3F4A6D6B1CC4E2893A3E0A8 /* GhosttySurfaceView.swift in Sources */,
+				C3F4A6D2B1CC4E2893A3E0A4 /* TerminalEmulator.swift in Sources */,
+				C3F4A6D4B1CC4E2893A3E0A6 /* TerminalView.swift in Sources */,
 				4C471C776EA0410496018A2E /* SettingsView.swift in Sources */,
 				E7DE4622B79F487381A5E9D7 /* VMManager.swift in Sources */,
 				B0B000000000000000000005 /* VMLibraryView.swift in Sources */,
 				E59A61D5A7ED4A43B2965238 /* VMSurfaceView.swift in Sources */,
 				A6B7C8D9E0F1122334455603 /* MacVirtualMachine.swift in Sources */,
+				A6B7C8D9E0F1122334455610 /* VMBackend.swift in Sources */,
 				B0B000000000000000000007 /* WindowsMediaDownloadView.swift in Sources */,
 				763CCC85691B452497100414 /* BobrvmKit.swift in Sources */,
 			);

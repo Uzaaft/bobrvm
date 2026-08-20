@@ -8,6 +8,7 @@ struct EditVMView: View {
     let vmInstance: VMInstance
 
     @State private var name: String
+    @State private var backend: VMBackend
     @State private var isoPath: String
     @State private var memoryGB: Double
     @State private var vcpuCount: Double
@@ -31,6 +32,7 @@ struct EditVMView: View {
     init(vmInstance: VMInstance) {
         self.vmInstance = vmInstance
         _name = State(initialValue: vmInstance.name)
+        _backend = State(initialValue: vmInstance.backend)
         _isoPath = State(initialValue: vmInstance.isoPath ?? "")
         _memoryGB = State(
             initialValue: Double(vmInstance.config.memoryBytes) / (1024 * 1024 * 1024))
@@ -61,6 +63,7 @@ struct EditVMView: View {
 
                 Form {
                     generalSection
+                    backendSection
                     storageSection
                     resourcesSection
                     graphicsSection
@@ -133,6 +136,26 @@ struct EditVMView: View {
         }
     }
 
+    private var backendSection: some View {
+        Section {
+            VMBackendSelectionView(
+                selection: $backend,
+                guestSystem: vmInstance.guestSystem,
+                disabled: isRunning
+            )
+            .onChange(of: backend) { _, selected in
+                if selected == .virtualization {
+                    sharedFolderPath = ""
+                }
+                hasChanges = true
+            }
+        } header: {
+            LockableSectionHeader(title: "Virtualization Backend", isLocked: isRunning)
+        } footer: {
+            Text("Changing backend performs a cold boot; backend-specific state is not reused.")
+        }
+    }
+
     private var storageSection: some View {
         Section {
             if let diskPath = vmInstance.config.diskPath {
@@ -156,14 +179,21 @@ struct EditVMView: View {
                     .disabled(isRunning)
                     .onChange(of: isoPath) { hasChanges = true }
 
-                FilePickerField(
-                    label: "Shared folder",
-                    path: $sharedFolderPath,
-                    types: [],
-                    selectDirectories: true
-                )
-                .disabled(isRunning)
-                .onChange(of: sharedFolderPath) { hasChanges = true }
+                if backend == .hypervisor {
+                    FilePickerField(
+                        label: "Shared folder",
+                        path: $sharedFolderPath,
+                        types: [],
+                        selectDirectories: true
+                    )
+                    .disabled(isRunning)
+                    .onChange(of: sharedFolderPath) { hasChanges = true }
+                } else {
+                    LabeledContent("Shared folder") {
+                        Text("Not available with Apple Virtualization")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         } header: {
             Text("Storage")
@@ -218,7 +248,7 @@ struct EditVMView: View {
         } header: {
             LockableSectionHeader(
                 title: "Graphics",
-                isLocked: isRunning && vmInstance.guestSystem == .macOS
+                isLocked: isRunning && backend == .virtualization
             )
         } footer: {
             if isRunning {
@@ -232,6 +262,11 @@ struct EditVMView: View {
         if vmInstance.guestSystem == .macOS {
             LabeledContent("Graphics") {
                 Text("Apple accelerated graphics")
+                    .foregroundStyle(.secondary)
+            }
+        } else if backend == .virtualization {
+            LabeledContent("Graphics") {
+                Text("Apple compatibility display")
                     .foregroundStyle(.secondary)
             }
         } else if isRunning {
@@ -255,7 +290,7 @@ struct EditVMView: View {
 
     @ViewBuilder
     private var displayControls: some View {
-        if isRunning && vmInstance.guestSystem == .macOS {
+        if isRunning && backend == .virtualization {
             ReadOnlyConfigRow(
                 label: "Maximum resolution",
                 value: resolution.label,
@@ -287,7 +322,7 @@ struct EditVMView: View {
                 .onChange(of: networkEnabled) { hasChanges = true }
 
             LabeledContent("Connection") {
-                Text("Share with my Mac")
+                Text(backend == .virtualization ? "Apple NAT" : "Share with my Mac")
                     .foregroundStyle(.secondary)
             }
         } header: {
@@ -304,6 +339,11 @@ struct EditVMView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+            }
+
+            LabeledContent("Backend") {
+                Text(backend.displayName)
+                    .foregroundStyle(.secondary)
             }
 
             if let diskPath = vmInstance.config.diskPath {
@@ -379,7 +419,7 @@ struct EditVMView: View {
     }
 
     private var graphicsFooter: String {
-        if vmInstance.guestSystem == .macOS {
+        if backend == .virtualization {
             return "Stop the VM to change its display configuration."
         }
         return "Resolution and Retina scaling apply immediately. "
@@ -390,7 +430,9 @@ struct EditVMView: View {
         if isRunning {
             return "Stop the VM to connect or disconnect its network adapter."
         }
-        return "Uses Bobrvm’s built-in NAT to share this Mac’s internet connection."
+        return backend == .virtualization
+            ? "Uses Apple’s NAT to share this Mac’s internet connection."
+            : "Uses Bobrvm’s built-in NAT to share this Mac’s internet connection."
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
@@ -422,7 +464,8 @@ struct EditVMView: View {
                     retinaEnabled: retinaEnabled,
                     networkEnabled: networkEnabled,
                     sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
-                    diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil
+                    diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil,
+                    backend: backend
                 )
             }
             dismiss()

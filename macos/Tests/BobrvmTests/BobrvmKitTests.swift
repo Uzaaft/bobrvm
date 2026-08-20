@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import Bobrvm
 
 final class BobrvmKitTests: XCTestCase {
@@ -103,6 +104,90 @@ final class BobrvmKitTests: XCTestCase {
             XCTAssertNil(c.disk_path)
             XCTAssertNil(c.disk2_path)
         }
+    }
+
+    func testVZLinuxConfigPreservesBackendFields() {
+        let config = VZLinuxVMConfig(
+            memoryBytes: 4 * 1024 * 1024 * 1024,
+            vcpuCount: 4,
+            displayWidth: 1920,
+            displayHeight: 1080,
+            networkEnabled: true,
+            diskReadOnly: false,
+            diskPath: "/tmp/linux.raw",
+            installerPath: "/tmp/linux.iso",
+            variableStorePath: "/tmp/efi-store",
+            machineIdentifierPath: "/tmp/machine-id",
+            macAddress: "02:01:02:03:04:05"
+        )
+
+        config.withCConfig { pointer in
+            let c = pointer.pointee
+            XCTAssertEqual(c.memory_bytes, config.memoryBytes)
+            XCTAssertEqual(c.vcpu_count, config.vcpuCount)
+            XCTAssertEqual(c.display_width, config.displayWidth)
+            XCTAssertEqual(c.display_height, config.displayHeight)
+            XCTAssertTrue(c.enable_net)
+            XCTAssertFalse(c.disk_read_only)
+            XCTAssertEqual(String(cString: c.disk_path), config.diskPath)
+            XCTAssertEqual(String(cString: c.installer_path), config.installerPath)
+            XCTAssertEqual(String(cString: c.variable_store_path), config.variableStorePath)
+            XCTAssertEqual(String(cString: c.machine_id_path), config.machineIdentifierPath)
+            XCTAssertEqual(String(cString: c.mac_address), config.macAddress)
+        }
+    }
+
+    func testBackendCompatibilityMatrixAndDefaults() {
+        XCTAssertTrue(VMBackend.hypervisor.supports(.linux))
+        XCTAssertTrue(VMBackend.virtualization.supports(.linux))
+        XCTAssertFalse(VMBackend.hypervisor.supports(.macOS))
+        XCTAssertTrue(VMBackend.virtualization.supports(.macOS))
+        XCTAssertTrue(VMBackend.hypervisor.supports(.windows))
+        XCTAssertFalse(VMBackend.virtualization.supports(.windows))
+        XCTAssertEqual(VMBackend.defaultValue(for: .linux), .hypervisor)
+        XCTAssertEqual(VMBackend.defaultValue(for: .windows), .hypervisor)
+        XCTAssertEqual(VMBackend.defaultValue(for: .macOS), .virtualization)
+    }
+
+    func testVirtualizationBackendRejectsNonRawLinuxDisk() {
+        let config = VMConfig(diskPath: "/tmp/linux.qcow2")
+        XCTAssertThrowsError(
+            try VMBackend.virtualization.validate(guestSystem: .linux, config: config)
+        ) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Apple Virtualization supports raw Linux disk images only.")
+        }
+    }
+
+    func testLegacyStoredVMMigratesToGuestDefaultBackend() throws {
+        let data = Data(
+            """
+            {
+              "id": "83BD9E0C-D6A6-414A-81F2-53A70C013DFC",
+              "name": "Legacy Linux",
+              "memoryBytes": 4294967296,
+              "vcpuCount": 4,
+              "diskReadOnly": false,
+              "vramMB": 512,
+              "guestSystem": "linux"
+            }
+            """.utf8
+        )
+        let stored = try JSONDecoder().decode(VMStorage.StoredVM.self, from: data)
+
+        XCTAssertNil(stored.backend)
+        XCTAssertEqual(stored.effectiveBackend, .hypervisor)
+    }
+
+    @MainActor
+    func testVirtualizationMACAddressIsStableAndLocallyAdministered() {
+        let id = UUID(uuidString: "83BD9E0C-D6A6-414A-81F2-53A70C013DFC")!
+        let first = LinuxVirtualMachine.macAddress(for: id)
+
+        XCTAssertEqual(first, LinuxVirtualMachine.macAddress(for: id))
+        XCTAssertTrue(first.hasPrefix("02:"))
+        XCTAssertEqual(first.split(separator: ":").count, 6)
     }
 
     @MainActor

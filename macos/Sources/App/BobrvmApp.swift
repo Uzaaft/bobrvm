@@ -10,7 +10,6 @@ struct BobrvmApp: SwiftUI.App {
         Window("Bobrvm", id: "library") {
             ContentView()
                 .environmentObject(appDelegate.vmManager)
-                .environmentObject(appDelegate.ghosttyRuntime)
         }
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1_100, height: 720)
@@ -24,7 +23,6 @@ struct BobrvmApp: SwiftUI.App {
             if let vmID {
                 VMWindowView(vmID: vmID)
                     .environmentObject(appDelegate.vmManager)
-                    .environmentObject(appDelegate.ghosttyRuntime)
             }
         }
         .windowToolbarStyle(.unifiedCompact)
@@ -37,7 +35,6 @@ struct BobrvmApp: SwiftUI.App {
             if let vmID {
                 VMConsoleWindowView(vmID: vmID)
                     .environmentObject(appDelegate.vmManager)
-                    .environmentObject(appDelegate.ghosttyRuntime)
             }
         }
         .windowToolbarStyle(.unified)

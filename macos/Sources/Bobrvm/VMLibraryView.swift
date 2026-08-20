@@ -7,6 +7,7 @@ struct VMLibraryHomeView: View {
     let searchText: String
     @Binding var selectedVMID: UUID?
     let showDetails: (VMInstance) -> Void
+    let delete: (VMInstance) -> Void
 
     @State private var startError: String?
 
@@ -48,7 +49,8 @@ struct VMLibraryHomeView: View {
                         open: { open(vm) },
                         pause: { vm.pause() },
                         stop: { vm.stop() },
-                        edit: { vmManager.vmPendingEdit = vm }
+                        edit: { vmManager.vmPendingEdit = vm },
+                        delete: { delete(vm) }
                     )
                 }
             }
@@ -113,6 +115,7 @@ struct VMOverviewView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Environment(\.openWindow) private var openWindow
     @State private var startError: String?
+    let delete: () -> Void
 
     var body: some View {
         ScrollView {
@@ -127,13 +130,18 @@ struct VMOverviewView: View {
         .navigationTitle(vmInstance.name)
         .navigationSubtitle(vmInstance.guestSystem.displayName)
         .toolbar {
-            ToolbarItem(placement: .automatic) {
+            ToolbarItemGroup(placement: .automatic) {
                 Button {
                     vmManager.vmPendingEdit = vmInstance
                 } label: {
                     Label("Settings", systemImage: "gearshape")
                 }
                 .help("Virtual machine settings")
+
+                Button(role: .destructive, action: delete) {
+                    Label("Delete", systemImage: "trash")
+                }
+                .help("Delete virtual machine")
             }
             ToolbarSpacer(.fixed)
             ToolbarItemGroup(placement: .primaryAction) {
@@ -197,6 +205,7 @@ struct VMOverviewView: View {
                 }
                 DetailPanel(title: "Identity", systemImage: "info.circle") {
                     DetailRow(label: "Guest", value: vmInstance.guestSystem.displayName)
+                    DetailRow(label: "Backend", value: vmInstance.backend.displayName)
                     DetailRow(label: "Identifier", value: shortIdentifier)
                 }
             }
@@ -301,6 +310,7 @@ private struct VMLibraryCard: View {
     let pause: () -> Void
     let stop: () -> Void
     let edit: () -> Void
+    let delete: () -> Void
 
     var body: some View {
         Button(action: handleActivation) {
@@ -429,6 +439,8 @@ private struct VMLibraryCard: View {
         }
         Button("Show Details", systemImage: "sidebar.right", action: showDetails)
         Button("Settings…", systemImage: "gearshape", action: edit)
+        Divider()
+        Button("Delete…", systemImage: "trash", role: .destructive, action: delete)
     }
 
     private var primaryTitle: String {

@@ -9,6 +9,7 @@ const apprt = lib.apprt;
 const config = lib.config;
 const disk = lib.disk;
 const macos_runtime = lib.runtime.macos;
+const linux_gui_vz = lib.runtime.linux_gui_vz;
 
 const log = std.log.scoped(.main);
 
@@ -412,6 +413,59 @@ pub export fn bobrvm_macos_vm_install(
 pub export fn bobrvm_macos_vm_install_progress(vm: ?*macos_runtime.MacRuntime) f64 {
     const handle = vm orelse return 0;
     return handle.backend.installProgress();
+}
+
+pub export fn bobrvm_vz_vm_new(
+    cfg: ?*const linux_gui_vz.Config,
+) ?*linux_gui_vz.LinuxGUIRuntime {
+    if (builtin.os.tag != .macos) return null;
+    const config_value = cfg orelse return null;
+    const handle = std.heap.c_allocator.create(linux_gui_vz.LinuxGUIRuntime) catch return null;
+    handle.* = linux_gui_vz.LinuxGUIRuntime.init(config_value) catch {
+        std.heap.c_allocator.destroy(handle);
+        return null;
+    };
+    return handle;
+}
+
+pub export fn bobrvm_vz_vm_destroy(vm: ?*linux_gui_vz.LinuxGUIRuntime) void {
+    const handle = vm orelse return;
+    handle.backend.deinit();
+    std.heap.c_allocator.destroy(handle);
+}
+
+pub export fn bobrvm_vz_vm_start(vm: ?*linux_gui_vz.LinuxGUIRuntime) c_int {
+    const handle = vm orelse return 1;
+    handle.start() catch return 3;
+    return 0;
+}
+
+pub export fn bobrvm_vz_vm_stop(vm: ?*linux_gui_vz.LinuxGUIRuntime) void {
+    const handle = vm orelse return;
+    handle.requestStop();
+}
+
+pub export fn bobrvm_vz_vm_pause(vm: ?*linux_gui_vz.LinuxGUIRuntime) void {
+    const handle = vm orelse return;
+    handle.pause();
+}
+
+pub export fn bobrvm_vz_vm_resume(vm: ?*linux_gui_vz.LinuxGUIRuntime) void {
+    const handle = vm orelse return;
+    handle.resumeVM();
+}
+
+pub export fn bobrvm_vz_vm_state(vm: ?*linux_gui_vz.LinuxGUIRuntime) VMState {
+    const handle = vm orelse return .failed;
+    handle.tick();
+    return @enumFromInt(@intFromEnum(handle.state));
+}
+
+pub export fn bobrvm_vz_vm_display_view(
+    vm: ?*linux_gui_vz.LinuxGUIRuntime,
+) ?*anyopaque {
+    const handle = vm orelse return null;
+    return handle.displayView();
 }
 
 // --------------------------------------------------------------------------

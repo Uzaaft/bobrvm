@@ -42,7 +42,9 @@ The main components are:
 - `src/virtio`, `src/pci`, `src/gic`: guest devices and interrupt delivery.
 - `src/gpu`, `src/renderer`: virgl/Venus translation and Metal rendering.
 - `src/runtime`, `src/apprt`: embedding and application-runtime boundaries.
-- `macos`: SwiftUI/AppKit application.
+- `macos`: SwiftUI/AppKit application. The guest console owns its own terminal: guest UART
+  bytes go into libghostty-vt for VT parsing and grid state, and `TerminalView` draws the
+  resulting cell grid with CoreText.
 
 ## Code Style
 

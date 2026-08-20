@@ -68,12 +68,14 @@ struct ContentView: View {
     @State private var selection: LibrarySelection? = .library
     @State private var searchText = ""
     @State private var libraryVMSelection: UUID?
+    @State private var vmToDelete: VMInstance?
 
     var body: some View {
         NavigationSplitView {
             VMListView(
                 selection: $selection,
-                searchText: $searchText
+                searchText: $searchText,
+                requestDelete: { vmToDelete = $0 }
             )
             .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 300)
         } detail: {
@@ -96,6 +98,22 @@ struct ContentView: View {
         .sheet(item: $vmManager.vmPendingEdit) { vm in
             EditVMView(vmInstance: vm)
         }
+        .confirmationDialog(
+            "Delete Virtual Machine?",
+            isPresented: deleteConfirmation,
+            titleVisibility: .visible,
+            presenting: vmToDelete
+        ) { vm in
+            Button("Delete \"\(vm.name)\"", role: .destructive) {
+                vmToDelete = nil
+                Task { await vmManager.deleteVM(vm) }
+            }
+            Button("Cancel", role: .cancel) {
+                vmToDelete = nil
+            }
+        } message: { vm in
+            Text(deleteMessage(for: vm))
+        }
         .frame(minWidth: 780, minHeight: 520)
         .focusedSceneObject(selectedVM)
         .onChange(of: visibleVMIDs) { _, ids in
@@ -114,7 +132,7 @@ struct ContentView: View {
         switch selection {
         case .virtualMachine(let id):
             if let vm = vmManager.vms.first(where: { $0.id == id }) {
-                VMOverviewView(vmInstance: vm)
+                VMOverviewView(vmInstance: vm, delete: { vmToDelete = vm })
             } else {
                 library
             }
@@ -127,8 +145,22 @@ struct ContentView: View {
         VMLibraryHomeView(
             searchText: searchText,
             selectedVMID: $libraryVMSelection,
-            showDetails: { selection = .virtualMachine($0.id) }
+            showDetails: { selection = .virtualMachine($0.id) },
+            delete: { vmToDelete = $0 }
         )
+    }
+
+    private var deleteConfirmation: Binding<Bool> {
+        Binding(
+            get: { vmToDelete != nil },
+            set: { if !$0 { vmToDelete = nil } }
+        )
+    }
+
+    private func deleteMessage(for vm: VMInstance) -> String {
+        let stopMessage = vm.state == .stopped ? "" : "The virtual machine will be stopped. "
+        return stopMessage
+            + "The saved configuration will be removed. Disk images remain on this Mac."
     }
 
     private var selectedVM: VMInstance? {
@@ -144,7 +176,8 @@ struct ContentView: View {
     private var visibleVMIDs: [UUID] {
         guard !searchText.isEmpty else { return vmManager.vms.map(\.id) }
         return vmManager.vms.compactMap { vm in
-            let matchesSearch = vm.name.localizedStandardContains(searchText)
+            let matchesSearch =
+                vm.name.localizedStandardContains(searchText)
                 || vm.guestSystem.displayName.localizedStandardContains(searchText)
             return matchesSearch ? vm.id : nil
         }
@@ -155,7 +188,7 @@ struct VMListView: View {
     @EnvironmentObject private var vmManager: VMManager
     @Binding var selection: LibrarySelection?
     @Binding var searchText: String
-    @State private var vmToDelete: VMInstance?
+    let requestDelete: (VMInstance) -> Void
 
     var body: some View {
         List(selection: $selection) {
@@ -172,7 +205,7 @@ struct VMListView: View {
                             VMContextMenu(
                                 vmInstance: vm,
                                 onEdit: { vmManager.vmPendingEdit = vm },
-                                onDelete: { vmToDelete = vm }
+                                onDelete: { requestDelete(vm) }
                             )
                         }
                 }
@@ -188,22 +221,6 @@ struct VMListView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .confirmationDialog(
-            "Delete Virtual Machine?",
-            isPresented: deleteConfirmation,
-            titleVisibility: .visible,
-            presenting: vmToDelete
-        ) { vm in
-            Button("Delete \"\(vm.name)\"", role: .destructive) {
-                vmManager.deleteVM(vm)
-                vmToDelete = nil
-            }
-            Button("Cancel", role: .cancel) {
-                vmToDelete = nil
-            }
-        } message: { _ in
-            Text("The saved configuration will be removed. Disk images remain on this Mac.")
-        }
     }
 
     private var filteredVMs: [VMInstance] {
@@ -214,12 +231,6 @@ struct VMListView: View {
         }
     }
 
-    private var deleteConfirmation: Binding<Bool> {
-        Binding(
-            get: { vmToDelete != nil },
-            set: { if !$0 { vmToDelete = nil } }
-        )
-    }
 }
 
 struct VMContextMenu: View {
@@ -321,7 +332,6 @@ struct VMContextMenu: View {
                 } label: {
                     Label("Delete…", systemImage: "trash")
                 }
-                .disabled(vmInstance.state == .running)
             }
         }
     }
@@ -335,7 +345,8 @@ struct VMContextMenu: View {
                 config: vmInstance.config,
                 isoPath: vmInstance.isoPath,
                 retinaEnabled: vmInstance.retinaEnabled,
-                guestSystem: vmInstance.guestSystem
+                guestSystem: vmInstance.guestSystem,
+                backend: vmInstance.backend
             )
         } catch {
             presentNativeError(error, title: "Could Not Duplicate Virtual Machine")
@@ -412,46 +423,52 @@ struct VMDetailView: View {
 
     var body: some View {
         display
-        .toolbar {
-            ToolbarItemGroup(placement: .automatic) {
-                Button {
-                    showingSettings = true
-                } label: {
-                    Label("Settings", systemImage: "gearshape")
-                }
-                .help("Virtual machine settings")
-
-                if vmInstance.guestSystem != .macOS {
-                    Menu {
-                        ISOMediaActions(vmInstance: vmInstance)
+            .toolbar {
+                ToolbarItemGroup(placement: .automatic) {
+                    Button {
+                        showingSettings = true
                     } label: {
-                        Label("CD/DVD", systemImage: "opticaldisc")
+                        Label("Settings", systemImage: "gearshape")
                     }
-                    .help(isoHelp)
+                    .help("Virtual machine settings")
+
+                    if vmInstance.guestSystem != .macOS {
+                        Menu {
+                            ISOMediaActions(vmInstance: vmInstance)
+                        } label: {
+                            Label("CD/DVD", systemImage: "opticaldisc")
+                        }
+                        .help(isoHelp)
+                    }
+                }
+                ToolbarSpacer(.fixed)
+                ToolbarItemGroup(placement: .primaryAction) {
+                    lifecycleControls
                 }
             }
-            ToolbarSpacer(.fixed)
-            ToolbarItemGroup(placement: .primaryAction) {
-                lifecycleControls
+            .sheet(isPresented: $showingSettings) {
+                EditVMView(vmInstance: vmInstance)
             }
-        }
-        .sheet(isPresented: $showingSettings) {
-            EditVMView(vmInstance: vmInstance)
-        }
-        .alert(errorTitle, isPresented: errorPresented) {
-            Button("OK") { errorMessage = nil }
-        } message: {
-            Text(errorMessage ?? "An unknown error occurred.")
-        }
+            .alert(errorTitle, isPresented: errorPresented) {
+                Button("OK") { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "An unknown error occurred.")
+            }
     }
 
     @ViewBuilder
     private var display: some View {
         if vmInstance.state == .running || vmInstance.state == .paused {
-            if vmInstance.guestSystem == .macOS,
+            if vmInstance.backend == .virtualization,
+                vmInstance.guestSystem == .macOS,
                 let machine = vmInstance.runtimeMacVM
             {
                 MacVirtualMachineView(machine: machine)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if vmInstance.backend == .virtualization,
+                let machine = vmInstance.runtimeLinuxVZVM
+            {
+                LinuxVirtualMachineView(machine: machine)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VMSurfaceRepresentable(vmInstance: vmInstance)
@@ -497,7 +514,9 @@ struct VMDetailView: View {
                 Label("Stop", systemImage: "stop.fill")
             }
             .help("Stop virtual machine")
-            guestToolsMenu
+            if vmInstance.backend == .hypervisor {
+                guestToolsMenu
+            }
         case .paused:
             Button {
                 vmInstance.resume()
@@ -736,8 +755,8 @@ struct VMConsoleWindowView: View {
     }
 
     private func consoleUnavailableDescription(for vm: VMInstance) -> String {
-        if vm.guestSystem == .macOS {
-            return "Console access is not available for macOS virtual machines."
+        if vm.backend == .virtualization {
+            return "Console access is not available with Apple Virtualization."
         }
         return "Start the virtual machine to open its console."
     }
@@ -745,24 +764,12 @@ struct VMConsoleWindowView: View {
 
 struct ConsoleView: View {
     @ObservedObject var vm: VM
-    @EnvironmentObject private var ghosttyRuntime: GhosttyRuntime
 
     var body: some View {
-        Group {
-            if let app = ghosttyRuntime.app {
-                GhosttyConsoleViewRepresentable(
-                    app: app,
-                    initialOutput: vm.consoleOutputData,
-                    events: vm.consoleEventPublisher
-                )
-            } else {
-                ContentUnavailableView(
-                    "Terminal Renderer Unavailable",
-                    systemImage: "terminal",
-                    description: Text("The console renderer could not be initialized.")
-                )
-            }
-        }
+        TerminalConsoleView(
+            initialOutput: vm.consoleOutputData,
+            events: vm.consoleEventPublisher
+        )
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) {

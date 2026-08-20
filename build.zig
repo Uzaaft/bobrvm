@@ -3,8 +3,6 @@ const builtin = @import("builtin");
 const XCFrameworkStep = @import("src/build/XCFrameworkStep.zig");
 const XcodebuildStep = @import("src/build/XcodebuildStep.zig");
 
-const GhosttyXCFrameworkTarget = enum { native, universal };
-
 const GhosttySteps = struct {
     install_root_step: *std.Build.Step,
 };
@@ -83,7 +81,7 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Build and run the macOS app");
     const macos_app_step = b.step("macos-app", "Build the macOS app");
     const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
-    const ghostty_step = b.step("ghostty-lib", "Build GhosttyKit.xcframework");
+    const ghostty_step = b.step("ghostty-lib", "Build ghostty-vt.xcframework");
     const bare_metal_integration_step = b.step(
         "test-bare-metal",
         "Run the bare-metal SMP integration test",
@@ -779,7 +777,7 @@ pub fn build(b: *std.Build) !void {
         try run_step.addError("the macOS app can only run on macOS", .{});
         try macos_app_step.addError("the macOS app can only build on macOS", .{});
         try xcframework_step.addError("BobrvmKit.xcframework requires macOS", .{});
-        try ghostty_step.addError("GhosttyKit.xcframework requires macOS", .{});
+        try ghostty_step.addError("ghostty-vt.xcframework requires macOS", .{});
     }
 }
 
@@ -834,25 +832,22 @@ fn addGhosttySteps(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
 ) GhosttySteps {
-    const ghostty_xcframework_target = b.option(
-        GhosttyXCFrameworkTarget,
-        "ghostty-xcframework-target",
-        "Ghostty xcframework target (native or universal).",
-    ) orelse .native;
-
     const ghostty_dep = b.dependency("ghostty", .{ .@"version-string" = "0.0.0" });
-    const ghostty_target_arg = @tagName(ghostty_xcframework_target);
 
+    // libghostty-vt only: escape-sequence parsing and terminal state, without
+    // the Ghostty application runtime, its configuration loading, or its
+    // renderer. Bobrvm draws the cell grid itself; see
+    // macos/Sources/Bobrvm/TerminalView.swift.
+    //
+    // In lib-vt mode the xcframework is always a macOS universal binary plus a
+    // slice per installed Apple SDK, so -Dxcframework-target does not apply.
     const ghostty_cmd = b.addSystemCommand(&.{
         "zig",
         "build",
-        "-Dapp-runtime=none",
-        "-Dversion-string=0.0.0",
-        "-Demit-macos-app=false",
+        "-Demit-lib-vt=true",
         "-Demit-xcframework=true",
-        "-Di18n=false",
+        "-Dversion-string=0.0.0",
         b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
-        b.fmt("-Dxcframework-target={s}", .{ghostty_target_arg}),
     });
     if (environmentVariable(b, "BOBRVM_ZIG_SYSTEM_PACKAGE_DIR")) |dir| {
         ghostty_cmd.addArgs(&.{ "--system", dir });
@@ -867,12 +862,12 @@ fn addGhosttySteps(
     ghostty_cmd.expectExitCode(0);
     ghostty_cmd.addFileInput(ghostty_dep.path("build.zig"));
     ghostty_cmd.addFileInput(ghostty_dep.path("build.zig.zon"));
-    ghostty_cmd.addFileInput(ghostty_dep.path("include/ghostty.h"));
+    ghostty_cmd.addFileInput(ghostty_dep.path("include/ghostty/vt.h"));
 
     const ghostty_install = b.addInstallDirectory(.{
-        .source_dir = ghostty_dep.path("macos/GhosttyKit.xcframework"),
+        .source_dir = ghostty_dep.path("zig-out/lib/ghostty-vt.xcframework"),
         .install_dir = .prefix,
-        .install_subdir = "GhosttyKit.xcframework",
+        .install_subdir = "ghostty-vt.xcframework",
     });
     ghostty_install.step.dependOn(&ghostty_cmd.step);
 

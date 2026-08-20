@@ -9,7 +9,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
     )
 
     let vmManager = VMManager()
-    let ghosttyRuntime = GhosttyRuntime()
     private var app: App?
     private var pasteboardChangeCount = NSPasteboard.general.changeCount
     private var pasteboardTimer: Timer?

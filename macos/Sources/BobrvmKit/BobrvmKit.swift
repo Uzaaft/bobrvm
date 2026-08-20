@@ -1,5 +1,5 @@
-import Combine
 import AppKit
+import Combine
 import Foundation
 import Metal
 import QuartzCore
@@ -476,18 +476,19 @@ public final class VM: ObservableObject {
     }
 
     public func stop() {
-        guard !isStopping, let h = handle else { return }
-        isStopping = true
-        let sendableHandle = SendableVMHandle(value: h)
-        bobrvm_vm_request_stop(h)
-        let stopTask = Task.detached(priority: .userInitiated) { [sendableHandle] in
-            bobrvm_vm_finish_stop(sendableHandle.value)
+        guard let handle = beginStop() else { return }
+        Task { await finishStop(handle) }
+    }
+
+    public func stopAndWait() async {
+        if isStopping {
+            while isStopping {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            return
         }
-        Task { [self, stopTask] in
-            await stopTask.value
-            state = .stopped
-            isStopping = false
-        }
+        guard let handle = beginStop() else { return }
+        await finishStop(handle)
     }
 
     public func pause() {
@@ -612,6 +613,21 @@ public final class VM: ObservableObject {
         }
         app?.removeVM(self)
     }
+
+    private func beginStop() -> SendableVMHandle? {
+        guard !isStopping, state != .stopped, let handle else { return nil }
+        isStopping = true
+        bobrvm_vm_request_stop(handle)
+        return SendableVMHandle(value: handle)
+    }
+
+    private func finishStop(_ handle: SendableVMHandle) async {
+        await Task.detached(priority: .userInitiated) {
+            bobrvm_vm_finish_stop(handle.value)
+        }.value
+        state = .stopped
+        isStopping = false
+    }
 }
 
 public enum VMState: String, CaseIterable {
@@ -649,18 +665,190 @@ public struct GuestToolsStatus: Equatable, Sendable {
     )
 
     init(_ status: bobrvm_guest_tools_status_s) {
-        connection = switch status.connection.rawValue {
-        case BOBRVM_GUEST_TOOLS_CONNECTING.rawValue: .connecting
-        case BOBRVM_GUEST_TOOLS_READY.rawValue: .ready
-        case BOBRVM_GUEST_TOOLS_PROTOCOL_ERROR.rawValue: .protocolError
-        default: .disconnected
-        }
+        connection =
+            switch status.connection.rawValue {
+            case BOBRVM_GUEST_TOOLS_CONNECTING.rawValue: .connecting
+            case BOBRVM_GUEST_TOOLS_READY.rawValue: .ready
+            case BOBRVM_GUEST_TOOLS_PROTOCOL_ERROR.rawValue: .protocolError
+            default: .disconnected
+            }
         capabilities = status.capabilities
     }
 
     public init(connection: Connection, capabilities: UInt64) {
         self.connection = connection
         self.capabilities = capabilities
+    }
+}
+
+// MARK: - Virtualization.framework Linux VM
+
+public struct VZLinuxVMConfig {
+    public let memoryBytes: UInt64
+    public let vcpuCount: UInt8
+    public let displayWidth: UInt32
+    public let displayHeight: UInt32
+    public let networkEnabled: Bool
+    public let diskReadOnly: Bool
+    public let diskPath: String
+    public let installerPath: String?
+    public let variableStorePath: String
+    public let machineIdentifierPath: String
+    public let macAddress: String
+
+    public init(
+        memoryBytes: UInt64,
+        vcpuCount: UInt8,
+        displayWidth: UInt32,
+        displayHeight: UInt32,
+        networkEnabled: Bool,
+        diskReadOnly: Bool,
+        diskPath: String,
+        installerPath: String?,
+        variableStorePath: String,
+        machineIdentifierPath: String,
+        macAddress: String
+    ) {
+        self.memoryBytes = memoryBytes
+        self.vcpuCount = vcpuCount
+        self.displayWidth = displayWidth
+        self.displayHeight = displayHeight
+        self.networkEnabled = networkEnabled
+        self.diskReadOnly = diskReadOnly
+        self.diskPath = diskPath
+        self.installerPath = installerPath
+        self.variableStorePath = variableStorePath
+        self.machineIdentifierPath = machineIdentifierPath
+        self.macAddress = macAddress
+    }
+
+    func withCConfig<T>(
+        _ body: (UnsafePointer<bobrvm_vz_vm_config_s>) throws -> T
+    ) rethrows -> T {
+        try diskPath.withCString { disk in
+            try variableStorePath.withCString { variableStore in
+                try machineIdentifierPath.withCString { machineIdentifier in
+                    try macAddress.withCString { macAddress in
+                        try withOptionalCString(installerPath) { installer in
+                            var config = bobrvm_vz_vm_config_s(
+                                memory_bytes: memoryBytes,
+                                vcpu_count: vcpuCount,
+                                display_width: displayWidth,
+                                display_height: displayHeight,
+                                enable_net: networkEnabled,
+                                disk_read_only: diskReadOnly,
+                                disk_path: disk,
+                                installer_path: installer,
+                                variable_store_path: variableStore,
+                                machine_id_path: machineIdentifier,
+                                mac_address: macAddress
+                            )
+                            return try withUnsafePointer(to: &config, body)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func withOptionalCString<T>(
+        _ value: String?,
+        _ body: (UnsafePointer<CChar>?) throws -> T
+    ) rethrows -> T {
+        guard let value else { return try body(nil) }
+        return try value.withCString(body)
+    }
+}
+
+@MainActor
+public final class VZLinuxVM: ObservableObject {
+    @Published public private(set) var state: VMState = .stopped
+
+    public var displayView: NSView? {
+        guard let handle, let pointer = bobrvm_vz_vm_display_view(handle) else { return nil }
+        return Unmanaged<NSView>.fromOpaque(pointer).takeUnretainedValue()
+    }
+
+    private var handle: bobrvm_vz_vm_t?
+    private var stateTimer: DispatchSourceTimer?
+
+    public init(config: VZLinuxVMConfig) throws {
+        handle = try config.withCConfig { pointer in
+            guard let handle = bobrvm_vz_vm_new(pointer) else {
+                throw BobrvmError.vmCreateFailed
+            }
+            return handle
+        }
+    }
+
+    deinit {
+        stateTimer?.cancel()
+        if let handle { bobrvm_vz_vm_destroy(handle) }
+    }
+
+    public func start() throws {
+        guard let handle else { throw BobrvmError.invalidState }
+        let code = bobrvm_vz_vm_start(handle)
+        guard code.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+        state = .running
+        beginStatePolling()
+    }
+
+    public func stop() {
+        guard let handle else { return }
+        bobrvm_vz_vm_stop(handle)
+        beginStatePolling()
+    }
+
+    public func pause() {
+        guard let handle else { return }
+        bobrvm_vz_vm_pause(handle)
+        beginStatePolling()
+    }
+
+    public func resume() {
+        guard let handle else { return }
+        bobrvm_vz_vm_resume(handle)
+        beginStatePolling()
+    }
+
+    public func destroy() {
+        stateTimer?.cancel()
+        stateTimer = nil
+        if let handle {
+            bobrvm_vz_vm_destroy(handle)
+            self.handle = nil
+        }
+        state = .stopped
+    }
+
+    private func beginStatePolling() {
+        guard stateTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(50), leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.pollState() }
+        }
+        stateTimer = timer
+        timer.resume()
+    }
+
+    private func pollState() {
+        guard let handle else { return }
+        switch bobrvm_vz_vm_state(handle) {
+        case BOBRVM_VM_STATE_RUNNING:
+            state = .running
+        case BOBRVM_VM_STATE_PAUSED:
+            state = .paused
+        case BOBRVM_VM_STATE_STOPPED, BOBRVM_VM_STATE_FAILED:
+            state = .stopped
+            stateTimer?.cancel()
+            stateTimer = nil
+        default:
+            break
+        }
     }
 }
 

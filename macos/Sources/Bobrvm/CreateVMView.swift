@@ -10,6 +10,7 @@ struct CreateVMView: View {
 
     @State private var step = CreationStep.operatingSystem
     @State private var operatingSystem: CreationOperatingSystem?
+    @State private var backend = VMBackend.hypervisor
     @State private var source = VMSource.installFromISO
     @State private var name = "Linux"
     @State private var isoPath = ""
@@ -56,6 +57,7 @@ struct CreateVMView: View {
         .onAppear(perform: applyDefaults)
         .onChange(of: operatingSystem) { _, selected in
             guard let selected else { return }
+            backend = VMBackend.defaultValue(for: selected.guestSystem)
             switch selected {
             case .linux:
                 source = .installFromISO
@@ -112,6 +114,7 @@ struct CreateVMView: View {
                 vramMB: $vramMB,
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
+                backend: $backend,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
                 systemInfo: systemInfo
             )
@@ -133,6 +136,7 @@ struct CreateVMView: View {
                 memoryGB: Int(memoryGB),
                 vcpuCount: Int(vcpuCount),
                 vramMB: Int(vramMB),
+                backend: backend,
                 resolution: resolution,
                 retinaEnabled: retinaEnabled,
                 diskSizeGB: Int(diskSizeGB)
@@ -286,7 +290,8 @@ struct CreateVMView: View {
                 config: config,
                 isoPath: source == .installFromISO ? isoPath : nil,
                 retinaEnabled: retinaEnabled,
-                guestSystem: (operatingSystem ?? .linux).guestSystem
+                guestSystem: (operatingSystem ?? .linux).guestSystem,
+                backend: backend
             )
             dismiss()
         } catch {
@@ -700,6 +705,7 @@ private struct HardwareStepView: View {
     @Binding var vramMB: Double
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
+    @Binding var backend: VMBackend
     let guestSystem: GuestSystem
     let systemInfo: SystemInfo
 
@@ -708,8 +714,22 @@ private struct HardwareStepView: View {
             title: "Configure virtual hardware",
             subtitle: "These settings can be changed later while the virtual machine is stopped."
         ) {
+            backendSettings
             performanceSettings
             displaySettings
+        }
+    }
+
+    private var backendSettings: some View {
+        SettingsGroup(title: "Virtualization Backend", systemImage: "server.rack") {
+            if guestSystem == .linux {
+                VMBackendSelectionView(selection: $backend, guestSystem: guestSystem)
+            } else {
+                SummaryRow(label: "Backend", value: backend.displayName)
+                Text("\(guestSystem.displayName) uses \(backend.frameworkName).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -732,7 +752,7 @@ private struct HardwareStepView: View {
                 step: 1,
                 footer: "\(systemInfo.totalMemoryGB) GB installed on this Mac"
             )
-            if guestSystem != .macOS {
+            if guestSystem != .macOS && backend == .hypervisor {
                 Divider()
                 SettingSlider(
                     title: "Shared graphics memory",
@@ -741,6 +761,12 @@ private struct HardwareStepView: View {
                     range: 128...2048,
                     step: 128,
                     footer: "Reserved from host memory for the virtual GPU"
+                )
+            } else if guestSystem == .linux {
+                Divider()
+                InformationLabel(
+                    text: "Apple manages display memory for this compatibility backend.",
+                    systemImage: "display"
                 )
             }
         }
@@ -751,6 +777,13 @@ private struct HardwareStepView: View {
             if guestSystem == .macOS {
                 Label("Apple accelerated graphics", systemImage: "gpu")
                     .foregroundStyle(.secondary)
+                Divider()
+            } else if backend == .virtualization {
+                Label(
+                    "Compatibility display — no Bobrvm OpenGL or Vulkan acceleration",
+                    systemImage: "display"
+                )
+                .foregroundStyle(.orange)
                 Divider()
             }
             LabeledContent("Maximum guest resolution") {
@@ -834,6 +867,7 @@ private struct SummaryStepView: View {
     let memoryGB: Int
     let vcpuCount: Int
     let vramMB: Int
+    let backend: VMBackend
     let resolution: DisplayResolution
     let retinaEnabled: Bool
     let diskSizeGB: Int
@@ -854,6 +888,8 @@ private struct SummaryStepView: View {
             SettingsGroup(title: "Configuration", systemImage: "gearshape") {
                 SummaryRow(label: "Operating System", value: operatingSystem.title)
                 Divider()
+                SummaryRow(label: "Backend", value: backend.displayName)
+                Divider()
                 SummaryRow(
                     label: "Processors & Memory",
                     value: "\(vcpuCount) cores, \(memoryGB) GB"
@@ -863,7 +899,7 @@ private struct SummaryStepView: View {
                     label: "Graphics",
                     value: source == .installMacOS
                         ? "Apple accelerated, \(resolution.label)"
-                        : "\(vramMB) MB, \(resolution.label)"
+                        : graphicsSummary
                 )
                 Divider()
                 SummaryRow(
@@ -885,6 +921,13 @@ private struct SummaryStepView: View {
                 )
             }
         }
+    }
+
+    private var graphicsSummary: String {
+        if backend == .virtualization {
+            return "Compatibility display, \(resolution.label)"
+        }
+        return "Accelerated OpenGL/Vulkan, \(vramMB) MB, \(resolution.label)"
     }
 
     private var installationMediaName: String {

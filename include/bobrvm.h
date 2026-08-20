@@ -18,6 +18,7 @@ typedef void* bobrvm_vm_t;
 typedef void* bobrvm_surface_t;
 typedef void* bobrvm_config_t;
 typedef void* bobrvm_macos_vm_t;
+typedef void* bobrvm_vz_vm_t;
 
 /* Build mode. */
 
@@ -139,6 +140,20 @@ typedef struct {
     const char* machine_identifier_base64;
     const char* mac_address;
 } bobrvm_macos_vm_config_s;
+
+typedef struct {
+    uint64_t memory_bytes;
+    uint8_t vcpu_count;
+    uint32_t display_width;
+    uint32_t display_height;
+    bool enable_net;
+    bool disk_read_only;
+    const char* disk_path;
+    const char* installer_path;
+    const char* variable_store_path;
+    const char* machine_id_path;
+    const char* mac_address;
+} bobrvm_vz_vm_config_s;
 
 bobrvm_vm_config_s bobrvm_vm_config_defaults(void);
 
@@ -293,6 +308,17 @@ bobrvm_error_e bobrvm_macos_vm_install(
     bobrvm_macos_install_callback_f callback
 );
 double bobrvm_macos_vm_install_progress(bobrvm_macos_vm_t vm);
+
+/* Virtualization.framework Linux guest runtime. */
+
+bobrvm_vz_vm_t bobrvm_vz_vm_new(const bobrvm_vz_vm_config_s* cfg);
+void bobrvm_vz_vm_destroy(bobrvm_vz_vm_t vm);
+bobrvm_error_e bobrvm_vz_vm_start(bobrvm_vz_vm_t vm);
+void bobrvm_vz_vm_stop(bobrvm_vz_vm_t vm);
+void bobrvm_vz_vm_pause(bobrvm_vz_vm_t vm);
+void bobrvm_vz_vm_resume(bobrvm_vz_vm_t vm);
+bobrvm_vm_state_e bobrvm_vz_vm_state(bobrvm_vz_vm_t vm);
+void* bobrvm_vz_vm_display_view(bobrvm_vz_vm_t vm);
 
 /* Display surfaces. */
 
