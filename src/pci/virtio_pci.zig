@@ -86,9 +86,11 @@ pub const BAR_DEVICE_CFG_SIZE: u32 = 0x100; // 256 bytes for device config
 
 /// Total BAR0 size (4KB minimum for PCI).
 pub const BAR0_SIZE: u32 = 0x1000;
+const queue_size_max: u16 = 256;
 
 /// Queue configuration state.
 pub const QueueConfig = struct {
+    size_max: u16 = queue_size_max,
     size: u16 = 0,
     enable: bool = false,
     notify_off: u16 = 0,
@@ -162,7 +164,7 @@ pub const VirtioPciTransport = struct {
     irq_userdata: ?*anyopaque,
 
     pub const MAX_QUEUES = 8;
-    pub const MAX_QUEUE_SIZE: u16 = 256;
+    pub const MAX_QUEUE_SIZE: u16 = queue_size_max;
 
     const AllocationLayout = struct {
         queues_offset: usize,
@@ -280,6 +282,17 @@ pub const VirtioPciTransport = struct {
         self.irq_userdata = userdata;
     }
 
+    /// Limit a queue to the largest ring the backing device can service.
+    pub fn setQueueSizeMax(self: *VirtioPciTransport, queue_index: u16, size_max: u16) void {
+        assert(queue_index < self.queues.len);
+        assert(size_max > 0);
+        assert(size_max <= MAX_QUEUE_SIZE);
+
+        const queue = &self.queues[queue_index];
+        queue.size_max = size_max;
+        queue.size = size_max;
+    }
+
     /// Read from BAR0 region.
     pub fn readBar(self: *VirtioPciTransport, offset: u32, size: u8) u32 {
         assert(size == 1 or size == 2 or size == 4);
@@ -357,7 +370,7 @@ pub const VirtioPciTransport = struct {
             },
             .queue_size => {
                 if (self.currentQueue()) |q| {
-                    q.size = @truncate(value);
+                    if (value <= q.size_max) q.size = @truncate(value);
                 }
             },
             .queue_enable => {
@@ -398,7 +411,8 @@ pub const VirtioPciTransport = struct {
             .queue_reset => {
                 if (value != 0) {
                     if (self.currentQueue()) |q| {
-                        q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
+                        const size_max = q.size_max;
+                        q.* = QueueConfig{ .size_max = size_max, .size = size_max };
                     }
                 }
             },
@@ -502,7 +516,8 @@ pub const VirtioPciTransport = struct {
         self.isr_status = .{};
 
         for (self.queues) |*q| {
-            q.* = QueueConfig{ .size = MAX_QUEUE_SIZE };
+            const size_max = q.size_max;
+            q.* = QueueConfig{ .size_max = size_max, .size = size_max };
         }
     }
 
@@ -823,6 +838,25 @@ test "VirtioPciTransport common config read" {
     transport.device_feature_select = 0;
     const features_lo = transport.readBar(BAR_COMMON_CFG_OFFSET + @intFromEnum(CommonCfgReg.device_feature), 4);
     try std.testing.expectEqual(@as(u32, 0x100), features_lo);
+}
+
+test "VirtioPciTransport preserves device queue limits across resets" {
+    const transport = try VirtioPciTransport.init(std.testing.allocator, 3, 0, 1, 0);
+    defer transport.deinit();
+    const size_offset = @intFromEnum(CommonCfgReg.queue_size);
+    const reset_offset = @intFromEnum(CommonCfgReg.queue_reset);
+
+    transport.setQueueSizeMax(0, 128);
+    try std.testing.expectEqual(@as(u32, 128), transport.readBar(size_offset, 2));
+    transport.writeBar(size_offset, 2, 256);
+    try std.testing.expectEqual(@as(u32, 128), transport.readBar(size_offset, 2));
+    transport.writeBar(size_offset, 2, 64);
+    transport.writeBar(reset_offset, 2, 1);
+    try std.testing.expectEqual(@as(u32, 128), transport.readBar(size_offset, 2));
+
+    transport.writeBar(size_offset, 2, 64);
+    transport.reset();
+    try std.testing.expectEqual(@as(u32, 128), transport.readBar(size_offset, 2));
 }
 
 test "VirtioPciTransport rejects malformed BAR accesses" {
