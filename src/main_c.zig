@@ -4,7 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
 const global = @import("global.zig");
-const os = @import("os/main.zig");
+const logging = @import("logging.zig");
 const apprt = lib.apprt;
 const config = lib.config;
 const disk = lib.disk;
@@ -13,67 +13,8 @@ const linux_gui_vz = lib.runtime.linux_gui_vz;
 
 const log = std.log.scoped(.main);
 
-/// Custom log function for all std.log calls in the library.
-/// Routes to stderr and/or macOS unified logging based on configuration.
-pub fn logFn(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.EnumLiteral),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const cfg = global.state.logging;
-
-    if (cfg.stderr) {
-        logToStderr(level, scope, format, args);
-    }
-
-    if (builtin.os.tag.isDarwin() and cfg.macos) {
-        logToMacOS(level, scope, format, args);
-    }
-}
-
-/// Log to stderr with thread-safe locking.
-fn logToStderr(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.EnumLiteral),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const level_txt = comptime level.asText();
-    const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
-    const prefix = level_txt ++ ": " ++ scope_prefix;
-
-    const stderr = std.posix.STDERR_FILENO;
-    var buf: [4096]u8 = undefined;
-    const msg = nosuspend std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
-    _ = std.c.write(stderr, msg.ptr, msg.len);
-}
-
-/// Log to macOS unified logging system.
-fn logToMacOS(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.EnumLiteral),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const logger = os.log.scopedLogger(scope) orelse return;
-    const log_type = os.log.LogType.fromStdLevel(level);
-
-    var buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-
-    logger.log(fba.allocator(), log_type, format, args);
-}
-
-/// Standard options for the entire library.
-/// Sets log level based on build mode and uses our custom logFn.
-pub const std_options: std.Options = .{
-    .log_level = switch (builtin.mode) {
-        .Debug => .debug,
-        else => .info,
-    },
-    .logFn = logFn,
-};
+/// The C library and CLI share the same logging implementation.
+pub const std_options = logging.std_options;
 
 /// Called automatically when library is loaded (or call manually).
 pub export fn bobrvm_init() void {
@@ -113,6 +54,24 @@ pub export fn bobrvm_is_debug() bool {
         .Debug, .ReleaseSafe => true,
         .ReleaseFast, .ReleaseSmall => false,
     };
+}
+
+pub const LogLevel = enum(c_int) {
+    err = 0,
+    warn = 1,
+    info = 2,
+    debug = 3,
+};
+
+pub export fn bobrvm_log_level() LogLevel {
+    return @enumFromInt(@intFromEnum(logging.compiled_level));
+}
+
+pub export fn bobrvm_log_enabled(level_raw: c_int) bool {
+    if (level_raw < @intFromEnum(LogLevel.err) or
+        level_raw > @intFromEnum(LogLevel.debug)) return false;
+    const level: LogLevel = @enumFromInt(level_raw);
+    return logging.enabled(@enumFromInt(@intFromEnum(level)));
 }
 
 // --------------------------------------------------------------------------

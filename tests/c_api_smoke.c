@@ -54,6 +54,21 @@ static void test_configuration(void) {
     assert(bobrvm_vm_config_validate(&config) == BOBRVM_ERROR_INVALID_ARGUMENT);
 }
 
+static void test_logging_configuration(void) {
+    bobrvm_log_level_e compiled = bobrvm_log_level();
+    int level;
+
+    assert(compiled >= BOBRVM_LOG_LEVEL_ERROR);
+    assert(compiled <= BOBRVM_LOG_LEVEL_DEBUG);
+    for (level = BOBRVM_LOG_LEVEL_ERROR;
+         level <= BOBRVM_LOG_LEVEL_DEBUG;
+         level++) {
+        assert(bobrvm_log_enabled((bobrvm_log_level_e)level) == (level <= compiled));
+    }
+    assert(!bobrvm_log_enabled((bobrvm_log_level_e)-1));
+    assert(!bobrvm_log_enabled((bobrvm_log_level_e)4));
+}
+
 static void test_filename_sanitization(void) {
     char output[32] = {0};
     size_t length = 0;
@@ -181,6 +196,7 @@ int main(void) {
     assert(bobrvm_is_debug() ==
            (build_mode == BOBRVM_BUILD_MODE_DEBUG ||
             build_mode == BOBRVM_BUILD_MODE_RELEASE_SAFE));
+    test_logging_configuration();
     test_configuration();
     test_filename_sanitization();
     test_disk_errors();

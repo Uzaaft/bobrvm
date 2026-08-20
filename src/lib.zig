@@ -12,6 +12,7 @@ pub const fs = @import("fs/main.zig");
 pub const global = @import("global.zig");
 pub const guest_memory = @import("guest_memory.zig");
 pub const hypervisor = @import("hypervisor/platform.zig");
+pub const logging = @import("logging.zig");
 pub const machine = @import("machine/main.zig");
 pub const os = @import("os/main.zig");
 pub const virtio = @import("virtio/main.zig");
@@ -65,6 +66,7 @@ test {
     _ = fs;
     _ = global;
     _ = hypervisor;
+    _ = logging;
     _ = machine;
     _ = os;
     _ = virtio;

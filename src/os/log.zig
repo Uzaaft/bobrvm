@@ -4,13 +4,13 @@
 //! with the macOS unified logging system.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 /// C function declarations for os_log.
 const c = struct {
     extern fn os_log_create(subsystem: [*:0]const u8, category: [*:0]const u8) ?*Log;
     extern fn os_log_type_enabled(log: *Log, log_type: LogType) bool;
+    extern fn os_release(object: *Log) void;
 };
 
 /// Helper C function we implement to call os_log_with_type.
@@ -26,8 +26,12 @@ pub const Log = opaque {
     pub fn create(
         subsystem: [:0]const u8,
         category: [:0]const u8,
-    ) ?*Log {
-        return c.os_log_create(subsystem.ptr, category.ptr);
+    ) *Log {
+        return c.os_log_create(subsystem.ptr, category.ptr).?;
+    }
+
+    pub fn release(self: *Log) void {
+        c.os_release(self);
     }
 
     /// Check if a given log type is enabled.
@@ -45,16 +49,10 @@ pub const Log = opaque {
         comptime format: []const u8,
         args: anytype,
     ) void {
-        // Format the message with sentinel terminator
-        const str = nosuspend std.fmt.allocPrint(alloc, format ++ .{0}, args) catch return;
+        const str = nosuspend std.fmt.allocPrintSentinel(alloc, format, args, 0) catch return;
         defer alloc.free(str);
 
         bobrvm_os_log_with_type(self, log_type, @ptrCast(str.ptr));
-    }
-
-    /// Log a message without formatting (just a string literal).
-    pub fn logLiteral(self: *Log, log_type: LogType, message: [:0]const u8) void {
-        bobrvm_os_log_with_type(self, log_type, message.ptr);
     }
 };
 
@@ -63,42 +61,14 @@ pub const LogType = enum(u8) {
     default = 0x00,
     info = 0x01,
     debug = 0x02,
-    @"error" = 0x10,
+    err = 0x10,
     fault = 0x11,
-
-    /// Convert from Zig std.log.Level.
-    pub fn fromStdLevel(level: std.log.Level) LogType {
-        return switch (level) {
-            .debug => .debug,
-            .info => .info,
-            .warn => .@"error",
-            .err => .fault,
-        };
-    }
 };
 
-/// Library subsystem identifier for os_log.
-pub const lib_subsystem: [:0]const u8 = "com.bobrvm.lib";
+test "unified logger accepts formatted messages" {
+    const logger = Log.create("com.bobrvm.app", "test");
+    defer logger.release();
 
-/// Get or create a logger for the given scope.
-///
-/// Uses comptime to create a cached static logger per scope.
-pub fn scopedLogger(comptime scope: @TypeOf(.EnumLiteral)) ?*Log {
-    const S = struct {
-        var cached: ?*Log = null;
-        var once: bool = false;
-    };
-
-    if (!S.once) {
-        S.cached = Log.create(lib_subsystem, @tagName(scope));
-        S.once = true;
-    }
-    return S.cached;
-}
-
-test "unified log types preserve standard log severity" {
-    try std.testing.expectEqual(LogType.debug, LogType.fromStdLevel(.debug));
-    try std.testing.expectEqual(LogType.info, LogType.fromStdLevel(.info));
-    try std.testing.expectEqual(LogType.@"error", LogType.fromStdLevel(.warn));
-    try std.testing.expectEqual(LogType.fault, LogType.fromStdLevel(.err));
+    try std.testing.expect(logger.typeEnabled(.fault));
+    logger.log(std.testing.allocator, .debug, "test value={}", .{12});
 }

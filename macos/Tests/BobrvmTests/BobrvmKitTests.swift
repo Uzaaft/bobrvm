@@ -26,6 +26,23 @@ final class BobrvmKitTests: XCTestCase {
         }
     }
 
+    func testSwiftLoggingUsesCompiledCLogLevel() {
+        let compiled = bobrvm_log_level().rawValue
+
+        XCTAssertEqual(
+            BobrvmLogging.debugEnabled,
+            BOBRVM_LOG_LEVEL_DEBUG.rawValue <= compiled
+        )
+        XCTAssertEqual(
+            BobrvmLogging.infoEnabled,
+            BOBRVM_LOG_LEVEL_INFO.rawValue <= compiled
+        )
+        XCTAssertEqual(
+            BobrvmLogging.warningEnabled,
+            BOBRVM_LOG_LEVEL_WARNING.rawValue <= compiled
+        )
+    }
+
     func testKeyEventsPreserveCFields() {
         let event = KeyEvent(keycode: UInt32.max, modifiers: 0xA5A5, pressed: true)
         let cEvent = event.toCStruct()

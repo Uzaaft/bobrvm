@@ -41,6 +41,15 @@ pub fn build(b: *std.Build) !void {
         });
     }
     const optimize = b.standardOptimizeOption(.{});
+    const log_level_default: std.log.Level = switch (optimize) {
+        .Debug => .debug,
+        else => .info,
+    };
+    const log_level = b.option(
+        std.log.Level,
+        "log-level",
+        "Minimum compiled log level: debug, info, warn, or err",
+    ) orelse log_level_default;
     const emit_guest_tools = b.option(
         bool,
         "emit-guest-tools",
@@ -147,6 +156,8 @@ pub fn build(b: *std.Build) !void {
     ) orelse false;
 
     const build_options = b.addOptions();
+    build_options.addOption(u2, "log_level", @intFromEnum(log_level));
+    build_options.addOption([:0]const u8, "bundle_id", "com.bobrvm.app");
     build_options.addOption(bool, "gpu_venus", gpu_venus);
     // Consumed by virtio/gpu.zig on Linux hosts; without a definition
     // here the Linux graph cannot even be analyzed.
@@ -761,7 +772,7 @@ pub fn build(b: *std.Build) !void {
 
         // Run the signed Xcode product directly so stderr remains visible.
         const run_cmd = b.addSystemCommand(&.{xcodebuild.app_executable});
-        run_cmd.setEnvironmentVariable("BOBRVM_LOG", "true");
+        run_cmd.setEnvironmentVariable("BOBRVM_LOG", "stderr,macos");
         run_cmd.step.dependOn(&xcodebuild.build.step);
         if (b.args) |args| run_cmd.addArgs(args);
         run_step.dependOn(&run_cmd.step);

@@ -19,6 +19,7 @@
 		E59A61D5A7ED4A43B2965238 /* VMSurfaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 016570CA1164450690E721F4 /* VMSurfaceView.swift */; };
 		B0B000000000000000000005 /* VMLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B000000000000000000006 /* VMLibraryView.swift */; };
 		763CCC85691B452497100414 /* BobrvmKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = F676F6AC49154476B8CBB58B /* BobrvmKit.swift */; };
+		B0B100000000000000000001 /* BobrvmLogging.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0B100000000000000000002 /* BobrvmLogging.swift */; };
 		08FEA81F40114C27A1A9251A /* BobrvmKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 27F916698DB04C12B429214A /* BobrvmKit.xcframework */; };
 		A1B2C3D4E5F60718293A4B5C /* ghostty-vt.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* ghostty-vt.xcframework */; };
 		C3F4A6D2B1CC4E2893A3E0A4 /* TerminalEmulator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F4A6D1B1CC4E2893A3E0A3 /* TerminalEmulator.swift */; };
@@ -50,6 +51,7 @@
 		016570CA1164450690E721F4 /* VMSurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMSurfaceView.swift; sourceTree = "<group>"; };
 		B0B000000000000000000006 /* VMLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMLibraryView.swift; sourceTree = "<group>"; };
 		F676F6AC49154476B8CBB58B /* BobrvmKit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmKit.swift; sourceTree = "<group>"; };
+		B0B100000000000000000002 /* BobrvmLogging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmLogging.swift; sourceTree = "<group>"; };
 		27F916698DB04C12B429214A /* BobrvmKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = BobrvmKit.xcframework; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4B5D /* ghostty-vt.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = "ghostty-vt.xcframework"; path = "../zig-out/ghostty-vt.xcframework"; sourceTree = SOURCE_ROOT; };
 		56F95697E6344228A7F9BA1B /* Bobrvm.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Bobrvm.entitlements; sourceTree = "<group>"; };
@@ -129,6 +131,7 @@
 			isa = PBXGroup;
 			children = (
 				8260A68E8A704D57966124E6 /* Bobrvm-Bridging-Header.h */,
+				B0B100000000000000000002 /* BobrvmLogging.swift */,
 				F676F6AC49154476B8CBB58B /* BobrvmKit.swift */,
 			);
 			path = Sources/BobrvmKit;
@@ -305,6 +308,7 @@
 				A6B7C8D9E0F1122334455610 /* VMBackend.swift in Sources */,
 				B0B000000000000000000007 /* WindowsMediaDownloadView.swift in Sources */,
 				763CCC85691B452497100414 /* BobrvmKit.swift in Sources */,
+				B0B100000000000000000001 /* BobrvmLogging.swift in Sources */,
 			);
 		};
 /* End PBXSourcesBuildPhase section */

@@ -1,11 +1,10 @@
 import AppKit
 import Combine
 import Metal
-import OSLog
 import QuartzCore
 import SwiftUI
 
-private let logger = Logger(subsystem: "com.bobrvm.app", category: "VMSurfaceView")
+private let logger = BobrvmLogging.logger(for: VMSurfaceView.self)
 
 public final class VMSurfaceView: NSView {
     private static let guestCursor = NSCursor(
@@ -70,7 +69,9 @@ public final class VMSurfaceView: NSView {
 
     @MainActor
     public func attach(to vmInstance: VMInstance) throws {
-        logger.info("Attaching surface to VM: \(vmInstance.name)")
+        if BobrvmLogging.infoEnabled {
+            logger.info("Attaching surface to VM: \(vmInstance.name)")
+        }
         self.vmInstance = vmInstance
 
         let newSurface = try vmInstance.requireVM().createSurface(
@@ -80,14 +81,18 @@ public final class VMSurfaceView: NSView {
         )
         surface = newSurface
         vmInstance.surface = newSurface
-        logger.info("Surface created successfully")
+        if BobrvmLogging.infoEnabled {
+            logger.info("Surface created successfully")
+        }
 
         updateSurfaceSize()
         updateContentScale()
         window?.invalidateCursorRects(for: self)
 
         startDisplayLink()
-        logger.info("Display link started")
+        if BobrvmLogging.infoEnabled {
+            logger.info("Display link started")
+        }
     }
 
     public func detach() {
@@ -359,9 +364,12 @@ public struct VMSurfaceRepresentable: NSViewRepresentable {
     }
 
     public func updateNSView(_ nsView: VMSurfaceView, context: Context) {
-        logger.debug(
-            "updateNSView called, surface=\(vmInstance.surface == nil ? "nil" : "exists"), state=\(vmInstance.state.rawValue)"
-        )
+        if BobrvmLogging.debugEnabled {
+            let surfaceState = vmInstance.surface == nil ? "nil" : "exists"
+            logger.debug(
+                "updateNSView called, surface=\(surfaceState), state=\(vmInstance.state.rawValue)"
+            )
+        }
         if vmInstance.surface == nil
             && (vmInstance.state == .running || vmInstance.state == .paused)
         {

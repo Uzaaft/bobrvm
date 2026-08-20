@@ -1,13 +1,9 @@
 import Combine
 import Foundation
-import OSLog
 
 @MainActor
 public final class VMManager: ObservableObject {
-    private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.bobrvm.app",
-        category: "VMManager"
-    )
+    private static let logger = BobrvmLogging.logger(for: VMManager.self)
 
     @Published public var vms: [VMInstance] = []
     @Published public var showingCreateVM = false
@@ -24,12 +20,16 @@ public final class VMManager: ObservableObject {
 
     public func loadExistingVMs() {
         guard let app else {
-            Self.logger.warning("Cannot load VMs: app not initialized")
+            if BobrvmLogging.warningEnabled {
+                Self.logger.warning("Cannot load VMs: app not initialized")
+            }
             return
         }
 
         let storedConfigs = VMStorage.loadAllVMs()
-        Self.logger.info("Found \(storedConfigs.count) stored VM(s)")
+        if BobrvmLogging.infoEnabled {
+            Self.logger.info("Found \(storedConfigs.count) stored VM(s)")
+        }
 
         for stored in storedConfigs {
             let instance = VMInstance(
@@ -45,7 +45,9 @@ public final class VMManager: ObservableObject {
                 macOSPlatform: stored.macOSPlatform
             )
             vms.append(instance)
-            Self.logger.info("Loaded VM: \(stored.name)")
+            if BobrvmLogging.infoEnabled {
+                Self.logger.info("Loaded VM: \(stored.name)")
+            }
         }
     }
 
@@ -77,7 +79,9 @@ public final class VMManager: ObservableObject {
             )
             try VMStorage.saveVM(instance)
             vms.append(instance)
-            Self.logger.info("Saved VM configuration: \(name)")
+            if BobrvmLogging.infoEnabled {
+                Self.logger.info("Saved VM configuration: \(name)")
+            }
         } catch {
             vm?.destroy()
             throw error
@@ -127,7 +131,9 @@ public final class VMManager: ObservableObject {
             )
             try VMStorage.saveVM(instance)
             vms.append(instance)
-            Self.logger.info("Installed macOS virtual machine: \(name)")
+            if BobrvmLogging.infoEnabled {
+                Self.logger.info("Installed macOS virtual machine: \(name)")
+            }
         } catch {
             try? FileManager.default.removeItem(at: bundleURL)
             throw error
@@ -192,7 +198,9 @@ public final class VMManager: ObservableObject {
             backend: backend
         )
 
-        Self.logger.info("Updated VM configuration: \(name)")
+        if BobrvmLogging.infoEnabled {
+            Self.logger.info("Updated VM configuration: \(name)")
+        }
     }
 
     public func updateISO(_ instance: VMInstance, path: String?) throws {
@@ -213,7 +221,9 @@ public final class VMManager: ObservableObject {
             backend: instance.backend
         )
 
-        Self.logger.info("Updated ISO media for VM: \(instance.name)")
+        if BobrvmLogging.infoEnabled {
+            Self.logger.info("Updated ISO media for VM: \(instance.name)")
+        }
     }
 
     public func updateLiveSettings(
@@ -263,7 +273,9 @@ public final class VMManager: ObservableObject {
         }
 
         objectWillChange.send()
-        Self.logger.info("Updated live settings for VM: \(instance.name)")
+        if BobrvmLogging.infoEnabled {
+            Self.logger.info("Updated live settings for VM: \(instance.name)")
+        }
     }
 
     private func replaceVM(

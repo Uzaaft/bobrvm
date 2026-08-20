@@ -3,31 +3,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli/main.zig");
+const global = @import("global.zig");
+const logging = @import("logging.zig");
 
 const log = std.log.scoped(.cli);
 
-pub const std_options: std.Options = .{
-    .log_level = .debug,
-    .logFn = logFn,
-};
-
-fn logFn(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.EnumLiteral),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const level_txt = comptime level.asText();
-    const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
-    const prefix = level_txt ++ ": " ++ scope_prefix;
-
-    const stderr = std.posix.STDERR_FILENO;
-    var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
-    _ = std.c.write(stderr, msg.ptr, msg.len);
-}
+pub const std_options = logging.std_options;
 
 pub fn main(minimal: std.process.Init.Minimal) !void {
+    global.state.initWithLogging(.{ .stderr = true });
+    defer global.state.deinit();
+
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer {
         if (builtin.mode == .Debug) _ = debug_allocator.deinit();

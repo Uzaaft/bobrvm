@@ -29,6 +29,14 @@ typedef enum {
     BOBRVM_BUILD_MODE_RELEASE_SMALL = 3,
 } bobrvm_build_mode_e;
 
+/** Severity compiled into the Zig library with -Dlog-level. */
+typedef enum {
+    BOBRVM_LOG_LEVEL_ERROR = 0,
+    BOBRVM_LOG_LEVEL_WARNING = 1,
+    BOBRVM_LOG_LEVEL_INFO = 2,
+    BOBRVM_LOG_LEVEL_DEBUG = 3,
+} bobrvm_log_level_e;
+
 /* Errors and state. */
 
 typedef enum {
@@ -210,7 +218,10 @@ typedef struct {
 
 /* Library lifecycle. */
 
-/** Call once before other API calls. Reads BOBRVM_LOG. */
+/**
+ * Call once before other API calls. BOBRVM_LOG selects destinations with
+ * "stderr", "macos", "no-stderr", and "no-macos".
+ */
 void bobrvm_init(void);
 
 void bobrvm_deinit(void);
@@ -375,6 +386,12 @@ void bobrvm_surface_mouse_scroll(bobrvm_surface_t surface, double dx, double dy)
 const char* bobrvm_version(void);
 
 bobrvm_build_mode_e bobrvm_build_mode(void);
+
+/** Return the minimum severity compiled into the library. */
+bobrvm_log_level_e bobrvm_log_level(void);
+
+/** True when the supplied severity was compiled into the library. */
+bool bobrvm_log_enabled(bobrvm_log_level_e level);
 
 /** True for Debug and ReleaseSafe builds. */
 bool bobrvm_is_debug(void);

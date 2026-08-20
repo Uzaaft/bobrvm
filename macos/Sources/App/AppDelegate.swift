@@ -1,19 +1,19 @@
 import AppKit
-import OSLog
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
-    private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.bobrvm.app",
-        category: "AppDelegate"
-    )
+    private static let logger = BobrvmLogging.logger(for: AppDelegate.self)
 
     let vmManager = VMManager()
     private var app: App?
     private var pasteboardChangeCount = NSPasteboard.general.changeCount
     private var pasteboardTimer: Timer?
+    private var bobrvmInitialized = false
 
     func applicationDidFinishLaunching(_: Notification) {
+        bobrvm_init()
+        bobrvmInitialized = true
+
         do {
             let app = try App()
             app.delegate = self
@@ -29,6 +29,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, BobrvmAppDelegate {
     func applicationWillTerminate(_: Notification) {
         pasteboardTimer?.invalidate()
         vmManager.stopAllVMs()
+        if bobrvmInitialized {
+            bobrvm_deinit()
+            bobrvmInitialized = false
+        }
     }
 
     func appGPUFrameReady(_ app: App) {

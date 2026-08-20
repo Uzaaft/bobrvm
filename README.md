@@ -224,10 +224,20 @@ details.
 
 ## Logging
 
-`zig build run` logs to the terminal. Packaged apps also use macOS unified
-logging. `BOBRVM_LOG` accepts `true`, `false`, or backend settings such as
-`stderr=true,macos=false`.
+`zig build run` logs to the terminal. The Zig core and Swift app use the same
+subsystem for macOS unified logging. For Zig logs, `BOBRVM_LOG` accepts `true`,
+`false`, or a comma-separated destination list using `stderr`, `macos`,
+`no-stderr`, and `no-macos`. Swift logs use macOS unified logging directly.
 
 ```sh
-log stream --level debug --predicate 'subsystem=="com.bobrvm.lib"'
+BOBRVM_LOG=stderr,macos zig build run
+log stream --level debug --predicate 'subsystem=="com.bobrvm.app"'
+```
+
+The compile-time minimum defaults to `debug` for Debug builds and `info` for
+release builds. Override it for Zig, the C API, and Swift logging with
+`-Dlog-level=debug|info|warn|err`:
+
+```sh
+zig build macos-app -Doptimize=ReleaseFast -Dlog-level=debug
 ```
