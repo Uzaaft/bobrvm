@@ -1,0 +1,124 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name != 'main' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  zig:
+    name: Zig tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
+        with:
+          determinate: true
+
+      - name: Restore and save Nix artifacts
+        uses: DeterminateSystems/magic-nix-cache-action@55718cd9ebf1737a061487d5ada21abf31e99a98
+        with:
+          use-flakehub: false
+
+      - name: Run Zig tests
+        run: nix build --print-build-logs .#checks.x86_64-linux.test
+
+  macos:
+    name: macOS compile
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Restore Zig cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        env:
+          DEPS_HASH: ${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig.zon.nix') }}
+        with:
+          path: |
+            .zig-cache/global
+            .zig-cache/local
+            .zig-cache/ghostty
+          key: bobrvm-test-macos-${{ env.DEPS_HASH }}-${{ github.sha }}
+          restore-keys: |
+            bobrvm-test-macos-${{ env.DEPS_HASH }}-
+            bobrvm-test-macos-
+
+      - name: Restore Xcode compilation cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        env:
+          XCODE_HASH: ${{ hashFiles('macos/Bobrvm.xcodeproj/project.pbxproj') }}
+        with:
+          path: ${{ runner.temp }}/bobrvm-xcode-cache
+          key: bobrvm-xcode-debug-${{ env.XCODE_HASH }}-${{ github.sha }}
+          restore-keys: |
+            bobrvm-xcode-debug-${{ env.XCODE_HASH }}-
+            bobrvm-xcode-debug-
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
+        with:
+          determinate: true
+
+      - name: Restore and save Nix artifacts
+        uses: DeterminateSystems/magic-nix-cache-action@55718cd9ebf1737a061487d5ada21abf31e99a98
+        with:
+          use-flakehub: false
+
+      - name: Prepare Zig package directories
+        id: zig-deps
+        run: |
+          system=$(nix build --no-link --print-out-paths .#deps)
+          direct=$(nix build --no-link --print-out-paths .#framework-deps)
+          echo "system=$system" >> "$GITHUB_OUTPUT"
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+          if [[ -L "$ZIG_GLOBAL_CACHE_DIR/p" ]]; then
+            unlink "$ZIG_GLOBAL_CACHE_DIR/p"
+          elif [[ -e "$ZIG_GLOBAL_CACHE_DIR/p" ]]; then
+            echo "$ZIG_GLOBAL_CACHE_DIR/p is not a symbolic link" >&2
+            exit 1
+          fi
+          ln -s "$direct" "$ZIG_GLOBAL_CACHE_DIR/p"
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build app frameworks
+        env:
+          BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.zig-deps.outputs.system }}
+        run: |
+          nix develop -c zig build \
+            xcframework \
+            ghostty-lib \
+            -Demit-macos-app=false
+
+      - name: Compile SwiftUI app
+        run: |
+          xcodebuild \
+            -project macos/Bobrvm.xcodeproj \
+            -scheme Bobrvm \
+            -configuration Debug \
+            "SYMROOT=$PWD/macos/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES \
+            "COMPILATION_CACHE_CAS_PATH=$RUNNER_TEMP/bobrvm-xcode-cache" \
+            COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES \
+            build
