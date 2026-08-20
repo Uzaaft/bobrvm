@@ -16,9 +16,13 @@
 //! contexts (reset on restore, QEMU's policy too).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
-const hypervisor = @import("../hypervisor/main.zig");
+const hypervisor = if (builtin.os.tag == .macos)
+    @import("../hypervisor/main.zig")
+else
+    @import("../hypervisor/arm_unsupported.zig");
 const virtio = @import("../virtio/main.zig");
 const gic_mod = @import("../gic/main.zig");
 const icc_mod = @import("../gic/icc.zig");

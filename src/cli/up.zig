@@ -15,8 +15,6 @@ const vz = @import("vz.zig");
 
 const log = std.log.scoped(.cli);
 
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
-
 pub fn execute(
     alloc: Allocator,
     args: *std.process.Args.Iterator,
@@ -106,9 +104,9 @@ fn detachedUp(
     const io = io_impl.io();
 
     var exe_buf: [1024]u8 = undefined;
-    var exe_len: u32 = exe_buf.len;
-    if (_NSGetExecutablePath(&exe_buf, &exe_len) != 0) return error.Unexpected;
-    const exe = std.mem.sliceTo(exe_buf[0..exe_len], 0);
+    const exe_len = std.process.executablePath(global.io(), &exe_buf) catch
+        return error.Unexpected;
+    const exe = exe_buf[0..exe_len];
 
     const log_path = try std.fs.path.join(arena, &.{ proj.state_dir, "console.log" });
     const console_log = try std.Io.Dir.cwd().createFile(io, log_path, .{});
