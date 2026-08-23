@@ -2,6 +2,7 @@
   lib,
   stdenv,
   OVMF,
+  autoPatchelfHook,
   alsa-lib,
   glib,
   gobject-introspection,
@@ -9,7 +10,6 @@
   libiconv,
   gtk4,
   libadwaita,
-  patchelf,
   pkg-config,
   virglrenderer,
   wrapGAppsHook4,
@@ -53,7 +53,7 @@ stdenv.mkDerivation (finalAttrs: {
   nativeBuildInputs =
     [
       pkg-config
-      patchelf
+      autoPatchelfHook
       zig
     ]
     ++ lib.optionals stdenv.hostPlatform.isLinux [
@@ -74,12 +74,15 @@ stdenv.mkDerivation (finalAttrs: {
   dontConfigure = true;
   dontUseZigBuild = true;
 
-  buildPhase = ''
+  buildPhase = let
+    linuxTarget = "-Dtarget=x86_64-linux-gnu";
+  in ''
     runHook preBuild
     export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
     zig build \
+      ${lib.optionalString stdenv.hostPlatform.isLinux "${linuxTarget} \\"}
       -Dcpu=baseline \
       -Doptimize=${optimize}
     runHook postBuild
@@ -89,8 +92,6 @@ stdenv.mkDerivation (finalAttrs: {
     runHook preInstall
     cp -R zig-out/. "$out"
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
-      patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm"
-      patchelf --set-interpreter ${stdenv.cc.bintools.dynamicLinker} "$out/bin/bobrvm-gtk"
       mkdir -p "$out/share/bobrvm"
       cp ${OVMF.fd}/FV/OVMF.fd "$out/share/bobrvm/OVMF.fd"
       cp ${OVMF.fd}/FV/OVMF_VARS.fd "$out/share/bobrvm/OVMF_VARS.fd"

@@ -173,7 +173,7 @@ fn checkPersistence(
 fn runLimitedChild(init: std.process.Init, cli: []const u8) !void {
     const ignore_file_size = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = 0,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(.XFSZ, &ignore_file_size, null);

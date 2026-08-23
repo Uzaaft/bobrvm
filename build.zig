@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) !void {
 
     // Keep the primary workflows visible in `zig build --help` regardless of
     // which artifacts the default install emits.
-    const run_step = b.step("run", "Build and run the macOS app");
+    const run_step = b.step("run", "Build and run the native app");
     const macos_app_step = b.step("macos-app", "Build the macOS app");
     const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
     const ghostty_step = b.step("ghostty-lib", "Build ghostty-vt.xcframework");
@@ -230,7 +230,7 @@ pub fn build(b: *std.Build) !void {
         .linkage = .static,
     });
 
-    b.installArtifact(lib);
+    if (target.result.os.tag == .macos) b.installArtifact(lib);
 
     b.installDirectory(.{
         .source_dir = b.path("include"),
@@ -239,7 +239,10 @@ pub fn build(b: *std.Build) !void {
     });
 
     const cli_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(if (target.result.os.tag == .linux)
+            "src/main_linux.zig"
+        else
+            "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -273,6 +276,10 @@ pub fn build(b: *std.Build) !void {
     }
 
     wireVenus(cli_module, build_options, gpu_venus, virgl_lib);
+    if (target.result.os.tag == .linux) {
+        cli_module.linkSystemLibrary("alsa", .{});
+        if (gpu_virglrenderer) cli_module.linkSystemLibrary("virglrenderer", .{});
+    }
 
     const cli_exe = b.addExecutable(.{
         .name = "bobrvm",
@@ -281,6 +288,31 @@ pub fn build(b: *std.Build) !void {
 
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
+
+    if (target.result.os.tag == .linux) {
+        const gtk_module = b.createModule(.{
+            .root_source_file = b.path("src/main_gtk.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wireVenus(gtk_module, build_options, gpu_venus, virgl_lib);
+        gtk_module.linkSystemLibrary("adwaita-1", .{});
+        gtk_module.linkSystemLibrary("gtk-4", .{});
+        gtk_module.linkSystemLibrary("alsa", .{});
+        if (gpu_virglrenderer) gtk_module.linkSystemLibrary("virglrenderer", .{});
+
+        const gtk_exe = b.addExecutable(.{
+            .name = "bobrvm-gtk",
+            .root_module = gtk_module,
+        });
+        b.installArtifact(gtk_exe);
+
+        const gtk_run = b.addRunArtifact(gtk_exe);
+        gtk_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| gtk_run.addArgs(args);
+        run_step.dependOn(&gtk_run.step);
+    }
 
     // Code-sign the installed CLI with hypervisor entitlement (macOS only)
     if (target.result.os.tag == .macos and !is_nix_build) {
@@ -390,7 +422,10 @@ pub fn build(b: *std.Build) !void {
 
     // Test module
     const test_module = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
+        .root_source_file = b.path(if (target.result.os.tag == .linux)
+            "src/linux_test.zig"
+        else
+            "src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -461,18 +496,18 @@ pub fn build(b: *std.Build) !void {
     );
     check_linux_step.dependOn(&linux_check.step);
 
-    const c_api_smoke_module = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_api_smoke_module.addCSourceFile(.{
-        .file = b.path("tests/c_api_smoke.c"),
-        .flags = &.{"-std=c11"},
-    });
-    c_api_smoke_module.addIncludePath(b.path("include"));
-    c_api_smoke_module.linkLibrary(lib);
     if (target.result.os.tag == .macos) {
+        const c_api_smoke_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        c_api_smoke_module.addCSourceFile(.{
+            .file = b.path("tests/c_api_smoke.c"),
+            .flags = &.{"-std=c11"},
+        });
+        c_api_smoke_module.addIncludePath(b.path("include"));
+        c_api_smoke_module.linkLibrary(lib);
         const sdk = environmentVariable(b, "SDKROOT") orelse std.mem.trim(
             u8,
             b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }),
@@ -484,27 +519,27 @@ pub fn build(b: *std.Build) !void {
             .cwd_relative = b.fmt("{s}/usr/include", .{sdk}),
         });
         c_api_smoke_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+
+        const c_api_smoke = b.addExecutable(.{
+            .name = "c_api_smoke",
+            .root_module = c_api_smoke_module,
+        });
+        const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
+        test_step.dependOn(&run_c_api_smoke.step);
+
+        const cli_smoke_module = b.createModule(.{
+            .root_source_file = b.path("tests/cli_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const cli_smoke = b.addExecutable(.{
+            .name = "cli_smoke",
+            .root_module = cli_smoke_module,
+        });
+        const run_cli_smoke = b.addRunArtifact(cli_smoke);
+        run_cli_smoke.addArtifactArg(cli_exe);
+        test_step.dependOn(&run_cli_smoke.step);
     }
-
-    const c_api_smoke = b.addExecutable(.{
-        .name = "c_api_smoke",
-        .root_module = c_api_smoke_module,
-    });
-    const run_c_api_smoke = b.addRunArtifact(c_api_smoke);
-    test_step.dependOn(&run_c_api_smoke.step);
-
-    const cli_smoke_module = b.createModule(.{
-        .root_source_file = b.path("tests/cli_smoke.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const cli_smoke = b.addExecutable(.{
-        .name = "cli_smoke",
-        .root_module = cli_smoke_module,
-    });
-    const run_cli_smoke = b.addRunArtifact(cli_smoke);
-    run_cli_smoke.addArtifactArg(cli_exe);
-    test_step.dependOn(&run_cli_smoke.step);
 
     const signal_smoke_signal_module = b.createModule(.{
         .root_source_file = b.path("src/os/signal.zig"),
@@ -787,8 +822,12 @@ pub fn build(b: *std.Build) !void {
         try ghostty_step.addError(message, .{});
         if (emit_xcframework) b.default_step.dependOn(xcframework_step);
         if (emit_macos_app) b.default_step.dependOn(macos_app_step);
+    } else if (target.result.os.tag == .linux) {
+        try macos_app_step.addError("the macOS app can only build on macOS", .{});
+        try xcframework_step.addError("BobrvmKit.xcframework requires macOS", .{});
+        try ghostty_step.addError("GhosttyKit.xcframework requires macOS", .{});
     } else {
-        try run_step.addError("the macOS app can only run on macOS", .{});
+        try run_step.addError("the native app is only available on macOS and Linux", .{});
         try macos_app_step.addError("the macOS app can only build on macOS", .{});
         try xcframework_step.addError("BobrvmKit.xcframework requires macOS", .{});
         try ghostty_step.addError("ghostty-vt.xcframework requires macOS", .{});

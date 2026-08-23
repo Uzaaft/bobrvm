@@ -447,18 +447,10 @@ fn testQgaLoop(hw: *machine.Machine, delay_s: u64) void {
     hw.queryGuestIps();
 }
 
-// Darwin libc (zig 0.16's std.c.stat doesn't resolve on macOS; the
-// plain symbol is correct on arm64).
-extern "c" fn stat(path: [*:0]const u8, st: *std.c.Stat) c_int;
-
 fn isDirectory(path: []const u8) bool {
-    var st: std.c.Stat = undefined;
-    var buf: [1024:0]u8 = undefined;
-    if (path.len >= buf.len) return false;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    if (stat(buf[0..path.len :0].ptr, &st) != 0) return false;
-    return std.c.S.ISDIR(st.mode);
+    const directory = std.Io.Dir.cwd().openDir(global.io(), path, .{}) catch return false;
+    directory.close(global.io());
+    return true;
 }
 
 /// Revert every disk recorded in a snapshot's meta.json: clonefile the
