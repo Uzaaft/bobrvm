@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const callback_binding = @import("../callback.zig");
+const virtio_config = @import("config.zig");
 
 pub const REGION_SIZE: usize = 0x200;
 
@@ -121,7 +122,7 @@ pub const Transport = struct {
     shm_region_len: u64 = 0,
 
     pub const Error = Allocator.Error;
-    pub const MAX_QUEUES = 16;
+    pub const MAX_QUEUES = virtio_config.device_queues_max;
 
     fn allocationSize(num_queues: usize) usize {
         assert(num_queues > 0);

@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const config_policy = @import("config.zig");
+const virtio_config = @import("../virtio/config.zig");
 
 const log = std.log.scoped(.virtio_pci);
 
@@ -163,7 +164,7 @@ pub const VirtioPciTransport = struct {
     irq_callback: ?*const fn (userdata: ?*anyopaque) void,
     irq_userdata: ?*anyopaque,
 
-    pub const MAX_QUEUES = 8;
+    pub const MAX_QUEUES = virtio_config.device_queues_max;
     pub const MAX_QUEUE_SIZE: u16 = queue_size_max;
 
     const AllocationLayout = struct {
@@ -813,6 +814,24 @@ test "VirtioPciTransport init" {
 
     try std.testing.expectEqual(@as(u32, 2), transport.device_id);
     try std.testing.expectEqual(@as(u16, 1), transport.num_queues);
+}
+
+test "VirtioPciDevice supports twelve console queues" {
+    const queue_count: u16 = 12;
+    const device = try VirtioPciDevice.init(
+        std.testing.allocator,
+        3,
+        0x0003,
+        0,
+        queue_count,
+        12,
+    );
+    defer device.deinit();
+
+    try std.testing.expectEqual(queue_count, device.transport.num_queues);
+    try std.testing.expectEqual(@as(usize, queue_count), device.transport.queues.len);
+    device.transport.setQueueSizeMax(queue_count - 1, 128);
+    try std.testing.expectEqual(@as(u16, 128), device.transport.queues[11].size_max);
 }
 
 test "virtio GPU uses the modern device id and display class" {

@@ -1135,6 +1135,58 @@ test "snapshot: GIC section assembly allocation profile" {
     try testing.expectEqual(@as(usize, 593), reader.section("gic").?.len);
 }
 
+test "snapshot: twelve-queue PCI device roundtrip" {
+    const queue_count: u16 = 12;
+    const config_bytes: usize = 12;
+    const device = try pci.VirtioPciDevice.init(
+        testing.allocator,
+        3,
+        0x0003,
+        1 << 1,
+        queue_count,
+        config_bytes,
+    );
+    defer device.deinit();
+    device.writeConfig(0x10, 4, 0xd008_0000);
+    device.transport.driver_features = 1 << 1;
+    device.transport.status = @bitCast(@as(u8, 0x0f));
+    device.transport.queue_select = queue_count - 1;
+    device.transport.queues[11] = .{
+        .size_max = 128,
+        .size = 64,
+        .enable = true,
+        .notify_off = 11,
+        .desc_addr = 0x4000_0000,
+        .driver_addr = 0x4001_0000,
+        .device_addr = 0x4002_0000,
+    };
+    @memset(device.transport.device_config, 0xa5);
+
+    const data = try serializePciDevice(testing.allocator, device);
+    defer testing.allocator.free(data);
+    const restored = try pci.VirtioPciDevice.init(
+        testing.allocator,
+        3,
+        0x0003,
+        1 << 1,
+        queue_count,
+        config_bytes,
+    );
+    defer restored.deinit();
+    restored.transport.setQueueSizeMax(queue_count - 1, 128);
+    try deserializePciDevice(testing.allocator, restored, data);
+
+    try testing.expectEqual(@as(u32, 0xd008_0000), restored.bar0_addr);
+    try testing.expectEqual(queue_count, restored.transport.num_queues);
+    try testing.expectEqual(queue_count - 1, restored.transport.queue_select);
+    try testing.expectEqual(device.transport.queues[11], restored.transport.queues[11]);
+    try testing.expectEqualSlices(
+        u8,
+        device.transport.device_config,
+        restored.transport.device_config,
+    );
+}
+
 test "snapshot: console device roundtrip (multiport)" {
     const con = try virtio.Console.init(testing.allocator, &.{"org.qemu.guest_agent.0"});
     defer con.deinit();
