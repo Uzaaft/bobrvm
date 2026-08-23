@@ -27,6 +27,7 @@ initrd_path: ?[]const u8 = null,
 cmdline: []const u8 = "console=hvc0 earlycon=pl011,0x09000000",
 enable_gpu: bool = false,
 enable_virgl: bool = false,
+kitty_display: bool = false,
 enable_net: bool = false,
 enable_snd: bool = false,
 display_width: u32 = config_policy.display_width_default,
@@ -137,6 +138,9 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--virgl")) {
             config.enable_gpu = true;
             config.enable_virgl = true;
+        } else if (std.mem.eql(u8, arg, "--kitty-display")) {
+            config.enable_gpu = true;
+            config.kitty_display = true;
         } else if (std.mem.eql(u8, arg, "--sound")) {
             config.enable_snd = true;
         } else if (std.mem.eql(u8, arg, "--net")) {
@@ -216,6 +220,7 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
 }
 
 pub fn validate(self: *const Config) ParseError!void {
+    if (self.kitty_display and !self.enable_gpu) return ParseError.InvalidArgument;
     const memory_bytes = std.math.mul(u64, self.memory_mb, 1024 * 1024) catch {
         return ParseError.InvalidArgument;
     };
@@ -451,6 +456,7 @@ pub fn printOptions() void {
         \\  --cmdline <str>       Kernel command line
         \\  --gpu                 Attach a virtio-gpu display device
         \\  --virgl               Accelerated 3D graphics (implies --gpu)
+        \\  --kitty-display       Stream GPU frames to Ghostty (implies --gpu)
         \\  --sound               Attach a virtio-snd playback device
         \\  --net                 Attach a virtio-net adapter (user-mode NAT)
         \\  --share <dir>         Export a host directory over virtio-9p (tag "host")
@@ -529,6 +535,7 @@ test "CLI arguments project into VM configuration" {
         "--initrd", "/initrd",
         "--cmdline", "console=hvc0",
         "--virgl",
+        "--kitty-display",
         "--sound",
         "--share", "/shared",
         "--restore", "/snapshot",
@@ -554,6 +561,7 @@ test "CLI arguments project into VM configuration" {
     try std.testing.expectEqualStrings("console=hvc0", parsed.cmdline);
     try std.testing.expect(parsed.enable_gpu);
     try std.testing.expect(parsed.enable_virgl);
+    try std.testing.expect(parsed.kitty_display);
     try std.testing.expect(parsed.enable_net);
     try std.testing.expect(parsed.enable_snd);
     try std.testing.expectEqualStrings("/shared", parsed.shared_dir.?);

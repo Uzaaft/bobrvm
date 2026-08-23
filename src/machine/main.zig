@@ -488,6 +488,7 @@ pub const Machine = struct {
     /// Frame ready callback (applied to the GPU at device init).
     frame_callback: ?*const fn (?*anyopaque) void = null,
     frame_userdata: ?*anyopaque = null,
+    frame_readback_required: bool = false,
 
     /// Initrd tracking (for DTB generation).
     initrd_start: u64 = 0,
@@ -693,6 +694,12 @@ pub const Machine = struct {
     ) void {
         self.frame_callback = callback;
         self.frame_userdata = userdata;
+    }
+
+    /// Keep CPU pixels for a 3D scanout even when IOSurface direct-present is
+    /// available. Must be configured before start.
+    pub fn setFrameReadbackRequired(self: *Machine, required: bool) void {
+        self.frame_readback_required = required;
     }
 
     /// Inject host input into the guest consoles. Thread-safe: buffers
@@ -2761,6 +2768,7 @@ pub const Machine = struct {
                 }
             }
             self.gpu.?.setDisplaySize(self.config.display_width, self.config.display_height);
+            self.gpu.?.setCpuScanoutRequired(self.frame_readback_required);
             self.registerVirtioMmioDevice(
                 self.gpu_slot,
                 .{ .gpu = self.gpu.? },

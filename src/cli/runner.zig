@@ -6,12 +6,15 @@ const Allocator = std.mem.Allocator;
 const Config = @import("Config.zig");
 const console_exec = @import("console_exec.zig");
 const global = @import("../global.zig");
+const KittyDisplay = @import("kitty_display.zig");
+const KittyInput = @import("kitty_input.zig");
 const machine = @import("../machine/main.zig");
 const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
 
 const log = std.log.scoped(.cli);
 const input_stack_size_bytes: usize = 1024 * 1024;
+const kitty_sequence_timeout_ms: i32 = 25;
 
 /// zig 0.16 removed std.Thread.sleep in favor of the Io.Clock
 /// abstraction; thin wrapper for these debug-hook sleeps.
@@ -95,6 +98,10 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     };
     defer hw.deinit();
 
+    const stderr_logging_saved = global.state.logging.stderr;
+    defer global.state.logging.stderr = stderr_logging_saved;
+    if (config.kitty_display) global.state.logging.stderr = false;
+
     registerMachineForCleanup(hw);
     defer unregisterMachineForCleanup();
     suspend_target = config.suspend_path;
@@ -118,13 +125,29 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         ) catch null;
     }
 
-    hw.setConsoleOutput(consoleOutput, null);
+    var show_console_output = !config.kitty_display;
+    hw.setConsoleOutput(consoleOutput, &show_console_output);
+
+    var kitty_display: ?KittyDisplay = null;
+    var kitty_signal_cleanup = false;
+    defer if (kitty_signal_cleanup) kitty_terminal_active.store(false, .release);
+    defer if (kitty_display) |*display| display.deinit();
+    if (config.kitty_display) {
+        kitty_display = KittyDisplay.init(alloc, hw);
+        hw.setFrameReadbackRequired(true);
+        try kitty_display.?.start();
+        kitty_terminal_active.store(true, .release);
+        kitty_signal_cleanup = true;
+        hw.setFrameCallback(KittyDisplay.frameReady, &kitty_display.?);
+        log.info("Ghostty display attached (Ctrl-] to quit)", .{});
+    }
 
     // Debug: dump scanout frames when BOBRVM_DUMP_FRAMES=<dir> is set.
-    if (config.enable_gpu) {
+    if (config.enable_gpu and !config.kitty_display) {
         if (std.c.getenv("BOBRVM_DUMP_FRAMES")) |dir| {
             frame_dump_dir = std.mem.span(dir);
             frame_machine = hw;
+            hw.setFrameReadbackRequired(true);
             hw.setFrameCallback(frameDump, null);
         }
 
@@ -242,7 +265,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     const input_thread = std.Thread.spawn(
         .{ .stack_size = input_stack_size_bytes },
         inputLoop,
-        .{ hw, stdin_is_tty },
+        .{ hw, stdin_is_tty, config.kitty_display },
     ) catch |err| blk: {
         log.warn("failed to start console input thread: {}", .{err});
         break :blk null;
@@ -607,12 +630,30 @@ fn restoreTermios() void {
 
 /// Reads host stdin and forwards it to the guest console. Runs detached;
 /// the process exits (and reaps it) when the VM stops.
-fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
+fn inputLoop(hw: *machine.Machine, is_tty: bool, kitty_mouse: bool) void {
     var buf: [1024]u8 = undefined;
+    var decoder: KittyInput = .{};
     var host_command_pending = false;
     while (true) {
+        // A lone Escape is ordinary guest input, but it is also the start of
+        // every mouse report. Bound that ambiguity instead of buffering it
+        // until another key happens to arrive.
+        if (kitty_mouse and decoder.hasPending() and
+            !stdinReady(kitty_sequence_timeout_ms))
+        {
+            if (decoder.flushPending()) |bytes| {
+                if (!routeHostInput(hw, bytes, &host_command_pending)) return;
+            }
+            continue;
+        }
+
         const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch break;
         if (n == 0) {
+            if (kitty_mouse) {
+                if (decoder.flushPending()) |bytes| {
+                    _ = routeHostInput(hw, bytes, &host_command_pending);
+                }
+            }
             // EOF. Interactive runs keep the VM alive (stdin may just be
             // closed); scripted harnesses set BOBRVM_EXIT_ON_EOF=1 to shut
             // the VM down when the feeder finishes — Ctrl-] can't serve
@@ -631,36 +672,105 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool) void {
             continue;
         }
 
-        var guest_start: usize = 0;
-        for (buf[0..n], 0..) |byte, i| {
-            if (host_command_pending) {
-                if (guest_start < i) hw.injectConsoleInput(buf[guest_start..i]);
-                host_command_pending = false;
-                if (classifyHostCommand(byte)) |command| {
-                    executeHostCommand(hw, command);
-                } else {
-                    log.warn("unknown host command 0x{x}; Ctrl-B ? lists commands", .{byte});
-                }
-                guest_start = i + 1;
-                continue;
-            }
+        if (kitty_mouse) {
+            if (!routeKittyInput(hw, &decoder, buf[0..n], &host_command_pending)) return;
+            continue;
+        }
 
-            if (byte == host_command_prefix) {
-                if (guest_start < i) hw.injectConsoleInput(buf[guest_start..i]);
-                host_command_pending = true;
-                guest_start = i + 1;
-                continue;
-            }
+        if (!routeHostInput(hw, buf[0..n], &host_command_pending)) return;
+    }
+}
 
-            // Ctrl-] detaches: forward everything before it, then shut down.
-            if (byte == 0x1d) {
-                if (guest_start < i) hw.injectConsoleInput(buf[guest_start..i]);
-                restoreTermios();
-                std.posix.raise(std.posix.SIG.TERM) catch {};
-                return;
+fn stdinReady(timeout_ms: i32) bool {
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = std.posix.STDIN_FILENO,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    return (std.posix.poll(&poll_fds, timeout_ms) catch return true) != 0;
+}
+
+fn routeKittyInput(
+    hw: *machine.Machine,
+    decoder: *KittyInput,
+    bytes: []const u8,
+    host_command_pending: *bool,
+) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (!decoder.hasPending()) {
+            const relative = std.mem.indexOfScalar(u8, bytes[offset..], '\x1b') orelse {
+                return routeHostInput(hw, bytes[offset..], host_command_pending);
+            };
+            if (relative > 0) {
+                if (!routeHostInput(
+                    hw,
+                    bytes[offset..][0..relative],
+                    host_command_pending,
+                )) return false;
+                offset += relative;
+                continue;
             }
         }
-        if (guest_start < n) hw.injectConsoleInput(buf[guest_start..n]);
+
+        switch (decoder.feed(bytes[offset])) {
+            .pending => {},
+            .forward => |forwarded| {
+                if (!routeHostInput(hw, forwarded, host_command_pending)) return false;
+            },
+            .mouse => |event| injectKittyMouse(hw, event),
+        }
+        offset += 1;
+    }
+    return true;
+}
+
+fn routeHostInput(
+    hw: *machine.Machine,
+    bytes: []const u8,
+    host_command_pending: *bool,
+) bool {
+    var guest_start: usize = 0;
+    for (bytes, 0..) |byte, i| {
+        if (host_command_pending.*) {
+            if (guest_start < i) hw.injectConsoleInput(bytes[guest_start..i]);
+            host_command_pending.* = false;
+            if (classifyHostCommand(byte)) |command| {
+                executeHostCommand(hw, command);
+            } else {
+                log.warn("unknown host command 0x{x}; Ctrl-B ? lists commands", .{byte});
+            }
+            guest_start = i + 1;
+            continue;
+        }
+
+        if (byte == host_command_prefix) {
+            if (guest_start < i) hw.injectConsoleInput(bytes[guest_start..i]);
+            host_command_pending.* = true;
+            guest_start = i + 1;
+            continue;
+        }
+
+        // Ctrl-] detaches: forward everything before it, then shut down.
+        if (byte == 0x1d) {
+            if (guest_start < i) hw.injectConsoleInput(bytes[guest_start..i]);
+            restoreTermios();
+            std.posix.raise(std.posix.SIG.TERM) catch {};
+            return false;
+        }
+    }
+    if (guest_start < bytes.len) hw.injectConsoleInput(bytes[guest_start..]);
+    return true;
+}
+
+fn injectKittyMouse(hw: *machine.Machine, event: KittyInput.MouseEvent) void {
+    const size = KittyInput.terminalPixelSize(std.posix.STDOUT_FILENO) orelse return;
+    const guest = KittyInput.translate(event, size);
+    hw.injectMousePosition(guest.x, guest.y);
+    switch (guest.action) {
+        .none => {},
+        .button => |button| hw.injectMouseButton(button.code, button.pressed),
+        .scroll => |scroll| hw.injectScroll(scroll.dx, scroll.dy),
     }
 }
 
@@ -761,9 +871,12 @@ test "host console command decoder" {
     try std.testing.expect(classifyHostCommand('x') == null);
 }
 
-fn consoleOutput(data: []const u8, _: ?*anyopaque) void {
-    const stdout = std.posix.STDOUT_FILENO;
-    _ = std.c.write(stdout, data.ptr, data.len);
+fn consoleOutput(data: []const u8, userdata: ?*anyopaque) void {
+    const show: *const bool = @ptrCast(@alignCast(userdata orelse return));
+    if (show.*) {
+        const stdout = std.posix.STDOUT_FILENO;
+        _ = std.c.write(stdout, data.ptr, data.len);
+    }
     // Tee to the provisioning session while it is running, so its
     // marker detection sees the same console stream the user does.
     if (provision_active.load(.acquire)) {
@@ -774,6 +887,7 @@ fn consoleOutput(data: []const u8, _: ?*anyopaque) void {
 }
 
 var cleanup_machine: ?*machine.Machine = null;
+var kitty_terminal_active = std.atomic.Value(bool).init(false);
 
 fn registerMachineForCleanup(hw: *machine.Machine) void {
     cleanup_machine = hw;
@@ -793,6 +907,9 @@ fn unregisterMachineForCleanup() void {
 /// request the vCPUs to stop and restore the terminal.
 fn machineCleanup() void {
     restoreTermios();
+    if (kitty_terminal_active.load(.acquire)) {
+        KittyDisplay.restoreTerminalSignalSafe();
+    }
     if (cleanup_machine) |hw| {
         hw.requestStop();
     }

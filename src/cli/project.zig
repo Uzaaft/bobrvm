@@ -171,6 +171,7 @@ const Key = enum {
     share_readonly,
     gpu,
     virgl,
+    kitty_display,
     sound,
     net,
     share,
@@ -198,6 +199,7 @@ const key_map = std.StaticStringMap(Key).initComptime(.{
     .{ "share-readonly", .share_readonly },
     .{ "gpu", .gpu },
     .{ "virgl", .virgl },
+    .{ "kitty-display", .kitty_display },
     .{ "sound", .sound },
     .{ "net", .net },
     .{ "share", .share },
@@ -248,6 +250,7 @@ fn mapTable(
             .share_readonly => config.share_read_only = try wantBool(key_name, value),
             .gpu => config.enable_gpu = try wantBool(key_name, value),
             .virgl => config.enable_virgl = try wantBool(key_name, value),
+            .kitty_display => config.kitty_display = try wantBool(key_name, value),
             .sound => config.enable_snd = try wantBool(key_name, value),
             .net => config.enable_net = try wantBool(key_name, value),
             .share => {
@@ -284,6 +287,7 @@ fn mapTable(
         config.shared_dir = arena.dupe(u8, root) catch return error.OutOfMemory;
     }
     if (config.enable_virgl) config.enable_gpu = true;
+    if (config.kitty_display) config.enable_gpu = true;
     if (config.forward_count > 0) config.enable_net = true;
 
     // The lite engine's device set is much smaller; reject what it
@@ -403,6 +407,7 @@ test "project: maps the full schema onto a config" {
         \\cmdline = "console=hvc0 root=/dev/vda"
         \\disk = "root.raw"
         \\virgl = true
+        \\kitty-display = true
         \\sound = true
         \\forwards = ["2222:22", "8080:80"]
         \\display = "1920x1080"
@@ -422,6 +427,7 @@ test "project: maps the full schema onto a config" {
     try testing.expectEqualStrings("/proj/root.raw", config.disk_path.?);
     try testing.expect(config.enable_virgl);
     try testing.expect(config.enable_gpu); // implied by virgl
+    try testing.expect(config.kitty_display);
     try testing.expect(config.enable_snd);
     try testing.expect(config.enable_net); // implied by forwards
     try testing.expectEqual(@as(u8, 2), config.forward_count);

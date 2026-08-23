@@ -645,6 +645,8 @@ pub const Gpu = struct {
     /// cached — scanout() re-derives it live from the (mutex-guarded) target so
     /// a destroyed/recreated target can never leave a dangling ref behind.
     scanout3d_direct: bool = false,
+    /// Preserve a readback alongside direct-present for non-Metal consumers.
+    cpu_scanout_required: bool = false,
     /// Count of submit_3d commands seen (used to log the first few for
     /// bring-up diagnostics without flooding the log).
     submit3d_seen: u32 = 0,
@@ -956,6 +958,11 @@ pub const Gpu = struct {
         self.frame_ready = frame_ready;
     }
 
+    /// Retain host-readable pixels even when an IOSurface is available.
+    pub fn setCpuScanoutRequired(self: *Gpu, required: bool) void {
+        self.cpu_scanout_required = required;
+    }
+
     pub fn presentationGeneration(self: *const Gpu) u64 {
         return self.presentation_generation.load(.acquire);
     }
@@ -1184,16 +1191,15 @@ pub const Gpu = struct {
         self.handleCursorCommand(req);
     }
 
-    /// Decode + apply one UPDATE_CURSOR/MOVE_CURSOR command. Split out from
-    /// processCursorCommand so it's directly unit-testable with a synthetic
-    /// buffer, matching the cmdXxx(req) pattern used for the control queue.
+    /// Apply one cursor command and notify presentation consumers only after
+    /// releasing the scanout lock; callbacks can immediately capture a frame.
     fn handleCursorCommand(self: *Gpu, req: []const u8) void {
         if (req.len < @sizeOf(UpdateCursor)) return;
         const cmd = std.mem.bytesToValue(UpdateCursor, req[0..@sizeOf(UpdateCursor)]);
         const cmd_type: CmdType = @enumFromInt(cmd.header.type);
 
         self.scanout_mutex.lockUncancelable(global.io());
-        defer self.scanout_mutex.unlock(global.io());
+        var changed = false;
 
         switch (cmd_type) {
             .update_cursor => {
@@ -1208,14 +1214,20 @@ pub const Gpu = struct {
                 self.cursor_visible = cmd.resource_id != 0;
                 self.cursor_generation +%= 1;
                 _ = self.presentation_generation.fetchAdd(1, .release);
+                changed = true;
             },
             .move_cursor => {
                 self.cursor_x = std.math.cast(i32, cmd.pos.x) orelse std.math.maxInt(i32);
                 self.cursor_y = std.math.cast(i32, cmd.pos.y) orelse std.math.maxInt(i32);
                 self.cursor_generation +%= 1;
                 _ = self.presentation_generation.fetchAdd(1, .release);
+                changed = true;
             },
             else => {},
+        }
+        self.scanout_mutex.unlock(global.io());
+        if (changed) {
+            if (self.frame_ready) |frame_ready| frame_ready.call();
         }
     }
 
@@ -1631,22 +1643,17 @@ pub const Gpu = struct {
         const res = self.gpu_device.getResource(id) orelse return;
         if (res.width == 0 or res.height == 0) return;
 
-        // Zero-copy path: the target renders straight into an IOSurface, so
-        // just mark direct-present — scanout() re-derives the live ref itself.
-        if (self.gpu_device.scanoutSurfaceRef(id) != null) {
-            self.scanout3d_direct = true;
-            self.scanout3d_w = res.width;
-            self.scanout3d_h = res.height;
-            return;
-        }
+        // Direct-present users only need the IOSurface. Terminal and dump
+        // consumers explicitly request a CPU copy alongside it.
+        self.scanout3d_direct = self.gpu_device.scanoutSurfaceRef(id) != null;
+        self.scanout3d_w = res.width;
+        self.scanout3d_h = res.height;
+        if (self.scanout3d_direct and !self.cpu_scanout_required) return;
 
         // Fallback: read the rendered pixels back into a host buffer.
-        self.scanout3d_direct = false;
         const needed = @as(usize, res.width) * res.height * 4;
         if (!self.ensureScanout3dCapacity(needed)) return;
         if (!self.gpu_device.readbackResource(id, self.scanout3d_data)) return;
-        self.scanout3d_w = res.width;
-        self.scanout3d_h = res.height;
     }
 
     fn ensureScanout3dCapacity(self: *Gpu, needed: usize) bool {
@@ -3153,6 +3160,15 @@ test "hardware cursor: update_cursor sets image+position, move_cursor reposition
     const gpu = try Gpu.init(testing.allocator, false);
     defer gpu.deinit();
 
+    const Ready = struct {
+        var count: u32 = 0;
+        fn call(_: ?*anyopaque) void {
+            count += 1;
+        }
+    };
+    Ready.count = 0;
+    gpu.setFrameCallback(FrameReady.initRaw(Ready.call, null));
+
     const Ctx = struct {
         var mem: [4096]u8 = undefined;
         fn get(addr: u64, len: usize) ?[]u8 {
@@ -3226,6 +3242,7 @@ test "hardware cursor: update_cursor sets image+position, move_cursor reposition
     gpu.handleCursorCommand(std.mem.asBytes(&hide));
     try testing.expect(gpu.cursorView() == null);
     try testing.expectEqual(present_after_update + 2, gpu.presentationGeneration());
+    try testing.expectEqual(@as(u32, 3), Ready.count);
 }
 
 test "EDID feature advertised" {
