@@ -74,15 +74,12 @@ stdenv.mkDerivation (finalAttrs: {
   dontConfigure = true;
   dontUseZigBuild = true;
 
-  buildPhase = let
-    linuxTarget = "-Dtarget=x86_64-linux-gnu";
-  in ''
+  buildPhase = ''
     runHook preBuild
     export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
     zig build \
-      ${lib.optionalString stdenv.hostPlatform.isLinux "${linuxTarget} \\"}
       -Dcpu=baseline \
       -Doptimize=${optimize}
     runHook postBuild
@@ -113,6 +110,9 @@ stdenv.mkDerivation (finalAttrs: {
       "x86_64-darwin"
       "x86_64-linux"
     ];
-    mainProgram = "bobrvm";
+    mainProgram =
+      if stdenv.hostPlatform.isLinux
+      then "bobrvm-gtk"
+      else "bobrvm";
   };
 })

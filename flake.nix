@@ -36,6 +36,8 @@
         function (import nixpkgs {
           inherit system;
           overlays = [ziglint.overlays.default];
+          config.allowUnfreePredicate = package:
+            lib.getName package == "bobrvm";
         }));
   in {
     packages =
@@ -68,6 +70,20 @@
       // (forPlatforms guestPlatforms (pkgs: {
         bobrvm-tools = pkgs.callPackage ./nix/guest-tools.nix {};
       }));
+
+    apps = lib.genAttrs ["x86_64-linux"] (system: let
+      package = self.packages.${system}.default;
+    in rec {
+      default = gui;
+      gui = {
+        type = "app";
+        program = "${package}/bin/bobrvm-gtk";
+      };
+      cli = {
+        type = "app";
+        program = "${package}/bin/bobrvm";
+      };
+    });
 
     devShells = forPlatforms hostPlatforms (pkgs: {
       default = pkgs.callPackage ./nix/devShell.nix {
