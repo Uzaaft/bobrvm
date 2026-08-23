@@ -276,6 +276,7 @@ pub const Machine = struct {
     block_worker_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     block_worker_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     block_kicks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    block_notifications: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     block_interrupts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     block_irq_desired: bool = false,
     block_irq_injected: bool = false,
@@ -299,6 +300,7 @@ pub const Machine = struct {
     gpu_irq_desired: bool = false,
     gpu_irq_injected: bool = false,
     gpu_wakeup: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    gpu_notifications: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     keyboard: ?*virtio.Input = null,
     pci_keyboard: ?*pci.VirtioPciDevice = null,
     keyboard_irq_desired: bool = false,
@@ -398,6 +400,19 @@ pub const Machine = struct {
     pub const MmioExitStats = struct {
         total: u64,
         last: ?u64,
+    };
+
+    pub const BootDiagnostics = struct {
+        exits_total: u64,
+        pci_config_reads: u64,
+        pci_gpu_reads: u64,
+        pci_installer_reads: u64,
+        mmio_exits_total: u64,
+        last_mmio_address: ?u64,
+        block_notifications: u64,
+        installer_notifications: u64,
+        gpu_notifications: u64,
+        gpu_commands: u64,
     };
 
     pub const Scanout = struct {
@@ -1902,6 +1917,23 @@ pub const Machine = struct {
         };
     }
 
+    pub fn bootDiagnostics(self: *Machine) BootDiagnostics {
+        self.exit_lock.lockUncancelable(global.io());
+        defer self.exit_lock.unlock(global.io());
+        return .{
+            .exits_total = self.exits_total.load(.acquire),
+            .pci_config_reads = self.pci_config_reads,
+            .pci_gpu_reads = self.pci_device_reads[pci_gpu_slot],
+            .pci_installer_reads = self.pci_device_reads[pci_block2_slot],
+            .mmio_exits_total = self.mmio_exits_total.load(.acquire),
+            .last_mmio_address = self.last_mmio_address,
+            .block_notifications = self.block_notifications.load(.acquire),
+            .installer_notifications = self.block2_notifications.load(.acquire),
+            .gpu_notifications = self.gpu_notifications.load(.acquire),
+            .gpu_commands = if (self.gpu) |gpu| gpu.controlCommandCount() else 0,
+        };
+    }
+
     fn handleIo(
         self: *Machine,
         vcpu: *kvm.Vcpu,
@@ -1949,8 +1981,32 @@ pub const Machine = struct {
         const device = self.pciDevice(address) orelse return;
         const old_bar_address = device.getBar0Addr();
         const old_irq = pciInterruptLine(device, pci_block_irq);
+        const old_interrupt_line = device.config[pci_interrupt_line_offset];
         device.writeConfig(address.register, access.size, value);
         const new_bar_address = device.getBar0Addr();
+        if (old_bar_address != new_bar_address) {
+            log.info(
+                "PCI 00:{x:0>2}.0 virtio device {} BAR0 0x{x}->0x{x}",
+                .{
+                    @as(u8, address.device),
+                    device.transport.device_id,
+                    old_bar_address,
+                    new_bar_address,
+                },
+            );
+        }
+        const new_interrupt_line = device.config[pci_interrupt_line_offset];
+        if (old_interrupt_line != new_interrupt_line) {
+            log.debug(
+                "PCI 00:{x:0>2}.0 virtio device {} interrupt line {}->{}",
+                .{
+                    @as(u8, address.device),
+                    device.transport.device_id,
+                    old_interrupt_line,
+                    new_interrupt_line,
+                },
+            );
+        }
         if (address.device != pci_block_slot) return;
         self.rebindBlockIoEvent(old_bar_address, new_bar_address) catch |err| {
             device.writeConfig(0x10, 4, old_bar_address);
@@ -2605,6 +2661,8 @@ pub const Machine = struct {
     fn blockNotify(queue_index: u32, userdata: ?*anyopaque) void {
         if (queue_index != 0) return;
         const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
+        const notifications = self.block_notifications.fetchAdd(1, .release);
+        if (notifications == 0) log.info("first primary disk notification", .{});
         self.processBlockQueue();
     }
 
@@ -2620,7 +2678,8 @@ pub const Machine = struct {
     fn block2Notify(queue_index: u32, userdata: ?*anyopaque) void {
         if (queue_index != 0) return;
         const self: *Machine = @ptrCast(@alignCast(userdata orelse return));
-        _ = self.block2_notifications.fetchAdd(1, .release);
+        const notifications = self.block2_notifications.fetchAdd(1, .release);
+        if (notifications == 0) log.info("first installer disk notification", .{});
         const device = self.pci_block2 orelse return;
         const block = self.block2 orelse return;
         processBlockDevice(device, block);
@@ -2674,6 +2733,11 @@ pub const Machine = struct {
         const gpu = self.gpu orelse return;
         if (queue_index >= device.transport.queues.len or
             queue_index >= gpu.transport.queues.len) return;
+
+        const notifications = self.gpu_notifications.fetchAdd(1, .release);
+        if (notifications == 0) {
+            log.info("first virtio-gpu notification: queue={}", .{queue_index});
+        }
 
         // EGL contexts cannot move between host threads while current. Guest
         // vCPUs may kick virtio-gpu from any CPU, so execute every renderer
@@ -3276,6 +3340,8 @@ pub const Machine = struct {
     fn processBlockKick(self: *Machine) void {
         const kicks = self.block_kick_event.?.consume() orelse return self.failBlockWorker();
         _ = self.block_kicks.fetchAdd(kicks, .release);
+        const notifications = self.block_notifications.fetchAdd(kicks, .release);
+        if (notifications == 0) log.info("first primary disk notification", .{});
         self.processBlockQueue();
     }
 

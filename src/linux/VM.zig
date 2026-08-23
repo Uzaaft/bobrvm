@@ -107,6 +107,30 @@ pub fn create(
     if ((config.kernel_path == null) == (config.firmware_path == null)) {
         return error.InvalidBootConfig;
     }
+    log.info(
+        "creating {s} VM: memory={} MiB vcpus={} display={}x{} 3d={} " ++
+            "disk={} installer={}",
+        .{
+            if (config.firmware_path != null) "firmware" else "direct-boot",
+            config.memory_bytes / 1024 / 1024,
+            config.vcpu_count,
+            if (config.display_enabled) config.display_width else 0,
+            if (config.display_enabled) config.display_height else 0,
+            config.gpu_3d_enabled,
+            config.disk_path != null,
+            config.disk2_path != null,
+        },
+    );
+    log.debug(
+        "boot media: firmware={?s} kernel={?s} initrd={?s} disk={?s} installer={?s}",
+        .{
+            config.firmware_path,
+            config.kernel_path,
+            config.initrd_path,
+            config.disk_path,
+            config.disk2_path,
+        },
+    );
     var restore_buffer: [1024]u8 = undefined;
     var restore_file_path = config.restore_path;
     var restore_directory: ?[]const u8 = null;
@@ -347,6 +371,10 @@ pub fn pciConfigReads(self: *const VM) u64 {
 
 pub fn pciDeviceReads(self: *const VM) [32]u64 {
     return self.machine.pciDeviceReads();
+}
+
+pub fn bootDiagnostics(self: *VM) x86.Machine.BootDiagnostics {
+    return self.machine.bootDiagnostics();
 }
 
 pub fn mmioExitStats(self: *const VM) x86.Machine.MmioExitStats {

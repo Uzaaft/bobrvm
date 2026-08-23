@@ -362,7 +362,10 @@ pub const VirtioPciTransport = struct {
             .device_feature_select => self.device_feature_select = value,
             .driver_feature_select => self.driver_feature_select = value,
             .driver_feature => self.writeDriverFeatures(value),
-            .device_status => self.handleStatusWrite(@truncate(value)),
+            .device_status => {
+                self.handleStatusWrite(@truncate(value));
+                log.debug("device {} status=0x{x}", .{ self.device_id, value & 0xff });
+            },
             .queue_select => {
                 if (value < self.num_queues) {
                     self.queue_select = @truncate(value);
@@ -376,6 +379,19 @@ pub const VirtioPciTransport = struct {
             .queue_enable => {
                 if (self.currentQueue()) |q| {
                     q.enable = value != 0;
+                    log.debug(
+                        "device {} queue {} enabled={} size={} desc=0x{x} " ++
+                            "driver=0x{x} device=0x{x}",
+                        .{
+                            self.device_id,
+                            self.queue_select,
+                            q.enable,
+                            q.size,
+                            q.desc_addr,
+                            q.driver_addr,
+                            q.device_addr,
+                        },
+                    );
                 }
             },
             .queue_desc_lo => {
@@ -763,7 +779,10 @@ pub const VirtioPciDevice = struct {
             .bar0_probe => log.debug("BAR0 sizing: returning 0xFFFFF000 (4KB)", .{}),
             .bar0_assigned => |address| {
                 self.bar0_addr = address;
-                log.info("BAR0 assigned to 0x{x}", .{address});
+                log.debug(
+                    "device {} subsystem=0x{x} BAR0 assigned to 0x{x}",
+                    .{ self.transport.device_id, self.subsystem_id, address },
+                );
             },
         }
     }

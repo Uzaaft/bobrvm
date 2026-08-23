@@ -13,6 +13,8 @@ const VM = @import("VM.zig");
 const x86 = @import("../machine/x86/main.zig");
 const mininat = @import("../net/mininat.zig");
 
+const log = std.log.scoped(.linux_gtk);
+
 const c = struct {
     pub const AdwApplication = opaque {};
     pub const AdwApplicationWindow = opaque {};
@@ -527,6 +529,12 @@ const output_pending_bytes: usize = 64 * 1024;
 const console_history_bytes: usize = 64 * 1024;
 const display_width_in_window_max: u32 = 960;
 const display_height_with_console_max: u32 = 480;
+const display_refresh_interval_ms: u32 = 16;
+const scanout_diagnostic_delay_ms: u32 = 5_000;
+const scanout_diagnostic_ticks: u16 = @intCast(
+    (scanout_diagnostic_delay_ms + display_refresh_interval_ms - 1) /
+        display_refresh_interval_ms,
+);
 const sessions_max: usize = 8;
 
 const SessionRegistry = struct {
@@ -666,6 +674,7 @@ const State = struct {
     output_pending: [output_pending_bytes]u8 = undefined,
     output_head: usize = 0,
     output_len: usize = 0,
+    serial_bytes_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     console_history: [console_history_bytes + 1]u8 = undefined,
     console_len: usize = 0,
     escape_state: enum { none, escape, csi } = .none,
@@ -673,6 +682,8 @@ const State = struct {
     frame_width: u32 = 0,
     frame_height: u32 = 0,
     frame_generation: u64 = 0,
+    display_wait_ticks: u16 = 0,
+    scanout_diagnostic_reported: bool = false,
     snapshot_thread: ?std.Thread = null,
     snapshot_status: std.atomic.Value(SnapshotStatus) =
         std.atomic.Value(SnapshotStatus).init(.idle),
@@ -682,6 +693,9 @@ const State = struct {
 
     fn start(self: *State) void {
         if (self.vm != null) return;
+        self.display_wait_ticks = 0;
+        self.scanout_diagnostic_reported = false;
+        self.serial_bytes_total.store(0, .release);
         self.ensureFrameBuffer() catch |err| {
             self.setError(err);
             return;
@@ -737,7 +751,7 @@ const State = struct {
         c.gtk_label_set_text(self.status.?, "Running");
         c.adw_view_stack_set_visible_child_name(self.view_stack.?, "display");
         self.setRunningControls(true);
-        _ = c.g_timeout_add(16, tick, self);
+        _ = c.g_timeout_add(display_refresh_interval_ms, tick, self);
     }
 
     fn startFromForm(self: *State) void {
@@ -1508,6 +1522,8 @@ const State = struct {
         };
         vm.destroy();
         self.vm = null;
+        self.display_wait_ticks = 0;
+        self.scanout_diagnostic_reported = false;
         c.gtk_label_set_text(self.status.?, switch (outcome) {
             .guest_shutdown => "Guest shut down",
             .stopped => "Stopped",
@@ -1524,6 +1540,7 @@ const State = struct {
     }
 
     fn writeSerial(self: *State, bytes: []const u8) void {
+        _ = self.serial_bytes_total.fetchAdd(bytes.len, .release);
         self.queueOutput(bytes);
         var remaining = bytes;
         while (remaining.len > 0) {
@@ -1565,13 +1582,50 @@ const State = struct {
 
     fn refreshDisplay(self: *State) void {
         const vm = self.vm orelse return;
-        const scanout = vm.copyScanout(self.frame_pixels) orelse return;
+        const scanout = vm.copyScanout(self.frame_pixels) orelse {
+            self.noteMissingScanout(vm);
+            return;
+        };
+        if (self.scanout_diagnostic_reported) {
+            log.info("guest scanout became active after the diagnostic timeout", .{});
+        }
+        self.display_wait_ticks = 0;
+        self.scanout_diagnostic_reported = false;
         if (scanout.generation == self.frame_generation and
             scanout.width == self.frame_width and scanout.height == self.frame_height) return;
         self.frame_width = scanout.width;
         self.frame_height = scanout.height;
         self.frame_generation = scanout.generation;
         c.gtk_widget_queue_draw(self.display.?);
+    }
+
+    fn noteMissingScanout(self: *State, vm: *VM) void {
+        if (self.scanout_diagnostic_reported) return;
+        self.display_wait_ticks +|= 1;
+        if (self.display_wait_ticks < scanout_diagnostic_ticks) return;
+        self.scanout_diagnostic_reported = true;
+
+        const diagnostic = vm.bootDiagnostics();
+        log.warn(
+            "no guest scanout after {} ms: exits={} pci_reads={} gpu_pci_reads={} " ++
+                "installer_pci_reads={} mmio_exits={} last_mmio=0x{x} " ++
+                "disk_notifications={} installer_notifications={} " ++
+                "gpu_notifications={} gpu_commands={} serial_bytes={}",
+            .{
+                scanout_diagnostic_delay_ms,
+                diagnostic.exits_total,
+                diagnostic.pci_config_reads,
+                diagnostic.pci_gpu_reads,
+                diagnostic.pci_installer_reads,
+                diagnostic.mmio_exits_total,
+                diagnostic.last_mmio_address orelse 0,
+                diagnostic.block_notifications,
+                diagnostic.installer_notifications,
+                diagnostic.gpu_notifications,
+                diagnostic.gpu_commands,
+                self.serial_bytes_total.load(.acquire),
+            },
+        );
     }
 
     fn flushClipboard(self: *State) void {

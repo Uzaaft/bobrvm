@@ -578,6 +578,7 @@ pub const Gpu = struct {
     /// Shadow avail-ring cursors for the two queues.
     ctrl_last_avail: u16,
     cursor_last_avail: u16,
+    control_commands: std.atomic.Value(u64),
 
     /// 2D resources.
     resources: std.AutoHashMap(u32, Resource2D),
@@ -743,6 +744,7 @@ pub const Gpu = struct {
             .config = .{ .num_capsets = num_capsets },
             .ctrl_last_avail = 0,
             .cursor_last_avail = 0,
+            .control_commands = std.atomic.Value(u64).init(0),
             .resources = std.AutoHashMap(u32, Resource2D).init(alloc),
             .memory_bytes_limit = memory_bytes_limit,
             .memory_bytes_used = 0,
@@ -956,6 +958,10 @@ pub const Gpu = struct {
 
     pub fn presentationGeneration(self: *const Gpu) u64 {
         return self.presentation_generation.load(.acquire);
+    }
+
+    pub fn controlCommandCount(self: *const Gpu) u64 {
+        return self.control_commands.load(.acquire);
     }
 
     pub const CursorView = struct {
@@ -1222,6 +1228,10 @@ pub const Gpu = struct {
 
         const header = std.mem.bytesToValue(CtrlHeader, req[0..@sizeOf(CtrlHeader)]);
         const cmd_type: CmdType = @enumFromInt(header.type);
+        const commands = self.control_commands.fetchAdd(1, .release);
+        if (commands == 0) {
+            log.info("first control command: opcode=0x{x}", .{header.type});
+        }
 
         var resp_type: CmdType = .resp_ok_nodata;
         var resp_len: u32 = @sizeOf(CtrlHeader);
@@ -1521,8 +1531,18 @@ pub const Gpu = struct {
                 return .resp_err_invalid_parameter;
             }
         }
+        const previous_resource_id = self.scanout_resource_id;
         self.scanout_resource_id = cmd.resource_id;
         self.scanout_rect = cmd.r;
+        if (previous_resource_id == 0 and cmd.resource_id != 0) {
+            log.info("scanout active: resource={} rect={}x{}+{}+{}", .{
+                cmd.resource_id,
+                cmd.r.width,
+                cmd.r.height,
+                cmd.r.x,
+                cmd.r.y,
+            });
+        }
         if (cmd.resource_id != 0 and !self.resources.contains(cmd.resource_id)) {
             self.refresh3dScanout();
         }
