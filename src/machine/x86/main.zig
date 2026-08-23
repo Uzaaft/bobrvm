@@ -619,7 +619,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             2,
-            0x0002,
             block.transport.device_features,
             1,
             @sizeOf(virtio.blk.Config),
@@ -667,7 +666,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             2,
-            0x0002,
             block.transport.device_features,
             1,
             @sizeOf(virtio.blk.Config),
@@ -701,7 +699,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             1,
-            0x0001,
             net.transport.device_features,
             2,
             @sizeOf(virtio.net.Config),
@@ -786,7 +783,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             16,
-            0x0010,
             gpu.transport.device_features,
             2,
             @sizeOf(virtio.gpu.Config),
@@ -845,7 +841,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             9,
-            0x0009,
             share.transport.device_features,
             1,
             2 + share.tag.len,
@@ -871,7 +866,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             4,
-            0x0004,
             rng.transport.device_features,
             1,
             0,
@@ -901,7 +895,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             25,
-            0x0019,
             sound.transport.device_features,
             @intCast(sound.transport.queues.len),
             @sizeOf(virtio.snd.Config),
@@ -936,7 +929,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             3,
-            0x0003,
             console.transport.device_features,
             @intCast(console.transport.queues.len),
             @sizeOf(virtio.console.Config),
@@ -1142,7 +1134,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             allocator,
             18,
-            0x0012,
             input.transport.device_features,
             2,
             @sizeOf(virtio.input.Config),
@@ -3574,7 +3565,7 @@ test "block notification address follows PCI BAR relocation" {
 }
 
 test "PCI interrupt line follows firmware assignment with direct boot fallback" {
-    const device = try pci.VirtioPciDevice.init(std.testing.allocator, 16, 0x0010, 0, 2, 0);
+    const device = try pci.VirtioPciDevice.init(std.testing.allocator, 16, 0, 2, 0);
     defer device.deinit();
 
     try std.testing.expectEqual(pci_gpu_irq, pciInterruptLine(device, pci_gpu_irq));

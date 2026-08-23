@@ -1141,7 +1141,6 @@ test "snapshot: twelve-queue PCI device roundtrip" {
     const device = try pci.VirtioPciDevice.init(
         testing.allocator,
         3,
-        0x0003,
         1 << 1,
         queue_count,
         config_bytes,
@@ -1167,7 +1166,6 @@ test "snapshot: twelve-queue PCI device roundtrip" {
     const restored = try pci.VirtioPciDevice.init(
         testing.allocator,
         3,
-        0x0003,
         1 << 1,
         queue_count,
         config_bytes,

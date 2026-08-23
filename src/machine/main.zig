@@ -2963,7 +2963,6 @@ pub const Machine = struct {
         const device = try pci.VirtioPciDevice.init(
             self.alloc,
             2,
-            0x0002,
             blk_features,
             1,
             @sizeOf(virtio.blk.Config),
@@ -2990,7 +2989,6 @@ pub const Machine = struct {
         self.pci_gpu = try pci.VirtioPciDevice.init(
             self.alloc,
             16,
-            0x0010,
             gpu_dev.transport.device_features,
             2,
             @sizeOf(virtio.gpu.Config),

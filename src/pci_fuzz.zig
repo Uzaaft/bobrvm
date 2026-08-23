@@ -78,7 +78,7 @@ fn modelPciWrite(config: []u8, offset: u12, size: u8, value: u64) ConfigWriteEff
 fn checkPciConfig(smith: *testing.Smith) !void {
     var legacy = ecam.PciDevice.initVirtioBlock(ecam.PCI_MMIO_BASE);
     var legacy_model = legacy.config;
-    const modern = try virtio_pci.VirtioPciDevice.init(testing.allocator, 2, 2, 0, 2, 64);
+    const modern = try virtio_pci.VirtioPciDevice.init(testing.allocator, 2, 0, 2, 64);
     defer modern.deinit();
     var modern_model = modern.config;
     var modern_bar0: u32 = 0;
