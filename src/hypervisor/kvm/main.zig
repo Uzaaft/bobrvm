@@ -7,6 +7,7 @@ const std = @import("std");
 const assert = @import("../../quirks.zig").inlineAssert;
 
 pub const c = @cImport({
+    @cUndef("_FORTIFY_SOURCE");
     @cInclude("fcntl.h");
     @cInclude("linux/kvm.h");
     @cInclude("sys/eventfd.h");

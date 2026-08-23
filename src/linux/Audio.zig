@@ -11,6 +11,7 @@ const global = @import("../global.zig");
 const snd = @import("../virtio/snd.zig");
 
 const c = @cImport({
+    @cUndef("_FORTIFY_SOURCE");
     @cInclude("alsa/asoundlib.h");
 });
 

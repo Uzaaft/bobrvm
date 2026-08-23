@@ -13,12 +13,13 @@
   pkg-config,
   virglrenderer,
   wrapGAppsHook4,
-  zig,
+  zig_0_16,
   optimize ? "ReleaseFast",
+  revision ? "dirty",
 }:
 stdenv.mkDerivation (finalAttrs: {
   pname = "bobrvm";
-  version = "0.1.0";
+  version = "0.1.0-dev+${revision}-nix";
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -41,7 +42,7 @@ stdenv.mkDerivation (finalAttrs: {
       ]);
   };
 
-  zigDeps = zig.fetchDeps {
+  zigDeps = zig_0_16.fetchDeps {
     inherit (finalAttrs) pname version src;
     hash = "sha256-8Jxd6eCAVre82oRiAkAh0jS7AxBFTGXMEIhHxDJhupI=";
   };
@@ -54,7 +55,7 @@ stdenv.mkDerivation (finalAttrs: {
     [
       pkg-config
       autoPatchelfHook
-      zig
+      zig_0_16
     ]
     ++ lib.optionals stdenv.hostPlatform.isLinux [
       gobject-introspection
@@ -72,6 +73,7 @@ stdenv.mkDerivation (finalAttrs: {
     ];
 
   dontConfigure = true;
+  dontSetZigDefaultFlags = true;
   dontUseZigBuild = true;
 
   buildPhase = ''

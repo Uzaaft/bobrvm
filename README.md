@@ -39,7 +39,10 @@ brew install --cask bobrvm
 nix develop
 nix build              # release library
 nix build .#debug       # debug library
+nix build .#releasesafe # release build with safety checks
 nix build .#test        # Zig tests
+nix run .#              # run the Linux GTK application
+nix run .#cli -- help   # run the headless Linux CLI
 
 zig build              # library in the development shell
 zig build run          # build and run the native app with terminal logging

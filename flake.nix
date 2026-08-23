@@ -2,14 +2,31 @@
   description = "🦫vm";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz";
 
-    zig-overlay = {
-      url = "github:mitchellh/zig-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
+    flake-compat = {
+      url = "github:edolstra/flake-compat";
+      flake = false;
     };
 
-    ziglint.url = "github:uzaaft/ziglint-nix";
+    systems = {
+      url = "github:nix-systems/default";
+      flake = false;
+    };
+
+    zig = {
+      url = "github:mitchellh/zig-overlay";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        flake-compat.follows = "flake-compat";
+        systems.follows = "systems";
+      };
+    };
+
+    ziglint = {
+      url = "github:uzaaft/ziglint-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     zon2nix = {
       url = "github:jcollie/zon2nix?ref=main";
@@ -20,90 +37,116 @@
   outputs = {
     self,
     nixpkgs,
-    zig-overlay,
+    zig,
     ziglint,
     zon2nix,
+    ...
   }: let
     inherit (nixpkgs) lib;
 
-    hostPlatforms = [
+    supportedHostPlatforms = [
       "aarch64-darwin"
       "x86_64-linux"
     ];
+    zigPlatforms = lib.attrNames zig.packages;
+    hostPlatforms =
+      lib.filter
+      (system: builtins.elem system supportedHostPlatforms)
+      zigPlatforms;
+    linuxHostPlatforms =
+      lib.filter
+      (system: (lib.systems.elaborate system).isLinux)
+      hostPlatforms;
     guestPlatforms = ["aarch64-linux"];
+
+    allowBobrvm = package:
+      builtins.elem (lib.getName package) [
+        "bobrvm"
+        "bobrvm-tools"
+      ];
+    pkgsFor = system:
+      import nixpkgs {
+        inherit system;
+        overlays = [ziglint.overlays.default];
+        config.allowUnfreePredicate = allowBobrvm;
+      };
     forPlatforms = platforms: function:
-      lib.genAttrs platforms (system:
-        function (import nixpkgs {
-          inherit system;
-          overlays = [ziglint.overlays.default];
-          config.allowUnfreePredicate = package:
-            lib.getName package == "bobrvm";
-        }));
+      lib.genAttrs platforms (system: function (pkgsFor system));
+
+    revision = self.shortRev or self.dirtyShortRev or "dirty";
+    mkPackage = pkgs: optimize:
+      pkgs.callPackage ./nix/package.nix {
+        inherit optimize revision;
+      };
+    mkOverlay = optimize: final: _: {
+      bobrvm = mkPackage final optimize;
+    };
   in {
-    packages =
-      (forPlatforms hostPlatforms (pkgs: let
-        zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
-        zigDeps = pkgs.callPackage ./build.zig.zon.nix {
-          name = "bobrvm-zig-deps";
-          zig_0_16 = zig;
-        };
-        package = optimize:
-          pkgs.callPackage ./nix/package.nix {
-            inherit optimize zig;
-          };
-      in
-        rec {
-          bobrvm-debug = package "Debug";
-          bobrvm-releasefast = package "ReleaseFast";
-          bobrvm = bobrvm-releasefast;
-          debug = bobrvm-debug;
-          default = bobrvm;
-
-          deps = zigDeps;
-          framework-deps = bobrvm.zigDeps;
-
-          test = pkgs.callPackage ./nix/test.nix {inherit zig;};
-        }
-        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          linux-kvm-fixture = pkgs.callPackage ./nix/linux-kvm-fixture.nix {inherit zig;};
-        }))
-      // (forPlatforms guestPlatforms (pkgs: {
-        bobrvm-tools = pkgs.callPackage ./nix/guest-tools.nix {};
-      }));
-
-    apps = lib.genAttrs ["x86_64-linux"] (system: let
-      package = self.packages.${system}.default;
-    in rec {
-      default = gui;
-      gui = {
-        type = "app";
-        program = "${package}/bin/bobrvm-gtk";
-      };
-      cli = {
-        type = "app";
-        program = "${package}/bin/bobrvm";
-      };
-    });
-
     devShells = forPlatforms hostPlatforms (pkgs: {
       default = pkgs.callPackage ./nix/devShell.nix {
-        zig = zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
+        zig = zig.packages.${pkgs.stdenv.hostPlatform.system}."0.16.0";
         inherit zon2nix;
       };
     });
 
+    packages = builtins.foldl' lib.recursiveUpdate {} [
+      (forPlatforms hostPlatforms (pkgs: let
+        zigCompiler = pkgs.zig_0_16;
+        zigDeps = pkgs.callPackage ./build.zig.zon.nix {
+          name = "bobrvm-zig-deps";
+        };
+      in
+        rec {
+          bobrvm-debug = mkPackage pkgs "Debug";
+          bobrvm-releasesafe = mkPackage pkgs "ReleaseSafe";
+          bobrvm-releasefast = mkPackage pkgs "ReleaseFast";
+
+          bobrvm = bobrvm-releasefast;
+          default = bobrvm;
+
+          debug = bobrvm-debug;
+          releasesafe = bobrvm-releasesafe;
+          releasefast = bobrvm-releasefast;
+          deps = zigDeps;
+          framework-deps = bobrvm.zigDeps;
+          test = pkgs.callPackage ./nix/test.nix {zig = zigCompiler;};
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          linux-kvm-fixture = pkgs.callPackage ./nix/linux-kvm-fixture.nix {
+            zig = zigCompiler;
+          };
+        }))
+      (forPlatforms guestPlatforms (pkgs: {
+        bobrvm-tools = pkgs.callPackage ./nix/guest-tools.nix {};
+      }))
+    ];
+
+    apps = forPlatforms linuxHostPlatforms (pkgs: let
+      package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      mkApp = program: description: {
+        type = "app";
+        program = "${package}/bin/${program}";
+        meta.description = description;
+      };
+    in rec {
+      default = gui;
+      gui = mkApp "bobrvm-gtk" "start the bobrvm virtual machine manager";
+      cli = mkApp "bobrvm" "run the headless bobrvm command-line interface";
+    });
+
     formatter = forPlatforms hostPlatforms (pkgs: pkgs.alejandra);
 
-    checks =
+    checks = builtins.foldl' lib.recursiveUpdate {} [
       (forPlatforms hostPlatforms (pkgs: {
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) test;
       }))
-      // (forPlatforms guestPlatforms (pkgs: let
-        guestSystem = nixpkgs.lib.nixosSystem {
+      (forPlatforms guestPlatforms (pkgs: let
+        guestSystem = lib.nixosSystem {
           system = pkgs.stdenv.hostPlatform.system;
           modules = [
             self.nixosModules.guest
             {
+              nixpkgs.config.allowUnfreePredicate = allowBobrvm;
               virtualisation.bobrvm.guest = {
                 enable = true;
                 management.enable = true;
@@ -128,7 +171,15 @@
           pkgs.runCommand "bobrvm-guest-module-check" {} ''
             touch "$out"
           '';
-      }));
+      }))
+    ];
+
+    overlays = {
+      default = self.overlays.releasefast;
+      releasefast = mkOverlay "ReleaseFast";
+      releasesafe = mkOverlay "ReleaseSafe";
+      debug = mkOverlay "Debug";
+    };
 
     nixosModules = rec {
       guest = import ./nix/guest-module.nix;
