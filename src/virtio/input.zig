@@ -155,6 +155,12 @@ pub const KeyCode = enum(u16) {
     _,
 };
 
+pub const KeyAction = enum(i32) {
+    release = 0,
+    press = 1,
+    repeat = 2,
+};
+
 /// Input event (evdev format, 8 bytes for virtio).
 pub const InputEvent = extern struct {
     type: u16,
@@ -294,10 +300,15 @@ pub const Input = struct {
 
     /// Inject a key event.
     pub fn injectKey(self: *Input, keycode: u16, pressed: bool) !void {
+        try self.injectKeyAction(keycode, if (pressed) .press else .release);
+    }
+
+    /// Inject a key event while preserving the evdev repeat value.
+    pub fn injectKeyAction(self: *Input, keycode: u16, action: KeyAction) !void {
         try self.queueEvent(.{
             .type = @intFromEnum(EventType.key),
             .code = keycode,
-            .value = if (pressed) 1 else 0,
+            .value = @intFromEnum(action),
         });
         try self.queueSyn();
     }
@@ -696,6 +707,16 @@ test "Input inject key" {
     try std.testing.expectEqual(@as(usize, 0), counted.allocations);
     try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
     try std.testing.expectEqual(@as(usize, 2), input.pending_count);
+}
+
+test "Input preserves key repeat events" {
+    const input = try Input.init(std.testing.allocator, .keyboard);
+    defer input.deinit();
+
+    try input.injectKeyAction(@intFromEnum(KeyCode.a), .repeat);
+
+    try std.testing.expectEqual(@as(usize, 2), input.pending_count);
+    try std.testing.expectEqual(@as(i32, 2), input.pending_events[0].value);
 }
 
 test "Input inject absolute position without allocation" {

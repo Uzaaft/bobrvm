@@ -413,53 +413,7 @@ fn testKeyLoop(hw: *machine.Machine) void {
 
 /// Map an ASCII character to an evdev keycode (unshifted keys only).
 fn asciiToEvdev(char: u8) u16 {
-    return switch (char) {
-        'a' => 30,
-        'b' => 48,
-        'c' => 46,
-        'd' => 32,
-        'e' => 18,
-        'f' => 33,
-        'g' => 34,
-        'h' => 35,
-        'i' => 23,
-        'j' => 36,
-        'k' => 37,
-        'l' => 38,
-        'm' => 50,
-        'n' => 49,
-        'o' => 24,
-        'p' => 25,
-        'q' => 16,
-        'r' => 19,
-        's' => 31,
-        't' => 20,
-        'u' => 22,
-        'v' => 47,
-        'w' => 17,
-        'x' => 45,
-        'y' => 21,
-        'z' => 44,
-        '1' => 2,
-        '2' => 3,
-        '3' => 4,
-        '4' => 5,
-        '5' => 6,
-        '6' => 7,
-        '7' => 8,
-        '8' => 9,
-        '9' => 10,
-        '0' => 11,
-        ' ' => 57,
-        '\n' => 28,
-        '-' => 12,
-        '=' => 13,
-        '/' => 53,
-        '.' => 52,
-        ',' => 51,
-        ';' => 39,
-        else => 0,
-    };
+    return KittyInput.evdevForCodepoint(char);
 }
 
 /// Exercise the guest-agent channel (BOBRVM_TEST_QGA debug hook).
@@ -633,16 +587,15 @@ fn restoreTermios() void {
 fn inputLoop(hw: *machine.Machine, is_tty: bool, kitty_mouse: bool) void {
     var buf: [1024]u8 = undefined;
     var decoder: KittyInput = .{};
-    var host_command_pending = false;
+    var host_input: HostInputState = .{};
     while (true) {
-        // A lone Escape is ordinary guest input, but it is also the start of
-        // every mouse report. Bound that ambiguity instead of buffering it
-        // until another key happens to arrive.
+        // Bound incomplete CSI input so a truncated mouse or key report does
+        // not remain buffered until another event happens to arrive.
         if (kitty_mouse and decoder.hasPending() and
             !stdinReady(kitty_sequence_timeout_ms))
         {
             if (decoder.flushPending()) |bytes| {
-                if (!routeHostInput(hw, bytes, &host_command_pending)) return;
+                if (!routeHostInput(hw, bytes, &host_input)) return;
             }
             continue;
         }
@@ -651,7 +604,7 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool, kitty_mouse: bool) void {
         if (n == 0) {
             if (kitty_mouse) {
                 if (decoder.flushPending()) |bytes| {
-                    _ = routeHostInput(hw, bytes, &host_command_pending);
+                    _ = routeHostInput(hw, bytes, &host_input);
                 }
             }
             // EOF. Interactive runs keep the VM alive (stdin may just be
@@ -673,11 +626,11 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool, kitty_mouse: bool) void {
         }
 
         if (kitty_mouse) {
-            if (!routeKittyInput(hw, &decoder, buf[0..n], &host_command_pending)) return;
+            if (!routeKittyInput(hw, &decoder, buf[0..n], &host_input)) return;
             continue;
         }
 
-        if (!routeHostInput(hw, buf[0..n], &host_command_pending)) return;
+        if (!routeHostInput(hw, buf[0..n], &host_input)) return;
     }
 }
 
@@ -694,19 +647,19 @@ fn routeKittyInput(
     hw: *machine.Machine,
     decoder: *KittyInput,
     bytes: []const u8,
-    host_command_pending: *bool,
+    host_input: *HostInputState,
 ) bool {
     var offset: usize = 0;
     while (offset < bytes.len) {
         if (!decoder.hasPending()) {
             const relative = std.mem.indexOfScalar(u8, bytes[offset..], '\x1b') orelse {
-                return routeHostInput(hw, bytes[offset..], host_command_pending);
+                return routeHostInput(hw, bytes[offset..], host_input);
             };
             if (relative > 0) {
                 if (!routeHostInput(
                     hw,
                     bytes[offset..][0..relative],
-                    host_command_pending,
+                    host_input,
                 )) return false;
                 offset += relative;
                 continue;
@@ -716,8 +669,9 @@ fn routeKittyInput(
         switch (decoder.feed(bytes[offset])) {
             .pending => {},
             .forward => |forwarded| {
-                if (!routeHostInput(hw, forwarded, host_command_pending)) return false;
+                if (!routeHostInput(hw, forwarded, host_input)) return false;
             },
+            .key => |event| if (!routeKittyKey(hw, event, host_input)) return false,
             .mouse => |event| injectKittyMouse(hw, event),
         }
         offset += 1;
@@ -725,16 +679,96 @@ fn routeKittyInput(
     return true;
 }
 
+const HostInputState = struct {
+    command_pending: bool = false,
+    suppressed_release: u16 = 0,
+};
+
+fn routeKittyKey(
+    hw: *machine.Machine,
+    event: KittyInput.KeyEvent,
+    host_input: *HostInputState,
+) bool {
+    if (event.evdev_code == host_input.suppressed_release) {
+        if (event.action == .release) {
+            host_input.suppressed_release = 0;
+            return true;
+        }
+        if (event.action == .repeat) return true;
+    }
+
+    if (event.action == .press and isKittyControlKey(event, 'b')) {
+        host_input.suppressed_release = event.evdev_code;
+        if (host_input.command_pending) {
+            host_input.command_pending = false;
+            hw.injectKeyAction(event.evdev_code, .press);
+            hw.injectKeyAction(event.evdev_code, .release);
+        } else {
+            host_input.command_pending = true;
+        }
+        return true;
+    }
+
+    if (host_input.command_pending and event.action == .press and !isKittyModifier(event)) {
+        host_input.command_pending = false;
+        host_input.suppressed_release = event.evdev_code;
+        if (classifyKittyHostCommand(event)) |command| {
+            executeHostCommand(hw, command);
+        } else {
+            log.warn("unknown host command key U+{x}; Ctrl-B ? lists commands", .{
+                event.codepoint,
+            });
+        }
+        return true;
+    }
+
+    if (event.action == .press and isKittyControlKey(event, ']')) {
+        restoreTermios();
+        std.posix.raise(std.posix.SIG.TERM) catch {};
+        return false;
+    }
+
+    injectKittyKey(hw, event);
+    return true;
+}
+
+fn injectKittyKey(hw: *machine.Machine, event: KittyInput.KeyEvent) void {
+    if (event.evdev_code == 0) return;
+    const action: machine.KeyAction = switch (event.action) {
+        .press => .press,
+        .repeat => .repeat,
+        .release => .release,
+    };
+    hw.injectKeyAction(event.evdev_code, action);
+}
+
+fn isKittyControlKey(event: KittyInput.KeyEvent, key: u8) bool {
+    if (event.modifiers & KittyInput.KeyEvent.Modifier.control == 0) return false;
+    if (event.codepoint > std.math.maxInt(u8)) return false;
+    return std.ascii.toLower(@as(u8, @intCast(event.codepoint))) == std.ascii.toLower(key);
+}
+
+fn isKittyModifier(event: KittyInput.KeyEvent) bool {
+    return switch (event.evdev_code) {
+        29, 42, 54, 56, 97, 100, 125, 126 => true,
+        else => event.codepoint >= 57441 and event.codepoint <= 57454,
+    };
+}
+
+fn classifyKittyHostCommand(event: KittyInput.KeyEvent) ?HostCommand {
+    return classifyHostCommand(event.commandByte() orelse return null);
+}
+
 fn routeHostInput(
     hw: *machine.Machine,
     bytes: []const u8,
-    host_command_pending: *bool,
+    host_input: *HostInputState,
 ) bool {
     var guest_start: usize = 0;
     for (bytes, 0..) |byte, i| {
-        if (host_command_pending.*) {
+        if (host_input.command_pending) {
             if (guest_start < i) hw.injectConsoleInput(bytes[guest_start..i]);
-            host_command_pending.* = false;
+            host_input.command_pending = false;
             if (classifyHostCommand(byte)) |command| {
                 executeHostCommand(hw, command);
             } else {
@@ -746,7 +780,7 @@ fn routeHostInput(
 
         if (byte == host_command_prefix) {
             if (guest_start < i) hw.injectConsoleInput(bytes[guest_start..i]);
-            host_command_pending.* = true;
+            host_input.command_pending = true;
             guest_start = i + 1;
             continue;
         }
@@ -806,6 +840,7 @@ var suspend_target: ?[]const u8 = null;
 const HostCommand = enum {
     literal_prefix,
     help,
+    ctrl_alt_delete,
     status,
     shutdown,
     reboot,
@@ -818,6 +853,7 @@ fn classifyHostCommand(byte: u8) ?HostCommand {
     return switch (byte) {
         host_command_prefix => .literal_prefix,
         '?' => .help,
+        'd' => .ctrl_alt_delete,
         'p' => .status,
         's' => .shutdown,
         'r' => .reboot,
@@ -832,9 +868,11 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
     switch (command) {
         .literal_prefix => hw.injectConsoleInput(&.{host_command_prefix}),
         .help => log.info(
-            "host commands: p=status s=shutdown r=reboot t=sync-time f=trim z=suspend+quit Ctrl-B=literal",
+            "host commands: d=ctrl-alt-delete p=status s=shutdown r=reboot " ++
+                "t=sync-time f=trim z=suspend+quit Ctrl-B=literal",
             .{},
         ),
+        .ctrl_alt_delete => injectCtrlAltDelete(hw),
         .status => log.info("guest tools: {s}, capabilities=0x{x}", .{
             @tagName(hw.guestToolsStatus()),
             hw.guestToolsCapabilities(),
@@ -859,8 +897,27 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
     }
 }
 
+const ctrl_alt_delete = [_]struct {
+    keycode: u16,
+    action: machine.KeyAction,
+}{
+    .{ .keycode = 29, .action = .press }, // KEY_LEFTCTRL
+    .{ .keycode = 56, .action = .press }, // KEY_LEFTALT
+    .{ .keycode = 111, .action = .press }, // KEY_DELETE
+    .{ .keycode = 111, .action = .release },
+    .{ .keycode = 56, .action = .release },
+    .{ .keycode = 29, .action = .release },
+};
+
+fn injectCtrlAltDelete(hw: *machine.Machine) void {
+    for (ctrl_alt_delete) |event| {
+        hw.injectKeyAction(event.keycode, event.action);
+    }
+}
+
 test "host console command decoder" {
     try std.testing.expectEqual(HostCommand.help, classifyHostCommand('?').?);
+    try std.testing.expectEqual(HostCommand.ctrl_alt_delete, classifyHostCommand('d').?);
     try std.testing.expectEqual(HostCommand.status, classifyHostCommand('p').?);
     try std.testing.expectEqual(HostCommand.shutdown, classifyHostCommand('s').?);
     try std.testing.expectEqual(HostCommand.reboot, classifyHostCommand('r').?);
@@ -869,6 +926,51 @@ test "host console command decoder" {
     try std.testing.expectEqual(HostCommand.suspend_quit, classifyHostCommand('z').?);
     try std.testing.expectEqual(HostCommand.literal_prefix, classifyHostCommand(0x02).?);
     try std.testing.expect(classifyHostCommand('x') == null);
+}
+
+test "Ctrl-Alt-Delete presses modifiers before releasing them" {
+    const keycodes = [_]u16{ 29, 56, 111, 111, 56, 29 };
+    const actions = [_]machine.KeyAction{
+        .press,
+        .press,
+        .press,
+        .release,
+        .release,
+        .release,
+    };
+    for (ctrl_alt_delete, keycodes, actions) |event, keycode, action| {
+        try std.testing.expectEqual(keycode, event.keycode);
+        try std.testing.expectEqual(action, event.action);
+    }
+}
+
+test "Kitty host shortcuts use physical and shifted key codes" {
+    const prefix: KittyInput.KeyEvent = .{
+        .evdev_code = 48,
+        .codepoint = 'b',
+        .shifted_codepoint = null,
+        .modifiers = KittyInput.KeyEvent.Modifier.control,
+        .action = .press,
+    };
+    try std.testing.expect(isKittyControlKey(prefix, 'b'));
+
+    const help: KittyInput.KeyEvent = .{
+        .evdev_code = 53,
+        .codepoint = '/',
+        .shifted_codepoint = '?',
+        .modifiers = KittyInput.KeyEvent.Modifier.shift,
+        .action = .press,
+    };
+    try std.testing.expectEqual(HostCommand.help, classifyKittyHostCommand(help).?);
+
+    const modifier: KittyInput.KeyEvent = .{
+        .evdev_code = 42,
+        .codepoint = 57441,
+        .shifted_codepoint = null,
+        .modifiers = KittyInput.KeyEvent.Modifier.shift,
+        .action = .press,
+    };
+    try std.testing.expect(isKittyModifier(modifier));
 }
 
 fn consoleOutput(data: []const u8, userdata: ?*anyopaque) void {

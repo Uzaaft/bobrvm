@@ -33,13 +33,16 @@ const payload_bytes_max: usize = 3072;
 const thread_stack_size_bytes: usize = 1024 * 1024;
 const frame_interval_ns: i96 = std.time.ns_per_s / 60;
 
+// Push modes 1|2|4|8 after entering the alternate screen so Ghostty reports
+// physical keys and releases without changing the main screen's mode stack.
+// https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement
 const terminal_enter =
-    "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l" ++
+    "\x1b[?1049h\x1b[>15u\x1b[2J\x1b[H\x1b[?25l" ++
     "\x1b[?1003h\x1b[?1006h\x1b[?1016h";
 // The leading ST also terminates a transmission interrupted by a signal.
 const terminal_leave =
     "\x1b\\\x1b[?1016l\x1b[?1006l\x1b[?1003l" ++
-    "\x1b[?25h\x1b[?1049l";
+    "\x1b[<u\x1b[?25h\x1b[?1049l";
 
 pub const StartError = Allocator.Error || std.Thread.SpawnError || error{
     NotATerminal,

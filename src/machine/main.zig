@@ -29,6 +29,7 @@ const dtb = @import("dtb.zig");
 const agent = @import("../agent/main.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const GuestToolsStatus = agent.native.Status;
+pub const KeyAction = virtio.input.KeyAction;
 
 const log = std.log.scoped(.machine);
 const ID_AA64PFR0_GIC_SHIFT: u6 = 24;
@@ -726,8 +727,13 @@ pub const Machine = struct {
 
     /// Inject a keyboard event (evdev keycode). Thread-safe.
     pub fn injectKey(self: *Machine, keycode: u16, pressed: bool) void {
+        self.injectKeyAction(keycode, if (pressed) .press else .release);
+    }
+
+    /// Inject a keyboard event with an explicit evdev action. Thread-safe.
+    pub fn injectKeyAction(self: *Machine, keycode: u16, action: KeyAction) void {
         const kbd = self.keyboard orelse return;
-        kbd.injectKey(keycode, pressed) catch {};
+        kbd.injectKeyAction(keycode, action) catch {};
         self.kickCpu(0);
     }
 
