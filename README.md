@@ -169,6 +169,13 @@ Protocol: add `{"mcpServers": {"bobrvm": {"command": "bobrvm", "args":
 
 Use `--disk2 <image> --disk2-writable` for a persistent second disk. Add a
 display device with `--gpu` or `--virgl`; use `--display WxH` to set its size.
+In terminals that support KIP, `--kitty-display` streams the scanout into
+a full-terminal Kitty graphics placement. Bobrvm keeps two Kitty
+animation frames and alternately updates the hidden frame before selecting
+it for display, avoiding placement deletion and unbounded terminal image
+storage. Frame callbacks are paced at up to 60 FPS, coalesced, converted
+with portable SIMD, and zlib-compressed off the vCPU thread. Press
+<kbd>Ctrl</kbd>+<kbd>]</kbd> to quit as usual.
 The build signs the CLI with the Hypervisor.framework entitlement.
 
 For a headless Linux guest:
