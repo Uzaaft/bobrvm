@@ -1,0 +1,27 @@
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index c9ccf8ad9816..1fc6162b0d4a 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8588,6 +8588,10 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	if (wake_flags & WF_TTWU) {
+ 		record_wakee(p);
+ 
++		if (sched_feat(WA_CURRENT) && p->last_wakee == current &&
++		    cpumask_test_cpu(cpu, p->cpus_ptr))
++			return cpu;
++
+ 		if ((wake_flags & WF_CURRENT_CPU) &&
+ 		    cpumask_test_cpu(cpu, p->cpus_ptr))
+ 			return cpu;
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 45f80f554b2c..6f3fc6d10608 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -112,6 +112,7 @@ SCHED_FEAT(LB_MIN, false)
+ SCHED_FEAT(ATTACH_AGE_LOAD, true)
+ 
+ SCHED_FEAT(WA_IDLE, true)
++SCHED_FEAT(WA_CURRENT, true)
+ SCHED_FEAT(WA_WEIGHT, true)
+ SCHED_FEAT(WA_BIAS, true)
+ 

@@ -9,6 +9,7 @@ KERNEL=$REPO/tests/integration/alpine/out/Image
 INITRD=$REPO/tests/integration/alpine/out/initramfs-minimal
 WORK=${EXEC_WORKDIR:-$(mktemp -d /tmp/bobrvm-exec.XXXXXX)}
 PROJ=$WORK/proj
+export XDG_CONFIG_HOME=$WORK/config
 
 [ -x "$BIN" ] || { echo "SKIP: build bobrvm first (zig build)"; exit 1; }
 [ -f "$KERNEL" ] || { echo "SKIP: alpine assets missing"; exit 1; }
@@ -22,13 +23,11 @@ kernel = "$KERNEL"
 initrd = "$INITRD"
 share = false
 EOF
-rm -rf "$HOME"/.config/bobrvm/projects/proj-*
-
 # Warm state parked at an idle prompt (a foreground process would
 # swallow the console-exec input).
 ( sleep 18 ) | BOBRVM_TEST_SUSPEND=13:"$PROJ/suspend.img" \
   env -C "$PROJ" "$BIN" up >/dev/null 2>&1
-STATE_DIR=$(ls -d "$HOME"/.config/bobrvm/projects/proj-*)
+STATE_DIR=$(ls -d "$XDG_CONFIG_HOME"/bobrvm/projects/proj-*)
 [ -n "$STATE_DIR" ] && [ -f "$PROJ/suspend.img" ] || { echo "FAIL: warm boot"; exit 1; }
 mv "$PROJ/suspend.img" "$STATE_DIR/warm.img"
 cd "$PROJ"
@@ -48,5 +47,5 @@ echo "$OUT" | grep -q "hello world" || fail "multi-word args ($OUT)"
 OUT=$("$BIN" exec -- cat /mark 2>&1)
 echo "$OUT" | grep -qiE "no such|can't open" || fail "clones are isolated ($OUT)"
 
-rm -rf "$WORK" "$STATE_DIR"
+rm -rf "$WORK"
 echo "EXEC: PASS"

@@ -9,6 +9,7 @@ KERNEL=$REPO/tests/integration/alpine/out/Image
 INITRD=$REPO/tests/integration/alpine/out/initramfs-minimal
 WORK=${UP_DETACH_WORKDIR:-$(mktemp -d /tmp/bobrvm-up-detach.XXXXXX)}
 PROJ=$WORK/proj
+export XDG_CONFIG_HOME=$WORK/config
 
 [ -x "$BIN" ] || { echo "SKIP: build bobrvm first (zig build)"; exit 1; }
 [ -f "$KERNEL" ] || { echo "SKIP: alpine assets missing"; exit 1; }
@@ -22,8 +23,6 @@ kernel = "$KERNEL"
 initrd = "$INITRD"
 share = false
 EOF
-rm -rf "$HOME"/.config/bobrvm/projects/proj-*
-
 fail() { echo "FAIL: $1"; exit 1; }
 cd "$PROJ"
 
@@ -38,11 +37,11 @@ sleep 10
 "$BIN" up --detach >/dev/null 2>&1 || fail "warm detached resume"
 sleep 3
 "$BIN" status | grep -q "running" || fail "status after resume"
-STATE_DIR=$(ls -d "$HOME"/.config/bobrvm/projects/proj-*)
+STATE_DIR=$(ls -d "$XDG_CONFIG_HOME"/bobrvm/projects/proj-*)
 grep -q "resuming warm state" "$STATE_DIR/console.log" || fail "resume was not warm"
 
 "$BIN" halt >/dev/null 2>&1 || fail "halt verb"
 "$BIN" status | grep -q "not running" || fail "status after halt"
 
-rm -rf "$WORK" "$STATE_DIR"
+rm -rf "$WORK"
 echo "UP-DETACH: PASS"

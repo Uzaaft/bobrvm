@@ -15,6 +15,12 @@ const vz = @import("vz.zig");
 
 const log = std.log.scoped(.cli);
 
+extern "c" fn setsid() std.c.pid_t;
+extern "c" fn getsid(pid: std.c.pid_t) std.c.pid_t;
+extern "c" fn kill(pid: std.c.pid_t, signal: c_int) c_int;
+
+const SIGTERM: c_int = 15;
+
 pub fn execute(
     alloc: Allocator,
     args: *std.process.Args.Iterator,
@@ -22,6 +28,7 @@ pub fn execute(
 ) !void {
     var fresh = false;
     var detach = false;
+    var detached_child = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
@@ -30,11 +37,14 @@ pub fn execute(
             fresh = true;
         } else if (std.mem.eql(u8, arg, "--detach") or std.mem.eql(u8, arg, "-d")) {
             detach = true;
+        } else if (std.mem.eql(u8, arg, "--detached-child")) {
+            detached_child = true;
         } else {
             log.err("unknown argument: {s}", .{arg});
             return error.InvalidArgument;
         }
     }
+    if (detached_child) try detachSession();
 
     // Everything project-related (paths, config strings) lives in one
     // arena that outlives the whole run; runner.run only borrows.
@@ -53,7 +63,33 @@ pub fn execute(
     };
 
     var proj = try project.load(arena, root);
-    try project.ensureStateDir(&proj);
+    return startProject(
+        alloc,
+        arena,
+        &proj,
+        fresh,
+        detach,
+        environ,
+        &.{ "up", "--detached-child" },
+    );
+}
+
+pub fn detachSession() !void {
+    if (setsid() < 0) return error.DetachFailed;
+}
+
+/// Start an already loaded project. `detached_args` are passed to the
+/// background copy after the parent records its pid and returns.
+pub fn startProject(
+    alloc: Allocator,
+    arena: Allocator,
+    proj: *project.Project,
+    fresh: bool,
+    detach: bool,
+    environ: std.process.Environ,
+    detached_args: []const []const u8,
+) !void {
+    try project.ensureStateDir(proj);
     log.info("project {s} ({s}); state in {s}", .{
         proj.config.name, proj.file_path, proj.state_dir,
     });
@@ -67,12 +103,12 @@ pub fn execute(
         }
     }
 
-    if (detach) return detachedUp(alloc, arena, &proj, environ);
+    if (detach) return detachedUp(alloc, arena, proj, environ, detached_args);
 
     if (proj.engine == .vz) {
         global.state.init();
         defer global.state.deinit();
-        return vz.upProject(arena, &proj);
+        return vz.upProject(arena, proj);
     }
 
     if (project.fileExists(proj.warm_image)) {
@@ -97,6 +133,7 @@ fn detachedUp(
     arena: Allocator,
     proj: *const project.Project,
     environ: std.process.Environ,
+    detached_args: []const []const u8,
 ) !void {
     const io_alloc = alloc;
     var io_impl = std.Io.Threaded.init(io_alloc, .{ .environ = environ });
@@ -112,14 +149,21 @@ fn detachedUp(
     const console_log = try std.Io.Dir.cwd().createFile(io, log_path, .{});
     defer console_log.close(io);
 
+    var child_argv = try arena.alloc([]const u8, detached_args.len + 1);
+    child_argv[0] = exe;
+    @memcpy(child_argv[1..], detached_args);
     const child = std.process.spawn(io, .{
-        .argv = &.{ exe, "up" },
+        .argv = child_argv,
         .stdin = .ignore,
         .stdout = .{ .file = console_log },
         .stderr = .{ .file = console_log },
     }) catch |err| {
         log.err("cannot start detached runner: {}", .{err});
         return error.Unexpected;
+    };
+    waitForDetached(io, child.id.?) catch |err| {
+        _ = kill(child.id.?, SIGTERM);
+        return err;
     };
     // Deliberately not waited or reaped: the runner outlives this
     // command and is reparented to init when we exit.
@@ -134,6 +178,18 @@ fn detachedUp(
         proj.config.name, child.id.?, log_path,
     });
     log.info("manage it with: bobrvm status | bobrvm suspend | bobrvm halt", .{});
+}
+
+fn waitForDetached(io: std.Io, pid: std.c.pid_t) !void {
+    var attempts: u8 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (getsid(pid) == pid) return;
+        std.Io.Clock.Duration.sleep(.{
+            .raw = .{ .nanoseconds = 10 * std.time.ns_per_ms },
+            .clock = .awake,
+        }, io) catch {};
+    }
+    return error.DetachFailed;
 }
 
 fn printHelp() void {
@@ -157,6 +213,8 @@ fn printHelp() void {
         \\  disk2 = "extra.iso"        disk2-writable = false
         \\  gpu = true                 virgl = true          sound = true
         \\  net = true                 forwards = ["2222:22"]
+        \\  docker = true              private Docker API socket
+        \\  docker-vsock = true        VZ virtio-vsock Docker transport
         \\  ssh-user = "root"          login user for bobrvm ssh
         \\  share = "dir" | false      (default: the project directory)
         \\  share-readonly = true      enforce the share read-only on the host

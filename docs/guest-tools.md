@@ -3,7 +3,8 @@
 The flake exposes an AArch64 Linux package and a NixOS module:
 
 - `packages.aarch64-linux.bobrvm-tools` contains `qemu-ga`, `spice-vdagent`,
-  `bobrvm-agentd`, `bobrvm-session-agent`, and `bobrvm-toolbox`.
+  `bobrvm-agentd`, `bobrvm-docker-proxy`, `bobrvm-session-agent`, and
+  `bobrvm-toolbox`.
 - `nixosModules.guest` installs the package, configures the selected services,
   and applies the Mesa Venus alignment patch without overriding Mesa globally.
 
@@ -26,6 +27,8 @@ Import the module from the same pinned bobrvm flake input used to build the host
             fileTransfer.enable = true;
             quiescedSnapshots.enable = true;
             sharedFolder.enable = true;
+            docker.enable = true;
+            docker.vsock.enable = true;
           };
         }
       ];
@@ -51,6 +54,8 @@ QGA command execution and file RPCs and therefore requires
 | Host-to-guest file delivery | `fileTransfer.enable` | bobrvm native agent |
 | Filesystem-consistent snapshots | `quiescedSnapshots.enable` | QGA fsfreeze |
 | Persistent host folder | `sharedFolder.enable` | virtio-9p |
+| Host Docker CLI and Compose | `docker.enable` | private host Unix socket |
+| Fast VZ Docker streams | `docker.vsock.enable` | virtio-vsock to guest Unix socket |
 
 The native file channel accepts one regular file at a time, uses acknowledged
 48 KiB chunks, and rejects traversal names and files larger than 16 GiB. Files
@@ -61,6 +66,26 @@ are never overwritten.
 The host folder has mount tag `host` and defaults to `/mnt/bobrvm`. Select the
 host directory in the macOS VM settings or pass `--share /absolute/path` to the
 CLI. Set `sharedFolder.readOnly = true` when the guest should not modify it.
+
+`docker.enable` installs and starts the guest Docker daemon. Enabling
+`docker.vsock.enable` also loads the virtio-vsock transport and starts the
+bounded `bobrvm-docker-proxy`; dockerd then listens only on `/run/docker.sock`.
+The module selects crun by default because the matched lifecycle experiment
+improved full container runs by 7.6–15.5%. Set `docker.runtime = "runc"` to
+retain Docker's conventional runtime.
+
+Configure one global guest under `~/.config/bobrvm/docker` with
+`engine = "vz"`, `docker = true`, and `docker-vsock = true`. Its private host
+Unix socket is available to Docker and Compose from every directory. Share a
+common host ancestor at the same absolute guest path so Compose bind mounts
+remain valid. Per-project Docker sockets and MiniNat port 2375 remain a
+compatibility path only when no global runtime is configured.
+
+Container bridge creation and teardown are sensitive to the guest kernel timer frequency. The
+guest module selects `CONFIG_HZ=300` together with the scheduler patch used by the measured Docker
+runtime. This preserved active container latency while reducing measured timer-driven background
+work; Linux still uses tickless idle. Keep the kernel, initramfs, and root modules on the exact same
+release.
 
 The user-session agent prefers the standardized `ext-data-control-v1` Wayland
 protocol and falls back to `wlr-data-control-unstable-v1`. It opens a dedicated

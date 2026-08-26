@@ -17,6 +17,7 @@ const config_policy = @import("../config.zig");
 const console_session = @import("../console/Session.zig");
 const global = @import("../global.zig");
 const GuestMemory = @import("../guest_memory.zig").GuestMemory;
+const net_compat = @import("../compat/net.zig");
 const thread_compat = @import("../compat/thread.zig");
 
 const hypervisor = @import("../hypervisor/main.zig");
@@ -34,6 +35,9 @@ pub const KeyAction = virtio.input.KeyAction;
 const log = std.log.scoped(.machine);
 const ID_AA64PFR0_GIC_SHIFT: u6 = 24;
 const ID_AA64PFR0_GIC_MASK: u64 = 0xF << ID_AA64PFR0_GIC_SHIFT;
+const CNTV_CTL_ENABLE: u64 = 1 << 0;
+const CNTV_CTL_IMASK: u64 = 1 << 1;
+const WFI_WAIT_ERROR_BACKSTOP_NS: u64 = 100 * std.time.ns_per_ms;
 
 // Darwin copy-on-write file clone (instant on APFS; snapshot substrate).
 extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: u32) c_int;
@@ -212,6 +216,10 @@ pub const MachineConfig = struct {
     /// stay valid until startSync() has initialized the devices.
     forwards: []const mininat.Forward = &.{},
 
+    /// Private host Docker socket forwarded to guest TCP port 2375.
+    /// The path must stay valid until the machine is deinitialized.
+    docker_socket_path: ?[]const u8 = null,
+
     /// Host directory exported to the guest via 9p (mount tag "host").
     /// The slice must stay valid until startSync() has initialized devices.
     shared_dir: ?[]const u8 = null,
@@ -352,6 +360,11 @@ const VcpuSnapRequest = struct {
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+const MachTimebase = struct {
+    numer: u32 = 1,
+    denom: u32 = 1,
+};
+
 /// Per-vCPU run state for the synchronous multi-threaded loop.
 const VcpuRunState = struct {
     pending_irq: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -368,11 +381,11 @@ const VcpuRunState = struct {
     /// Pending snapshot register operation (see VcpuSnapRequest).
     snap_request: std.atomic.Value(?*VcpuSnapRequest) = std.atomic.Value(?*VcpuSnapRequest).init(null),
 
-    /// WFI wait: the vCPU thread blocks here when the guest halts with no
-    /// deliverable interrupt; kickCpu signals it so device IRQs from
-    /// other threads wake it immediately instead of after the poll tick.
+    /// Pause and snapshot coordination. WFI uses wake_pipe because pipe
+    /// signals survive the signal-before-wait race and are async-signal-safe.
     wake_mutex: std.Io.Mutex = .init,
     wake_cond: std.Io.Condition = .init,
+    wake_pipe: net_compat.WakePipe = .{},
 };
 
 pub const Machine = struct {
@@ -399,6 +412,9 @@ pub const Machine = struct {
     /// set by restore so the guest's monotonic clock continues from
     /// the capture point instead of jumping by the suspend gap.
     vtimer_offset: u64 = 0,
+
+    /// Conversion from mach_absolute_time/CNTVCT ticks to nanoseconds.
+    mach_timebase: MachTimebase = .{},
 
     /// Virtio console device.
     console: ?*virtio.Console = null,
@@ -498,6 +514,10 @@ pub const Machine = struct {
     /// Running state.
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Durable notification for callers waiting through startup and restore.
+    /// The pipe preserves a transition that races with the wait itself.
+    start_pipe: net_compat.WakePipe = .{},
+
     /// Set before or during startup to prevent the vCPU loop from beginning.
     /// Embedded runtimes prepare this token before spawning the owning thread,
     /// so an immediate Stop cannot be lost before startSyncPrepared enters.
@@ -530,6 +550,7 @@ pub const Machine = struct {
             EmptyBootImage,
             RestoreFailed,
             StartCancelled,
+            WakePipeFailed,
         };
 
     pub fn init(alloc: Allocator, config: MachineConfig) Error!*Machine {
@@ -558,8 +579,21 @@ pub const Machine = struct {
             .alloc = alloc,
             .config = config,
             .cpu_states = cpu_states,
+            .mach_timebase = hostMachTimebase(),
         };
-        for (machine.cpu_states) |*state| state.* = .{};
+        machine.start_pipe = net_compat.WakePipe.init() catch
+            return error.WakePipeFailed;
+        errdefer machine.start_pipe.deinit();
+        var wake_pipes_initialized: usize = 0;
+        errdefer for (machine.cpu_states[0..wake_pipes_initialized]) |*state| {
+            state.wake_pipe.deinit();
+        };
+        for (machine.cpu_states) |*state| {
+            state.* = .{};
+            state.wake_pipe = net_compat.WakePipe.init() catch
+                return error.WakePipeFailed;
+            wake_pipes_initialized += 1;
+        }
 
         return machine;
     }
@@ -680,6 +714,8 @@ pub const Machine = struct {
 
         // Clean up hypervisor (vCPUs then VM)
         self.cleanupHypervisor();
+        for (self.cpu_states) |*state| state.wake_pipe.deinit();
+        self.start_pipe.deinit();
         const allocation_bytes = @sizeOf(Machine) + self.cpu_states.len * @sizeOf(VcpuRunState);
         self.cpu_states = &.{};
 
@@ -1002,6 +1038,10 @@ pub const Machine = struct {
     /// Start the machine.
     pub fn start(self: *Machine) Error!void {
         if (self.running.load(.acquire)) return;
+        errdefer {
+            self.stop_requested.store(true, .release);
+            self.start_pipe.signal();
+        }
 
         log.info("starting machine", .{});
 
@@ -1055,7 +1095,10 @@ pub const Machine = struct {
         // Start execution (vCPUs created on their threads)
         try self.runner.?.start();
 
-        self.running.store(true, .release);
+        if (!self.markRunning()) {
+            self.runner.?.stop();
+            return error.StartCancelled;
+        }
         log.info("machine started", .{});
     }
 
@@ -1080,13 +1123,14 @@ pub const Machine = struct {
 
     /// Stop the machine.
     /// Async-signal-safe stop request: only an atomic store and the
-    /// hv_vcpus_exit syscall — no locks, no allocation. Safe to call from
-    /// a signal handler; the vCPU loops observe running=false and unwind
-    /// (WFI-halted CPUs wake within their 1ms condvar timeout).
+    /// hv_vcpus_exit/write syscalls — no locks, no allocation. Safe to call
+    /// from a signal handler; the durable pipe byte wakes a WFI-halted vCPU.
     pub fn requestStop(self: *Machine) void {
         self.stop_requested.store(true, .release);
         self.running.store(false, .release);
+        self.start_pipe.signal();
         for (self.cpu_states) |*state| {
+            state.wake_pipe.signal();
             if (state.vcpu) |v| v.forceExit() catch {};
         }
     }
@@ -1094,11 +1138,37 @@ pub const Machine = struct {
     /// True once startup (including any restore) has finished and the
     /// vCPUs are entering the run loop. Used to time warm restore.
     pub fn isRunning(self: *const Machine) bool {
-        return self.running.load(.acquire);
+        return self.running.load(.acquire) and !self.stop_requested.load(.acquire);
+    }
+
+    /// Wait until restore has completed and the vCPU loop can accept input.
+    /// Stop and startup failure both wake the wait and return false.
+    pub fn waitUntilRunning(self: *Machine, timeout_ns: u64) bool {
+        const deadline_ns = monotonicNs() +| timeout_ns;
+        while (!self.isRunning()) {
+            if (self.stop_requested.load(.acquire)) return false;
+            const now_ns = monotonicNs();
+            if (now_ns >= deadline_ns) return false;
+            self.start_pipe.wait(deadline_ns - now_ns) catch return false;
+        }
+        return true;
+    }
+
+    /// Publish startup unless a concurrent stop request won the race. The
+    /// second check closes the window between observing stop and publishing
+    /// running; a later request clears running itself.
+    fn markRunning(self: *Machine) bool {
+        if (self.stop_requested.load(.acquire)) return false;
+        self.running.store(true, .release);
+        self.start_pipe.signal();
+        if (!self.stop_requested.load(.acquire)) return true;
+        self.running.store(false, .release);
+        return false;
     }
 
     pub fn stop(self: *Machine) void {
         self.stop_requested.store(true, .release);
+        self.start_pipe.signal();
         if (!self.running.load(.acquire)) return;
 
         log.info("stopping machine", .{});
@@ -1109,9 +1179,10 @@ pub const Machine = struct {
 
         self.running.store(false, .release);
 
-        // Kick every sync-loop vCPU out of hv_vcpu_run and wake any that
-        // are WFI-halted on the condvar so they observe running=false.
+        // Kick every sync-loop vCPU out of hv_vcpu_run and wake both WFI
+        // pipe waits and pause/snapshot condition waits.
         for (self.cpu_states) |*state| {
+            state.wake_pipe.signal();
             state.wake_mutex.lockUncancelable(global.io());
             state.wake_cond.signal(global.io());
             state.wake_mutex.unlock(global.io());
@@ -1209,10 +1280,40 @@ pub const Machine = struct {
 
     extern "c" fn mach_absolute_time() u64;
 
+    fn hostMachTimebase() MachTimebase {
+        if (builtin.os.tag != .macos) return .{};
+        var info: std.c.mach_timebase_info_data = undefined;
+        if (std.c.mach_timebase_info(&info) != 0 or info.denom == 0) return .{};
+        return .{ .numer = info.numer, .denom = info.denom };
+    }
+
     /// Host tick counter in CNTVCT units (Apple Silicon's
     /// mach_absolute_time is the physical counter).
     fn machTicks() u64 {
         return mach_absolute_time();
+    }
+
+    fn ticksToNsCeil(ticks: u64, timebase: MachTimebase) u64 {
+        assert(timebase.numer > 0);
+        assert(timebase.denom > 0);
+        const product = @as(u128, ticks) * timebase.numer + timebase.denom - 1;
+        const ns = product / timebase.denom;
+        return @intCast(@min(ns, @as(u128, std.math.maxInt(u64))));
+    }
+
+    fn timerWaitNs(ctl: u64, cval: u64, counter: u64, timebase: MachTimebase) ?u64 {
+        if (ctl & CNTV_CTL_ENABLE == 0 or ctl & CNTV_CTL_IMASK != 0) {
+            return null;
+        }
+        if (cval <= counter) return 0;
+        return ticksToNsCeil(cval - counter, timebase);
+    }
+
+    fn wfiWaitNs(self: *const Machine, vcpu: *hypervisor.Vcpu) ?u64 {
+        const ctl = vcpu.getSysReg(.cntv_ctl_el0) catch return WFI_WAIT_ERROR_BACKSTOP_NS;
+        const cval = vcpu.getSysReg(.cntv_cval_el0) catch return WFI_WAIT_ERROR_BACKSTOP_NS;
+        const counter = machTicks() -% self.vtimer_offset;
+        return timerWaitNs(ctl, cval, counter, self.mach_timebase);
     }
 
     /// Length of the flash content up to the last programmed byte;
@@ -1696,6 +1797,7 @@ pub const Machine = struct {
     pub fn prepareStart(self: *Machine) void {
         assert(!self.running.load(.acquire));
         assert(self.hv_vm == null);
+        self.start_pipe.drain();
         self.stop_requested.store(false, .release);
         self.paused.store(false, .release);
     }
@@ -1713,6 +1815,10 @@ pub const Machine = struct {
     ) Error!void {
         assert(!self.running.load(.acquire));
         assert(self.hv_vm == null);
+        errdefer {
+            self.stop_requested.store(true, .release);
+            self.start_pipe.signal();
+        }
         const startup_started_ns = if (profile != null) monotonicNs() else 0;
         var step_started_ns = startup_started_ns;
         try self.checkStartupCancelled();
@@ -1797,7 +1903,7 @@ pub const Machine = struct {
             value.total_ns = monotonicNs() - startup_started_ns;
         }
 
-        self.running.store(true, .release);
+        if (!self.markRunning()) return error.StartCancelled;
         log.info("machine started, running vCPU loop", .{});
 
         if (mode == .setup_only) {
@@ -1913,19 +2019,18 @@ pub const Machine = struct {
                                 self.machine_lock.unlock(global.io());
                             }
                             try vcpu.advancePC(exit_info);
-                            // Wait for an interrupt instead of busy-spinning.
-                            // Skip the wait entirely if one is already
-                            // deliverable; otherwise block until kickCpu
-                            // signals or the 1ms timer-poll cap elapses.
+                            // Wait until the guest's programmed virtual timer or
+                            // a durable pipe wakeup from a device or stop request.
                             self.machine_lock.lockUncancelable(global.io());
-                            const has_irq = if (self.gic_device) |g| g.hasDeliverableIrq(cpu_id) else false;
+                            const has_irq = if (self.gic_device) |g|
+                                g.hasDeliverableIrq(cpu_id)
+                            else
+                                false;
                             self.machine_lock.unlock(global.io());
-                            if (!has_irq and !state.pending_irq.load(.acquire)) {
-                                state.wake_mutex.lockUncancelable(global.io());
-                                thread_compat.waitTimeout(&state.wake_cond, global.io(), &state.wake_mutex, .{
-                                    .duration = .{ .raw = .{ .nanoseconds = 1_000_000 }, .clock = .awake },
-                                }) catch {};
-                                state.wake_mutex.unlock(global.io());
+                            if (!has_irq) {
+                                if (!state.pending_irq.load(.acquire)) {
+                                    try state.wake_pipe.wait(self.wfiWaitNs(vcpu));
+                                }
                             }
                         },
                         .hvc_aarch64, .smc_aarch64 => {
@@ -2858,6 +2963,12 @@ pub const Machine = struct {
                     });
                 };
             }
+            if (self.config.docker_socket_path) |path| {
+                self.nat.addUnixForward(path, 2375) catch |err| {
+                    log.err("Docker socket forward {s} failed: {}", .{ path, err });
+                    return error.Unexpected;
+                };
+            }
             try self.nat.start();
             self.net.?.setTxCallback(
                 callback_binding.Handler1(Machine, []const u8, void, netTxCallback).bind(self),
@@ -3642,7 +3753,10 @@ pub const Machine = struct {
 
     /// NAT responder → guest frame.
     fn natReplyCallback(self: *Machine, frame: []const u8) void {
-        if (self.net) |net| net.queueRxFrame(frame);
+        if (self.net) |net| {
+            net.queueRxFrame(frame);
+            self.kickCpu(0);
+        }
     }
 
     fn natReplyReserveCallback(self: *Machine, frame_len: usize) ?mininat.ReplyLease {
@@ -3664,6 +3778,7 @@ pub const Machine = struct {
             .bytes = lease.frame,
             .storage_index = @intCast(lease.token),
         });
+        self.kickCpu(0);
     }
 
     /// NAT back-pressure: true while the guest RX queue has headroom.
@@ -3705,11 +3820,9 @@ pub const Machine = struct {
         if (cpu_id >= self.cpu_states.len) return;
         const state = &self.cpu_states[cpu_id];
         state.pending_irq.store(true, .release);
-        // Wake a WFI-halted vCPU (blocked on the condvar) and force a
+        // Wake a WFI-halted vCPU (blocked on the pipe) and force a
         // running one out of hv_vcpu_run.
-        state.wake_mutex.lockUncancelable(global.io());
-        state.wake_cond.signal(global.io());
-        state.wake_mutex.unlock(global.io());
+        state.wake_pipe.signal();
         if (state.vcpu) |v| v.forceExit() catch {};
     }
 };
@@ -3739,6 +3852,33 @@ test "MemoryLayout constants" {
     try testing.expectEqual(@as(u64, 0x7fe0_0000), MemoryLayout.dtbBase(16 * 1024 * 1024 * 1024));
     try testing.expectEqual(@as(u64, 0x0A00_0000), MemoryLayout.virtioBase(0));
     try testing.expectEqual(@as(u64, 0x0A00_0200), MemoryLayout.virtioBase(1));
+}
+
+test "virtual timer wait follows the programmed deadline and stays bounded" {
+    const testing = std.testing;
+    const timebase = MachTimebase{ .numer = 125, .denom = 3 };
+
+    try testing.expectEqual(@as(u64, 1_000), Machine.ticksToNsCeil(24, timebase));
+    try testing.expectEqual(
+        @as(u64, std.time.ns_per_ms),
+        Machine.timerWaitNs(CNTV_CTL_ENABLE, 25_000, 1_000, timebase),
+    );
+    try testing.expectEqual(
+        @as(u64, 0),
+        Machine.timerWaitNs(CNTV_CTL_ENABLE, 1_000, 1_000, timebase),
+    );
+    try testing.expectEqual(
+        null,
+        Machine.timerWaitNs(0, 25_000, 1_000, timebase),
+    );
+    try testing.expectEqual(
+        null,
+        Machine.timerWaitNs(CNTV_CTL_ENABLE | CNTV_CTL_IMASK, 25_000, 1_000, timebase),
+    );
+    try testing.expectEqual(
+        @as(u64, 1_000_000_000),
+        Machine.timerWaitNs(CNTV_CTL_ENABLE, 24_000_001, 1, timebase),
+    );
 }
 
 test "withGicSystemRegisters advertises GICv3 without changing other features" {
@@ -3834,6 +3974,19 @@ test "stop before synchronous thread entry cancels startup" {
     try testing.expectError(error.StartCancelled, machine.startSyncPrepared());
     try testing.expect(!machine.running.load(.acquire));
     try testing.expect(machine.stop_requested.load(.acquire));
+}
+
+test "startup publication cannot overwrite a prior stop request" {
+    const testing = std.testing;
+    const machine = try Machine.init(testing.allocator, .{ .vcpu_count = 1 });
+    defer machine.deinit();
+
+    machine.prepareStart();
+    machine.requestStop();
+
+    try testing.expect(!machine.markRunning());
+    try testing.expect(!machine.waitUntilRunning(std.time.ns_per_ms));
+    try testing.expect(!machine.running.load(.acquire));
 }
 
 test "trimErasedFlash keeps content up to the last programmed byte" {

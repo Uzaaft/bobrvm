@@ -17,6 +17,10 @@ const builtin = @import("builtin");
 const objc = @import("objc");
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
+const mininat = @import("../net/mininat.zig");
+const vz_mininat = @import("vz_mininat.zig");
+const vz_process_policy = @import("vz_process_policy.zig");
+const vz_vsock = @import("vz_vsock.zig");
 
 const Object = objc.Object;
 const id = objc.c.id;
@@ -25,6 +29,16 @@ const NSInteger = isize;
 const NSUInteger = usize;
 const ObjectError = error{FrameworkObjectCreationFailed};
 const log = std.log.scoped(.vz);
+
+const DiskCachingMode = enum(NSInteger) {
+    automatic = 0,
+    cached = 2,
+};
+
+const DiskSynchronizationMode = enum(NSInteger) {
+    full = 1,
+    fsync = 2,
+};
 
 extern "c" fn CFRunLoopRunInMode(mode: ?*anyopaque, seconds: f64, return_after_source: u8) i32;
 extern "c" var kCFRunLoopDefaultMode: ?*anyopaque;
@@ -39,6 +53,16 @@ pub const Config = struct {
     /// console_in, guest output is written to console_out).
     console_in: i32,
     console_out: i32,
+    disk_path: ?[:0]const u8 = null,
+    disk_read_only: bool = false,
+    disk2_path: ?[:0]const u8 = null,
+    disk2_read_only: bool = true,
+    enable_net: bool = false,
+    forwards: []const mininat.Forward = &.{},
+    docker_socket_path: ?[]const u8 = null,
+    docker_vsock: bool = false,
+    shared_dir: ?[:0]const u8 = null,
+    share_read_only: bool = false,
     /// Persisted VZGenericMachineIdentifier (created on first use).
     /// Restore validates the identifier embedded in the saved state
     /// against the machine's, so it must survive across processes.
@@ -61,6 +85,9 @@ pub const State = enum(NSInteger) {
 
 pub const Machine = struct {
     vm: Object,
+    network: ?*vz_mininat.Bridge,
+    docker: ?*vz_vsock.Bridge,
+    performance_policy: ?*vz_process_policy.Controller,
     startup_started_ns: u64,
     startup_profile: StartupProfile,
 
@@ -68,6 +95,9 @@ pub const Machine = struct {
         boot_loader_ns: u64 = 0,
         configuration_ns: u64 = 0,
         console_ns: u64 = 0,
+        storage_ns: u64 = 0,
+        network_ns: u64 = 0,
+        share_ns: u64 = 0,
         platform_ns: u64 = 0,
         validation_ns: u64 = 0,
         save_restore_validation_ns: u64 = 0,
@@ -80,6 +110,8 @@ pub const Machine = struct {
         UnsupportedHost,
         FrameworkObjectCreationFailed,
         ConfigurationValidationFailed,
+        DockerSetupFailed,
+        NetworkSetupFailed,
     };
 
     const FlagBlock = objc.Block(struct {
@@ -94,7 +126,45 @@ pub const Machine = struct {
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
-        const configuration = try createConfiguration(config, &profile);
+        const performance_policy = if (config.docker_vsock)
+            vz_process_policy.Controller.create(std.heap.c_allocator) catch |err| blk: {
+                log.warn("VZ process policy unavailable: {}", .{err});
+                break :blk null;
+            }
+        else
+            null;
+        errdefer if (performance_policy) |policy| policy.destroy();
+
+        const docker = if (config.docker_vsock)
+            vz_vsock.Bridge.create(
+                std.heap.c_allocator,
+                config.docker_socket_path orelse return error.DockerSetupFailed,
+                performance_policy,
+            ) catch |err| {
+                log.err("VZ Docker socket setup failed: {}", .{err});
+                return error.DockerSetupFailed;
+            }
+        else
+            null;
+        errdefer if (docker) |bridge| bridge.destroy();
+
+        const network = if (config.enable_net)
+            vz_mininat.Bridge.create(std.heap.c_allocator, .{
+                .forwards = config.forwards,
+                .docker_socket_path = if (config.docker_vsock)
+                    null
+                else
+                    config.docker_socket_path,
+                .performance_policy = performance_policy,
+            }) catch |err| {
+                log.err("VZ network setup failed: {}", .{err});
+                return error.NetworkSetupFailed;
+            }
+        else
+            null;
+        errdefer if (network) |bridge| bridge.destroy();
+
+        const configuration = try createConfiguration(config, network, &profile);
         defer configuration.release();
 
         const vm_started_ns = monotonicNs();
@@ -104,16 +174,24 @@ pub const Machine = struct {
             .{configuration.value},
         );
         if (vm.value == null) return error.FrameworkObjectCreationFailed;
+        if (docker) |bridge| bridge.setSocketDevice(firstSocketDevice(vm));
+        if (performance_policy) |policy| policy.discover();
         profile.vm_ns = monotonicNs() - vm_started_ns;
         return .{
             .vm = vm,
+            .network = network,
+            .docker = docker,
+            .performance_policy = performance_policy,
             .startup_started_ns = startup_started_ns,
             .startup_profile = profile,
         };
     }
 
     pub fn deinit(self: *Machine) void {
+        if (self.docker) |docker| docker.destroy();
         self.vm.release();
+        if (self.network) |network| network.destroy();
+        if (self.performance_policy) |policy| policy.destroy();
         self.* = undefined;
     }
 
@@ -127,26 +205,30 @@ pub const Machine = struct {
         const finished_ns = monotonicNs();
         self.startup_profile.start_ns = finished_ns - started_ns;
         self.startup_profile.total_ns = finished_ns - self.startup_started_ns;
+        if (self.performance_policy) |policy| policy.discover();
     }
 
     pub fn logStartupProfile(self: *const Machine) void {
         const profile = self.startup_profile;
         log.info(
             "startup profile (Virtualization.framework): total={}us boot-loader={}us " ++
-                "configuration={}us console={}us platform={}us",
+                "configuration={}us console={}us storage={}us network={}us",
             .{
                 profile.total_ns / std.time.ns_per_us,
                 profile.boot_loader_ns / std.time.ns_per_us,
                 profile.configuration_ns / std.time.ns_per_us,
                 profile.console_ns / std.time.ns_per_us,
-                profile.platform_ns / std.time.ns_per_us,
+                profile.storage_ns / std.time.ns_per_us,
+                profile.network_ns / std.time.ns_per_us,
             },
         );
         log.info(
-            "startup profile (Virtualization.framework): validate={}us " ++
+            "startup profile (Virtualization.framework): share={}us platform={}us validate={}us " ++
                 "save-restore-validate={}us " ++
                 "vm={}us start={}us",
             .{
+                profile.share_ns / std.time.ns_per_us,
+                profile.platform_ns / std.time.ns_per_us,
                 profile.validation_ns / std.time.ns_per_us,
                 profile.save_restore_validation_ns / std.time.ns_per_us,
                 profile.vm_ns / std.time.ns_per_us,
@@ -161,6 +243,17 @@ pub const Machine = struct {
 
     pub fn resumeVM(self: *Machine) !void {
         try self.performFlag("resumeWithCompletionHandler:", .{});
+        if (self.performance_policy) |policy| policy.discover();
+    }
+
+    pub fn dockerConnectionCount(self: *const Machine) u32 {
+        const docker = self.docker orelse return 0;
+        return docker.connectionCount();
+    }
+
+    pub fn tickPerformancePolicy(self: *Machine) void {
+        const policy = self.performance_policy orelse return;
+        policy.tick(self.dockerConnectionCount());
     }
 
     pub fn stop(self: *Machine) !void {
@@ -201,7 +294,11 @@ pub const Machine = struct {
 /// Pump the main run loop briefly; VZ completion handlers and device
 /// work are dispatched onto it.
 pub fn pump() void {
-    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1);
+    pumpFor(0.05);
+}
+
+pub fn pumpFor(seconds: f64) void {
+    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 1);
 }
 
 fn monotonicNs() u64 {
@@ -216,6 +313,7 @@ fn finishStartupStep(field: *u64, step_started_ns: *u64) void {
 
 fn createConfiguration(
     config: *const Config,
+    network: ?*vz_mininat.Bridge,
     profile: *Machine.StartupProfile,
 ) Machine.InitError!Object {
     if (config.memory_bytes == 0 or config.vcpu_count == 0) {
@@ -245,13 +343,13 @@ fn createConfiguration(
     // console_out.
     const read_handle = try initObject(
         "NSFileHandle",
-        "initWithFileDescriptor:",
-        .{@as(c_int, config.console_in)},
+        "initWithFileDescriptor:closeOnDealloc:",
+        .{ @as(c_int, config.console_in), boolParam(false) },
     );
     const write_handle = try initObject(
         "NSFileHandle",
-        "initWithFileDescriptor:",
-        .{@as(c_int, config.console_out)},
+        "initWithFileDescriptor:closeOnDealloc:",
+        .{ @as(c_int, config.console_out), boolParam(false) },
     );
     const attachment = try initObject(
         "VZFileHandleSerialPortAttachment",
@@ -263,8 +361,95 @@ fn createConfiguration(
     configuration.msgSend(void, "setSerialPorts:", .{array(&.{console}).value});
     finishStartupStep(&profile.console_ns, &step_started_ns);
 
+    var storage_devices: [2]Object = undefined;
+    var storage_count: usize = 0;
+    const disk_caching_mode: DiskCachingMode = if (config.docker_vsock)
+        .cached
+    else
+        .automatic;
+    const disk_synchronization_mode: DiskSynchronizationMode = if (config.docker_vsock)
+        .fsync
+    else
+        .full;
+    if (config.disk_path) |path| {
+        storage_devices[storage_count] = try createDiskDevice(
+            path,
+            config.disk_read_only,
+            disk_caching_mode,
+            disk_synchronization_mode,
+        );
+        storage_count += 1;
+    }
+    if (config.disk2_path) |path| {
+        storage_devices[storage_count] = try createDiskDevice(
+            path,
+            config.disk2_read_only,
+            disk_caching_mode,
+            disk_synchronization_mode,
+        );
+        storage_count += 1;
+    }
+    if (storage_count > 0) configuration.msgSend(
+        void,
+        "setStorageDevices:",
+        .{array(storage_devices[0..storage_count]).value},
+    );
+    finishStartupStep(&profile.storage_ns, &step_started_ns);
+
+    if (network) |bridge| {
+        const handle = try initObject(
+            "NSFileHandle",
+            "initWithFileDescriptor:closeOnDealloc:",
+            .{ @as(c_int, bridge.vz_fd), boolParam(false) },
+        );
+        const network_attachment = try initObject(
+            "VZFileHandleNetworkDeviceAttachment",
+            "initWithFileHandle:",
+            .{handle.value},
+        );
+        const device = try newObject("VZVirtioNetworkDeviceConfiguration");
+        device.msgSend(void, "setAttachment:", .{network_attachment.value});
+        device.msgSend(void, "setMACAddress:", .{(try initObject(
+            "VZMACAddress",
+            "initWithString:",
+            .{string("52:54:00:12:34:56").value},
+        )).value});
+        configuration.msgSend(void, "setNetworkDevices:", .{array(&.{device}).value});
+    }
+    finishStartupStep(&profile.network_ns, &step_started_ns);
+
+    if (config.docker_vsock) {
+        configuration.msgSend(void, "setSocketDevices:", .{
+            array(&.{try newObject("VZVirtioSocketDeviceConfiguration")}).value,
+        });
+    }
+
+    if (config.shared_dir) |path| {
+        const directory = try initObject(
+            "VZSharedDirectory",
+            "initWithURL:readOnly:",
+            .{ (try fileURL(path)).value, boolParam(config.share_read_only) },
+        );
+        const share = try initObject(
+            "VZSingleDirectoryShare",
+            "initWithDirectory:",
+            .{directory.value},
+        );
+        const device = try initObject(
+            "VZVirtioFileSystemDeviceConfiguration",
+            "initWithTag:",
+            .{string("host").value},
+        );
+        device.msgSend(void, "setShare:", .{share.value});
+        configuration.msgSend(void, "setDirectorySharingDevices:", .{array(&.{device}).value});
+    }
+    finishStartupStep(&profile.share_ns, &step_started_ns);
+
     configuration.msgSend(void, "setEntropyDevices:", .{
         array(&.{try newObject("VZVirtioEntropyDeviceConfiguration")}).value,
+    });
+    configuration.msgSend(void, "setMemoryBalloonDevices:", .{
+        array(&.{try newObject("VZVirtioTraditionalMemoryBalloonDeviceConfiguration")}).value,
     });
 
     if (config.machine_id_path) |path| {
@@ -293,6 +478,40 @@ fn createConfiguration(
     }
     finishStartupStep(&profile.save_restore_validation_ns, &step_started_ns);
     return configuration.retain();
+}
+
+fn firstSocketDevice(vm: Object) Object {
+    const devices = vm.msgSend(Object, "socketDevices", .{});
+    return devices.msgSend(Object, "objectAtIndex:", .{@as(NSUInteger, 0)});
+}
+
+fn createDiskDevice(
+    path: [:0]const u8,
+    read_only: bool,
+    caching_mode: DiskCachingMode,
+    synchronization_mode: DiskSynchronizationMode,
+) ObjectError!Object {
+    var error_object: id = null;
+    const attachment = (try allocObject("VZDiskImageStorageDeviceAttachment")).msgSend(
+        Object,
+        "initWithURL:readOnly:cachingMode:synchronizationMode:error:",
+        .{
+            (try fileURL(path)).value,
+            boolParam(read_only),
+            @intFromEnum(caching_mode),
+            @intFromEnum(synchronization_mode),
+            &error_object,
+        },
+    );
+    if (attachment.value == null) {
+        logNSError("VZ disk attachment failed", error_object);
+        return error.FrameworkObjectCreationFailed;
+    }
+    return initObject(
+        "VZVirtioBlockDeviceConfiguration",
+        "initWithAttachment:",
+        .{attachment.msgSend(Object, "autorelease", .{}).value},
+    );
 }
 
 /// Load the persisted machine identifier, creating and persisting a
@@ -335,7 +554,11 @@ fn string(value: [*:0]const u8) Object {
 }
 
 fn fileURL(path: [*:0]const u8) ObjectError!Object {
-    const result = objc.getClass("NSURL").?.msgSend(Object, "fileURLWithPath:", .{string(path).value});
+    const result = objc.getClass("NSURL").?.msgSend(
+        Object,
+        "fileURLWithPath:",
+        .{string(path).value},
+    );
     if (result.value == null) return error.FrameworkObjectCreationFailed;
     return result;
 }

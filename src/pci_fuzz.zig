@@ -222,7 +222,9 @@ fn applyQueueOperation(
     writeCommon(transport, regs[operation], if (operation < 2) 2 else 4, value);
     const queue = &model.queues[model.queue_select];
     switch (operation) {
-        0 => queue.size = @truncate(value),
+        0 => if (value <= virtio_pci.VirtioPciTransport.MAX_QUEUE_SIZE) {
+            queue.size = @truncate(value);
+        },
         1 => queue.enable = value != 0,
         2 => queue.desc_addr = (queue.desc_addr & 0xFFFF_FFFF_0000_0000) | value,
         3 => queue.desc_addr =

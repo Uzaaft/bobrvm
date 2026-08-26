@@ -19,7 +19,33 @@ const log = std.log.scoped(.cli);
 
 const EXEC_TIMEOUT_MS: u32 = 120_000;
 
+const ExecProfile = struct {
+    enabled: bool,
+    started_ns: u64,
+
+    fn init() ExecProfile {
+        return .{
+            .enabled = std.c.getenv("BOBRVM_BENCHMARK_EXEC") != null,
+            .started_ns = monotonicNs(),
+        };
+    }
+
+    fn mark(self: ExecProfile, label: []const u8) void {
+        if (!self.enabled) return;
+        log.info("exec profile: {s} at {d} us", .{
+            label,
+            (monotonicNs() - self.started_ns) / std.time.ns_per_us,
+        });
+    }
+};
+
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
 pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
+    const profile = ExecProfile.init();
+    defer profile.mark("complete");
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -46,6 +72,7 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     // one word in the injected command line — otherwise
     // `exec -- sh -c 'a b'` would flatten to `sh -c a b`.
     const command = try shellJoin(arena, parts.items);
+    profile.mark("arguments parsed");
 
     var cwd_buf: [1024]u8 = undefined;
     const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
@@ -55,34 +82,53 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
         return error.NoProjectFile;
     };
     const proj = try project.load(arena, root);
+    profile.mark("project loaded");
 
     global.state.init();
-    defer global.state.deinit();
+    defer {
+        global.state.deinit();
+        profile.mark("global state released");
+    }
 
     const clone = try fork.prepare(arena, &proj);
-    defer fork.deleteTree(clone.dir);
+    defer {
+        fork.deleteTree(clone.dir);
+        profile.mark("clone deleted");
+    }
+    profile.mark("clone prepared");
 
     var hw = try machine.Machine.init(alloc, machineConfig(&clone.config));
-    defer hw.deinit();
+    defer {
+        hw.deinit();
+        profile.mark("machine deinitialized");
+    }
+    profile.mark("machine initialized");
 
     var session = console_exec.Session.init(alloc, hw);
-    defer session.deinit();
+    defer {
+        session.deinit();
+        profile.mark("session released");
+    }
     hw.setConsoleOutput(console_exec.Session.sink, &session);
 
     const vm_thread = std.Thread.spawn(.{}, machineMain, .{hw}) catch return error.Unexpected;
     defer {
         hw.requestStop();
         vm_thread.join();
+        profile.mark("vCPU joined");
     }
+    profile.mark("vCPU spawned");
 
     if (!session.waitForPrompt(alloc, 30_000)) {
         log.err("guest did not reach a shell prompt", .{});
         return error.ExecTimeout;
     }
+    profile.mark("shell ready");
 
     const result = try session.run(alloc, command, EXEC_TIMEOUT_MS);
     defer alloc.free(result.output);
     _ = std.c.write(std.posix.STDOUT_FILENO, result.output.ptr, result.output.len);
+    profile.mark("command complete");
     if (result.exit_code != 0) {
         log.info("exit code {d}", .{result.exit_code});
         std.process.exit(@intCast(@as(u8, @truncate(@as(u64, @bitCast(result.exit_code))))));

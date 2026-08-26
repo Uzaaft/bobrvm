@@ -29,6 +29,14 @@ enable_gpu: bool = false,
 enable_virgl: bool = false,
 kitty_display: bool = false,
 enable_net: bool = false,
+/// Expose the guest Docker API through a private host Unix socket.
+docker_enabled: bool = false,
+/// Use Virtualization.framework virtio-vsock instead of MiniNat TCP.
+docker_vsock: bool = false,
+/// Derived project socket path. This is never accepted from bobrvm.toml.
+docker_socket_path: ?[]const u8 = null,
+/// Suspend an empty shared Docker host. Set only by `docker-host`.
+docker_idle_sleep: bool = false,
 enable_snd: bool = false,
 display_width: u32 = config_policy.display_width_default,
 display_height: u32 = config_policy.display_height_default,

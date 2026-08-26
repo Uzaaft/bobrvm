@@ -32,6 +32,7 @@ if not KERNEL.exists():
 work = pathlib.Path(tempfile.mkdtemp(prefix="bobrvm-mcp."))
 proj = work / "proj"
 proj.mkdir()
+base_env = dict(os.environ, XDG_CONFIG_HOME=str(work / "config"))
 (proj / "bobrvm.toml").write_text(
     f'name = "mcp-test"\nmemory = 512\ncpus = 1\n'
     f'kernel = "{KERNEL}"\ninitrd = "{INITRD}"\nshare = false\n'
@@ -39,20 +40,18 @@ proj.mkdir()
 
 # Warm state: boot once, suspend at an idle shell prompt (a foreground
 # process would swallow the console-exec input).
-for stale in pathlib.Path.home().glob(".config/bobrvm/projects/proj-*"):
-    shutil.rmtree(stale, ignore_errors=True)
-env = dict(os.environ, BOBRVM_TEST_SUSPEND=f"14:{proj}/suspend.img")
-boot = subprocess.Popen([BIN, "up"], cwd=proj, env=env,
+boot_env = dict(base_env, BOBRVM_TEST_SUSPEND=f"14:{proj}/suspend.img")
+boot = subprocess.Popen([BIN, "up"], cwd=proj, env=boot_env,
                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL)
 time.sleep(20)
 boot.stdin.close()
 boot.wait(timeout=30)
-state_dirs = list(pathlib.Path.home().glob(".config/bobrvm/projects/proj-*"))
+state_dirs = list((work / "config/bobrvm/projects").glob("proj-*"))
 assert len(state_dirs) == 1 and (proj / "suspend.img").exists(), "warm boot failed"
 (proj / "suspend.img").rename(state_dirs[0] / "warm.img")
 
-p = subprocess.Popen([BIN, "mcp"], cwd=proj,
+p = subprocess.Popen([BIN, "mcp"], cwd=proj, env=base_env,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=subprocess.DEVNULL)
 
@@ -82,7 +81,6 @@ check("sandbox_exec" in names and "sandbox_start" in names, "tools/list")
 
 err, text = tool(3, "sandbox_start")
 check(not err and "sandbox 1 started" in text, "sandbox_start", text)
-time.sleep(2)
 
 t0 = time.time()
 err, text = tool(4, "sandbox_exec", {"id": 1, "command": "echo hello-from-sandbox && uname -m"})
@@ -97,12 +95,13 @@ check(not err and "tainted" in text, "sandbox 1 writes a file")
 
 err, text = tool(7, "sandbox_start")
 check(not err and "sandbox 2 started" in text, "second concurrent sandbox")
-time.sleep(2)
 err, text = tool(8, "sandbox_exec", {"id": 2, "command": "cat /mark 2>&1"})
 check("No such file" in text or "can't open" in text, "fork isolation")
 
 check(not tool(9, "sandbox_stop", {"id": 1})[0], "sandbox_stop 1")
 check(not tool(10, "sandbox_stop", {"id": 2})[0], "sandbox_stop 2")
+forks = state_dirs[0] / "forks"
+check(not forks.exists() or not any(forks.iterdir()), "fork cleanup")
 
 p.stdin.close()
 p.wait(timeout=30)
@@ -112,6 +111,4 @@ if failures:
     print("MCP-SANDBOX: FAIL —", ", ".join(failures))
     sys.exit(1)
 shutil.rmtree(work, ignore_errors=True)
-for d in state_dirs:
-    shutil.rmtree(d, ignore_errors=True)
 print("MCP-SANDBOX: PASS")

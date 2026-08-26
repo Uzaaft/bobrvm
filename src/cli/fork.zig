@@ -92,10 +92,16 @@ pub fn deleteTree(path: []const u8) void {
 }
 
 pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
+    var ready_marker: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
+        } else if (std.mem.eql(u8, arg, "--ready-marker")) {
+            const marker = args.next() orelse return error.InvalidArgument;
+            if (marker.len == 0 or marker.len > 128) return error.InvalidArgument;
+            ready_marker = marker;
+            continue;
         }
         log.err("unknown argument: {s}", .{arg});
         return error.InvalidArgument;
@@ -121,7 +127,7 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     log.info("fork: {s} — disposable clone of the warm state (Ctrl-] to quit)", .{
         clone.config.name,
     });
-    try runner.run(alloc, &clone.config);
+    try runner.runWithReadyMarker(alloc, &clone.config, ready_marker);
 }
 
 fn printHelp() void {

@@ -37,9 +37,13 @@ pub fn execute(alloc: Allocator, verb: Verb) !void {
     };
     const proj = try project.load(arena, root);
 
+    return executeProject(arena, &proj, verb);
+}
+
+pub fn executeProject(arena: Allocator, proj: *const project.Project, verb: Verb) !void {
     const pid_path = try std.fs.path.join(arena, &.{ proj.state_dir, "runner.pid" });
-    const pid = readPid(arena, pid_path);
-    const alive = pid != null and kill(pid.?, 0) == 0;
+    const pid = runningPid(arena, proj);
+    const alive = pid != null;
 
     switch (verb) {
         .status => {
@@ -57,7 +61,8 @@ pub fn execute(alloc: Allocator, verb: Verb) !void {
         .halt => {
             const target = pid orelse return notRunning(proj.config.name);
             if (!alive) return notRunning(proj.config.name);
-            _ = kill(target, SIGTERM);
+            if (kill(target, SIGTERM) != 0) return error.SignalFailed;
+            try deleteWarmState(proj.warm_image);
             try waitForExit(target, 15_000);
             deleteFile(pid_path);
             print(arena, "{s}: halted\n", .{proj.config.name});
@@ -65,17 +70,35 @@ pub fn execute(alloc: Allocator, verb: Verb) !void {
         .@"suspend" => {
             const target = pid orelse return notRunning(proj.config.name);
             if (!alive) return notRunning(proj.config.name);
-            _ = kill(target, SIGUSR1);
+            const previous_inode = fileInode(proj.warm_image);
+            if (kill(target, SIGUSR1) != 0) return error.SignalFailed;
             // The runner saves the warm image and exits.
             try waitForExit(target, 60_000);
             deleteFile(pid_path);
-            if (!project.fileExists(proj.warm_image)) {
-                log.err("runner exited but wrote no warm image", .{});
+            const saved_inode = fileInode(proj.warm_image);
+            if (saved_inode == null or saved_inode == previous_inode) {
+                log.err("runner exited without replacing the warm image", .{});
                 return error.SuspendFailed;
             }
             print(arena, "{s}: suspended; next `bobrvm up` resumes it\n", .{proj.config.name});
         },
     }
+}
+
+pub fn runningPid(arena: Allocator, proj: *const project.Project) ?std.c.pid_t {
+    const pid_path = std.fs.path.join(arena, &.{ proj.state_dir, "runner.pid" }) catch return null;
+    const pid = readPid(arena, pid_path) orelse return null;
+    return if (processExists(pid)) pid else null;
+}
+
+/// Permission to signal is separate from process existence. Treat EPERM as a
+/// live runner so a restricted client cannot start a second VM over its socket.
+fn processExists(pid: std.c.pid_t) bool {
+    return probeMeansAlive(kill(pid, 0), std.c.errno(@as(c_int, -1)));
+}
+
+fn probeMeansAlive(result: c_int, err: std.c.E) bool {
+    return result == 0 or err == .PERM;
 }
 
 fn notRunning(name: []const u8) error{NotRunning} {
@@ -96,7 +119,7 @@ fn readPid(arena: Allocator, path: []const u8) ?std.c.pid_t {
 
 fn waitForExit(pid: std.c.pid_t, timeout_ms: u32) !void {
     var waited_ms: u32 = 0;
-    while (kill(pid, 0) == 0) {
+    while (processExists(pid)) {
         if (waited_ms >= timeout_ms) return error.Timeout;
         std.Io.Clock.Duration.sleep(.{
             .raw = .{ .nanoseconds = 50 * std.time.ns_per_ms },
@@ -106,8 +129,26 @@ fn waitForExit(pid: std.c.pid_t, timeout_ms: u32) !void {
     }
 }
 
+test "process probe treats permission denial as alive" {
+    try std.testing.expect(probeMeansAlive(0, .SUCCESS));
+    try std.testing.expect(probeMeansAlive(-1, .PERM));
+    try std.testing.expect(!probeMeansAlive(-1, .SRCH));
+}
+
 fn deleteFile(path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(global.io(), path) catch {};
+}
+
+fn deleteWarmState(path: []const u8) !void {
+    std.Io.Dir.deleteFileAbsolute(global.io(), path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn fileInode(path: []const u8) ?std.Io.File.INode {
+    const stat = std.Io.Dir.cwd().statFile(global.io(), path, .{}) catch return null;
+    return stat.inode;
 }
 
 fn print(arena: Allocator, comptime fmt: []const u8, args: anytype) void {

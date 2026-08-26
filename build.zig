@@ -268,6 +268,7 @@ pub fn build(b: *std.Build) !void {
         cli_module.linkFramework("AppKit", .{});
         cli_module.linkFramework("Virtualization", .{});
         cli_module.linkSystemLibrary("objc", .{});
+        cli_module.linkSystemLibrary("proc", .{});
 
         cli_module.addCSourceFile(.{
             .file = b.path("src/os/log.c"),
@@ -288,6 +289,20 @@ pub fn build(b: *std.Build) !void {
 
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
+
+    if (target.result.os.tag == .macos) {
+        const docker_launcher_module = b.createModule(.{
+            .root_source_file = b.path("src/docker_launcher_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const docker_launcher = b.addExecutable(.{
+            .name = "bobrvm-docker-launcher",
+            .root_module = docker_launcher_module,
+        });
+        b.installArtifact(docker_launcher);
+    }
 
     if (target.result.os.tag == .linux) {
         const gtk_module = b.createModule(.{
@@ -454,6 +469,7 @@ pub fn build(b: *std.Build) !void {
         test_module.linkFramework("AppKit", .{});
         test_module.linkFramework("Virtualization", .{});
         test_module.linkSystemLibrary("objc", .{});
+        test_module.linkSystemLibrary("proc", .{});
     }
 
     wireVenus(test_module, build_options, gpu_venus, virgl_lib);
@@ -844,6 +860,7 @@ fn addGuestTools(
     }
     const tools = .{
         .{ "bobrvm-agentd", "src/guest_tools/agentd.zig" },
+        .{ "bobrvm-docker-proxy", "src/guest_tools/docker_proxy.zig" },
         .{ "bobrvm-session-agent", "src/guest_tools/session_agent.zig" },
         .{ "bobrvm-toolbox", "src/guest_tools/toolbox.zig" },
     };

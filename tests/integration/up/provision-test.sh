@@ -9,6 +9,7 @@ KERNEL=$REPO/tests/integration/alpine/out/Image
 INITRD=$REPO/tests/integration/alpine/out/initramfs-minimal
 WORK=${PROVISION_WORKDIR:-$(mktemp -d /tmp/bobrvm-provision.XXXXXX)}
 PROJ=$WORK/proj
+export XDG_CONFIG_HOME=$WORK/config
 
 [ -x "$BIN" ] || { echo "SKIP: build bobrvm first (zig build)"; exit 1; }
 [ -f "$KERNEL" ] || { echo "SKIP: alpine assets missing"; exit 1; }
@@ -23,7 +24,6 @@ initrd = "$INITRD"
 share = false
 provision = ["echo provisioned-ok > /provisioned-marker", "mkdir -p /opt/app"]
 EOF
-rm -rf "$HOME"/.config/bobrvm/projects/proj-*
 cd "$PROJ"
 
 fail() { echo "FAIL: $1"; exit 1; }
@@ -33,7 +33,7 @@ fail() { echo "FAIL: $1"; exit 1; }
   BOBRVM_LOG=stderr=true "$BIN" up > "$WORK/up.log" 2>&1
 grep -q "provisioning complete (2 steps)" "$WORK/up.log" || fail "provisioning did not complete"
 
-STATE_DIR=$(ls -d "$HOME"/.config/bobrvm/projects/proj-*)
+STATE_DIR=$(ls -d "$XDG_CONFIG_HOME"/bobrvm/projects/proj-*)
 [ -n "$STATE_DIR" ] && [ -f "$PROJ/suspend.img" ] || fail "warm boot"
 mv "$PROJ/suspend.img" "$STATE_DIR/warm.img"
 
@@ -41,5 +41,5 @@ OUT=$("$BIN" exec -- cat /provisioned-marker 2>/dev/null)
 echo "$OUT" | grep -q "provisioned-ok" || fail "provisioned file missing in warm state ($OUT)"
 "$BIN" exec -- sh -c 'test -d /opt/app' >/dev/null 2>&1 || fail "provisioned directory missing"
 
-rm -rf "$WORK" "$STATE_DIR"
+rm -rf "$WORK"
 echo "PROVISION: PASS"

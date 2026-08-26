@@ -103,6 +103,7 @@ jobs:
           BOBRVM_ZIG_SYSTEM_PACKAGE_DIR: ${{ steps.zig-deps.outputs.system }}
         run: |
           nix develop -c zig build \
+            install \
             xcframework \
             ghostty-lib \
             -Demit-macos-app=false \
@@ -123,6 +124,12 @@ jobs:
             "COMPILATION_CACHE_CAS_PATH=$RUNNER_TEMP/bobrvm-xcode-cache" \
             COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES \
             build
+
+      - name: Bundle Docker command-line tools
+        run: |
+          tools/bundle-docker-cli.sh \
+            macos/build/Release/Bobrvm.app \
+            zig-out/bin/bobrvm
 
       - name: Select signing mode
         id: signing
@@ -192,6 +199,23 @@ jobs:
             --options runtime \
             --timestamp \
             --sign "$MACOS_CERTIFICATE_NAME" \
+            --entitlements cli.entitlements \
+            "$app/Contents/MacOS/bin/bobrvm"
+          for tool in "$app"/Contents/MacOS/xbin/*-cli \
+              "$app/Contents/MacOS/xbin/docker-launcher" \
+              "$app/Contents/MacOS/xbin/docker-credential-osxkeychain"; do
+            codesign \
+              --force \
+              --options runtime \
+              --timestamp \
+              --sign "$MACOS_CERTIFICATE_NAME" \
+              "$tool"
+          done
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$MACOS_CERTIFICATE_NAME" \
             --entitlements macos/Bobrvm.entitlements \
             "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
@@ -203,7 +227,21 @@ jobs:
           test -d "$app"
           codesign \
             --force \
-            --deep \
+            --options runtime \
+            --sign - \
+            --entitlements cli.entitlements \
+            "$app/Contents/MacOS/bin/bobrvm"
+          for tool in "$app"/Contents/MacOS/xbin/*-cli \
+              "$app/Contents/MacOS/xbin/docker-launcher" \
+              "$app/Contents/MacOS/xbin/docker-credential-osxkeychain"; do
+            codesign \
+              --force \
+              --options runtime \
+              --sign - \
+              "$tool"
+          done
+          codesign \
+            --force \
             --options runtime \
             --sign - \
             --entitlements macos/Bobrvm.entitlements \

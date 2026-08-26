@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 
 const global = @import("../global.zig");
 const machine = @import("../machine/main.zig");
+const thread_compat = @import("../compat/thread.zig");
 
 const log = std.log.scoped(.cli);
 
@@ -23,6 +24,12 @@ pub const MarkerHit = struct {
     /// output ends here).
     start: usize,
     exit_code: i64,
+};
+
+pub const Transport = struct {
+    context: *anyopaque,
+    write: *const fn (context: *anyopaque, data: []const u8) void,
+    wait_ready: *const fn (context: *anyopaque, timeout_ns: u64) bool,
 };
 
 /// Format the completion marker for a given sequence number into `buf`.
@@ -47,14 +54,23 @@ pub fn findMarker(window: []const u8, marker_text: []const u8) ?MarkerHit {
     return null;
 }
 
-/// Drop the leading tty echo of the injected command (the first line,
-/// which carries the marker prefix with a literal "$?").
-pub fn stripCommandEcho(output: []const u8) []const u8 {
-    const newline = std.mem.indexOfScalar(u8, output, '\n') orelse return output;
-    if (std.mem.indexOf(u8, output[0..newline], MARKER_PREFIX) != null) {
-        return output[newline + 1 ..];
+/// Drop the tty echo through the line carrying `marker_text$?`. A restored
+/// shell may print a prompt immediately before that echo, so the marker is a
+/// more reliable boundary than the first line.
+pub fn stripCommandEcho(output: []const u8, marker_text: []const u8) []const u8 {
+    var content_start: ?usize = null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search, marker_text)) |marker| {
+        const suffix_start = marker + marker_text.len;
+        const suffix = output[suffix_start..];
+        if (std.mem.startsWith(u8, suffix, "$?")) {
+            if (std.mem.indexOfScalar(u8, suffix[2..], '\n')) |newline| {
+                content_start = suffix_start + 2 + newline + 1;
+            }
+        }
+        search = marker + 1;
     }
-    return output;
+    return if (content_start) |start| output[start..] else output;
 }
 
 /// An in-process console-exec session over one Machine: buffers the
@@ -63,17 +79,35 @@ pub fn stripCommandEcho(output: []const u8) []const u8 {
 /// via bind().
 pub const Session = struct {
     alloc: Allocator,
-    hw: *machine.Machine,
+    transport: Transport,
     mutex: std.Io.Mutex = .init,
+    output_cond: std.Io.Condition = .init,
     output: std.ArrayListUnmanaged(u8) = .empty,
     next_seq: u32 = 1,
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(alloc: Allocator, hw: *machine.Machine) Session {
-        return .{ .alloc = alloc, .hw = hw };
+        return initTransport(alloc, .{
+            .context = hw,
+            .write = machineWrite,
+            .wait_ready = machineWaitReady,
+        });
+    }
+
+    pub fn initTransport(alloc: Allocator, transport: Transport) Session {
+        return .{ .alloc = alloc, .transport = transport };
     }
 
     pub fn deinit(self: *Session) void {
         self.output.deinit(self.alloc);
+    }
+
+    pub fn cancel(self: *Session) void {
+        self.cancelled.store(true, .release);
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        self.output_cond.broadcast(io);
+        self.mutex.unlock(io);
     }
 
     /// Route a Machine's console output into this session. Pass the
@@ -84,6 +118,7 @@ pub const Session = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.output.appendSlice(self.alloc, data) catch return;
+        self.output_cond.signal(io);
     }
 
     pub const Result = struct {
@@ -108,50 +143,134 @@ pub const Session = struct {
         const line = try std.fmt.allocPrint(alloc, "{s} ; echo {s}$?\n", .{ command, marker });
         defer alloc.free(line);
 
+        if (self.cancelled.load(.acquire)) return error.ExecCancelled;
+
         self.mutex.lockUncancelable(io);
         const start_pos = self.output.items.len;
         self.mutex.unlock(io);
 
-        self.hw.injectConsoleInput(line);
+        self.transport.write(self.transport.context, line);
 
-        var waited_ms: u32 = 0;
+        const timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+        const deadline_ns = monotonicNs() +| timeout_ns;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         while (true) {
-            self.mutex.lockUncancelable(io);
+            if (self.cancelled.load(.acquire)) return error.ExecCancelled;
             const window = self.output.items[@min(start_pos, self.output.items.len)..];
             const hit = findMarker(window, marker);
             if (hit) |result| {
-                const captured = try alloc.dupe(u8, stripCommandEcho(window[0..result.start]));
-                self.mutex.unlock(io);
+                const captured = try alloc.dupe(
+                    u8,
+                    stripCommandEcho(window[0..result.start], marker),
+                );
                 return .{ .exit_code = result.exit_code, .output = captured };
             }
-            self.mutex.unlock(io);
-            if (waited_ms >= timeout_ms) return error.ExecTimeout;
-            std.Io.Clock.Duration.sleep(.{
-                .raw = .{ .nanoseconds = 10 * std.time.ns_per_ms },
-                .clock = .awake,
-            }, io) catch {};
-            waited_ms += 10;
+            const now_ns = monotonicNs();
+            if (now_ns >= deadline_ns) return error.ExecTimeout;
+            thread_compat.waitTimeout(&self.output_cond, io, &self.mutex, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = deadline_ns - now_ns },
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => return error.ExecTimeout,
+                else => return err,
+            };
         }
     }
 
-    /// Wait until the guest shell round-trips a command, so exec and
-    /// provisioning do not race the boot. Re-probes on a short cadence:
-    /// a single injection can be lost if it lands mid-restore (restore
-    /// overwrites the console's receive queue), so one long wait would
-    /// hang forever. The 150 ms probe interval keeps the lost-probe
-    /// penalty small, so the measured time stays close to the real
-    /// restore-to-responsive latency. Returns false on timeout.
+    /// Wait until startup and restore are complete, then round-trip a shell
+    /// command. The durable machine notification prevents the probe from
+    /// being overwritten by restore. Returns false on timeout or startup
+    /// failure.
     pub fn waitForPrompt(self: *Session, alloc: Allocator, timeout_ms: u32) bool {
-        var waited_ms: u32 = 0;
-        while (waited_ms < timeout_ms) : (waited_ms += 150) {
-            if (self.run(alloc, "true", 150)) |probe| {
-                alloc.free(probe.output);
-                return true;
-            } else |_| {}
+        if (self.cancelled.load(.acquire)) return false;
+        const timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+        const deadline_ns = monotonicNs() +| timeout_ns;
+        if (!self.transport.wait_ready(self.transport.context, timeout_ns)) return false;
+        if (!self.waitForShellHint(deadline_ns)) return false;
+
+        const now_ns = monotonicNs();
+        if (now_ns >= deadline_ns) return false;
+        const remaining_ms: u32 = @intCast(@min(
+            @divTrunc(deadline_ns - now_ns, std.time.ns_per_ms) + 1,
+            std.math.maxInt(u32),
+        ));
+        const probe = self.run(alloc, "true", remaining_ms) catch return false;
+        alloc.free(probe.output);
+        return true;
+    }
+
+    fn waitForShellHint(self: *Session, deadline_ns: u64) bool {
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (true) {
+            if (self.cancelled.load(.acquire)) return false;
+            if (hasShellHint(self.output.items)) return true;
+            const now_ns = monotonicNs();
+            if (now_ns >= deadline_ns) return false;
+            thread_compat.waitTimeout(&self.output_cond, io, &self.mutex, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = deadline_ns - now_ns },
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => return false,
+                else => return false,
+            };
         }
-        return false;
+    }
+
+    fn machineWrite(context: *anyopaque, data: []const u8) void {
+        const hw: *machine.Machine = @ptrCast(@alignCast(context));
+        hw.injectConsoleInput(data);
+    }
+
+    fn machineWaitReady(context: *anyopaque, timeout_ns: u64) bool {
+        const hw: *machine.Machine = @ptrCast(@alignCast(context));
+        return hw.waitUntilRunning(timeout_ns);
     }
 };
+
+/// Run first-boot provisioning commands in order over a console session.
+pub fn provision(session: *Session, steps: []const []const u8) void {
+    if (!session.waitForPrompt(session.alloc, 60_000)) {
+        log.err("provisioning: guest did not reach a shell prompt", .{});
+        return;
+    }
+    for (steps, 0..) |step, index| {
+        const result = session.run(session.alloc, step, 300_000) catch |err| {
+            log.err("provision step {d} ({s}) failed: {}", .{ index + 1, step, err });
+            return;
+        };
+        defer session.alloc.free(result.output);
+        if (result.exit_code != 0) {
+            log.err("provision step {d}/{d} exit {d}: {s}", .{
+                index + 1,
+                steps.len,
+                result.exit_code,
+                step,
+            });
+            return;
+        }
+        log.info("provision step {d}/{d} ok: {s}", .{ index + 1, steps.len, step });
+    }
+    log.info("provisioning complete ({d} steps)", .{steps.len});
+}
+
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
+}
+
+fn hasShellHint(output: []const u8) bool {
+    const hints = [_][]const u8{ "\x1b[6n", "\n~ # ", "\n# ", "\n$ " };
+    for (hints) |hint| {
+        if (std.mem.indexOf(u8, output, hint) != null) return true;
+    }
+    return false;
+}
 
 const testing = std.testing;
 
@@ -167,5 +286,25 @@ test "console_exec: marker matches digits but not the command echo" {
     const done = "run me ; echo __BRVM_7_RC_$?\r\nhello\r\n__BRVM_7_RC_2\r\n";
     const hit = findMarker(done, marker).?;
     try testing.expectEqual(@as(i64, 2), hit.exit_code);
-    try testing.expectEqualStrings("hello\r\n", stripCommandEcho(done[0..hit.start]));
+    try testing.expectEqualStrings("hello\r\n", stripCommandEcho(done[0..hit.start], marker));
+
+    const prompted = "\r\n~ # " ++ done;
+    const prompted_hit = findMarker(prompted, marker).?;
+    try testing.expectEqualStrings(
+        "hello\r\n",
+        stripCommandEcho(prompted[0..prompted_hit.start], marker),
+    );
+
+    const duplicate_echo = "run me ; echo __BRVM_7_RC_$?\r\n~ # " ++ done;
+    const duplicate_hit = findMarker(duplicate_echo, marker).?;
+    try testing.expectEqualStrings(
+        "hello\r\n",
+        stripCommandEcho(duplicate_echo[0..duplicate_hit.start], marker),
+    );
+}
+
+test "console_exec: shell hints require a prompt or cursor query" {
+    try testing.expect(!hasShellHint("booting\nStarting Docker"));
+    try testing.expect(hasShellHint("\r\n~ # \x1b[6n"));
+    try testing.expect(hasShellHint("\n# "));
 }

@@ -13,10 +13,16 @@ const Allocator = std.mem.Allocator;
 
 const global = @import("../global.zig");
 const linux_vz = @import("../runtime/linux_vz.zig");
+const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
+const console_exec = @import("console_exec.zig");
+const docker_idle = @import("docker_idle.zig");
 const project = @import("project.zig");
+const VzConsole = @import("vz_console.zig").Console;
 
 const log = std.log.scoped(.cli);
+const interactive_pump_seconds: f64 = 0.05;
+const detached_pump_seconds: f64 = 1.0;
 
 /// Run a project on the lite engine (the `engine = "vz"` path of
 /// `bobrvm up`): resume the warm state when it exists, and answer
@@ -24,10 +30,19 @@ const log = std.log.scoped(.cli);
 /// by saving it and quitting. The guest console uses stdin/stdout.
 pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
     const config = &proj.config;
+    const console = try VzConsole.create(arena);
+    defer console.destroy();
     const machine_id = try std.fmt.allocPrintSentinel(arena, "{s}/machine.id", .{
         proj.state_dir,
     }, 0);
     const warm = try arena.dupeZ(u8, proj.warm_image);
+    var forwards: [@import("Config.zig").MAX_FORWARDS]mininat.Forward = undefined;
+    for (config.forwards[0..config.forward_count], 0..) |forward, index| {
+        forwards[index] = .{
+            .host_port = forward.host_port,
+            .guest_port = forward.guest_port,
+        };
+    }
 
     var machine = try linux_vz.Machine.init(&.{
         .kernel_path = try arena.dupeZ(u8, config.kernel_path.?),
@@ -35,14 +50,25 @@ pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
         .cmdline = try arena.dupeZ(u8, config.cmdline),
         .memory_bytes = config.memory_mb * 1024 * 1024,
         .vcpu_count = config.vcpu_count,
-        .console_in = std.posix.STDIN_FILENO,
-        .console_out = std.posix.STDOUT_FILENO,
+        .console_in = console.guest_fd,
+        .console_out = console.guest_fd,
+        .disk_path = if (config.disk_path) |path| try arena.dupeZ(u8, path) else null,
+        .disk_read_only = config.disk_read_only,
+        .disk2_path = if (config.disk2_path) |path| try arena.dupeZ(u8, path) else null,
+        .disk2_read_only = config.disk2_read_only,
+        .enable_net = config.enable_net,
+        .forwards = forwards[0..config.forward_count],
+        .docker_socket_path = config.docker_socket_path,
+        .docker_vsock = config.docker_vsock,
+        .shared_dir = if (config.shared_dir) |path| try arena.dupeZ(u8, path) else null,
+        .share_read_only = config.share_read_only,
         .machine_id_path = machine_id,
     });
     defer machine.deinit();
 
+    const cold_boot = !project.fileExists(proj.warm_image);
     const start_ms = nowMs();
-    if (project.fileExists(proj.warm_image)) {
+    if (!cold_boot) {
         try machine.restoreFrom(warm);
         try machine.resumeVM();
         log.info("up: {s} — resuming warm state (vz engine, {d} ms)", .{
@@ -54,24 +80,95 @@ pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
             config.name, nowMs() - start_ms,
         });
     }
+    console.markReady();
 
+    var provision_context = ProvisionContext{
+        .console = console,
+        .steps = config.provision_steps,
+        .done = std.atomic.Value(bool).init(!cold_boot or config.provision_steps.len == 0),
+    };
+    var provision_thread: ?std.Thread = if (cold_boot and config.provision_steps.len > 0) blk: {
+        console.setCapture(true);
+        break :blk std.Thread.spawn(.{}, provision, .{&provision_context}) catch |err| {
+            console.setCapture(false);
+            provision_context.done.store(true, .release);
+            log.err("could not start VZ provisioning: {}", .{err});
+            break :blk null;
+        };
+    } else null;
+    defer if (provision_thread) |thread| {
+        console.cancelIO();
+        thread.join();
+    };
+
+    const pump_seconds = if (std.c.isatty(std.posix.STDIN_FILENO) != 0)
+        interactive_pump_seconds
+    else
+        detached_pump_seconds;
+    var idle_controller: ?docker_idle.Controller = if (config.docker_idle_sleep)
+        docker_idle.Controller.init(
+            &machine,
+            config.docker_socket_path.?,
+            &provision_context.done,
+        )
+    else
+        null;
+    defer if (idle_controller) |*controller| controller.deinit();
     os.signal.registerSuspendRequest();
     while (true) {
-        linux_vz.pump();
+        console.pumpInput();
+        linux_vz.pumpFor(pump_seconds);
+        machine.tickPerformancePolicy();
+        if (provision_thread != null and provision_context.done.load(.acquire)) {
+            provision_thread.?.join();
+            provision_thread = null;
+        }
         switch (machine.state()) {
             .stopped, .@"error" => break,
             else => {},
         }
+        if (idle_controller) |*controller| switch (try controller.tick()) {
+            .none => {},
+            .checkpoint => {
+                const t0 = nowMs();
+                try machine.pause();
+                saveReplacing(arena, &machine, warm) catch |err| {
+                    log.err("vz: automatic idle suspend failed: {}; resuming", .{err});
+                    try machine.resumeVM();
+                    controller.retryLater();
+                    continue;
+                };
+                log.info("vz: automatically suspended idle Docker VM in {d} ms", .{
+                    nowMs() - t0,
+                });
+                exitAfterSave();
+            },
+        };
         if (os.signal.takeSuspendRequest()) {
             const t0 = nowMs();
             try machine.pause();
-            try machine.saveTo(warm);
+            saveReplacing(arena, &machine, warm) catch |err| {
+                log.err("vz: suspend failed: {}; resuming", .{err});
+                try machine.resumeVM();
+                continue;
+            };
             log.info("vz: suspended to warm state in {d} ms", .{nowMs() - t0});
-            try machine.stop();
-            break;
+            exitAfterSave();
         }
     }
     log.info("vz: machine stopped", .{});
+}
+
+const ProvisionContext = struct {
+    console: *VzConsole,
+    steps: []const []const u8,
+    done: std.atomic.Value(bool),
+};
+
+fn provision(context: *ProvisionContext) void {
+    defer context.done.store(true, .release);
+    defer context.console.setCapture(false);
+    console_exec.provision(&context.console.session, context.steps);
 }
 
 fn nowMs() i64 {
@@ -180,14 +277,44 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
             if (nowMs() >= deadline) {
                 const t0 = nowMs();
                 try machine.pause();
-                try machine.saveTo(suspend_path.?);
+                try saveReplacing(arena, &machine, suspend_path.?);
                 log.info("vz: paused and saved in {d} ms", .{nowMs() - t0});
-                try machine.stop();
-                break;
+                exitAfterSave();
             }
         }
     }
     log.info("vz: machine stopped", .{});
+}
+
+/// VZ requires a fresh save destination. Write beside the old checkpoint and
+/// atomically replace it only after the complete state has reached disk.
+fn saveReplacing(
+    arena: Allocator,
+    machine: *linux_vz.Machine,
+    final_path: [:0]const u8,
+) !void {
+    const temporary_path = try std.fmt.allocPrintSentinel(
+        arena,
+        "{s}.tmp",
+        .{final_path},
+        0,
+    );
+    const io = global.io();
+    std.Io.Dir.deleteFileAbsolute(io, temporary_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    errdefer std.Io.Dir.deleteFileAbsolute(io, temporary_path) catch {};
+    try machine.saveTo(temporary_path);
+    try std.Io.Dir.renameAbsolute(temporary_path, final_path, io);
+}
+
+/// Apple's save workflow quits with the VM paused. Normal object teardown can
+/// destructively stop the VM and advance its external writable disk beyond the
+/// saved machine checkpoint, so successful suspend ends the runner directly.
+/// https://developer.apple.com/videos/play/wwdc2023/10007/
+fn exitAfterSave() noreturn {
+    std.process.exit(0);
 }
 
 fn printHelp() void {

@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const console_exec = @import("console_exec.zig");
 const global = @import("../global.zig");
 const project = @import("project.zig");
+const thread_compat = @import("../compat/thread.zig");
 
 const log = std.log.scoped(.mcp);
 
@@ -35,13 +36,33 @@ const Sandbox = struct {
     child: std.process.Child,
     reader_thread: std.Thread,
     out_mutex: std.Io.Mutex = .init,
+    out_cond: std.Io.Condition = .init,
     output: std.ArrayListUnmanaged(u8) = .empty,
+    output_base: u64 = 0,
+    ready_marker: [64]u8 = undefined,
+    ready_marker_len: usize = 0,
+    ready: bool = false,
+    reader_done: bool = false,
+
+    fn marker(self: *const Sandbox) []const u8 {
+        return self.ready_marker[0..self.ready_marker_len];
+    }
 
     fn appendOutput(self: *Sandbox, data: []const u8) void {
         const io = global.io();
         self.out_mutex.lockUncancelable(io);
         defer self.out_mutex.unlock(io);
         self.output.appendSlice(self.alloc, data) catch return;
+        if (!self.ready) {
+            if (std.mem.indexOf(u8, self.output.items, self.marker())) |index| {
+                const tail = index + self.ready_marker_len;
+                std.mem.copyForwards(u8, self.output.items[index..], self.output.items[tail..]);
+                self.output.shrinkRetainingCapacity(
+                    self.output.items.len - self.ready_marker_len,
+                );
+                self.ready = true;
+            }
+        }
         if (self.output.items.len > OUTPUT_CAP) {
             const drop = self.output.items.len - OUTPUT_CAP;
             std.mem.copyForwards(
@@ -50,12 +71,53 @@ const Sandbox = struct {
                 self.output.items[drop..],
             );
             self.output.shrinkRetainingCapacity(self.output.items.len - drop);
+            self.output_base +|= @intCast(drop);
         }
+        self.out_cond.signal(io);
+    }
+
+    fn finishReader(self: *Sandbox) void {
+        const io = global.io();
+        self.out_mutex.lockUncancelable(io);
+        self.reader_done = true;
+        self.out_cond.signal(io);
+        self.out_mutex.unlock(io);
+    }
+
+    fn waitReady(self: *Sandbox, timeout_ns: u64) bool {
+        const io = global.io();
+        const deadline_ns = monotonicNs() +| timeout_ns;
+        self.out_mutex.lockUncancelable(io);
+        defer self.out_mutex.unlock(io);
+        while (!self.ready) {
+            if (self.reader_done) return false;
+            const now_ns = monotonicNs();
+            if (now_ns >= deadline_ns) return false;
+            thread_compat.waitTimeout(&self.out_cond, io, &self.out_mutex, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = deadline_ns - now_ns },
+                    .clock = .awake,
+                },
+            }) catch return false;
+        }
+        return true;
+    }
+
+    fn outputOffset(self: *const Sandbox) u64 {
+        return self.output_base +| @as(u64, @intCast(self.output.items.len));
+    }
+
+    fn outputSince(self: *const Sandbox, offset: u64) []const u8 {
+        if (offset <= self.output_base) return self.output.items;
+        const relative = offset - self.output_base;
+        if (relative >= @as(u64, @intCast(self.output.items.len))) return &.{};
+        return self.output.items[@intCast(relative)..];
     }
 };
 
 /// Drain the child's console (stdout pipe) into the output buffer.
 fn sandboxReader(sandbox: *Sandbox) void {
+    defer sandbox.finishReader();
     const stdout = sandbox.child.stdout orelse return;
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -63,6 +125,10 @@ fn sandboxReader(sandbox: *Sandbox) void {
         if (n == 0) break;
         sandbox.appendOutput(buf[0..n]);
     }
+}
+
+fn monotonicNs() u64 {
+    return @intCast(std.Io.Clock.awake.now(global.io()).nanoseconds);
 }
 
 pub const Server = struct {
@@ -73,6 +139,7 @@ pub const Server = struct {
     proc_io: std.Io,
     proj: ?project.Project = null,
     proj_arena: std.heap.ArenaAllocator,
+    child_environ: ?*const std.process.Environ.Map = null,
     sandboxes: [SANDBOX_MAX]?*Sandbox = @splat(null),
     next_id: u32 = 1,
     next_marker: u32 = 1,
@@ -130,9 +197,16 @@ pub const Server = struct {
             .child = undefined,
             .reader_thread = undefined,
         };
+        const ready_marker = std.fmt.bufPrint(
+            &sandbox.ready_marker,
+            "\x1eBOBRVM_READY_{d}\x1e",
+            .{sandbox.id},
+        ) catch return error.Unexpected;
+        sandbox.ready_marker_len = ready_marker.len;
 
         sandbox.child = std.process.spawn(self.proc_io, .{
-            .argv = &.{ exe, "fork" },
+            .argv = &.{ exe, "fork", "--ready-marker", ready_marker },
+            .environ_map = self.child_environ,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = if (std.c.getenv("BOBRVM_MCP_DEBUG") != null) .inherit else .ignore,
@@ -140,13 +214,21 @@ pub const Server = struct {
             log.err("sandbox spawn failed: {} ({s} fork)", .{ err, exe });
             return error.Unexpected;
         };
+        var reader_started = false;
         errdefer {
             sandbox.child.kill(self.proc_io);
+            if (sandbox.child.stdin) |stdin| {
+                stdin.close(self.proc_io);
+                sandbox.child.stdin = null;
+            }
+            if (reader_started) sandbox.reader_thread.join();
             _ = sandbox.child.wait(self.proc_io) catch {};
         }
 
         sandbox.reader_thread = std.Thread.spawn(.{}, sandboxReader, .{sandbox}) catch
             return error.Unexpected;
+        reader_started = true;
+        if (!sandbox.waitReady(30 * std.time.ns_per_s)) return error.SandboxNotReady;
         self.next_id += 1;
         slot.* = sandbox;
         return sandbox;
@@ -163,10 +245,9 @@ pub const Server = struct {
 
     fn destroySandbox(self: *Server, sandbox: *Sandbox) void {
         const io = self.proc_io;
-        // SIGTERM takes the child through the runner's cleanup path
-        // (the same one Ctrl-] raises): stop the guest, delete its
-        // fork directory, exit. The reader sees EOF when it dies.
-        if (sandbox.child.id) |pid| _ = std.c.kill(pid, .TERM);
+        // MCP children treat stdin EOF as a graceful stop. That lets Zig
+        // unwind through fork deletion; SIGTERM deliberately exits from its
+        // signal handler and cannot run those filesystem defers.
         if (sandbox.child.stdin) |stdin| {
             stdin.close(io);
             sandbox.child.stdin = null;
@@ -219,7 +300,7 @@ pub const Server = struct {
         defer alloc.free(line);
 
         sandbox.out_mutex.lockUncancelable(io);
-        const start_pos = sandbox.output.items.len;
+        const start_offset = sandbox.outputOffset();
         sandbox.out_mutex.unlock(io);
 
         const stdin = sandbox.child.stdin orelse return error.SandboxGone;
@@ -230,23 +311,32 @@ pub const Server = struct {
             written += @intCast(rc);
         }
 
-        var waited_ms: u32 = 0;
+        const deadline_ns = monotonicNs() +|
+            @as(u64, timeout_ms) * std.time.ns_per_ms;
+        sandbox.out_mutex.lockUncancelable(io);
+        defer sandbox.out_mutex.unlock(io);
         while (true) {
-            sandbox.out_mutex.lockUncancelable(io);
-            const window = sandbox.output.items[@min(start_pos, sandbox.output.items.len)..];
+            const window = sandbox.outputSince(start_offset);
             const done = console_exec.findMarker(window, marker_text);
             if (done) |result| {
-                const captured = try alloc.dupe(u8, window[0..result.start]);
-                sandbox.out_mutex.unlock(io);
+                const captured = try alloc.dupe(
+                    u8,
+                    console_exec.stripCommandEcho(window[0..result.start], marker_text),
+                );
                 return .{ .exit_code = result.exit_code, .output = captured };
             }
-            sandbox.out_mutex.unlock(io);
-            if (waited_ms >= timeout_ms) return error.ExecTimeout;
-            std.Io.Clock.Duration.sleep(.{
-                .raw = .{ .nanoseconds = 10 * std.time.ns_per_ms },
-                .clock = .awake,
-            }, io) catch {};
-            waited_ms += 10;
+            if (sandbox.reader_done) return error.SandboxGone;
+            const now_ns = monotonicNs();
+            if (now_ns >= deadline_ns) return error.ExecTimeout;
+            thread_compat.waitTimeout(&sandbox.out_cond, io, &sandbox.out_mutex, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = deadline_ns - now_ns },
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => return error.ExecTimeout,
+                else => return err,
+            };
         }
     }
 };
@@ -412,7 +502,7 @@ fn handleToolCall(
         };
         defer alloc.free(outcome.output);
         const text = try std.fmt.allocPrint(alloc, "exit code {d}\n{s}", .{
-            outcome.exit_code, stripCommandEcho(outcome.output),
+            outcome.exit_code, outcome.output,
         });
         defer alloc.free(text);
         return try textResult(alloc, id_json, text, outcome.exit_code != 0);
@@ -469,8 +559,6 @@ fn argInt(args: std.json.ObjectMap, key: []const u8) ?i64 {
     return value.integer;
 }
 
-const stripCommandEcho = console_exec.stripCommandEcho;
-
 pub fn execute(
     alloc: Allocator,
     args: *std.process.Args.Iterator,
@@ -488,11 +576,15 @@ pub fn execute(
     global.state.init();
     defer global.state.deinit();
 
-    // Sandbox children must inherit the real environment (HOME etc.),
-    // which spawn takes from this Io instance.
+    // Sandbox children inherit the real environment, plus a private EOF
+    // contract that stops their VM and lets fork cleanup unwind normally.
+    var child_environ = try std.process.Environ.createMap(environ, alloc);
+    defer child_environ.deinit();
+    try child_environ.put("BOBRVM_EXIT_ON_EOF", "1");
     var io_impl = std.Io.Threaded.init(alloc, .{ .environ = environ });
     defer io_impl.deinit();
     var server = Server.init(alloc, io_impl.io());
+    server.child_environ = &child_environ;
     defer server.deinit();
 
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -573,4 +665,24 @@ test "mcp: protocol handshake, tool list, and errors" {
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"sandbox_list\"}}",
         "no sandboxes",
     );
+}
+
+test "mcp: split readiness marker is removed from guest output" {
+    const marker = "\x1eBOBRVM_READY_7\x1e";
+    var sandbox = Sandbox{
+        .id = 7,
+        .alloc = testing.allocator,
+        .child = undefined,
+        .reader_thread = undefined,
+    };
+    defer sandbox.output.deinit(testing.allocator);
+    @memcpy(sandbox.ready_marker[0..marker.len], marker);
+    sandbox.ready_marker_len = marker.len;
+
+    sandbox.appendOutput("guest prefix\x1eBOBRVM_");
+    try testing.expect(!sandbox.ready);
+    sandbox.appendOutput("READY_7\x1eguest suffix");
+
+    try testing.expect(sandbox.ready);
+    try testing.expectEqualStrings("guest prefixguest suffix", sandbox.output.items);
 }

@@ -87,6 +87,16 @@ in {
       };
       readOnly = lib.mkEnableOption "read-only access to the host share";
     };
+
+    docker = {
+      enable = lib.mkEnableOption "the private bobrvm Docker API endpoint";
+      vsock.enable = lib.mkEnableOption "the Virtualization.framework Docker vsock transport";
+      runtime = lib.mkOption {
+        type = lib.types.enum ["crun" "runc"];
+        default = "crun";
+        description = "OCI runtime used for bobrvm Docker containers.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -111,6 +121,10 @@ in {
           message = "bobrvm quiesced snapshots require management.enable.";
         }
         {
+          assertion = !cfg.docker.vsock.enable || cfg.docker.enable;
+          message = "bobrvm Docker vsock requires docker.enable.";
+        }
+        {
           assertion =
             !cfg.fileTransfer.enable
             || lib.hasPrefix "/" cfg.fileTransfer.directory;
@@ -127,6 +141,31 @@ in {
         "9p"
         "9pnet_virtio"
       ];
+      boot.kernelModules =
+        ["virtio_rng"]
+        ++ lib.optional cfg.docker.vsock.enable "vmw_vsock_virtio_transport";
+      boot.kernelPatches = lib.mkIf cfg.docker.enable (lib.mkAfter [
+        {
+          name = "bobrvm-sched-wake-affine-current";
+          patch = ./patches/linux-sched-wake-affine-current.patch;
+          extraStructuredConfig = {
+            HZ = lib.kernel.freeform "300";
+            HZ_300 = lib.kernel.yes;
+            HZ_1000 = lib.kernel.no;
+          };
+        }
+        {
+          name = "bobrvm-fuse-coherent-directory-cache";
+          patch = ./patches/linux-fuse-coherent-directory-cache.patch;
+        }
+      ]);
+      boot.kernelParams = lib.mkIf cfg.docker.enable (lib.mkAfter [
+        "preempt=full"
+        "transparent_hugepage=never"
+        "rootflags=noatime,lazytime,commit=30"
+        "fuse.force_cache_dir=1"
+        "fuse.dir_cache_timeout_ms=1000"
+      ]);
     }
 
     (lib.mkIf cfg.graphics.enable {
@@ -220,6 +259,58 @@ in {
             "x-systemd.device-timeout=1s"
           ]
           ++ lib.optional cfg.sharedFolder.readOnly "ro";
+      };
+    })
+
+    (lib.mkIf cfg.docker.enable {
+      # The shared Docker guest has no VGA console. Keeping an idle tty1
+      # getty only consumes guest memory; hvc0 remains the management console.
+      systemd.services."getty@tty1".enable = false;
+      systemd.services."autovt@tty1".enable = false;
+      boot.kernel.sysctl = {
+        # Published container ports traverse Docker's conntrack rules. The
+        # kernel default of 65,536 entries can fill in seconds under local
+        # HTTP load, while reset connections need no long NAT grace period.
+        "net.netfilter.nf_conntrack_max" = 262144;
+        "net.netfilter.nf_conntrack_tcp_timeout_close" = 1;
+      };
+      virtualisation.docker = {
+        enable = true;
+        extraPackages = lib.optional (cfg.docker.runtime == "crun") pkgs.crun;
+        daemon.settings = lib.mkIf (cfg.docker.runtime == "crun") {
+          default-runtime = "crun";
+          runtimes.crun.path = "${pkgs.crun}/bin/crun";
+        };
+        listenOptions =
+          ["/run/docker.sock"]
+          ++ lib.optional (!cfg.docker.vsock.enable) "10.0.2.15:2375";
+        # Make the intentional plaintext listener explicit. Dockerd otherwise
+        # delays startup to warn about a listener that MiniNat keeps private.
+        extraOptions = lib.optionalString (!cfg.docker.vsock.enable) "--tls=false";
+      };
+      systemd.sockets.docker.socketConfig.FreeBind = lib.mkIf (!cfg.docker.vsock.enable) true;
+      networking.firewall.allowedTCPPorts = lib.optional (!cfg.docker.vsock.enable) 2375;
+    })
+
+    (lib.mkIf cfg.docker.vsock.enable {
+      systemd.services.bobrvm-docker-proxy = {
+        description = "bobrvm Docker virtio-vsock proxy";
+        wantedBy = ["multi-user.target"];
+        requires = ["docker.socket"];
+        after = ["docker.socket"];
+        serviceConfig = {
+          ExecStart = "${cfg.package}/bin/bobrvm-docker-proxy";
+          Restart = "always";
+          RestartSec = 1;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          RestrictAddressFamilies = [
+            "AF_UNIX"
+            "AF_VSOCK"
+          ];
+        };
       };
     })
   ]);

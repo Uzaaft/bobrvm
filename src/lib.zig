@@ -81,7 +81,13 @@ test {
     _ = @import("cli/console_exec.zig");
     _ = @import("cli/exec.zig");
     _ = @import("cli/bench.zig");
+    _ = @import("cli/bench_host.zig");
+    _ = @import("cli/host_metrics.zig");
+    _ = @import("cli/bench_command.zig");
     _ = @import("cli/ssh.zig");
+    _ = @import("cli/docker.zig");
+    _ = @import("cli/docker_launcher.zig");
+    _ = @import("cli/install_cli.zig");
     _ = @import("compat/file.zig");
     _ = @import("compat/net.zig");
     _ = @import("compat/thread.zig");

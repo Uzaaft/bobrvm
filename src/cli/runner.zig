@@ -26,6 +26,16 @@ fn sleepNs(ns: u64) void {
 }
 
 pub fn run(alloc: Allocator, config: *const Config) !void {
+    return runWithReadyMarker(alloc, config, null);
+}
+
+/// Run a VM and optionally publish a host-only marker after restore. MCP uses
+/// the marker to keep commands out of the guest console until restore is done.
+pub fn runWithReadyMarker(
+    alloc: Allocator,
+    config: *const Config,
+    ready_marker: ?[]const u8,
+) !void {
     global.state.init();
     defer global.state.deinit();
 
@@ -70,6 +80,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         .enable_net = config.enable_net,
         .enable_snd = config.enable_snd,
         .forwards = forwards_buf[0..config.forward_count],
+        .docker_socket_path = config.docker_socket_path,
         .shared_dir = config.shared_dir,
         .share_read_only = config.share_read_only,
         .restore_path = restore_path,
@@ -272,6 +283,12 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     };
     if (input_thread) |t| t.detach();
 
+    const ready_thread: ?std.Thread = if (ready_marker) |marker|
+        try std.Thread.spawn(.{}, readyNotifier, .{ hw, marker })
+    else
+        null;
+    defer if (ready_thread) |thread| thread.join();
+
     // First-boot provisioning: run the project's provision steps over
     // the console once, on a cold boot only (a warm restore already
     // carries the provisioned state). Runs on a side thread because
@@ -290,7 +307,7 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
         provision_active.store(true, .release);
         provision_thread = std.Thread.spawn(
             .{ .stack_size = input_stack_size_bytes },
-            provisionLoop,
+            console_exec.provision,
             .{ &provision_session, config.provision_steps },
         ) catch null;
     }
@@ -304,35 +321,15 @@ pub fn run(alloc: Allocator, config: *const Config) !void {
     log.info("VM stopped", .{});
 }
 
+fn readyNotifier(hw: *machine.Machine, marker: []const u8) void {
+    if (!hw.waitUntilRunning(30 * std.time.ns_per_s)) return;
+    _ = std.c.write(std.posix.STDOUT_FILENO, marker.ptr, marker.len);
+}
+
 /// Console tee target for provisioning (see provisionLoop). Guarded by
 /// provision_active so consoleOutput only touches it while live.
 var active_provision_session: ?*console_exec.Session = null;
 var provision_active = std.atomic.Value(bool).init(false);
-
-/// Run each provision step over the guest console, in order, on the
-/// first cold boot. Logs a one-line result per step.
-fn provisionLoop(session: *console_exec.Session, steps: []const []const u8) void {
-    if (!session.waitForPrompt(session.alloc, 60_000)) {
-        log.err("provisioning: guest did not reach a shell prompt", .{});
-        return;
-    }
-    for (steps, 0..) |step, i| {
-        const result = session.run(session.alloc, step, 300_000) catch |err| {
-            log.err("provision step {d} ({s}) failed: {}", .{ i + 1, step, err });
-            return;
-        };
-        defer session.alloc.free(result.output);
-        if (result.exit_code == 0) {
-            log.info("provision step {d}/{d} ok: {s}", .{ i + 1, steps.len, step });
-        } else {
-            log.err("provision step {d}/{d} exit {d}: {s}", .{
-                i + 1, steps.len, result.exit_code, step,
-            });
-            return;
-        }
-    }
-    log.info("provisioning complete ({d} steps); save with Ctrl-B z", .{steps.len});
-}
 
 var saved_termios: ?std.posix.termios = null;
 var frame_dump_dir: ?[]const u8 = null;

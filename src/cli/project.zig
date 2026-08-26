@@ -98,7 +98,8 @@ pub fn load(arena: Allocator, root: []const u8) Error!Project {
         },
         error.Syntax => {
             log.warn(
-                "{s}:{d}: unsupported syntax (supported: key = \"string\" | integer | true/false | [\"strings\"])",
+                "{s}:{d}: unsupported syntax " ++
+                    "(supported: key = \"string\" | integer | true/false | [\"strings\"])",
                 .{ file_path, error_line },
             );
             return error.ProjectFileInvalid;
@@ -125,6 +126,18 @@ pub fn load(arena: Allocator, root: []const u8) Error!Project {
     // The console's suspend-and-quit command writes the warm image, so
     // the next `up` resumes instead of booting.
     config.suspend_path = warm_image;
+    if (config.docker_enabled) {
+        config.docker_socket_path = std.fs.path.join(arena, &.{ state_dir, "docker.sock" }) catch
+            return error.OutOfMemory;
+        const socket_path_bytes_max = @sizeOf(@FieldType(std.posix.sockaddr.un, "path"));
+        if (config.docker_socket_path.?.len >= socket_path_bytes_max) {
+            log.warn("{s}: Docker socket path is too long: {s}", .{
+                FILE_NAME,
+                config.docker_socket_path.?,
+            });
+            return error.ProjectFileInvalid;
+        }
+    }
 
     return .{
         .root = root,
@@ -140,14 +153,26 @@ pub fn load(arena: Allocator, root: []const u8) Error!Project {
 /// moving a project gets fresh state) but prefixed with its basename
 /// for human navigation.
 pub fn stateDir(arena: Allocator, root: []const u8) Error![]const u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHomeDir);
+    const config_home = try configHome(arena);
     const hash = std.hash.Wyhash.hash(0, root);
     const dir_name = std.fmt.allocPrint(arena, "{s}-{x:0>16}", .{
         std.fs.path.basename(root), hash,
     }) catch return error.OutOfMemory;
     return std.fs.path.join(arena, &.{
-        home, ".config", "bobrvm", "projects", dir_name,
+        config_home, "bobrvm", "projects", dir_name,
     }) catch return error.OutOfMemory;
+}
+
+pub fn configHome(arena: Allocator) Error![]const u8 {
+    if (std.c.getenv("XDG_CONFIG_HOME")) |value_ptr| {
+        const value = std.mem.span(value_ptr);
+        if (value.len > 0 and std.fs.path.isAbsolute(value)) {
+            return arena.dupe(u8, value) catch return error.OutOfMemory;
+        }
+    }
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHomeDir);
+    return std.fs.path.join(arena, &.{ home, ".config" }) catch
+        return error.OutOfMemory;
 }
 
 pub fn ensureStateDir(project: *const Project) !void {
@@ -174,6 +199,8 @@ const Key = enum {
     kitty_display,
     sound,
     net,
+    docker,
+    docker_vsock,
     share,
     ssh_user,
     forwards,
@@ -202,6 +229,8 @@ const key_map = std.StaticStringMap(Key).initComptime(.{
     .{ "kitty-display", .kitty_display },
     .{ "sound", .sound },
     .{ "net", .net },
+    .{ "docker", .docker },
+    .{ "docker-vsock", .docker_vsock },
     .{ "share", .share },
     .{ "ssh-user", .ssh_user },
     .{ "forwards", .forwards },
@@ -238,14 +267,38 @@ fn mapTable(
             .name => config.name = try wantString(key_name, value),
             .memory => config.memory_mb = @intCast(try wantInt(key_name, value, 1, 1024 * 1024)),
             .cpus => config.vcpu_count = @intCast(try wantInt(key_name, value, 1, 255)),
-            .kernel => config.kernel_path = try resolvePath(arena, root, try wantString(key_name, value)),
-            .initrd => config.initrd_path = try resolvePath(arena, root, try wantString(key_name, value)),
+            .kernel => config.kernel_path = try resolvePath(
+                arena,
+                root,
+                try wantString(key_name, value),
+            ),
+            .initrd => config.initrd_path = try resolvePath(
+                arena,
+                root,
+                try wantString(key_name, value),
+            ),
             .cmdline => config.cmdline = try wantString(key_name, value),
-            .firmware => config.firmware_path = try resolvePath(arena, root, try wantString(key_name, value)),
-            .vars => config.vars_path = try resolvePath(arena, root, try wantString(key_name, value)),
-            .disk => config.disk_path = try resolvePath(arena, root, try wantString(key_name, value)),
+            .firmware => config.firmware_path = try resolvePath(
+                arena,
+                root,
+                try wantString(key_name, value),
+            ),
+            .vars => config.vars_path = try resolvePath(
+                arena,
+                root,
+                try wantString(key_name, value),
+            ),
+            .disk => config.disk_path = try resolvePath(
+                arena,
+                root,
+                try wantString(key_name, value),
+            ),
             .disk_readonly => config.disk_read_only = try wantBool(key_name, value),
-            .disk2 => config.disk2_path = try resolvePath(arena, root, try wantString(key_name, value)),
+            .disk2 => config.disk2_path = try resolvePath(
+                arena,
+                root,
+                try wantString(key_name, value),
+            ),
             .disk2_writable => config.disk2_read_only = !(try wantBool(key_name, value)),
             .share_readonly => config.share_read_only = try wantBool(key_name, value),
             .gpu => config.enable_gpu = try wantBool(key_name, value),
@@ -253,6 +306,8 @@ fn mapTable(
             .kitty_display => config.kitty_display = try wantBool(key_name, value),
             .sound => config.enable_snd = try wantBool(key_name, value),
             .net => config.enable_net = try wantBool(key_name, value),
+            .docker => config.docker_enabled = try wantBool(key_name, value),
+            .docker_vsock => config.docker_vsock = try wantBool(key_name, value),
             .share => {
                 share_set = true;
                 switch (value) {
@@ -286,28 +341,35 @@ fn mapTable(
     if (!share_set) {
         config.shared_dir = arena.dupe(u8, root) catch return error.OutOfMemory;
     }
+    if (config.docker_enabled and config.shared_dir == null) {
+        log.warn("{s}: docker requires the project share", .{FILE_NAME});
+        return error.ProjectFileInvalid;
+    }
+    if (config.docker_vsock and !config.docker_enabled) {
+        log.warn("{s}: docker-vsock requires docker = true", .{FILE_NAME});
+        return error.ProjectFileInvalid;
+    }
+    if (config.docker_vsock and engine_out.* != .vz) {
+        log.warn("{s}: docker-vsock requires engine = \"vz\"", .{FILE_NAME});
+        return error.ProjectFileInvalid;
+    }
+    if (config.docker_enabled) try prependDockerMount(arena, &config, engine_out.*);
     if (config.enable_virgl) config.enable_gpu = true;
     if (config.kitty_display) config.enable_gpu = true;
     if (config.forward_count > 0) config.enable_net = true;
+    if (config.docker_enabled) config.enable_net = true;
 
-    // The lite engine's device set is much smaller; reject what it
-    // cannot match rather than silently degrading.
+    // The VZ engine owns the Docker-oriented block, network, entropy,
+    // balloon, and shared-directory devices. Graphics and firmware boot
+    // remain on the native engine.
     if (engine_out.* == .vz) {
-        if (config.enable_gpu or config.enable_snd or config.enable_net or
-            config.forward_count > 0 or config.disk_path != null or
-            config.disk2_path != null or config.firmware_path != null)
-        {
+        if (config.enable_gpu or config.enable_snd or config.firmware_path != null) {
             log.warn(
-                "{s}: gpu/sound/net/forwards/disks/firmware are not supported on the vz engine yet",
+                "{s}: gpu/sound/firmware are not supported on the vz engine yet",
                 .{FILE_NAME},
             );
             return error.ProjectFileInvalid;
         }
-        if (share_set and config.shared_dir != null) {
-            log.warn("{s}: 'share' is not supported on the vz engine yet", .{FILE_NAME});
-            return error.ProjectFileInvalid;
-        }
-        config.shared_dir = null;
         if (config.kernel_path == null) {
             log.warn("{s}: the vz engine requires 'kernel'", .{FILE_NAME});
             return error.ProjectFileInvalid;
@@ -391,6 +453,43 @@ fn resolvePath(arena: Allocator, root: []const u8, path: []const u8) Error![]con
     return std.fs.path.join(arena, &.{ root, path }) catch return error.OutOfMemory;
 }
 
+fn prependDockerMount(arena: Allocator, config: *Config, engine: Engine) Error!void {
+    const path = config.shared_dir.?;
+    const quoted = try shellQuote(arena, path);
+    const command = switch (engine) {
+        .native => std.fmt.allocPrint(
+            arena,
+            "mkdir -p -- {s} && mount -t 9p " ++
+                "-o trans=virtio,version=9p2000.L,msize=262144{s} host {s}",
+            .{ quoted, if (config.share_read_only) ",ro" else "", quoted },
+        ),
+        .vz => std.fmt.allocPrint(
+            arena,
+            "mkdir -p -- {s} && mount -t virtiofs -o {s}noatime host {s}",
+            .{ quoted, if (config.share_read_only) "ro," else "", quoted },
+        ),
+    } catch return error.OutOfMemory;
+    const steps = arena.alloc([]const u8, config.provision_steps.len + 1) catch
+        return error.OutOfMemory;
+    steps[0] = command;
+    @memcpy(steps[1..], config.provision_steps);
+    config.provision_steps = steps;
+}
+
+fn shellQuote(arena: Allocator, value: []const u8) Error![]const u8 {
+    var quoted: std.ArrayListUnmanaged(u8) = .empty;
+    quoted.append(arena, '\'') catch return error.OutOfMemory;
+    for (value) |byte| {
+        if (byte == '\'') {
+            quoted.appendSlice(arena, "'\\''") catch return error.OutOfMemory;
+        } else {
+            quoted.append(arena, byte) catch return error.OutOfMemory;
+        }
+    }
+    quoted.append(arena, '\'') catch return error.OutOfMemory;
+    return quoted.items;
+}
+
 const testing = std.testing;
 
 test "project: maps the full schema onto a config" {
@@ -409,6 +508,7 @@ test "project: maps the full schema onto a config" {
         \\virgl = true
         \\kitty-display = true
         \\sound = true
+        \\docker = true
         \\forwards = ["2222:22", "8080:80"]
         \\display = "1920x1080"
         \\gpu-memory = 1024
@@ -429,14 +529,15 @@ test "project: maps the full schema onto a config" {
     try testing.expect(config.enable_gpu); // implied by virgl
     try testing.expect(config.kitty_display);
     try testing.expect(config.enable_snd);
+    try testing.expect(config.docker_enabled);
     try testing.expect(config.enable_net); // implied by forwards
     try testing.expectEqual(@as(u8, 2), config.forward_count);
     try testing.expectEqual(@as(u16, 2222), config.forwards[0].host_port);
     try testing.expectEqual(@as(u16, 80), config.forwards[1].guest_port);
     try testing.expectEqual(@as(u32, 1920), config.display_width);
     try testing.expectEqual(@as(u64, 1024), config.gpu_memory_mb);
-    try testing.expectEqual(@as(usize, 2), config.provision_steps.len);
-    try testing.expectEqualStrings("apk add git", config.provision_steps[0]);
+    try testing.expectEqual(@as(usize, 3), config.provision_steps.len);
+    try testing.expectEqualStrings("apk add git", config.provision_steps[1]);
     // Project dir shared by default.
     try testing.expectEqualStrings("/proj", config.shared_dir.?);
 }
@@ -455,7 +556,10 @@ test "project: share=false opts out and unknown keys fail loudly" {
     try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &unknown, &engine));
 
     var bad_forward = try toml.parse(arena, "forwards = [\"22\"]\n", null);
-    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bad_forward, &engine));
+    try testing.expectError(
+        error.ProjectFileInvalid,
+        mapTable(arena, "/proj", &bad_forward, &engine),
+    );
 
     var bad_type = try toml.parse(arena, "memory = \"lots\"\n", null);
     try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bad_type, &engine));
@@ -499,7 +603,54 @@ test "project: findRoot walks up and load wires the warm image" {
     try testing.expect(std.mem.indexOf(u8, project.state_dir, "/projects/repo-") != null);
 }
 
-test "project: vz engine parses and rejects unsupported devices" {
+test "project: docker derives a private socket and enables networking" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = global.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, FILE_NAME, .{});
+    try file.writeStreamingAll(io, "docker = true\n");
+    file.close(io);
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const project = try load(arena, root_buffer[0..root_len]);
+    try testing.expect(project.config.docker_enabled);
+    try testing.expect(project.config.enable_net);
+    try testing.expectEqualStrings(
+        try std.fs.path.join(arena, &.{ project.state_dir, "docker.sock" }),
+        project.config.docker_socket_path.?,
+    );
+    try testing.expectEqual(@as(usize, 1), project.config.provision_steps.len);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        project.config.provision_steps[0],
+        "mount -t 9p",
+    ) != null);
+}
+
+test "project: Docker mount shell-quotes the shared path" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var table = try toml.parse(
+        arena,
+        "docker = true\nshare = \"it's here\"\n",
+        null,
+    );
+    var engine: Engine = .native;
+    const config = try mapTable(arena, "/proj", &table, &engine);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        config.provision_steps[0],
+        "'/proj/it'\\''s here'",
+    ) != null);
+}
+
+test "project: vz engine parses Docker devices and rejects graphics" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -508,14 +659,71 @@ test "project: vz engine parses and rejects unsupported devices" {
     var minimal = try toml.parse(arena, "engine = \"vz\"\nkernel = \"Image\"\n", null);
     const config = try mapTable(arena, "/proj", &minimal, &engine);
     try testing.expectEqual(Engine.vz, engine);
-    // No 9p device on the lite engine: the default project share is off.
-    try testing.expectEqual(@as(?[]const u8, null), config.shared_dir);
+    try testing.expectEqualStrings("/proj", config.shared_dir.?);
+
+    var docker = try toml.parse(
+        arena,
+        "engine = \"vz\"\nkernel = \"Image\"\ndisk = \"root.raw\"\ndocker = true\n",
+        null,
+    );
+    const docker_config = try mapTable(arena, "/proj", &docker, &engine);
+    try testing.expect(docker_config.docker_enabled);
+    try testing.expect(docker_config.enable_net);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        docker_config.provision_steps[0],
+        "mount -t virtiofs -o noatime",
+    ) != null);
+
+    var read_only_share = try toml.parse(
+        arena,
+        "engine = \"vz\"\nkernel = \"Image\"\ndocker = true\nshare-readonly = true\n",
+        null,
+    );
+    const read_only_config = try mapTable(arena, "/proj", &read_only_share, &engine);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        read_only_config.provision_steps[0],
+        "mount -t virtiofs -o ro,noatime",
+    ) != null);
+
+    var vsock = try toml.parse(
+        arena,
+        "engine = \"vz\"\nkernel = \"Image\"\ndocker = true\ndocker-vsock = true\n",
+        null,
+    );
+    const vsock_config = try mapTable(arena, "/proj", &vsock, &engine);
+    try testing.expect(vsock_config.docker_vsock);
+
+    var vsock_without_docker = try toml.parse(
+        arena,
+        "engine = \"vz\"\nkernel = \"Image\"\ndocker-vsock = true\n",
+        null,
+    );
+    try testing.expectError(
+        error.ProjectFileInvalid,
+        mapTable(arena, "/proj", &vsock_without_docker, &engine),
+    );
+
+    var native_vsock = try toml.parse(
+        arena,
+        "docker = true\ndocker-vsock = true\n",
+        null,
+    );
+    engine = .native;
+    try testing.expectError(
+        error.ProjectFileInvalid,
+        mapTable(arena, "/proj", &native_vsock, &engine),
+    );
 
     var gpu = try toml.parse(arena, "engine = \"vz\"\nkernel = \"Image\"\ngpu = true\n", null);
     try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &gpu, &engine));
 
     var no_kernel = try toml.parse(arena, "engine = \"vz\"\n", null);
-    try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &no_kernel, &engine));
+    try testing.expectError(
+        error.ProjectFileInvalid,
+        mapTable(arena, "/proj", &no_kernel, &engine),
+    );
 
     var bogus = try toml.parse(arena, "engine = \"qemu\"\n", null);
     try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bogus, &engine));

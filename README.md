@@ -123,8 +123,8 @@ shell state intact — in tens of milliseconds instead of booting. `bobrvm up
 --fresh` discards the warm state. The project directory is shared with the
 guest over virtio-9p by default (`share = false` opts out), relative paths
 resolve against the project root, and warm state lives under
-`~/.config/bobrvm/projects/`, never in the repository. `bobrvm up --help`
-lists the full key set.
+`$XDG_CONFIG_HOME/bobrvm/projects/` (default `~/.config/bobrvm/projects/`), never in the
+repository. `bobrvm up --help` lists the full key set.
 
 A `provision = ["cmd", ...]` list in `bobrvm.toml` runs shell commands once
 on the first cold boot; save the result with <kbd>Ctrl</kbd>+<kbd>B</kbd>
@@ -134,13 +134,114 @@ status`, `bobrvm suspend`, and `bobrvm halt` manage it. `engine = "vz"` runs
 the project on Apple's Virtualization.framework instead of the custom VMM — a
 lighter device set with the same verbs.
 
+### Docker Compose
+
+Release app bundles include the Docker CLI, Docker Compose, Buildx, and the
+macOS keychain credential helper. Install their entry points with:
+
+```sh
+sudo /Applications/Bobrvm.app/Contents/MacOS/bin/bobrvm install-cli
+```
+
+The installer creates `/usr/local/bin/bobrvm`, `docker`, `docker-compose`,
+`docker-buildx`, and `docker-credential-osxkeychain` symlinks and never
+replaces a valid existing path. Dangling absolute symlinks left by an
+uninstalled runtime are repaired. If OrbStack or Docker Desktop still owns
+those names, use a temporary directory first:
+
+```sh
+mkdir -p /tmp/bobrvm-cli
+ln -s /Applications/Bobrvm.app/Contents/MacOS/bin/bobrvm /tmp/bobrvm-cli/bobrvm
+ln -s /Applications/Bobrvm.app/Contents/MacOS/xbin/docker /tmp/bobrvm-cli/docker
+ln -s /Applications/Bobrvm.app/Contents/MacOS/xbin/docker-compose \
+  /tmp/bobrvm-cli/docker-compose
+export PATH="/tmp/bobrvm-cli:$PATH"
+```
+
+To test a source build without changing `/usr/local/bin`, build a local app,
+bundle the pinned clients, and point the installer at a temporary prefix:
+
+```sh
+nix develop -c zig build install macos-app
+tools/bundle-docker-cli.sh macos/build/Debug/Bobrvm.app zig-out/bin/bobrvm
+mkdir -p /tmp/bobrvm-cli
+macos/build/Debug/Bobrvm.app/Contents/MacOS/bin/bobrvm install-cli \
+  --app "$PWD/macos/build/Debug/Bobrvm.app" \
+  --prefix /tmp/bobrvm-cli
+export PATH="/tmp/bobrvm-cli:$PATH"
+```
+
+Linux containers need a Linux kernel on macOS. Bobrvm runs exactly one shared
+Virtualization.framework Linux runtime for Docker; it does not create a VM per
+container or Compose project. Docker Engine runs in that runtime and its Unix
+socket is forwarded directly over virtio-vsock.
+
+Enable Docker and the socket proxy when building the guest. The measured crun
+runtime is the default; set `runtime = "runc"` only for compatibility:
+
+```nix
+virtualisation.bobrvm.guest.docker = {
+  enable = true;
+  vsock.enable = true;
+  runtime = "crun";
+};
+```
+
+Put the resulting kernel, initramfs, and writable raw root disk in the shared
+runtime directory, then create its configuration:
+
+```toml
+# ~/.config/bobrvm/docker/bobrvm.toml
+name = "docker"
+engine = "vz"
+memory = 4096
+cpus = 4
+kernel = "Image"
+initrd = "initramfs"
+disk = "root.raw"
+docker = true
+docker-vsock = true
+share = "/Users/example/Developer"
+forwards = ["5433:5433"]
+```
+
+The shared directory must contain every host project that containers bind
+mount, at the same absolute path. Use the narrowest common project ancestor:
+exporting an entire home directory increases the host-visible surface and can
+make metadata-heavy traversals slower. Static host-to-guest forwards currently
+live in this global configuration.
+
+Start the runtime explicitly, or let the first server-side Docker command
+start it and wait for the Docker API automatically:
+
+```sh
+bobrvm docker-host start
+docker info
+docker compose up --wait
+docker compose ps
+```
+
+Docker and Compose now work from any directory and do not require a project
+`bobrvm.toml`. `bobrvm docker-host status|suspend|stop` manages the one shared
+runtime. Suspend atomically replaces the VZ checkpoint and preserves running
+containers. The VZ socket transport carries Docker streams without Ethernet,
+IP, or a plaintext guest listener. If no shared runtime is configured,
+existing per-project `docker = true` configurations remain available as a
+compatibility fallback.
+
 `bobrvm exec -- <command>` runs a command in a disposable clone of the warm
 state and prints its output, without touching the project. `bobrvm ssh` opens
 a session to the guest through the host port forwarded to guest port 22
 (`forwards = ["2222:22"]`, `ssh-user = "root"`); the guest must run sshd.
-`bobrvm bench-warm` reports warm-restore latency over several trials. A `share-readonly = true`
-key makes the project share read-only on the host, not just in the guest
-mount — a sandbox cannot write host files through it.
+`bobrvm bench-warm --json` reports restore, shell-ready, command, cleanup, and host-resource
+measurements over several trials. A `share-readonly = true` key makes the project share read-only
+on the host, not just in the guest mount — a sandbox cannot write host files through it.
+
+On macOS, `bobrvm bench-host --pid PID [--pid PID ...]` measures a fixed interval, while
+`bobrvm bench-command --pid PID ... -- COMMAND` measures repeated commands. Both emit versioned
+JSON with CPU time, wakeups, memory, I/O, instructions, cycles, and kernel-accounted energy for a
+complete runtime process set. See [Performance and energy benchmarking](docs/performance.md) for
+the controlled comparison protocol and current development baseline.
 
 ### Disposable sandboxes
 
@@ -202,7 +303,7 @@ BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm vz-run \
 The flake exports `packages.aarch64-linux.bobrvm-tools` and
 `nixosModules.guest`. The module configures Venus/Zink graphics and can opt in
 to clipboard integration, guest lifecycle management, quiesced snapshots,
-file delivery, and a shared folder:
+file delivery, a shared folder, and Docker:
 
 ```nix
 {
@@ -213,6 +314,7 @@ file delivery, and a shared folder:
     clipboard.enable = true;
     fileTransfer.enable = true;
     sharedFolder.enable = true;
+    docker.enable = true;
   };
 }
 ```

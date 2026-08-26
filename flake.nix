@@ -154,11 +154,27 @@
                 fileTransfer.enable = true;
                 quiescedSnapshots.enable = true;
                 sharedFolder.enable = true;
+                docker.enable = true;
               };
             }
           ];
         };
         guestConfig = guestSystem.config;
+        guestVsockSystem = lib.nixosSystem {
+          system = pkgs.stdenv.hostPlatform.system;
+          modules = [
+            self.nixosModules.guest
+            {
+              nixpkgs.config.allowUnfreePredicate = allowBobrvm;
+              virtualisation.bobrvm.guest = {
+                enable = true;
+                docker.enable = true;
+                docker.vsock.enable = true;
+              };
+            }
+          ];
+        };
+        guestVsockConfig = guestVsockSystem.config;
       in {
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) bobrvm-tools;
         guest-module = assert guestConfig.services.qemuGuest.enable;
@@ -168,7 +184,32 @@
         assert guestConfig.fileSystems."/mnt/bobrvm".fsType == "9p";
         assert lib.hasInfix "--inbox /var/lib/bobrvm/inbox"
         guestConfig.systemd.services.bobrvm-agentd.serviceConfig.ExecStart;
+        assert guestConfig.virtualisation.docker.enable;
+        assert lib.elem "10.0.2.15:2375"
+        guestConfig.virtualisation.docker.listenOptions;
+        assert lib.hasInfix "--tls=false"
+        guestConfig.virtualisation.docker.extraOptions;
+        assert guestConfig.virtualisation.docker.daemon.settings."default-runtime" == "crun";
+        assert guestConfig.virtualisation.docker.daemon.settings.runtimes.crun.path
+        == "${pkgs.crun}/bin/crun";
+        assert lib.elem pkgs.crun guestConfig.virtualisation.docker.extraPackages;
+        assert guestConfig.systemd.sockets.docker.socketConfig.FreeBind;
+        assert lib.elem "preempt=full" guestConfig.boot.kernelParams;
+        assert lib.elem "transparent_hugepage=never" guestConfig.boot.kernelParams;
+        assert lib.elem "rootflags=noatime,lazytime,commit=30"
+        guestConfig.boot.kernelParams;
+        assert lib.elem "fuse.force_cache_dir=1" guestConfig.boot.kernelParams;
+        assert lib.elem "fuse.dir_cache_timeout_ms=1000" guestConfig.boot.kernelParams;
           pkgs.runCommand "bobrvm-guest-module-check" {} ''
+            touch "$out"
+          '';
+        guest-module-vsock = assert guestVsockConfig.virtualisation.docker.enable;
+        assert guestVsockConfig.systemd.services.bobrvm-docker-proxy.enable;
+        assert lib.elem "vmw_vsock_virtio_transport" guestVsockConfig.boot.kernelModules;
+        assert !(lib.elem "10.0.2.15:2375"
+          guestVsockConfig.virtualisation.docker.listenOptions);
+        assert guestVsockConfig.virtualisation.docker.extraOptions == "";
+          pkgs.runCommand "bobrvm-guest-module-vsock-check" {} ''
             touch "$out"
           '';
       }))

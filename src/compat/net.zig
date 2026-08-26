@@ -10,7 +10,9 @@
 //! EINPROGRESS/EALREADY handling for nonblocking connect.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
+const unix_path_bytes_max = @sizeOf(@FieldType(posix.sockaddr.un, "path"));
 
 // std.c doesn't publicly expose these two (they're private helpers in
 // libc.zig), even though the extern symbols exist — declare our own.
@@ -18,6 +20,7 @@ extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
 
 pub const Error = error{ WouldBlock, ConnectionPending, Unexpected };
+pub const UnixSocketPathError = error{ AddressInUse, NameTooLong, Unexpected };
 
 fn errnoError() Error {
     return switch (std.c.errno(@as(c_int, -1))) {
@@ -41,21 +44,155 @@ pub fn socketCreate(domain: u32, socket_type: u32, protocol: u32) Error!posix.so
 
     const rc = socket(@intCast(domain), @intCast(filtered_type), @intCast(protocol));
     if (rc == -1) return errnoError();
-    if (want_nonblock) setNonBlocking(rc);
+    if (want_nonblock and !setNonBlocking(rc)) {
+        _ = close(rc);
+        return error.Unexpected;
+    }
     return rc;
 }
 
-fn setNonBlocking(fd: posix.socket_t) void {
+fn setNonBlocking(fd: posix.fd_t) bool {
     const cur = std.c.fcntl(fd, std.c.F.GETFL);
-    if (cur == -1) return;
+    if (cur == -1) return false;
     var flags: std.c.O = @bitCast(@as(u32, @intCast(cur)));
     flags.NONBLOCK = true;
-    _ = std.c.fcntl(fd, std.c.F.SETFL, @as(u32, @bitCast(flags)));
+    return std.c.fcntl(fd, std.c.F.SETFL, @as(u32, @bitCast(flags))) != -1;
+}
+
+fn setCloseOnExec(fd: posix.fd_t) bool {
+    const flags = std.c.fcntl(fd, std.c.F.GETFD);
+    if (flags == -1) return false;
+    return std.c.fcntl(fd, std.c.F.SETFD, flags | std.c.FD_CLOEXEC) != -1;
 }
 
 pub fn socketClose(fd: posix.socket_t) void {
     _ = close(fd);
 }
+
+/// Remove an abandoned Unix socket without clobbering a live listener or an
+/// unrelated filesystem entry at the same path.
+pub fn removeStaleUnixSocket(path: []const u8) UnixSocketPathError!void {
+    if (path.len == 0 or path.len >= unix_path_bytes_max) return error.NameTooLong;
+    const probe = socketCreate(
+        posix.AF.UNIX,
+        posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
+        0,
+    ) catch return error.Unexpected;
+    defer socketClose(probe);
+
+    var address: posix.sockaddr.un = undefined;
+    @memset(std.mem.asBytes(&address), 0);
+    address.family = posix.AF.UNIX;
+    @memcpy(address.path[0..path.len], path);
+    const address_len = @offsetOf(posix.sockaddr.un, "path") + path.len + 1;
+    if (@hasField(posix.sockaddr.un, "len")) address.len = @intCast(address_len);
+    if (std.c.connect(probe, @ptrCast(&address), @intCast(address_len)) == 0) {
+        return error.AddressInUse;
+    }
+
+    switch (std.c.errno(@as(c_int, -1))) {
+        .NOENT => {},
+        .CONNREFUSED => {
+            if (std.c.unlink(@ptrCast(&address.path)) != 0 and
+                std.c.errno(@as(c_int, -1)) != .NOENT)
+            {
+                return error.Unexpected;
+            }
+        },
+        else => return error.AddressInUse,
+    }
+}
+
+/// Non-blocking self-pipe used to wake a thread blocked in poll/select. Signals
+/// coalesce when the pipe is full; one readable byte is enough to rebuild the
+/// caller's poll set from authoritative state.
+pub const WakePipe = struct {
+    read_fd: posix.fd_t = -1,
+    write_fd: posix.fd_t = -1,
+
+    pub fn init() error{Unexpected}!WakePipe {
+        var fds: [2]posix.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.Unexpected;
+        errdefer {
+            _ = close(fds[0]);
+            _ = close(fds[1]);
+        }
+        if (!setNonBlocking(fds[0]) or
+            !setNonBlocking(fds[1]) or
+            !setCloseOnExec(fds[0]) or
+            !setCloseOnExec(fds[1]) or
+            fds[0] >= fd_set_size)
+        {
+            return error.Unexpected;
+        }
+        return .{ .read_fd = fds[0], .write_fd = fds[1] };
+    }
+
+    pub fn deinit(self: *WakePipe) void {
+        if (self.read_fd >= 0) _ = close(self.read_fd);
+        if (self.write_fd >= 0) _ = close(self.write_fd);
+        self.* = .{};
+    }
+
+    pub fn signal(self: WakePipe) void {
+        if (self.write_fd < 0) return;
+        const bytes = [_]u8{1};
+        _ = std.c.write(self.write_fd, bytes[0..].ptr, bytes.len);
+    }
+
+    pub fn drain(self: WakePipe) void {
+        if (self.read_fd < 0) return;
+        var bytes: [64]u8 = undefined;
+        while (std.c.read(self.read_fd, &bytes, bytes.len) > 0) {}
+    }
+
+    /// Wait for a signal or a nanosecond-resolution timeout. A null timeout
+    /// blocks indefinitely. Pipe readability preserves wakeups that arrive
+    /// immediately before the wait begins.
+    pub fn wait(self: WakePipe, timeout_ns: ?u64) Error!void {
+        if (self.read_fd < 0) return error.Unexpected;
+        var read_fds = FdSet{};
+        read_fds.set(self.read_fd);
+        var timeout: std.c.timespec = undefined;
+        const timeout_ptr = if (timeout_ns) |ns| blk: {
+            timeout = .{
+                .sec = @intCast(ns / std.time.ns_per_s),
+                .nsec = @intCast(ns % std.time.ns_per_s),
+            };
+            break :blk &timeout;
+        } else null;
+        const result = pselect(self.read_fd + 1, &read_fds, null, null, timeout_ptr, null);
+        if (result < 0 and std.c.errno(@as(c_int, -1)) != .INTR) {
+            return error.Unexpected;
+        }
+        if (result > 0) self.drain();
+    }
+};
+
+const fd_set_size: posix.fd_t = 1024;
+const FdMask = if (builtin.os.tag == .macos) i32 else c_long;
+const fd_mask_bits = @bitSizeOf(FdMask);
+const FdMaskUnsigned = std.meta.Int(.unsigned, fd_mask_bits);
+
+const FdSet = extern struct {
+    bits: [fd_set_size / fd_mask_bits]FdMask = @splat(0),
+
+    fn set(self: *FdSet, fd: posix.fd_t) void {
+        const index: usize = @intCast(@divTrunc(fd, fd_mask_bits));
+        const shift: std.math.Log2Int(FdMaskUnsigned) = @intCast(@mod(fd, fd_mask_bits));
+        const mask: FdMaskUnsigned = @as(FdMaskUnsigned, 1) << shift;
+        self.bits[index] = @bitCast(mask);
+    }
+};
+
+extern "c" fn pselect(
+    nfds: c_int,
+    read_fds: ?*FdSet,
+    write_fds: ?*FdSet,
+    except_fds: ?*FdSet,
+    timeout: ?*const std.c.timespec,
+    signal_mask: ?*const anyopaque,
+) c_int;
 
 pub fn sendto(
     sockfd: posix.socket_t,
@@ -105,7 +242,10 @@ pub fn listen(sockfd: posix.socket_t, backlog: c_uint) Error!void {
 pub fn accept(sockfd: posix.socket_t) Error!posix.socket_t {
     const rc = std.c.accept(sockfd, null, null);
     if (rc == -1) return errnoError();
-    setNonBlocking(rc);
+    if (!setNonBlocking(rc)) {
+        _ = close(rc);
+        return error.Unexpected;
+    }
     return rc;
 }
 
@@ -168,4 +308,35 @@ test "socketCreate without SOCK.NONBLOCK leaves a blocking fd" {
     try testing.expect(flags != -1);
     const o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
     try testing.expect(!o.NONBLOCK);
+}
+
+test "WakePipe interrupts poll and drains coalesced signals" {
+    var wake = try WakePipe.init();
+    defer wake.deinit();
+
+    wake.signal();
+    wake.signal();
+    var poll_fds = [_]posix.pollfd{.{
+        .fd = wake.read_fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try testing.expectEqual(@as(usize, 1), try posix.poll(&poll_fds, 0));
+    wake.drain();
+    poll_fds[0].revents = 0;
+    try testing.expectEqual(@as(usize, 0), try posix.poll(&poll_fds, 0));
+}
+
+test "WakePipe preserves a signal sent before an indefinite wait" {
+    var wake = try WakePipe.init();
+    defer wake.deinit();
+
+    wake.signal();
+    try wake.wait(null);
+    var poll_fds = [_]posix.pollfd{.{
+        .fd = wake.read_fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try testing.expectEqual(@as(usize, 0), try posix.poll(&poll_fds, 0));
 }

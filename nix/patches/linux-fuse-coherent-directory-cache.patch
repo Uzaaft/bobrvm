@@ -1,0 +1,454 @@
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -141,7 +141,7 @@
+  */
+ void fuse_invalidate_atime(struct inode *inode)
+ {
+-	if (!IS_RDONLY(inode))
++	if (!IS_RDONLY(inode) && !IS_NOATIME(inode))
+ 		fuse_invalidate_attr_mask(inode, STATX_ATIME);
+ }
+ 
+@@ -1411,6 +1411,7 @@
+ 	if (!S_ISDIR(parent->i_mode))
+ 		goto unlock;
+ 
++	fuse_dir_changed(parent);
+ 	err = -ENOENT;
+ 	dir = d_find_alias(parent);
+ 	if (!dir)
+@@ -1422,7 +1423,6 @@
+ 	if (!entry)
+ 		goto unlock;
+ 
+-	fuse_dir_changed(parent);
+ 	if (!(flags & FUSE_EXPIRE_ONLY))
+ 		d_invalidate(entry);
+ 	fuse_invalidate_entry_cache(entry);
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -22,6 +22,10 @@
+ #include <linux/splice.h>
+ #include <linux/task_io_accounting_ops.h>
+ #include <linux/iomap.h>
++
++bool fuse_force_cache_dir;
++module_param_named(force_cache_dir, fuse_force_cache_dir, bool, 0644);
++MODULE_PARM_DESC(force_cache_dir, "cache directories until FUSE invalidates them");
+ 
+ static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
+ 			  unsigned int open_flags, int opcode,
+@@ -174,6 +178,8 @@
+ 		}
+ 	}
+ 
++	if (isdir && fuse_force_cache_dir)
++		ff->open_flags |= FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE;
+ 	if (isdir)
+ 		ff->open_flags &= ~FOPEN_DIRECT_IO;
+ 
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -76,6 +76,7 @@
+ /** Module parameters */
+ extern unsigned int max_user_bgreq;
+ extern unsigned int max_user_congthresh;
++extern bool fuse_force_cache_dir;
+ 
+ /* One forget request */
+ struct fuse_forget_link {
+@@ -168,6 +169,12 @@
+ 			/* true if fully cached */
+ 			bool cached;
+ 
++			/* true if cache records include READDIRPLUS attributes */
++			bool plus;
++
++			/* true if owner_kh identifies the open filling this cache */
++			bool owner_valid;
++
+ 			/* size of cache */
+ 			loff_t size;
+ 
+@@ -183,7 +190,13 @@
+ 
+ 			/* iversion of directory when cache was started */
+ 			u64 iversion;
++
++			/* End of the interval where cached directory names are valid. */
++			u64 valid_until;
+ 
++			/* Unique handle of the only open allowed to fill this cache. */
++			u64 owner_kh;
++
+ 			/* protects above fields */
+ 			spinlock_t lock;
+ 		} rdc;
+@@ -275,6 +288,9 @@
+ 		/* Version of cache we are reading */
+ 		u64 version;
+ 
++		/* Keep a stream on server data if it began before cache completion. */
++		bool cache_bypass;
++
+ 	} readdir;
+ 
+ 	/** RB node to be linked on fuse_conn->polled_files */
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -11,6 +11,7 @@
+ #include "dev_uring_i.h"
+ 
+ #include <linux/dax.h>
++#include <linux/iversion.h>
+ #include <linux/pagemap.h>
+ #include <linux/slab.h>
+ #include <linux/file.h>
+@@ -570,6 +571,8 @@
+ 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+ 	spin_unlock(&fi->lock);
+ 
++	if (fuse_force_cache_dir && S_ISDIR(inode->i_mode))
++		inode_maybe_inc_iversion(inode, false);
+ 	fuse_invalidate_attr(inode);
+ 	forget_all_cached_acls(inode);
+ 	if (offset >= 0) {
+--- a/fs/fuse/readdir.c
++++ b/fs/fuse/readdir.c
+@@ -14,6 +14,10 @@
+ #include <linux/highmem.h>
+ #include <linux/vmalloc.h>
+ 
++static unsigned int dir_cache_timeout_ms;
++module_param(dir_cache_timeout_ms, uint, 0644);
++MODULE_PARM_DESC(dir_cache_timeout_ms, "maximum cached directory name lifetime");
++
+ static bool fuse_use_readdirplus(struct inode *dir, struct dir_context *ctx)
+ {
+ 	struct fuse_conn *fc = get_fuse_conn(dir);
+@@ -31,10 +35,12 @@
+ }
+ 
+ static void fuse_add_dirent_to_cache(struct file *file,
+-				     struct fuse_dirent *dirent, loff_t pos)
++				     void *record, size_t reclen,
++				     struct fuse_dirent *dirent, loff_t pos,
++				     bool plus)
+ {
+ 	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
+-	size_t reclen = FUSE_DIRENT_SIZE(dirent);
++	struct fuse_file *ff = file->private_data;
+ 	pgoff_t index;
+ 	struct page *page;
+ 	loff_t size;
+@@ -55,6 +61,14 @@
+ 		spin_unlock(&fi->rdc.lock);
+ 		return;
+ 	}
++	if (!fi->rdc.owner_valid || fi->rdc.owner_kh != ff->kh) {
++		spin_unlock(&fi->rdc.lock);
++		return;
++	}
++	if (fi->rdc.size && fi->rdc.plus != plus) {
++		spin_unlock(&fi->rdc.lock);
++		return;
++	}
+ 	version = fi->rdc.version;
+ 	size = fi->rdc.size;
+ 	offset = size & ~PAGE_MASK;
+@@ -86,9 +100,10 @@
+ 		clear_page(addr);
+ 		SetPageUptodate(page);
+ 	}
+-	memcpy(addr + offset, dirent, reclen);
++	memcpy(addr + offset, record, reclen);
+ 	kunmap_local(addr);
+ 	fi->rdc.size = (index << PAGE_SHIFT) + offset + reclen;
++	fi->rdc.plus = plus;
+ 	fi->rdc.pos = dirent->off;
+ unlock:
+ 	spin_unlock(&fi->rdc.lock);
+@@ -99,16 +114,21 @@
+ static void fuse_readdir_cache_end(struct file *file, loff_t pos)
+ {
+ 	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
++	struct fuse_file *ff = file->private_data;
+ 	loff_t end;
+ 
+ 	spin_lock(&fi->rdc.lock);
+-	/* does cache end position match current position? */
+-	if (fi->rdc.pos != pos) {
++	/* Does this open own the cache and end at its current position? */
++	if (!fi->rdc.owner_valid || fi->rdc.owner_kh != ff->kh ||
++	    fi->rdc.pos != pos) {
+ 		spin_unlock(&fi->rdc.lock);
+ 		return;
+ 	}
+ 
+ 	fi->rdc.cached = true;
++	if (dir_cache_timeout_ms)
++		fi->rdc.valid_until = get_jiffies_64() +
++			msecs_to_jiffies(dir_cache_timeout_ms);
+ 	end = ALIGN(fi->rdc.size, PAGE_SIZE);
+ 	spin_unlock(&fi->rdc.lock);
+ 
+@@ -122,7 +142,24 @@
+ 	struct fuse_file *ff = file->private_data;
+ 
+ 	if (ff->open_flags & FOPEN_CACHE_DIR)
+-		fuse_add_dirent_to_cache(file, dirent, ctx->pos);
++		fuse_add_dirent_to_cache(file, dirent,
++					 FUSE_DIRENT_SIZE(dirent), dirent,
++					 ctx->pos, false);
++
++	return dir_emit(ctx, dirent->name, dirent->namelen, dirent->ino,
++			dirent->type | FILLDIR_FLAG_NOINTR);
++}
++
++static bool fuse_emit_plus(struct file *file, struct dir_context *ctx,
++			   struct fuse_direntplus *direntplus)
++{
++	struct fuse_dirent *dirent = &direntplus->dirent;
++	struct fuse_file *ff = file->private_data;
++
++	if (ff->open_flags & FOPEN_CACHE_DIR)
++		fuse_add_dirent_to_cache(file, direntplus,
++					 FUSE_DIRENTPLUS_SIZE(direntplus),
++					 dirent, ctx->pos, true);
+ 
+ 	return dir_emit(ctx, dirent->name, dirent->namelen, dirent->ino,
+ 			dirent->type | FILLDIR_FLAG_NOINTR);
+@@ -320,7 +357,7 @@
+ 			   we need to send a FORGET for each of those
+ 			   which we did not link.
+ 			*/
+-			over = !fuse_emit(file, ctx, dirent);
++			over = !fuse_emit_plus(file, ctx, direntplus);
+ 			if (!over)
+ 				ctx->pos = dirent->off;
+ 		}
+@@ -441,25 +478,104 @@
+ 	FOUND_ALL,
+ };
+ 
+-static enum fuse_parse_result fuse_parse_cache(struct fuse_file *ff,
+-					       void *addr, unsigned int size,
+-					       struct dir_context *ctx)
++static void fuse_refresh_cached_dirent(struct file *file,
++				       struct fuse_direntplus *direntplus)
+ {
++	struct fuse_entry_out *o = &direntplus->entry_out;
++	struct fuse_dirent *dirent = &direntplus->dirent;
++	struct dentry *parent = file->f_path.dentry;
++	struct qstr name = QSTR_INIT(dirent->name, dirent->namelen);
++	struct inode *dir = file_inode(file);
++	struct fuse_conn *fc = get_fuse_conn(dir);
++	struct dentry *dentry;
++	struct inode *inode;
++	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
++
++	if (!o->nodeid || name.name[0] == '.' || invalid_nodeid(o->nodeid) ||
++	    fuse_invalid_attr(&o->attr))
++		return;
++
++	name.hash = full_name_hash(parent, name.name, name.len);
++	dentry = d_lookup(parent, &name);
++	if (!dentry) {
++		down_read(&fc->killsb);
++		inode = fuse_ilookup(fc, o->nodeid, NULL);
++		up_read(&fc->killsb);
++		if (!inode)
++			return;
++		if (fuse_is_bad(inode) ||
++		    fuse_stale_inode(inode, o->generation, &o->attr)) {
++			iput(inode);
++			return;
++		}
++
++		dentry = d_alloc_parallel(parent, &name, &wq);
++		if (IS_ERR(dentry)) {
++			iput(inode);
++			return;
++		}
++		if (d_in_lookup(dentry)) {
++			struct dentry *alias = d_splice_alias(inode, dentry);
++
++			d_lookup_done(dentry);
++			if (alias) {
++				dput(dentry);
++				dentry = alias;
++			}
++			if (IS_ERR(dentry))
++				return;
++		} else {
++			iput(inode);
++		}
++	}
++
++	inode = d_inode(dentry);
++	if (inode && get_node_id(inode) == o->nodeid &&
++	    !fuse_is_bad(inode) &&
++	    !fuse_stale_inode(inode, o->generation, &o->attr)) {
++		struct fuse_inode *fi = get_fuse_inode(inode);
++
++		spin_lock(&fi->lock);
++		if (!(fi->inval_mask & STATX_BASIC_STATS))
++			fi->i_time = ATTR_TIMEOUT(o);
++		spin_unlock(&fi->lock);
++		dentry->d_time = atomic_read(&fc->epoch);
++		fuse_change_entry_timeout(dentry, o);
++	}
++	dput(dentry);
++}
++
++static enum fuse_parse_result fuse_parse_cache(struct file *file, void *addr,
++					       unsigned int size,
++					       struct dir_context *ctx,
++					       bool plus)
++{
++	struct fuse_file *ff = file->private_data;
+ 	unsigned int offset = ff->readdir.cache_off & ~PAGE_MASK;
+ 	enum fuse_parse_result res = FOUND_NONE;
+ 
+ 	WARN_ON(offset >= size);
+ 
+ 	for (;;) {
+-		struct fuse_dirent *dirent = addr + offset;
++		struct fuse_direntplus *direntplus = addr + offset;
++		struct fuse_dirent *dirent;
+ 		unsigned int nbytes = size - offset;
+ 		size_t reclen;
+ 
+-		if (nbytes < FUSE_NAME_OFFSET || !dirent->namelen)
++		if (plus) {
++			if (nbytes < FUSE_NAME_OFFSET_DIRENTPLUS)
++				break;
++			dirent = &direntplus->dirent;
++			reclen = FUSE_DIRENTPLUS_SIZE(direntplus);
++		} else {
++			if (nbytes < FUSE_NAME_OFFSET)
++				break;
++			dirent = (struct fuse_dirent *)direntplus;
++			reclen = FUSE_DIRENT_SIZE(dirent);
++		}
++		if (!dirent->namelen)
+ 			break;
+ 
+-		reclen = FUSE_DIRENT_SIZE(dirent); /* derefs ->namelen */
+-
+ 		if (WARN_ON(dirent->namelen > FUSE_NAME_MAX))
+ 			return FOUND_ERR;
+ 		if (WARN_ON(reclen > nbytes))
+@@ -473,6 +589,8 @@
+ 				      dirent->ino, dirent->type | FILLDIR_FLAG_NOINTR))
+ 				return FOUND_ALL;
+ 			ctx->pos = dirent->off;
++			if (plus)
++				fuse_refresh_cached_dirent(file, direntplus);
+ 		}
+ 		ff->readdir.pos = dirent->off;
+ 		ff->readdir.cache_off += reclen;
+@@ -491,6 +609,10 @@
+ 	fi->rdc.version++;
+ 	fi->rdc.size = 0;
+ 	fi->rdc.pos = 0;
++	fi->rdc.plus = false;
++	fi->rdc.valid_until = 0;
++	fi->rdc.owner_kh = 0;
++	fi->rdc.owner_valid = false;
+ }
+ 
+ #define UNCACHED 1
+@@ -506,6 +628,8 @@
+ 	unsigned int size;
+ 	struct page *page;
+ 	void *addr;
++	bool plus;
++	bool check_mtime = false;
+ 
+ 	/* Seeked?  If so, reset the cache stream */
+ 	if (ff->readdir.pos != ctx->pos) {
+@@ -517,17 +641,31 @@
+ 	 * We're just about to start reading into the cache or reading the
+ 	 * cache; both cases require an up-to-date mtime value.
+ 	 */
+-	if (!ctx->pos && fc->auto_inval_data) {
+-		int err = fuse_update_attributes(inode, file, STATX_MTIME);
++	if (!ctx->pos &&
++	    ((!fuse_force_cache_dir && fc->auto_inval_data) ||
++	     (fuse_force_cache_dir && dir_cache_timeout_ms &&
++	      READ_ONCE(fi->rdc.cached) && time_after64(get_jiffies_64(),
++			   READ_ONCE(fi->rdc.valid_until))))) {
++		int err;
+ 
++		if (fuse_force_cache_dir)
++			fuse_invalidate_attr_mask(inode, STATX_MTIME);
++		err = fuse_update_attributes(inode, file, STATX_MTIME);
+ 		if (err)
+ 			return err;
++		check_mtime = true;
+ 	}
+ 
+ retry:
+ 	spin_lock(&fi->rdc.lock);
+ retry_locked:
+ 	if (!fi->rdc.cached) {
++		if (!ctx->pos && (!fi->rdc.owner_valid ||
++				  fi->rdc.owner_kh != ff->kh)) {
++			fuse_rdc_reset(inode);
++			fi->rdc.owner_kh = ff->kh;
++			fi->rdc.owner_valid = true;
++		}
+ 		/* Starting cache? Set cache mtime. */
+ 		if (!ctx->pos && !fi->rdc.size) {
+ 			fi->rdc.mtime = inode_get_mtime(inode);
+@@ -545,10 +683,15 @@
+ 		struct timespec64 mtime = inode_get_mtime(inode);
+ 
+ 		if (inode_peek_iversion(inode) != fi->rdc.iversion ||
+-		    !timespec64_equal(&fi->rdc.mtime, &mtime)) {
++		    ((!fuse_force_cache_dir || check_mtime) &&
++		     !timespec64_equal(&fi->rdc.mtime, &mtime))) {
+ 			fuse_rdc_reset(inode);
+ 			goto retry_locked;
+ 		}
++		if (check_mtime && dir_cache_timeout_ms) {
++			fi->rdc.valid_until = get_jiffies_64() +
++				msecs_to_jiffies(dir_cache_timeout_ms);
++		}
+ 	}
+ 
+ 	/*
+@@ -568,6 +711,7 @@
+ 
+ 	WARN_ON(fi->rdc.size < ff->readdir.cache_off);
+ 
++	plus = fi->rdc.plus;
+ 	index = ff->readdir.cache_off >> PAGE_SHIFT;
+ 
+ 	if (index == (fi->rdc.size >> PAGE_SHIFT))
+@@ -612,7 +756,7 @@
+ 	 * the page lock.
+ 	 */
+ 	addr = kmap_local_page(page);
+-	res = fuse_parse_cache(ff, addr, size, ctx);
++	res = fuse_parse_cache(file, addr, size, ctx, plus);
+ 	kunmap_local(addr);
+ 	unlock_page(page);
+ 	put_page(page);
+@@ -647,10 +791,13 @@
+ 		return -EIO;
+ 
+ 	err = UNCACHED;
+-	if (ff->open_flags & FOPEN_CACHE_DIR)
++	if ((ff->open_flags & FOPEN_CACHE_DIR) &&
++	    !ff->readdir.cache_bypass)
+ 		err = fuse_readdir_cached(file, ctx);
+-	if (err == UNCACHED)
++	if (err == UNCACHED) {
++		ff->readdir.cache_bypass = true;
+ 		err = fuse_readdir_uncached(file, ctx);
++	}
+ 
+ 	return err;
+ }

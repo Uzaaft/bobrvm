@@ -20,6 +20,7 @@ KERNEL=$REPO/tests/integration/alpine/out/Image
 INITRD=$REPO/tests/integration/alpine/out/initramfs-minimal
 WORK=${UP_WARM_WORKDIR:-$(mktemp -d /tmp/bobrvm-up-warm.XXXXXX)}
 PROJ=$WORK/proj
+export XDG_CONFIG_HOME=$WORK/config
 LOG_A=$WORK/up-a.log
 LOG_B=$WORK/up-b.log
 
@@ -36,10 +37,6 @@ kernel = "$KERNEL"
 initrd = "$INITRD"
 share = false
 EOF
-
-# The state dir is keyed by the project path; wipe leftovers so run A
-# is genuinely cold.
-rm -rf "$HOME"/.config/bobrvm/projects/proj-*
 
 echo "=== RUN A: cold boot, tick loop, suspend at t+25s ==="
 cd "$PROJ"
