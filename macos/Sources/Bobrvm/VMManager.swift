@@ -340,6 +340,46 @@ public final class VMManager: ObservableObject {
 // MARK: - VM Instance
 
 @MainActor
+protocol VMRuntime: AnyObject {
+    var state: VMState { get }
+    var stateChanges: AnyPublisher<Void, Never> { get }
+
+    func start() throws
+    func stop()
+    func stopAndWait() async
+    func pause()
+    func resume()
+    func destroy()
+}
+
+extension VMRuntime {
+    func stopAndWait() async {
+        while state != .stopped {
+            stop()
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+}
+
+extension VM: VMRuntime {
+    var stateChanges: AnyPublisher<Void, Never> {
+        objectWillChange.eraseToAnyPublisher()
+    }
+}
+
+extension MacVirtualMachine: VMRuntime {
+    var stateChanges: AnyPublisher<Void, Never> {
+        objectWillChange.eraseToAnyPublisher()
+    }
+}
+
+extension LinuxVirtualMachine: VMRuntime {
+    var stateChanges: AnyPublisher<Void, Never> {
+        objectWillChange.eraseToAnyPublisher()
+    }
+}
+
+@MainActor
 public final class VMInstance: ObservableObject, Identifiable, Hashable {
     public nonisolated static func == (lhs: VMInstance, rhs: VMInstance) -> Bool {
         lhs.id == rhs.id
@@ -352,7 +392,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     @Published public private(set) var name: String
     @Published public private(set) var config: VMConfig
     private let app: App
-    private var vm: VM?
+    private var runtime: (any VMRuntime)?
     public let isoPath: String?
     @Published public private(set) var retinaEnabled: Bool
     public let guestSystem: GuestSystem
@@ -362,11 +402,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
 
     @Published public var surface: Surface?
 
-    private var vmStateCancellable: AnyCancellable?
-    private var macVM: MacVirtualMachine?
-    private var macVMStateCancellable: AnyCancellable?
-    private var linuxVZVM: LinuxVirtualMachine?
-    private var linuxVZStateCancellable: AnyCancellable?
+    private var runtimeStateCancellable: AnyCancellable?
 
     public init(
         id: UUID = UUID(),
@@ -385,7 +421,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         self.name = name
         self.config = config
         self.app = app
-        self.vm = vm
+        self.runtime = vm
         self.isoPath = isoPath
         self.retinaEnabled = retinaEnabled
         self.guestSystem = guestSystem
@@ -393,18 +429,31 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         self.creationDate = creationDate
         self.macOSPlatform = macOSPlatform
 
-        observeVM()
+        precondition(vm == nil || self.backend == .hypervisor)
+        observeRuntime()
+    }
+
+    convenience init(
+        name: String,
+        config: VMConfig,
+        app: App,
+        runtime: any VMRuntime,
+        guestSystem: GuestSystem,
+        backend: VMBackend
+    ) {
+        self.init(
+            name: name,
+            config: config,
+            app: app,
+            guestSystem: guestSystem,
+            backend: backend
+        )
+        self.runtime = runtime
+        observeRuntime()
     }
 
     public var state: VMState {
-        switch backend {
-        case .hypervisor:
-            return vm?.state ?? .stopped
-        case .virtualization:
-            return guestSystem == .macOS
-                ? macVM?.state ?? .stopped
-                : linuxVZVM?.state ?? .stopped
-        }
+        runtime?.state ?? .stopped
     }
 
     public var vramMB: Int {
@@ -412,121 +461,78 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
 
     public var guestToolsStatus: GuestToolsStatus {
-        vm?.guestToolsStatus ?? .disconnected
+        runtimeVM?.guestToolsStatus ?? .disconnected
     }
 
     public var isGuestManagementReady: Bool {
-        vm?.isGuestManagementReady ?? false
+        runtimeVM?.isGuestManagementReady ?? false
     }
 
     var runtimeVM: VM? {
-        vm
+        runtime as? VM
     }
 
     var runtimeMacVM: MacVirtualMachine? {
-        macVM
+        runtime as? MacVirtualMachine
     }
 
     var runtimeLinuxVZVM: LinuxVirtualMachine? {
-        linuxVZVM
+        runtime as? LinuxVirtualMachine
     }
 
     public func start() throws {
         try backend.validate(guestSystem: guestSystem, config: config)
-        if backend == .virtualization, guestSystem == .macOS {
-            guard let macOSPlatform else {
-                throw MacVirtualMachineError.missingPlatformMetadata
-            }
-            let machine =
-                macVM
-                ?? MacVirtualMachine(
-                    config: config,
-                    metadata: macOSPlatform,
-                    retinaEnabled: retinaEnabled
-                )
-            macVM = machine
-            observeMacVM()
-            try machine.start()
-            return
-        }
-
-        if backend == .virtualization {
-            let machine = linuxVZVM ?? LinuxVirtualMachine(id: id, config: config)
-            linuxVZVM = machine
-            observeLinuxVZVM()
-            try machine.start()
-            return
-        }
-
-        let vm: VM
-        if let existing = self.vm {
-            vm = existing
+        let runtime: any VMRuntime
+        if let existing = self.runtime {
+            runtime = existing
         } else {
-            vm = try app.createVM(config: config)
-            self.vm = vm
-            observeVM()
+            runtime = try makeRuntime()
+            self.runtime = runtime
+            observeRuntime()
         }
-        try vm.start()
+        try runtime.start()
     }
 
     public func stop() {
-        if backend == .hypervisor {
-            vm?.stop()
-        } else if guestSystem == .macOS {
-            macVM?.stop()
-        } else {
-            linuxVZVM?.stop()
-        }
+        runtime?.stop()
     }
 
     public func pause() {
-        if backend == .hypervisor {
-            vm?.pause()
-        } else if guestSystem == .macOS {
-            macVM?.pause()
-        } else {
-            linuxVZVM?.pause()
-        }
+        runtime?.pause()
     }
 
     public func resume() {
-        if backend == .hypervisor {
-            vm?.resume()
-        } else if guestSystem == .macOS {
-            macVM?.resume()
-        } else {
-            linuxVZVM?.resume()
-        }
+        runtime?.resume()
     }
 
     public func shutdownGracefully() {
-        vm?.shutdownGracefully()
+        runtimeVM?.shutdownGracefully()
     }
 
     public func rebootGuest() {
-        vm?.rebootGuest()
+        runtimeVM?.rebootGuest()
     }
 
     public func trimGuestFilesystems() {
-        vm?.trimGuestFilesystems()
+        runtimeVM?.trimGuestFilesystems()
     }
 
     public func synchronizeGuestTime() {
-        vm?.synchronizeGuestTime()
+        runtimeVM?.synchronizeGuestTime()
     }
 
     public func sendFileToGuest(_ file: URL) throws {
-        guard let vm else { throw BobrvmError.invalidState }
+        guard let vm = runtimeVM else { throw BobrvmError.invalidState }
         try vm.sendFileToGuest(file)
     }
 
     public func snapshotQuiesced(to directory: URL) async throws {
-        guard let vm else { throw BobrvmError.invalidState }
+        guard let vm = runtimeVM else { throw BobrvmError.invalidState }
         try await vm.snapshotQuiesced(to: directory)
     }
 
     public func requireVM() throws -> VM {
-        guard let vm else { throw BobrvmError.invalidState }
+        guard let vm = runtimeVM else { throw BobrvmError.invalidState }
         return vm
     }
 
@@ -549,44 +555,36 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
 
     public func destroy() {
-        vm?.stop()
-        vm?.destroy()
-        vm = nil
-        macVM?.destroy()
-        macVM = nil
-        linuxVZVM?.destroy()
-        linuxVZVM = nil
-        vmStateCancellable = nil
-        macVMStateCancellable = nil
-        linuxVZStateCancellable = nil
+        runtimeVM?.stop()
+        runtime?.destroy()
+        runtime = nil
+        runtimeStateCancellable = nil
     }
 
     func destroyForDeletion() async {
-        if backend == .hypervisor {
-            await vm?.stopAndWait()
-        } else {
-            while state != .stopped {
-                stop()
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-        }
+        await runtime?.stopAndWait()
         destroy()
     }
 
-    private func observeVM() {
-        vmStateCancellable = vm?.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+    private func makeRuntime() throws -> any VMRuntime {
+        if backend == .hypervisor {
+            return try app.createVM(config: config)
         }
+        if guestSystem == .macOS {
+            guard let macOSPlatform else {
+                throw MacVirtualMachineError.missingPlatformMetadata
+            }
+            return MacVirtualMachine(
+                config: config,
+                metadata: macOSPlatform,
+                retinaEnabled: retinaEnabled
+            )
+        }
+        return LinuxVirtualMachine(id: id, config: config)
     }
 
-    private func observeMacVM() {
-        macVMStateCancellable = macVM?.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }
-    }
-
-    private func observeLinuxVZVM() {
-        linuxVZStateCancellable = linuxVZVM?.objectWillChange.sink { [weak self] _ in
+    private func observeRuntime() {
+        runtimeStateCancellable = runtime?.stateChanges.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
     }

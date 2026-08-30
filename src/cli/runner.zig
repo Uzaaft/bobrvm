@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Config = @import("Config.zig");
+const checkpoint = @import("checkpoint.zig");
 const console_exec = @import("console_exec.zig");
 const global = @import("../global.zig");
 const KittyDisplay = @import("kitty_display.zig");
@@ -466,7 +467,7 @@ fn testSnapshotLoop(hw: *machine.Machine, delay_s: u64, dir: []const u8) void {
 fn testSuspendLoop(hw: *machine.Machine, delay_s: u64, path: []const u8) void {
     sleepNs(delay_s * std.time.ns_per_s);
     log.info("suspending machine to {s}", .{path});
-    hw.suspendToDisk(path) catch |err| {
+    saveCheckpoint(hw, path) catch |err| {
         log.err("suspend failed: {}", .{err});
         return;
     };
@@ -815,7 +816,7 @@ fn suspendWatcher(
     while (!stop.load(.acquire)) {
         if (os.signal.takeSuspendRequest()) {
             log.info("suspending machine to {s} (SIGUSR1)", .{path});
-            hw.suspendToDisk(path) catch |err| {
+            saveCheckpoint(hw, path) catch |err| {
                 log.err("suspend failed: {}; resuming", .{err});
                 hw.unpause();
                 continue;
@@ -884,7 +885,7 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
                 return;
             };
             log.info("suspending machine to {s}", .{path});
-            hw.suspendToDisk(path) catch |err| {
+            saveCheckpoint(hw, path) catch |err| {
                 log.err("suspend failed: {}; resuming", .{err});
                 hw.unpause();
                 return;
@@ -892,6 +893,14 @@ fn executeHostCommand(hw: *machine.Machine, command: HostCommand) void {
             hw.requestStop();
         },
     }
+}
+
+fn saveCheckpoint(hw: *machine.Machine, path: []const u8) !void {
+    try checkpoint.replace(std.heap.c_allocator, path, hw, saveMachineCheckpoint);
+}
+
+fn saveMachineCheckpoint(hw: *machine.Machine, path: [:0]const u8) !void {
+    try hw.suspendToDisk(path);
 }
 
 const ctrl_alt_delete = [_]struct {

@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 
 @testable import Bobrvm
@@ -282,5 +283,69 @@ final class BobrvmKitTests: XCTestCase {
         XCTAssertEqual(instance.config.displayWidth, 1280)
         XCTAssertEqual(instance.config.displayHeight, 800)
         XCTAssertFalse(instance.retinaEnabled)
+    }
+
+    @MainActor
+    func testVMInstanceRoutesLifecycleThroughOneRuntime() throws {
+        let app = try App()
+        let runtime = RecordingVMRuntime()
+        let instance = VMInstance(
+            name: "Runtime",
+            config: VMConfig(),
+            app: app,
+            runtime: runtime,
+            guestSystem: .linux,
+            backend: .hypervisor
+        )
+
+        try instance.start()
+        instance.pause()
+        instance.resume()
+        instance.stop()
+        instance.destroy()
+
+        XCTAssertEqual(runtime.calls, ["start", "pause", "resume", "stop", "destroy"])
+        XCTAssertEqual(instance.state, .stopped)
+    }
+}
+
+@MainActor
+private final class RecordingVMRuntime: VMRuntime {
+    private let changes = PassthroughSubject<Void, Never>()
+    private(set) var calls: [String] = []
+    private(set) var state: VMState = .stopped
+
+    var stateChanges: AnyPublisher<Void, Never> {
+        changes.eraseToAnyPublisher()
+    }
+
+    func start() throws {
+        calls.append("start")
+        state = .running
+        changes.send()
+    }
+
+    func stop() {
+        calls.append("stop")
+        state = .stopped
+        changes.send()
+    }
+
+    func pause() {
+        calls.append("pause")
+        state = .paused
+        changes.send()
+    }
+
+    func resume() {
+        calls.append("resume")
+        state = .running
+        changes.send()
+    }
+
+    func destroy() {
+        calls.append("destroy")
+        state = .stopped
+        changes.send()
     }
 }

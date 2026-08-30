@@ -15,6 +15,7 @@ const global = @import("../global.zig");
 const linux_vz = @import("../runtime/linux_vz.zig");
 const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
+const checkpoint = @import("checkpoint.zig");
 const console_exec = @import("console_exec.zig");
 const docker_idle = @import("docker_idle.zig");
 const project = @import("project.zig");
@@ -132,7 +133,7 @@ pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
             .checkpoint => {
                 const t0 = nowMs();
                 try machine.pause();
-                saveReplacing(arena, &machine, warm) catch |err| {
+                checkpoint.replace(arena, warm, &machine, saveMachineCheckpoint) catch |err| {
                     log.err("vz: automatic idle suspend failed: {}; resuming", .{err});
                     try machine.resumeVM();
                     controller.retryLater();
@@ -147,7 +148,7 @@ pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
         if (os.signal.takeSuspendRequest()) {
             const t0 = nowMs();
             try machine.pause();
-            saveReplacing(arena, &machine, warm) catch |err| {
+            checkpoint.replace(arena, warm, &machine, saveMachineCheckpoint) catch |err| {
                 log.err("vz: suspend failed: {}; resuming", .{err});
                 try machine.resumeVM();
                 continue;
@@ -277,7 +278,12 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
             if (nowMs() >= deadline) {
                 const t0 = nowMs();
                 try machine.pause();
-                try saveReplacing(arena, &machine, suspend_path.?);
+                try checkpoint.replace(
+                    arena,
+                    suspend_path.?,
+                    &machine,
+                    saveMachineCheckpoint,
+                );
                 log.info("vz: paused and saved in {d} ms", .{nowMs() - t0});
                 exitAfterSave();
             }
@@ -286,27 +292,8 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     log.info("vz: machine stopped", .{});
 }
 
-/// VZ requires a fresh save destination. Write beside the old checkpoint and
-/// atomically replace it only after the complete state has reached disk.
-fn saveReplacing(
-    arena: Allocator,
-    machine: *linux_vz.Machine,
-    final_path: [:0]const u8,
-) !void {
-    const temporary_path = try std.fmt.allocPrintSentinel(
-        arena,
-        "{s}.tmp",
-        .{final_path},
-        0,
-    );
-    const io = global.io();
-    std.Io.Dir.deleteFileAbsolute(io, temporary_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    errdefer std.Io.Dir.deleteFileAbsolute(io, temporary_path) catch {};
-    try machine.saveTo(temporary_path);
-    try std.Io.Dir.renameAbsolute(temporary_path, final_path, io);
+fn saveMachineCheckpoint(machine: *linux_vz.Machine, path: [:0]const u8) !void {
+    try machine.saveTo(path);
 }
 
 /// Apple's save workflow quits with the VM paused. Normal object teardown can
