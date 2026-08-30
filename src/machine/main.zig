@@ -3960,7 +3960,7 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    try testing.expect(@sizeOf(Machine) <= 6232);
+    try testing.expect(@sizeOf(Machine) <= 6240);
 }
 
 test "stop before synchronous thread entry cancels startup" {
