@@ -36,6 +36,7 @@ pub fn create(
         b.pathFromRoot("macos/build.nu"),
         "--configuration",
         configuration.toString(),
+        "--skip-dependencies",
     });
     build_step.expectExitCode(0);
     build_step.step.dependOn(&xcframework.step);

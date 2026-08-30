@@ -5,26 +5,26 @@ The Zig libraries own virtualization and rendering.
 
 ## Build
 
-Enter the Nix development environment and build the Zig frameworks without
-asking Zig to invoke Xcode:
-
-```sh
-nix develop -c zig build xcframework ghostty-lib -Demit-macos-app=false
-nix develop -c macos/build.nu
-```
-
-This follows Ghostty's macOS build boundary: Nix provides Zig and its
-dependencies, while the native app is built by Xcode in a clean environment.
-The app is written to `macos/build/Debug/Bobrvm.app` by default.
-
-For Swift-only iteration, generate the frameworks once, then reuse the helper:
+Enter the Nix development environment and run the macOS build helper:
 
 ```sh
 nix develop -c macos/build.nu
-nix develop -c macos/build.nu --configuration Release
-nix develop -c macos/build.nu --action clean
-nix develop -c macos/build.nu --action test
 ```
+
+The helper brings the Zig XCFrameworks up to date before running Xcode in a
+clean environment. This follows Ghostty's macOS build boundary: Zig owns the
+generated dependencies and Xcode owns the native app. The app is written to
+`macos/build/Debug/Bobrvm.app` by default.
+
+For Swift-only iteration after a successful build, reuse the generated
+frameworks:
+
+```sh
+nix develop -c macos/build.nu --skip-dependencies
+```
+
+The helper also accepts `--configuration Release`, `--action clean`, and
+`--action test`. A clean action does not rebuild the Zig dependencies.
 
 The helper avoids Nix compiler and linker overrides. It requires Nushell,
 which is included in `nix develop`. `zig build macos-app` and `zig build run`
