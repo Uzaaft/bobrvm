@@ -1,24 +1,21 @@
 # bobrvm
 
-bobrvm runs virtual machines on macOS and Linux. On Apple Silicon, the Linux VM
-uses Hypervisor.framework and macOS guests use Apple's Virtualization framework.
-On x86-64 Linux, the direct-boot VM uses KVM with a GTK host application. The
-platform applications stay thin while Zig owns virtualization and devices.
+bobrvm runs virtual machines on macOS and Linux. Linux guests support headless
+and graphical operation, accelerated graphics, persistent disks, networking,
+audio, shared folders, snapshots, and a project-oriented CLI.
 
-The project is under active development. Linux guests can boot to a GUI or
-headless console with SMP, persistent virtio disks, input, built-in NAT, audio,
-and accelerated virtio-GPU display output. Linux uses virglrenderer with a
-surfaceless EGL context and falls back to the 2D scanout when the host renderer
-is unavailable. On Apple Silicon, the optional Venus stack supports Vulkan 1.4
-and OpenGL 4.6 through Zink using the vendored GPU dependencies in `third_party/`.
+On Apple Silicon, bobrvm uses Hypervisor.framework for Linux guests and Apple's
+Virtualization framework for macOS guests. On x86-64 Linux, it uses KVM. The
+native applications stay thin; the Zig core owns virtualization, devices, and
+rendering.
 
-macOS guests support IPSW installation, persistent hardware identity, and
-native display, input, networking, and audio devices.
+The project is under active development. Automated Apple Silicon builds of the
+latest commit on `main` are published in the
+[`tip` release](https://github.com/polymath-as/bobrvm/releases/tag/tip).
 
-Automated Apple Silicon builds of the latest commit on `main` are published to
-the prerelease tagged [`tip`](https://github.com/polymath-as/bobrvm/releases/tag/tip).
+## Install
 
-Install the latest successful `main` build with Homebrew:
+On Apple Silicon running macOS 26 or later:
 
 ```sh
 brew tap polymath-as/bobrvm https://github.com/polymath-as/bobrvm
@@ -26,90 +23,13 @@ brew trust --cask polymath-as/bobrvm/bobrvm
 brew install --cask bobrvm
 ```
 
-## Requirements
+Linux builds currently run from source; see [HACKING.md](HACKING.md).
 
-- Apple Silicon Mac running macOS 13 or later (the Bobrvm app requires macOS 26 or later)
-- Or x86-64 Linux with KVM, GTK 4, and Libadwaita 1.5 or later
-- Nix for the Zig core
-- Xcode 26 or later and its Swift toolchain for the macOS app
+## Project VMs
 
-## Build
-
-```sh
-nix develop
-nix build              # release library
-nix build .#debug       # debug library
-nix build .#releasesafe # release build with safety checks
-nix build .#test        # Zig tests
-nix run .#              # run the Linux GTK application
-nix run .#cli -- help   # run the headless Linux CLI
-
-zig build              # library in the development shell
-zig build run          # build and run the native app with terminal logging
-zig build macos-app    # build the native app without running it
-zig build cli -- help  # run the headless CLI
-zig build test         # run all Zig tests
-zig build test -Dtest-filter=<name>
-```
-
-See [macos/README.md](macos/README.md) for Xcode and framework builds.
-
-### Linux host preview
-
-The Linux package installs a dependency-light headless binary and a separate
-Libadwaita application, including desktop metadata and an application icon. Both
-use the same cancellable Zig VM lifecycle and KVM device model.
-The GTK application manages a persistent VM library, installer media, sparse raw
-disks, shared folders, port forwards, memory, CPUs, networking, pause/resume,
-guest management, clipboard sharing, host-to-guest file delivery, and quiesced snapshots.
-Its Libadwaita interface provides an adaptive VM sidebar, a card-based library, focused machine
-details, and separate Machine, Display, and Console destinations for active sessions. Persistent
-defaults live in a preferences dialog, while lifecycle controls remain in the window header:
-
-```sh
-bobrvm run-kernel bzImage initrd writable-root.raw
-bobrvm-gtk
-```
-
-For automation, the GTK executable also accepts `--iso`, `--disk`, `--kernel`,
-`--initrd`, `--share`, `--restore`, repeatable `--forward host:guest`, `--memory`,
-`--cpus`, `--display WxH`, and `--gpu-memory MiB`. Stereo virtio-snd playback and
-accelerated virgl graphics are enabled by default; use `--no-audio` or `--no-3d`
-to disable them.
-The Nix development shell and package provide OVMF automatically;
-`BOBRVM_OVMF_FD` and `BOBRVM_OVMF_VARS_FD` can override its images. Saving a VM
-creates a private writable variable store so UEFI boot entries survive restarts.
-
-The x86 host supports direct kernel boot and an OVMF firmware path with primary and
-secondary virtio-pci block devices, including read-only ISO installation media,
-plus virtio GPU, keyboard, tablet, entropy, networking, 9p shared-folder, and
-multiport console devices. Guest PCM output is buffered away from the vCPU hot
-path and played through the desktop's default ALSA route. Guest virgl commands
-execute through the host's surfaceless EGL renderer, while GTK remains a thin
-presenter for the resulting scanout.
-Queue kicks and level interrupts use KVM `ioeventfd`/`irqfd`, keeping block I/O off
-the vCPU thread. A virtio-net adapter uses the shared Zig user-mode NAT, with no TAP
-device or host privileges required. The GTK application presents the guest's
-virtio-GPU scanout with live guest modesetting and aspect-correct scaling, injects
-keyboard and absolute pointer events, and retains a bounded serial-console history.
-Stock qemu-guest-agent and spice-vdagent channels provide graceful lifecycle actions
-and text clipboard sharing when their guest services are installed. Closing the window
-requests an immediate vCPU exit and joins the VM before releasing resources.
-The Snapshot action freezes guest filesystems through qemu-guest-agent, captures KVM,
-device, RAM, firmware, and writable disk state, then resumes the guest. Select the
-snapshot directory in Restore Snapshot before starting an identically configured VM.
-
-Direct boot uses two KVM vCPUs by default and exposes their topology through an Intel
-MP table. Use `bobrvm kvm-boot-benchmark <bzImage> <initrd> <disk>` for three comparable
-host-monotonic samples of VM creation and start-to-root-readiness latency.
-
-## Project workflow: `bobrvm up`
-
-A `bobrvm.toml` checked into a repository describes the VM for that project.
-`bobrvm up` finds it (searching from the current directory upward) and boots:
+Put a `bobrvm.toml` in a project:
 
 ```toml
-# bobrvm.toml
 memory = 2048
 cpus = 2
 kernel = "boot/Image"
@@ -117,240 +37,25 @@ initrd = "boot/initrd"
 forwards = ["2222:22"]
 ```
 
-Quit with <kbd>Ctrl</kbd>+<kbd>B</kbd> <kbd>z</kbd> to suspend the machine to a
-per-project warm image; the next `bobrvm up` resumes it — RAM, processes, and
-shell state intact — in tens of milliseconds instead of booting. `bobrvm up
---fresh` discards the warm state. The project directory is shared with the
-guest over virtio-9p by default (`share = false` opts out), relative paths
-resolve against the project root, and warm state lives under
-`$XDG_CONFIG_HOME/bobrvm/projects/` (default `~/.config/bobrvm/projects/`), never in the
-repository. `bobrvm up --help` lists the full key set.
+Then run `bobrvm up`. Quit with <kbd>Ctrl</kbd>+<kbd>B</kbd> <kbd>z</kbd> to
+suspend the VM; the next `bobrvm up` restores its memory, processes, and disks.
 
-A `provision = ["cmd", ...]` list in `bobrvm.toml` runs shell commands once
-on the first cold boot; save the result with <kbd>Ctrl</kbd>+<kbd>B</kbd>
-<kbd>z</kbd> and every later `up` and `fork` starts from the provisioned
-state. `bobrvm up --detach` runs the project in the background; `bobrvm
-status`, `bobrvm suspend`, and `bobrvm halt` manage it. `engine = "vz"` runs
-the project on Apple's Virtualization.framework instead of the custom VMM — a
-lighter device set with the same verbs.
+See [Project VMs](docs/project-vms.md) for provisioning, disposable forks, SSH,
+and agent sandboxes.
 
-### Docker Compose
+## Documentation
 
-Release app bundles include the Docker CLI, Docker Compose, Buildx, and the
-macOS keychain credential helper. Install their entry points with:
+- [Running guests](docs/running-guests.md)
+- [Project VMs](docs/project-vms.md)
+- [Docker and Compose](docs/docker.md)
+- [Guest tools and NixOS module](docs/guest-tools.md)
+- [Linux host](docs/linux-host.md)
+- [macOS application](macos/README.md)
+- [GPU direction and design](docs/gpu-direction-decision.md)
 
-```sh
-sudo /Applications/Bobrvm.app/Contents/MacOS/bin/bobrvm install-cli
-```
+For source builds and technical details, read [HACKING.md](HACKING.md). Before
+sending a change, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The installer creates `/usr/local/bin/bobrvm`, `docker`, `docker-compose`,
-`docker-buildx`, and `docker-credential-osxkeychain` symlinks and never
-replaces a valid existing path. Dangling absolute symlinks left by an
-uninstalled runtime are repaired. If OrbStack or Docker Desktop still owns
-those names, use a temporary directory first:
+## License
 
-```sh
-mkdir -p /tmp/bobrvm-cli
-ln -s /Applications/Bobrvm.app/Contents/MacOS/bin/bobrvm /tmp/bobrvm-cli/bobrvm
-ln -s /Applications/Bobrvm.app/Contents/MacOS/xbin/docker /tmp/bobrvm-cli/docker
-ln -s /Applications/Bobrvm.app/Contents/MacOS/xbin/docker-compose \
-  /tmp/bobrvm-cli/docker-compose
-export PATH="/tmp/bobrvm-cli:$PATH"
-```
-
-To test a source build without changing `/usr/local/bin`, build a local app,
-bundle the pinned clients, and point the installer at a temporary prefix:
-
-```sh
-nix develop -c zig build install macos-app
-tools/bundle-docker-cli.sh macos/build/Debug/Bobrvm.app zig-out/bin/bobrvm
-mkdir -p /tmp/bobrvm-cli
-macos/build/Debug/Bobrvm.app/Contents/MacOS/bin/bobrvm install-cli \
-  --app "$PWD/macos/build/Debug/Bobrvm.app" \
-  --prefix /tmp/bobrvm-cli
-export PATH="/tmp/bobrvm-cli:$PATH"
-```
-
-Linux containers need a Linux kernel on macOS. Bobrvm runs exactly one shared
-Virtualization.framework Linux runtime for Docker; it does not create a VM per
-container or Compose project. Docker Engine runs in that runtime and its Unix
-socket is forwarded directly over virtio-vsock.
-
-Enable Docker and the socket proxy when building the guest. The measured crun
-runtime is the default; set `runtime = "runc"` only for compatibility:
-
-```nix
-virtualisation.bobrvm.guest.docker = {
-  enable = true;
-  vsock.enable = true;
-  runtime = "crun";
-};
-```
-
-Put the resulting kernel, initramfs, and writable raw root disk in the shared
-runtime directory, then create its configuration:
-
-```toml
-# ~/.config/bobrvm/docker/bobrvm.toml
-name = "docker"
-engine = "vz"
-memory = 4096
-cpus = 4
-kernel = "Image"
-initrd = "initramfs"
-disk = "root.raw"
-docker = true
-docker-vsock = true
-share = "/Users/example/Developer"
-forwards = ["5433:5433"]
-```
-
-The shared directory must contain every host project that containers bind
-mount, at the same absolute path. Use the narrowest common project ancestor:
-exporting an entire home directory increases the host-visible surface and can
-make metadata-heavy traversals slower. Static host-to-guest forwards currently
-live in this global configuration.
-
-Start the runtime explicitly, or let the first server-side Docker command
-start it and wait for the Docker API automatically:
-
-```sh
-bobrvm docker-host start
-docker info
-docker compose up --wait
-docker compose ps
-```
-
-Docker and Compose now work from any directory and do not require a project
-`bobrvm.toml`. `bobrvm docker-host status|suspend|stop` manages the one shared
-runtime. Suspend atomically replaces the VZ checkpoint and preserves running
-containers. The VZ socket transport carries Docker streams without Ethernet,
-IP, or a plaintext guest listener. If no shared runtime is configured,
-existing per-project `docker = true` configurations remain available as a
-compatibility fallback.
-
-`bobrvm exec -- <command>` runs a command in a disposable clone of the warm
-state and prints its output, without touching the project. `bobrvm ssh` opens
-a session to the guest through the host port forwarded to guest port 22
-(`forwards = ["2222:22"]`, `ssh-user = "root"`); the guest must run sshd.
-`bobrvm bench-warm --json` reports restore, shell-ready, command, cleanup, and host-resource
-measurements over several trials. A `share-readonly = true` key makes the project share read-only
-on the host, not just in the guest mount — a sandbox cannot write host files through it.
-
-On macOS, `bobrvm bench-host --pid PID [--pid PID ...]` measures a fixed interval, while
-`bobrvm bench-command --pid PID ... -- COMMAND` measures repeated commands. Both emit versioned
-JSON with CPU time, wakeups, memory, I/O, instructions, cycles, and kernel-accounted energy for a
-complete runtime process set. See [Performance and energy benchmarking](docs/performance.md) for
-the controlled comparison protocol and current development baseline.
-
-### Disposable sandboxes
-
-`bobrvm fork` runs a throwaway clone of the warm state: copy-on-write copies
-of the warm image and writable disks, deleted on exit, with the originals
-never touched — any number of forks resume from exactly the same moment.
-`bobrvm mcp` serves those sandboxes to AI agents over the Model Context
-Protocol: add `{"mcpServers": {"bobrvm": {"command": "bobrvm", "args":
-["mcp"]}}}` to an agent's MCP config and it gets `sandbox_start`,
-`sandbox_exec` (console-based, no guest agent needed), `sandbox_output`,
-`sandbox_list`, and `sandbox_stop`.
-
-## Run a Linux guest
-
-`bobrvm run` starts a headless VM attached to the guest console. Press
-<kbd>Ctrl</kbd>+<kbd>]</kbd> to quit. Press <kbd>Ctrl</kbd>+<kbd>B</kbd>, then
-<kbd>?</kbd>, for guest-tools status and lifecycle commands.
-
-```sh
-./zig-out/bin/bobrvm run \
-  --kernel Image --initrd initrd \
-  --memory 4096 --cpus 4 \
-  --disk root.raw --net \
-  --cmdline 'console=hvc0 root=LABEL=... init=/nix/store/...-init'
-```
-
-Use `--disk2 <image> --disk2-writable` for a persistent second disk. Add a
-display device with `--gpu` or `--virgl`; use `--display WxH` to set its size.
-In terminals that support KIP, `--kitty-display` streams the scanout into
-a full-terminal Kitty graphics placement. Bobrvm keeps two Kitty
-animation frames and alternately updates the hidden frame before selecting
-it for display, avoiding placement deletion and unbounded terminal image
-storage. Frame callbacks are paced at up to 60 FPS, coalesced, converted
-with portable SIMD, and zlib-compressed off the vCPU thread. Press
-<kbd>Ctrl</kbd>+<kbd>]</kbd> to quit as usual.
-The build signs the CLI with the Hypervisor.framework entitlement.
-
-For a headless Linux guest:
-
-```sh
-zig build cli -- run --kernel Image --initrd initrd \
-  --cmdline 'console=hvc0 ...'
-```
-
-Set `BOBRVM_BENCHMARK_STARTUP=1` to stop after host-side VM and primary-vCPU
-setup and emit phase timings. The same variable makes `vz-run` stop after
-Virtualization.framework completes its asynchronous start, so the two engines
-can be profiled without waiting for a guest shutdown:
-
-```sh
-BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm run \
-  --kernel Image --initrd initrd
-BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm vz-run \
-  --kernel Image --initrd initrd
-```
-
-## Guest tools
-
-The flake exports `packages.aarch64-linux.bobrvm-tools` and
-`nixosModules.guest`. The module configures Venus/Zink graphics and can opt in
-to clipboard integration, guest lifecycle management, quiesced snapshots,
-file delivery, a shared folder, and Docker:
-
-```nix
-{
-  imports = [ bobrvm.nixosModules.guest ];
-  virtualisation.bobrvm.guest = {
-    enable = true;
-    management.enable = true;
-    clipboard.enable = true;
-    fileTransfer.enable = true;
-    sharedFolder.enable = true;
-    docker.enable = true;
-  };
-}
-```
-
-The guest Mesa package must be built on aarch64 Linux, either inside the guest
-or with a remote Linux builder. Build the host GPU stack with:
-
-```sh
-third_party/sync.sh
-third_party/build.sh
-zig build -Dgpu-venus
-```
-
-See [docs/guest-tools.md](docs/guest-tools.md) for the feature matrix, security
-defaults, diagnostics, and complete NixOS configuration.
-
-See [third_party/README.md](third_party/README.md) for the pinned GPU forks and
-[docs/gpu-direction-decision.md](docs/gpu-direction-decision.md) for design
-details.
-
-## Logging
-
-`zig build run` logs to the terminal. The Zig core and Swift app use the same
-subsystem for macOS unified logging. For Zig logs, `BOBRVM_LOG` accepts `true`,
-`false`, or a comma-separated destination list using `stderr`, `macos`,
-`no-stderr`, and `no-macos`. Swift logs use macOS unified logging directly.
-
-```sh
-BOBRVM_LOG=stderr,macos zig build run
-log stream --level debug --predicate 'subsystem=="com.bobrvm.app"'
-```
-
-The compile-time minimum defaults to `debug` for Debug builds and `info` for
-release builds. Override it for Zig, the C API, and Swift logging with
-`-Dlog-level=debug|info|warn|err`:
-
-```sh
-zig build macos-app -Doptimize=ReleaseFast -Dlog-level=debug
-```
+bobrvm is licensed under the [MIT License](LICENSE).
