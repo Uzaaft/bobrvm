@@ -16,6 +16,7 @@ const callback_binding = @import("../callback.zig");
 const config_policy = @import("../config.zig");
 const global = @import("../global.zig");
 const GuestMemory = @import("../guest_memory.zig").GuestMemory;
+const scatter_gather = @import("../backing.zig");
 const mmio = @import("mmio.zig");
 const ring = @import("ring.zig");
 const virgl = @import("../gpu/virgl/main.zig");
@@ -208,6 +209,8 @@ pub const MemEntry = extern struct {
     length: u32,
     _padding: u32 = 0,
 };
+
+const BackingReader = scatter_gather.Reader(MemEntry);
 
 const BackingEntries = union(enum) {
     empty,
@@ -1702,14 +1705,18 @@ pub const Gpu = struct {
 
         // General case: partial-width rect, copy row by row.
         const row_bytes = @as(usize, r.width) * Resource2D.BYTES_PER_PIXEL;
+        const row_advance = @as(u64, stride) - row_bytes;
+        var backing = BackingReader.init(entries, cmd.offset) orelse
+            return .resp_err_unspec;
         var row: u32 = 0;
         while (row < r.height) : (row += 1) {
-            const line_off = @as(u64, r.y + row) * stride + @as(u64, r.x) * Resource2D.BYTES_PER_PIXEL;
-            // Per spec the source offset is cmd.offset plus the rect's
-            // position within the resource for the transferred region.
-            const src_off = cmd.offset + @as(u64, row) * stride;
+            const line_off = @as(u64, r.y + row) * stride +
+                @as(u64, r.x) * Resource2D.BYTES_PER_PIXEL;
             const dst = res.host_data[@intCast(line_off)..][0..row_bytes];
-            if (!copyFromBacking(entries, src_off, dst, get_mem)) {
+            if (!backing.read(dst, get_mem)) {
+                return .resp_err_unspec;
+            }
+            if (row + 1 < r.height and !backing.skip(row_advance)) {
                 return .resp_err_unspec;
             }
         }
@@ -1868,12 +1875,15 @@ pub const Gpu = struct {
                     return error.OutOfMemory;
         }
         const staging = self.transfer3d_staging[0..total];
+        var backing = BackingReader.init(entries, offset) orelse return error.InvalidBacking;
         var y: u32 = 0;
         while (y < height) : (y += 1) {
-            const src_off = offset + @as(u64, y) * stride;
             const dst_offset: usize = @intCast(@as(u64, y) * row_bytes);
             const dst_row = staging[dst_offset..][0..@intCast(row_bytes)];
-            if (!copyFromBacking(entries, src_off, dst_row, get_mem)) return error.InvalidBacking;
+            if (!backing.read(dst_row, get_mem)) return error.InvalidBacking;
+            if (y + 1 < height and !backing.skip(stride - row_bytes)) {
+                return error.InvalidBacking;
+            }
         }
         return .{ .data = staging, .bytes_per_row = @intCast(row_bytes) };
     }
@@ -1908,22 +1918,8 @@ pub const Gpu = struct {
         dst: []u8,
         get_mem: anytype,
     ) bool {
-        var remaining = dst;
-        var skip = offset;
-        for (entries) |entry| {
-            if (remaining.len == 0) return true;
-            if (skip >= entry.length) {
-                skip -= entry.length;
-                continue;
-            }
-            const avail = entry.length - @as(u32, @intCast(skip));
-            const n: usize = @min(remaining.len, avail);
-            const src = ring.get(get_mem, entry.addr + skip, n) orelse return false;
-            @memcpy(remaining[0..n], src[0..n]);
-            remaining = remaining[n..];
-            skip = 0;
-        }
-        return remaining.len == 0;
+        var reader = BackingReader.init(entries, offset) orelse return false;
+        return reader.read(dst, get_mem);
     }
 
     fn cmdResourceAttachBacking(
@@ -2681,7 +2677,7 @@ test "3D resources are bounded, charged, and released" {
     );
 }
 
-test "transfer_to_host_2d full-width fast path matches guest backing" {
+test "transfer_to_host_2d full and partial paths match guest backing" {
     const gpu = try Gpu.init(testing.allocator, false);
     defer gpu.deinit();
 
@@ -2749,8 +2745,49 @@ test "transfer_to_host_2d full-width fast path matches guest backing" {
     try testing.expectEqual(CmdType.resp_ok_nodata, gpu.cmdTransferToHost2D(std.mem.asBytes(&xfer), Ctx.get));
 
     // host copy must match the guest backing byte-for-byte
-    const res = gpu.resources.get(1).?;
+    const res = gpu.resources.getPtr(1).?;
     try testing.expect(std.mem.eql(u8, res.host_data, guest));
+
+    @memset(res.host_data, 0);
+    const partial = TransferToHost2D{
+        .header = .{ .type = @intFromEnum(CmdType.transfer_to_host_2d) },
+        .r = .{ .x = 7, .y = 2, .width = 11, .height = 4 },
+        .offset = (2 * w + 7) * Resource2D.BYTES_PER_PIXEL,
+        .resource_id = 1,
+    };
+    try testing.expectEqual(
+        CmdType.resp_ok_nodata,
+        gpu.cmdTransferToHost2D(std.mem.asBytes(&partial), Ctx.get),
+    );
+    for (0..h) |row| {
+        const row_offset = row * w * Resource2D.BYTES_PER_PIXEL;
+        const copied_offset = row_offset + 7 * Resource2D.BYTES_PER_PIXEL;
+        const copied_len = 11 * Resource2D.BYTES_PER_PIXEL;
+        if (row >= 2 and row < 6) {
+            try testing.expect(std.mem.allEqual(
+                u8,
+                res.host_data[row_offset..copied_offset],
+                0,
+            ));
+            try testing.expectEqualSlices(
+                u8,
+                guest[copied_offset..][0..copied_len],
+                res.host_data[copied_offset..][0..copied_len],
+            );
+            const row_end = row_offset + w * Resource2D.BYTES_PER_PIXEL;
+            try testing.expect(std.mem.allEqual(
+                u8,
+                res.host_data[copied_offset + copied_len .. row_end],
+                0,
+            ));
+        } else {
+            try testing.expect(std.mem.allEqual(
+                u8,
+                res.host_data[row_offset..][0 .. w * 4],
+                0,
+            ));
+        }
+    }
 }
 
 test "transfer_to_host_3d uploads guest TEXTURE data via replaceRegion" {
