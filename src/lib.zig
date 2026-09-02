@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const agent = @import("agent/main.zig");
+pub const auth = @import("auth/main.zig");
 pub const apprt = @import("apprt/main.zig");
 pub const config = @import("config.zig");
 pub const console = @import("console/main.zig");
@@ -26,6 +27,7 @@ pub const version: [:0]const u8 = "0.1.0";
 test {
     if (builtin.os.tag == .linux) {
         _ = std.testing.refAllDecls(agent);
+        _ = std.testing.refAllDecls(auth);
         _ = std.testing.refAllDecls(config);
         _ = std.testing.refAllDecls(console);
         _ = std.testing.refAllDecls(disk);

@@ -46,4 +46,5 @@ BOBRVM_LOG=true BOBRVM_BENCHMARK_STARTUP=1 ./zig-out/bin/bobrvm vz-run \
 The flake exports `packages.aarch64-linux.bobrvm-tools` and
 `nixosModules.guest`. The module can configure graphics, lifecycle management,
 clipboard integration, file delivery, shared folders, snapshots, and Docker.
+It can also expose Mac Touch ID through Linux's standard fprintd/PAM stack.
 See [guest-tools.md](guest-tools.md).

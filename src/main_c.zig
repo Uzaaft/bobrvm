@@ -254,6 +254,32 @@ pub export fn bobrvm_vm_host_clipboard_changed(vm: ?*apprt.VM) void {
     v.hostClipboardChanged();
 }
 
+pub export fn bobrvm_vm_authentication_complete(
+    vm: ?*apprt.VM,
+    request_id: u64,
+    result_raw: c_int,
+) void {
+    const v = vm orelse return;
+    const result: lib.agent.native.AuthenticationResult = switch (result_raw) {
+        1 => .success,
+        2 => .no_match,
+        3 => .cancelled,
+        4 => .unavailable,
+        5 => .locked,
+        6 => .failed,
+        else => return,
+    };
+    v.completeAuthentication(request_id, result);
+}
+
+pub export fn bobrvm_vm_touch_id_complete(
+    vm: ?*apprt.VM,
+    request_id: u64,
+    result_raw: c_int,
+) void {
+    bobrvm_vm_authentication_complete(vm, request_id, result_raw);
+}
+
 pub export fn bobrvm_vm_resume(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.unpause();

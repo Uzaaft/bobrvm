@@ -22,6 +22,7 @@ struct CreateVMView: View {
     @State private var vramMB = 512.0
     @State private var resolution = DisplayResolution.defaultValue
     @State private var retinaEnabled = true
+    @State private var touchIDEnabled = false
     @State private var diskSizeGB = 64.0
     @State private var isCreating = false
     @State private var installationProgress = 0.0
@@ -114,6 +115,7 @@ struct CreateVMView: View {
                 vramMB: $vramMB,
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
+                touchIDEnabled: $touchIDEnabled,
                 backend: $backend,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
                 systemInfo: systemInfo
@@ -139,6 +141,7 @@ struct CreateVMView: View {
                 backend: backend,
                 resolution: resolution,
                 retinaEnabled: retinaEnabled,
+                touchIDEnabled: touchIDEnabled,
                 diskSizeGB: Int(diskSizeGB)
             )
         }
@@ -315,6 +318,8 @@ struct CreateVMView: View {
             displayHeight: resolution.height,
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
             networkEnabled: true,
+            touchIDEnabled: touchIDEnabled && backend == .hypervisor
+                && operatingSystem == .linux,
             firmwarePath: Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd"),
             varsPath: varsPath,
             diskPath: diskPath,
@@ -705,6 +710,7 @@ private struct HardwareStepView: View {
     @Binding var vramMB: Double
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
+    @Binding var touchIDEnabled: Bool
     @Binding var backend: VMBackend
     let guestSystem: GuestSystem
     let systemInfo: SystemInfo
@@ -717,6 +723,7 @@ private struct HardwareStepView: View {
             backendSettings
             performanceSettings
             displaySettings
+            deviceSettings
         }
     }
 
@@ -806,6 +813,26 @@ private struct HardwareStepView: View {
         }
     }
 
+    @ViewBuilder
+    private var deviceSettings: some View {
+        if guestSystem == .linux {
+            SettingsGroup(title: "Devices", systemImage: "touchid") {
+                Toggle("Fingerprint reader", isOn: $touchIDEnabled)
+                    .disabled(backend != .hypervisor)
+                Text(touchIDDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var touchIDDescription: String {
+        if backend != .hypervisor {
+            return "The fingerprint reader requires the Bobrvm Hypervisor backend."
+        }
+        return "Adds a Linux fingerprint device backed by this Mac’s native Touch ID prompt."
+    }
+
     private var retinaDescription: String {
         retinaEnabled
             ? "Renders one guest pixel per Retina pixel for sharper output."
@@ -870,6 +897,7 @@ private struct SummaryStepView: View {
     let backend: VMBackend
     let resolution: DisplayResolution
     let retinaEnabled: Bool
+    let touchIDEnabled: Bool
     let diskSizeGB: Int
 
     var body: some View {
@@ -906,6 +934,14 @@ private struct SummaryStepView: View {
                     label: "Retina",
                     value: retinaEnabled ? "Full resolution" : "Standard scale"
                 )
+                if operatingSystem == .linux {
+                    Divider()
+                    SummaryRow(
+                        label: "Fingerprint reader",
+                        value: touchIDEnabled && backend == .hypervisor
+                            ? "Attached" : "Not attached"
+                    )
+                }
                 Divider()
                 SummaryRow(
                     label: "Disk",

@@ -157,6 +157,7 @@ public final class VMManager: ObservableObject {
         displayHeight: Int,
         retinaEnabled: Bool,
         networkEnabled: Bool,
+        touchIDEnabled: Bool,
         sharedFolderPath: String?,
         diskSizeGB: Int?,
         backend: VMBackend
@@ -177,6 +178,8 @@ public final class VMManager: ObservableObject {
             displayHeight: UInt32(displayHeight),
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
             networkEnabled: networkEnabled,
+            touchIDEnabled: touchIDEnabled && backend == .hypervisor
+                && instance.guestSystem == .linux,
             sharedFolderPath: effectiveSharedFolder,
             firmwarePath: instance.config.firmwarePath,
             varsPath: instance.config.varsPath,
@@ -615,6 +618,7 @@ enum VMStorage {
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
         let networkEnabled: Bool?
+        let touchIDEnabled: Bool?
         let sharedFolderPath: String?
         let guestSystem: GuestSystem?
         let backend: VMBackend?
@@ -667,6 +671,7 @@ enum VMStorage {
                 displayHeight: displayHeight ?? 800,
                 gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
                 networkEnabled: networkEnabled ?? true,
+                touchIDEnabled: touchIDEnabled ?? false,
                 sharedFolderPath: sharedFolderPath,
                 firmwarePath: effectiveFirmwarePath,
                 varsPath: effectiveVarsPath,
@@ -699,6 +704,7 @@ enum VMStorage {
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled
             self.networkEnabled = instance.config.networkEnabled
+            self.touchIDEnabled = instance.config.touchIDEnabled
             self.sharedFolderPath = instance.config.sharedFolderPath
             self.guestSystem = instance.guestSystem
             self.backend = instance.backend

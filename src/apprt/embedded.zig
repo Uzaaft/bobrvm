@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const callback_binding = @import("../callback.zig");
+const agent = @import("../agent/main.zig");
 const config_policy = @import("../config.zig");
 const console = @import("../console/main.zig");
 const global = @import("../global.zig");
@@ -60,6 +61,18 @@ pub const RuntimeConfig = extern struct {
         [*]const u8,
         usize,
     ) callconv(.c) void = null,
+
+    /// Ask the frontend to present its native authentication UI.
+    request_authentication: ?*const fn (
+        ?*anyopaque,
+        *anyopaque,
+        u64,
+        c_int,
+        [*:0]const u8,
+    ) callconv(.c) void = null,
+
+    /// Cancel a pending native authentication request.
+    cancel_authentication: ?*const fn (?*anyopaque, *anyopaque, u64) callconv(.c) void = null,
 };
 
 /// VM configuration (C API struct - pointers are temporary).
@@ -81,6 +94,8 @@ pub const VMConfig = extern struct {
     disk2_read_only: bool = true,
     /// Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP).
     enable_net: bool = false,
+    /// Attach the host-backed macOS Touch ID authentication device.
+    enable_touch_id: bool = false,
     /// Host directory exported through virtio-9p with mount tag "host".
     shared_dir: ?[*:0]const u8 = null,
     /// Initial guest display size in pixels (0 = machine default).
@@ -194,6 +209,7 @@ pub const VMConfig = extern struct {
             .disk2_path = owned_strings[6],
             .disk2_read_only = self.disk2_read_only,
             .enable_net = self.enable_net,
+            .enable_touch_id = self.enable_touch_id,
             .shared_dir = owned_strings[7],
             .display_width = self.display_width,
             .display_height = self.display_height,
@@ -218,6 +234,7 @@ pub const OwnedVMConfig = struct {
     disk2_path: ?[]const u8 = null,
     disk2_read_only: bool = true,
     enable_net: bool = false,
+    enable_touch_id: bool = false,
     shared_dir: ?[]const u8 = null,
     display_width: u32 = 0,
     display_height: u32 = 0,
@@ -538,6 +555,7 @@ pub const VM = struct {
                 .enable_gpu = true,
                 .enable_virgl = self.config.enable_gpu3d,
                 .enable_net = self.config.enable_net,
+                .enable_touch_id = self.config.enable_touch_id,
                 .shared_dir = self.config.shared_dir,
                 .display_width = if (self.config.display_width != 0)
                     self.config.display_width
@@ -582,6 +600,13 @@ pub const VM = struct {
                 requestHostClipboardCallback,
                 self,
             );
+            if (self.config.enable_touch_id) {
+                self.hw_machine.?.setAuthenticationHandlers(
+                    authenticationRequestCallback,
+                    authenticationCancelCallback,
+                    self,
+                );
+            }
         }
 
         // Run the synchronous vCPU loop on a dedicated thread (the same
@@ -742,6 +767,43 @@ pub const VM = struct {
         if (self.app.runtime.free_clipboard) |free_cb| {
             free_cb(self.app.runtime.userdata, t);
         }
+    }
+
+    fn authenticationRequestCallback(
+        request_id: u64,
+        request: agent.native.AuthenticationRequest,
+        userdata: ?*anyopaque,
+    ) void {
+        const self: *VM = @ptrCast(@alignCast(userdata));
+        const callback = self.app.runtime.request_authentication orelse {
+            self.completeAuthentication(request_id, .unavailable);
+            return;
+        };
+        var principal: [agent.native.authentication_principal_bytes_max + 1]u8 = @splat(0);
+        @memcpy(principal[0..request.principal.len], request.principal);
+        const terminated = principal[0..request.principal.len :0];
+        callback(
+            self.app.runtime.userdata,
+            self,
+            request_id,
+            @intFromEnum(request.operation),
+            terminated.ptr,
+        );
+    }
+
+    fn authenticationCancelCallback(request_id: u64, userdata: ?*anyopaque) void {
+        const self: *VM = @ptrCast(@alignCast(userdata));
+        const callback = self.app.runtime.cancel_authentication orelse return;
+        callback(self.app.runtime.userdata, self, request_id);
+    }
+
+    pub fn completeAuthentication(
+        self: *VM,
+        request_id: u64,
+        result: agent.native.AuthenticationResult,
+    ) void {
+        const hw = self.hw_machine orelse return;
+        hw.completeAuthentication(request_id, result);
     }
 
     pub fn pause(self: *VM) void {

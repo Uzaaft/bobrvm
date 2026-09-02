@@ -55,15 +55,19 @@ final class BobrvmKitTests: XCTestCase {
 
     func testGuestToolCapabilitiesAreIndependent() {
         let clipboard = UInt64(BOBRVM_GUEST_TOOLS_CLIPBOARD.rawValue)
+        let authentication = UInt64(BOBRVM_GUEST_TOOLS_HOST_AUTHENTICATION.rawValue)
+        let fingerprint = UInt64(BOBRVM_GUEST_TOOLS_AUTH_FINGERPRINT.rawValue)
         let management = UInt64(BOBRVM_GUEST_TOOLS_MANAGEMENT.rawValue)
         let status = GuestToolsStatus(
             connection: .ready,
-            capabilities: clipboard | management
+            capabilities: clipboard | authentication | fingerprint | management
         )
 
         XCTAssertEqual(status.connection, .ready)
         XCTAssertTrue(status.supportsClipboard)
         XCTAssertFalse(status.supportsFileTransfer)
+        XCTAssertTrue(status.supportsHostAuthentication)
+        XCTAssertTrue(status.supportsFingerprintAuthentication)
         XCTAssertTrue(status.supportsManagement)
     }
 
@@ -75,6 +79,7 @@ final class BobrvmKitTests: XCTestCase {
             displayHeight: 901,
             gpuMemoryBytes: 257_949_696,
             networkEnabled: true,
+            touchIDEnabled: true,
             sharedFolderPath: "/tmp/shared",
             firmwarePath: "/tmp/firmware.fd",
             varsPath: "/tmp/vars.fd",
@@ -95,6 +100,7 @@ final class BobrvmKitTests: XCTestCase {
             XCTAssertEqual(c.display_height, config.displayHeight)
             XCTAssertEqual(c.gpu_memory_bytes, config.gpuMemoryBytes)
             XCTAssertEqual(c.enable_net, config.networkEnabled)
+            XCTAssertEqual(c.enable_touch_id, config.touchIDEnabled)
             XCTAssertEqual(c.disk_read_only, config.diskReadOnly)
             XCTAssertEqual(c.disk2_read_only, config.isoReadOnly)
             XCTAssertEqual(String(cString: c.shared_dir), config.sharedFolderPath)
@@ -175,6 +181,20 @@ final class BobrvmKitTests: XCTestCase {
             XCTAssertEqual(
                 error.localizedDescription,
                 "Apple Virtualization supports raw Linux disk images only.")
+        }
+    }
+
+    func testTouchIDRequiresLinuxHypervisorBackend() {
+        var config = VMConfig(diskPath: "/tmp/linux.raw")
+        config.touchIDEnabled = true
+        XCTAssertNoThrow(try VMBackend.hypervisor.validate(guestSystem: .linux, config: config))
+        XCTAssertThrowsError(
+            try VMBackend.virtualization.validate(guestSystem: .linux, config: config)
+        ) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Mac Touch ID requires a Linux VM using Bobrvm Hypervisor."
+            )
         }
     }
 

@@ -90,6 +90,28 @@ public enum MouseButton: Int32 {
     case middle = 2
 }
 
+public enum TouchIDOperation: UInt32, Sendable {
+    case enroll = 1
+    case verify = 2
+
+    init?(_ value: bobrvm_authentication_operation_e) {
+        self.init(rawValue: value.rawValue)
+    }
+}
+
+public enum TouchIDResult: UInt32, Sendable {
+    case success = 1
+    case noMatch = 2
+    case cancelled = 3
+    case unavailable = 4
+    case locked = 5
+    case failed = 6
+
+    var cValue: bobrvm_authentication_result_e {
+        bobrvm_authentication_result_e(rawValue: rawValue)
+    }
+}
+
 enum ConsoleEvent: Sendable {
     case output(Data)
     case clear
@@ -104,6 +126,7 @@ public struct VMConfig {
     public var displayHeight: UInt32
     public var gpuMemoryBytes: UInt64
     public var networkEnabled: Bool
+    public var touchIDEnabled: Bool
     public var sharedFolderPath: String?
     /// UEFI firmware path (e.g., QEMU_EFI.fd). If set, boots via firmware.
     public var firmwarePath: String?
@@ -126,6 +149,7 @@ public struct VMConfig {
         displayHeight: UInt32? = nil,
         gpuMemoryBytes: UInt64? = nil,
         networkEnabled: Bool? = nil,
+        touchIDEnabled: Bool = false,
         sharedFolderPath: String? = nil,
         firmwarePath: String? = nil,
         varsPath: String? = nil,
@@ -144,6 +168,7 @@ public struct VMConfig {
         self.displayHeight = displayHeight ?? defaults.display_height
         self.gpuMemoryBytes = gpuMemoryBytes ?? defaults.gpu_memory_bytes
         self.networkEnabled = networkEnabled ?? defaults.enable_net
+        self.touchIDEnabled = touchIDEnabled
         self.sharedFolderPath = sharedFolderPath
         self.firmwarePath = firmwarePath
         self.varsPath = varsPath
@@ -164,6 +189,7 @@ public struct VMConfig {
         config.display_height = displayHeight
         config.gpu_memory_bytes = gpuMemoryBytes
         config.enable_net = networkEnabled
+        config.enable_touch_id = touchIDEnabled
         config.disk_read_only = diskReadOnly
         config.disk2_read_only = isoReadOnly
 
@@ -321,6 +347,40 @@ public final class App {
                 app.delegate?.app(app, vm: vm, didReceiveConsoleOutput: output)
             }
         }
+        runtimeConfig.request_authentication = {
+            userdata, vmHandle, requestID, operationValue, username in
+            guard let userdata, let vmHandle, let username,
+                let operation = TouchIDOperation(operationValue)
+            else { return }
+            let app = Unmanaged<App>.fromOpaque(userdata).takeUnretainedValue()
+            let usernameValue = String(cString: username)
+            DispatchQueue.main.async {
+                guard let vm = app.vms.first(where: { $0.matches(vmHandle) }) else { return }
+                guard vm.state == .running else {
+                    vm.completeTouchID(requestID: requestID, result: .cancelled)
+                    return
+                }
+                guard let delegate = app.delegate else {
+                    vm.completeTouchID(requestID: requestID, result: .unavailable)
+                    return
+                }
+                delegate.app(
+                    app,
+                    vm: vm,
+                    didRequestTouchID: operation,
+                    username: usernameValue,
+                    requestID: requestID
+                )
+            }
+        }
+        runtimeConfig.cancel_authentication = { userdata, vmHandle, requestID in
+            guard let userdata, let vmHandle else { return }
+            let app = Unmanaged<App>.fromOpaque(userdata).takeUnretainedValue()
+            DispatchQueue.main.async {
+                guard let vm = app.vms.first(where: { $0.matches(vmHandle) }) else { return }
+                app.delegate?.app(app, vm: vm, didCancelTouchIDRequest: requestID)
+            }
+        }
 
         guard let h = withUnsafePointer(to: &runtimeConfig, { bobrvm_app_new($0) }) else {
             throw BobrvmError.outOfMemory
@@ -389,6 +449,15 @@ public protocol BobrvmAppDelegate: AnyObject {
     func app(_ app: App, didRequestWriteClipboard text: String)
     func appGPUFrameReady(_ app: App)
     func app(_ app: App, vm: VM, didReceiveConsoleOutput data: Data)
+    func app(
+        _ app: App,
+        vm: VM,
+        didRequestTouchID operation: TouchIDOperation,
+        username: String,
+        requestID: UInt64
+    )
+    func app(_ app: App, vm: VM, didCancelTouchIDRequest requestID: UInt64)
+    func app(_ app: App, didInvalidateTouchIDRequestsFor vm: VM)
 }
 
 extension BobrvmAppDelegate {
@@ -398,6 +467,17 @@ extension BobrvmAppDelegate {
     public func app(_ app: App, didRequestWriteClipboard text: String) {}
     public func appGPUFrameReady(_ app: App) {}
     public func app(_ app: App, vm: VM, didReceiveConsoleOutput data: Data) {}
+    public func app(
+        _ app: App,
+        vm: VM,
+        didRequestTouchID operation: TouchIDOperation,
+        username: String,
+        requestID: UInt64
+    ) {
+        vm.completeTouchID(requestID: requestID, result: .unavailable)
+    }
+    public func app(_ app: App, vm: VM, didCancelTouchIDRequest requestID: UInt64) {}
+    public func app(_ app: App, didInvalidateTouchIDRequestsFor vm: VM) {}
 }
 
 // MARK: - VM
@@ -550,6 +630,11 @@ public final class VM: ObservableObject {
         bobrvm_vm_host_clipboard_changed(handle)
     }
 
+    public func completeTouchID(requestID: UInt64, result: TouchIDResult) {
+        guard let handle else { return }
+        bobrvm_vm_authentication_complete(handle, requestID, result.cValue)
+    }
+
     public var isGuestManagementReady: Bool {
         guard let handle else { return false }
         return bobrvm_vm_guest_management_ready(handle)
@@ -607,6 +692,9 @@ public final class VM: ObservableObject {
 
     func destroy() {
         surfaces.removeAll()
+        if let app {
+            app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)
+        }
         if let h = handle {
             bobrvm_vm_destroy(h)
             handle = nil
@@ -617,6 +705,9 @@ public final class VM: ObservableObject {
     private func beginStop() -> SendableVMHandle? {
         guard !isStopping, state != .stopped, let handle else { return nil }
         isStopping = true
+        if let app {
+            app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)
+        }
         bobrvm_vm_request_stop(handle)
         return SendableVMHandle(value: handle)
     }
@@ -653,6 +744,19 @@ public struct GuestToolsStatus: Equatable, Sendable {
 
     public var supportsFileTransfer: Bool {
         capabilities & UInt64(BOBRVM_GUEST_TOOLS_FILE_TRANSFER.rawValue) != 0
+    }
+
+    public var supportsHostAuthentication: Bool {
+        capabilities & UInt64(BOBRVM_GUEST_TOOLS_HOST_AUTHENTICATION.rawValue) != 0
+    }
+
+    public var supportsFingerprintAuthentication: Bool {
+        capabilities & UInt64(BOBRVM_GUEST_TOOLS_AUTH_FINGERPRINT.rawValue) != 0
+    }
+
+    @available(*, deprecated, renamed: "supportsHostAuthentication")
+    public var supportsBiometric: Bool {
+        supportsHostAuthentication
     }
 
     public var supportsManagement: Bool {

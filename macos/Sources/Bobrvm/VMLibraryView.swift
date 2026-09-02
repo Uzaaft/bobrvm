@@ -186,6 +186,12 @@ struct VMOverviewView: View {
                     DetailRow(label: "Processors", value: "\(vmInstance.config.vcpuCount) cores")
                     DetailRow(label: "Memory", value: memoryText)
                     DetailRow(label: "Graphics", value: graphicsText)
+                    if vmInstance.guestSystem == .linux {
+                        DetailRow(
+                            label: "Fingerprint reader",
+                            value: vmInstance.config.touchIDEnabled ? "Attached" : "Not attached"
+                        )
+                    }
                 }
                 DetailPanel(title: "Display", systemImage: "display") {
                     DetailRow(label: "Maximum resolution", value: displayText)

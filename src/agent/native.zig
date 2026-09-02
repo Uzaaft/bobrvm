@@ -1,11 +1,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const callback = @import("../callback.zig");
+const authentication = @import("../auth/main.zig");
 const protocol = @import("protocol.zig");
 
 pub const protocol_version = protocol.protocol_version;
 pub const payload_bytes_max = protocol.payload_bytes_max;
 pub const clipboard_text_bytes_max = protocol.clipboard_text_bytes_max;
+pub const authentication_principal_bytes_max = protocol.authentication_principal_bytes_max;
 pub const Header = protocol.Header;
 pub const MessageKind = protocol.MessageKind;
 pub const Frame = protocol.Frame;
@@ -14,6 +16,10 @@ pub const Capability = protocol.Capability;
 pub const Clipboard = protocol.Clipboard;
 pub const FileChunk = protocol.FileChunk;
 pub const FileOffer = protocol.FileOffer;
+pub const AuthenticationOperation = protocol.AuthenticationOperation;
+pub const AuthenticationRequest = protocol.AuthenticationRequest;
+pub const AuthenticationResponse = protocol.AuthenticationResponse;
+pub const AuthenticationResult = protocol.AuthenticationResult;
 pub const encode = protocol.encode;
 pub const encodeHeader = protocol.encodeHeader;
 pub const Decoder = protocol.Decoder;
@@ -28,12 +34,39 @@ pub const Status = enum(u8) {
 pub const HostCapability = struct {
     pub const clipboard = Capability.clipboard;
     pub const file_transfer = Capability.file_transfer;
+    pub const host_authentication = Capability.host_authentication;
+    pub const authentication_v1 = Capability.authentication_v1;
     pub const management: u64 = 1 << 8;
 };
 
 pub const Send = callback.Binding1([]const u8, void);
 pub const GuestClipboard = callback.Binding1([]const u8, void);
 pub const HostClipboardRequest = callback.Binding0(void);
+pub const HostAuthenticationRequest = callback.Binding2(u64, AuthenticationRequest, void);
+pub const HostAuthenticationCancel = callback.Binding1(u64, void);
+
+const CallbackAuthenticationBackend = struct {
+    on_start: ?HostAuthenticationRequest = null,
+    on_cancel: ?HostAuthenticationCancel = null,
+
+    pub fn available(self: *const CallbackAuthenticationBackend) bool {
+        return self.on_start != null;
+    }
+
+    pub fn start(
+        self: *CallbackAuthenticationBackend,
+        request_id: u64,
+        request: AuthenticationRequest,
+    ) void {
+        self.on_start.?.call(request_id, request);
+    }
+
+    pub fn cancel(self: *CallbackAuthenticationBackend, request_id: u64) void {
+        if (self.on_cancel) |handler| handler.call(request_id);
+    }
+};
+
+const AuthenticationBroker = authentication.Broker(CallbackAuthenticationBackend);
 
 pub const FileTransferError = std.Io.File.OpenError || std.Io.File.LengthError || error{
     Busy,
@@ -56,6 +89,7 @@ pub const Native = struct {
     transfer: ?Transfer = null,
     next_request_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
     pending_host_clipboard_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    authentication: AuthenticationBroker = .{ .backend = .{} },
     on_guest_clipboard: ?GuestClipboard = null,
     request_host_clipboard: ?HostClipboardRequest = null,
 
@@ -102,6 +136,26 @@ pub const Native = struct {
     ) void {
         self.on_guest_clipboard = on_guest_clipboard;
         self.request_host_clipboard = request_host_clipboard;
+    }
+
+    pub fn setAuthenticationHandlers(
+        self: *Native,
+        request: HostAuthenticationRequest,
+        cancel: HostAuthenticationCancel,
+    ) void {
+        self.authentication.backend = .{
+            .on_start = request,
+            .on_cancel = cancel,
+        };
+    }
+
+    pub fn completeAuthentication(
+        self: *Native,
+        request_id: u64,
+        result: AuthenticationResult,
+    ) void {
+        if (!self.authentication.complete(request_id)) return;
+        self.sendAuthenticationResult(request_id, result);
     }
 
     pub fn hostClipboardGrab(self: *Native) void {
@@ -183,8 +237,38 @@ pub const Native = struct {
             .clipboard_data => self.handleClipboardData(frame),
             .file_accept => self.handleFileAccept(frame),
             .file_reject, .file_cancel => self.finishFileTransfer(frame.request_id),
+            .authentication_request => self.handleAuthenticationRequest(frame),
+            .authentication_cancel => self.handleAuthenticationCancel(frame.request_id),
             else => {},
         }
+    }
+
+    fn handleAuthenticationRequest(self: *Native, frame: Frame) void {
+        if (self.capabilities() & Capability.host_authentication == 0) return;
+        const request = AuthenticationRequest.decode(frame.payload) catch {
+            self.sendAuthenticationResult(frame.request_id, .failed);
+            return;
+        };
+        const result = self.authentication.start(frame.request_id, request);
+        switch (result) {
+            .started => {},
+            .unavailable => self.sendAuthenticationResult(frame.request_id, .unavailable),
+            .busy, .invalid => self.sendAuthenticationResult(frame.request_id, .failed),
+        }
+    }
+
+    fn handleAuthenticationCancel(self: *Native, request_id: u64) void {
+        _ = self.authentication.cancel(request_id);
+    }
+
+    fn sendAuthenticationResult(
+        self: *Native,
+        request_id: u64,
+        result: AuthenticationResult,
+    ) void {
+        var payload: [1]u8 = undefined;
+        const encoded = AuthenticationResponse.encode(&payload, result) catch unreachable;
+        self.sendFrame(.authentication_result, request_id, encoded);
     }
 
     fn handleClipboardOffer(self: *Native, frame: Frame) void {
@@ -535,4 +619,82 @@ test "native clipboard negotiates by demand in both directions" {
     });
     native.feed(guest_data_bytes);
     try testing.expectEqualStrings("guest text", State.guest_text[0..State.guest_text_len]);
+}
+
+test "native authentication request permits one host operation and correlates its result" {
+    const testing = std.testing;
+    const State = struct {
+        var sent: [Header.bytes + 8]u8 = undefined;
+        var sent_len: usize = 0;
+        var requested_id: u64 = 0;
+        var requested_operation: AuthenticationOperation = .bind;
+        var principal: [16]u8 = undefined;
+        var principal_len: usize = 0;
+
+        fn send(data: []const u8, _: ?*anyopaque) void {
+            @memcpy(sent[0..data.len], data);
+            sent_len = data.len;
+        }
+
+        fn request(id: u64, value: AuthenticationRequest, _: ?*anyopaque) void {
+            requested_id = id;
+            requested_operation = value.operation;
+            @memcpy(principal[0..value.principal.len], value.principal);
+            principal_len = value.principal.len;
+        }
+
+        fn cancel(_: u64, _: ?*anyopaque) void {}
+    };
+    State.sent_len = 0;
+    State.requested_id = 0;
+    State.principal_len = 0;
+
+    var native = Native.init(
+        testing.allocator,
+        Send.initRaw(State.send, null),
+        .{ .capabilities = Capability.authentication_v1 },
+    );
+    defer native.deinit();
+    native.setAuthenticationHandlers(
+        HostAuthenticationRequest.initRaw(State.request, null),
+        HostAuthenticationCancel.initRaw(State.cancel, null),
+    );
+
+    var capabilities: [8]u8 = undefined;
+    // A legacy peer advertises only the original bit; stable request IDs and
+    // payload values keep it interoperable with the generalized broker.
+    std.mem.writeInt(u64, &capabilities, Capability.host_authentication, .little);
+    var frame_buffer: [Header.bytes + AuthenticationRequest.header_bytes + 16]u8 = undefined;
+    const hello = try encode(&frame_buffer, .{
+        .kind = .hello,
+        .request_id = 0,
+        .payload = &capabilities,
+    });
+    native.feed(hello);
+
+    var request_payload: [AuthenticationRequest.header_bytes + 16]u8 = undefined;
+    const request = try AuthenticationRequest.encode(&request_payload, .{
+        .operation = .authenticate,
+        .principal = "alice",
+    });
+    const request_frame = try encode(&frame_buffer, .{
+        .kind = .authentication_request,
+        .request_id = 42,
+        .payload = request,
+    });
+    native.feed(request_frame);
+    try testing.expectEqual(@as(u64, 42), State.requested_id);
+    try testing.expectEqual(AuthenticationOperation.authenticate, State.requested_operation);
+    try testing.expectEqualStrings("alice", State.principal[0..State.principal_len]);
+
+    native.completeAuthentication(42, .success);
+    var decoder = Decoder.init(testing.allocator);
+    defer decoder.deinit();
+    const response = (try decoder.feed(State.sent[0..State.sent_len])).?;
+    try testing.expectEqual(MessageKind.authentication_result, response.kind);
+    try testing.expectEqual(@as(u64, 42), response.request_id);
+    try testing.expectEqual(
+        AuthenticationResult.success,
+        try AuthenticationResponse.decode(response.payload),
+    );
 }

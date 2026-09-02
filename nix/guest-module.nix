@@ -5,9 +5,37 @@
   ...
 }: let
   cfg = config.virtualisation.bobrvm.guest;
+  virtualImageDriver =
+    "    'virtual_image': { 'virtual': true, 'helper': ['virtual'], "
+    + "'optional': true },";
   patchedMesa = pkgs.mesa.overrideAttrs (old: {
     patches = (old.patches or []) ++ [./patches/mesa-venus-16k-blob-align.patch];
   });
+  bobrvmLibfprint = pkgs.libfprint.overrideAttrs (old: {
+    postPatch =
+      (old.postPatch or "")
+      + ''
+            cp ${../pkg/libfprint-bobrvm/bobrvm.c} libfprint/drivers/bobrvm.c
+            cp ${../pkg/libfprint-bobrvm/bobrvm_transport.h} \
+              libfprint/drivers/bobrvm_transport.h
+            substituteInPlace meson.build \
+              --replace-fail \
+                "${virtualImageDriver}" \
+                "    'bobrvm': { 'virtual': true, 'optional': true },
+        'virtual_image': { 'virtual': true, 'helper': ['virtual'], 'optional': true },"
+            substituteInPlace libfprint/meson.build \
+              --replace-fail \
+                "    'virtual_image' : files('drivers/virtual-image.c')," \
+                "    'bobrvm' : files('drivers/bobrvm.c'),
+        'virtual_image' : files('drivers/virtual-image.c'),"
+            substituteInPlace libfprint/meson.build \
+              --replace-fail \
+                "    mathlib_dep," \
+                "    mathlib_dep,
+        cc.find_library('bobrvm-fprint-transport', dirs: '${cfg.package}/lib', static: true),"
+      '';
+  });
+  bobrvmFprintd = pkgs.fprintd.override {libfprint = bobrvmLibfprint;};
   managementRpcs = [
     "guest-sync"
     "guest-sync-delimited"
@@ -46,9 +74,10 @@
     cfg.management.enable
     || cfg.automation.enable
     || cfg.quiescedSnapshots.enable;
-  nativeAgentEnabled = cfg.fileTransfer.enable;
+  nativeAgentEnabled = cfg.fileTransfer.enable || cfg.touchID.enable;
   inboxDirectory = lib.escapeShellArg cfg.fileTransfer.directory;
   inboxArgument = lib.optionalString cfg.fileTransfer.enable " --inbox ${inboxDirectory}";
+  touchIDArgument = lib.optionalString cfg.touchID.enable " --touch-id";
 in {
   options.virtualisation.bobrvm.guest = {
     enable = lib.mkEnableOption "bobrvm guest integration";
@@ -76,6 +105,7 @@ in {
         description = "Directory where files sent by the host are delivered.";
       };
     };
+    touchID.enable = lib.mkEnableOption "macOS Touch ID as a Linux fingerprint device";
     quiescedSnapshots.enable = lib.mkEnableOption "filesystem freeze and thaw for snapshots";
 
     sharedFolder = {
@@ -230,19 +260,35 @@ in {
       systemd.services.bobrvm-agentd = {
         description = "bobrvm guest integration transport";
         serviceConfig = {
-          ExecStart = "${cfg.package}/bin/bobrvm-agentd${inboxArgument}";
+          ExecStart = "${cfg.package}/bin/bobrvm-agentd${inboxArgument}${touchIDArgument}";
           Restart = "always";
           RestartSec = 1;
+          RuntimeDirectory = "bobrvm";
+          RuntimeDirectoryMode = "0755";
           NoNewPrivileges = true;
           ProtectSystem = "strict";
           ProtectHome = true;
           PrivateTmp = true;
-          ReadWritePaths = lib.optional cfg.fileTransfer.enable cfg.fileTransfer.directory;
+          ReadWritePaths =
+            lib.optional cfg.fileTransfer.enable cfg.fileTransfer.directory
+            ++ lib.optional cfg.touchID.enable "/run/bobrvm";
         };
       };
       systemd.tmpfiles.rules = lib.optionals cfg.fileTransfer.enable [
         "d ${cfg.fileTransfer.directory} 0755 root root -"
       ];
+    })
+
+    (lib.mkIf cfg.touchID.enable {
+      services.fprintd = {
+        enable = true;
+        package = bobrvmFprintd;
+      };
+      systemd.services.fprintd.environment.FP_BOBRVM_TOUCH_ID = "/run/bobrvm/touch-id.sock";
+      systemd.services.fprintd = {
+        after = ["bobrvm-agentd.service"];
+        requires = ["bobrvm-agentd.service"];
+      };
     })
 
     (lib.mkIf cfg.sharedFolder.enable {

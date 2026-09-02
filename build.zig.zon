@@ -19,6 +19,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "pkg",
         "include",
         "LICENSE",
         "AGENTS.md",

@@ -207,6 +207,9 @@ pub const MachineConfig = struct {
     /// Enable the virtio-net device (built-in NAT backend).
     enable_net: bool = false,
 
+    /// Expose host-backed local authentication on the native agent port.
+    enable_touch_id: bool = false,
+
     /// Enable the virtio-snd (sound) device. Opt-in: audio is not always
     /// present, so both the DTB virtio count and the slot assignment gate
     /// on this flag.
@@ -838,6 +841,28 @@ pub const Machine = struct {
     pub fn sendHostClipboard(self: *Machine, text: []const u8) void {
         if (self.vdagent) |*v| v.sendClipboard(text);
         if (self.wayland_agent) |native| native.sendClipboard(text);
+    }
+
+    pub fn setAuthenticationHandlers(
+        self: *Machine,
+        request: *const fn (u64, agent.native.AuthenticationRequest, ?*anyopaque) void,
+        cancel: *const fn (u64, ?*anyopaque) void,
+        userdata: ?*anyopaque,
+    ) void {
+        const native = self.native_agent orelse return;
+        native.setAuthenticationHandlers(
+            agent.native.HostAuthenticationRequest.initRaw(request, userdata),
+            agent.native.HostAuthenticationCancel.initRaw(cancel, userdata),
+        );
+    }
+
+    pub fn completeAuthentication(
+        self: *Machine,
+        request_id: u64,
+        result: agent.native.AuthenticationResult,
+    ) void {
+        const native = self.native_agent orelse return;
+        native.completeAuthentication(request_id, result);
     }
 
     /// Send bytes to the guest agent port (host→guest). Thread-safe.
@@ -2800,10 +2825,16 @@ pub const Machine = struct {
         );
 
         self.native_agent = try self.alloc.create(agent.Native);
+        const authentication_capability = if (self.config.enable_touch_id)
+            agent.native.Capability.authentication_v1
+        else
+            0;
         self.native_agent.?.* = agent.Native.init(
             self.alloc,
             callback_binding.Handler1(Machine, []const u8, void, nativeAgentSend).bind(self),
-            .{ .capabilities = agent.native.Capability.file_transfer },
+            .{
+                .capabilities = agent.native.Capability.file_transfer | authentication_capability,
+            },
         );
         self.console.?.setPortOutput(
             BOBRVM_AGENT_PORT,

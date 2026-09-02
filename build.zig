@@ -727,7 +727,7 @@ pub fn build(b: *std.Build) !void {
     test_compile_step.dependOn(&wayland_tests.step);
 
     const guest_protocol_test_module = b.createModule(.{
-        .root_source_file = b.path("src/agent/protocol.zig"),
+        .root_source_file = b.path("src/guest_protocol.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -744,6 +744,21 @@ pub fn build(b: *std.Build) !void {
     });
     const run_guest_agent_tests = b.addRunArtifact(guest_agent_tests);
     test_step.dependOn(&run_guest_agent_tests.step);
+
+    const fprint_transport_test_module = b.createModule(.{
+        .root_source_file = b.path("src/guest_tools/fprint_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const fprint_transport_tests = b.addTest(.{
+        .name = "bobrvm-fprint-transport-tests",
+        .root_module = fprint_transport_test_module,
+        .filters = test_filters,
+    });
+    const run_fprint_transport_tests = b.addRunArtifact(fprint_transport_tests);
+    test_step.dependOn(&run_fprint_transport_tests.step);
+    test_compile_step.dependOn(&fprint_transport_tests.step);
 
     // ==========================================================================
     // Integration test: bare-metal ARM64 test binary (pure assembly)
@@ -865,7 +880,7 @@ fn addGuestTools(
         .{ "bobrvm-toolbox", "src/guest_tools/toolbox.zig" },
     };
     const protocol_module = b.createModule(.{
-        .root_source_file = b.path("src/agent/protocol.zig"),
+        .root_source_file = b.path("src/guest_protocol.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -875,6 +890,22 @@ fn addGuestTools(
         .optimize = optimize,
         .link_libc = true,
     });
+    const fprint_transport_module = b.createModule(.{
+        .root_source_file = b.path("src/guest_tools/fprint_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const fprint_transport = b.addLibrary(.{
+        .name = "bobrvm-fprint-transport",
+        .root_module = fprint_transport_module,
+        .linkage = .static,
+    });
+    b.installArtifact(fprint_transport);
+    b.installFile(
+        "pkg/libfprint-bobrvm/bobrvm_transport.h",
+        "include/bobrvm_transport.h",
+    );
     inline for (tools) |tool| {
         const module = b.createModule(.{
             .root_source_file = b.path(tool[1]),

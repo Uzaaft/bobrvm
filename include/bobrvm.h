@@ -81,6 +81,14 @@ typedef struct {
 typedef enum {
     BOBRVM_GUEST_TOOLS_CLIPBOARD = 1ULL << 0,
     BOBRVM_GUEST_TOOLS_FILE_TRANSFER = 1ULL << 1,
+    BOBRVM_GUEST_TOOLS_HOST_AUTHENTICATION = 1ULL << 2,
+    BOBRVM_GUEST_TOOLS_AUTH_BIND = 1ULL << 3,
+    BOBRVM_GUEST_TOOLS_AUTH_AUTHENTICATE = 1ULL << 4,
+    BOBRVM_GUEST_TOOLS_AUTH_MATCH_ON_DEVICE = 1ULL << 5,
+    BOBRVM_GUEST_TOOLS_AUTH_CANCELLATION = 1ULL << 6,
+    BOBRVM_GUEST_TOOLS_AUTH_FINGERPRINT = 1ULL << 7,
+    /** Compatibility alias for BOBRVM_GUEST_TOOLS_HOST_AUTHENTICATION. */
+    BOBRVM_GUEST_TOOLS_BIOMETRIC = BOBRVM_GUEST_TOOLS_HOST_AUTHENTICATION,
     BOBRVM_GUEST_TOOLS_MANAGEMENT = 1ULL << 8,
 } bobrvm_guest_tools_capability_e;
 
@@ -103,6 +111,32 @@ typedef struct {
     double y;
 } bobrvm_point_s;
 
+typedef enum {
+    BOBRVM_AUTHENTICATION_BIND = 1,
+    BOBRVM_AUTHENTICATION_AUTHENTICATE = 2,
+} bobrvm_authentication_operation_e;
+
+typedef enum {
+    BOBRVM_AUTHENTICATION_SUCCESS = 1,
+    BOBRVM_AUTHENTICATION_NO_MATCH = 2,
+    BOBRVM_AUTHENTICATION_CANCELLED = 3,
+    BOBRVM_AUTHENTICATION_UNAVAILABLE = 4,
+    BOBRVM_AUTHENTICATION_LOCKED = 5,
+    BOBRVM_AUTHENTICATION_FAILED = 6,
+} bobrvm_authentication_result_e;
+
+/** Compatibility names for the original macOS-specific API. */
+typedef bobrvm_authentication_operation_e bobrvm_touch_id_operation_e;
+typedef bobrvm_authentication_result_e bobrvm_touch_id_result_e;
+#define BOBRVM_TOUCH_ID_ENROLL BOBRVM_AUTHENTICATION_BIND
+#define BOBRVM_TOUCH_ID_VERIFY BOBRVM_AUTHENTICATION_AUTHENTICATE
+#define BOBRVM_TOUCH_ID_SUCCESS BOBRVM_AUTHENTICATION_SUCCESS
+#define BOBRVM_TOUCH_ID_NO_MATCH BOBRVM_AUTHENTICATION_NO_MATCH
+#define BOBRVM_TOUCH_ID_CANCELLED BOBRVM_AUTHENTICATION_CANCELLED
+#define BOBRVM_TOUCH_ID_UNAVAILABLE BOBRVM_AUTHENTICATION_UNAVAILABLE
+#define BOBRVM_TOUCH_ID_LOCKED BOBRVM_AUTHENTICATION_LOCKED
+#define BOBRVM_TOUCH_ID_FAILED BOBRVM_AUTHENTICATION_FAILED
+
 /* Configuration. */
 
 typedef struct {
@@ -121,6 +155,8 @@ typedef struct {
     /** Defaults to read-only for ISO media. */
     bool disk2_read_only;
     bool enable_net;
+    /** Attach the host-backed macOS Touch ID authentication device. */
+    bool enable_touch_id;
     /** Host directory exported through virtio-9p with mount tag "host". */
     const char* shared_dir;
     /** Initial guest display width in pixels (0 = default 1280). */
@@ -214,6 +250,18 @@ typedef struct {
         const uint8_t* data,
         size_t len
     );
+
+    /** Called on a vCPU thread; copy principal before returning. */
+    void (*request_authentication)(
+        void* userdata,
+        bobrvm_vm_t vm,
+        uint64_t request_id,
+        bobrvm_authentication_operation_e operation,
+        const char* principal
+    );
+
+    /** Cancel a native authentication request that is no longer needed by the guest. */
+    void (*cancel_authentication)(void* userdata, bobrvm_vm_t vm, uint64_t request_id);
 } bobrvm_runtime_config_s;
 
 /* Library lifecycle. */
@@ -292,6 +340,20 @@ bobrvm_error_e bobrvm_vm_send_file(bobrvm_vm_t vm, const char* path);
  * pastes. Call on NSPasteboard changeCount transitions.
  */
 void bobrvm_vm_host_clipboard_changed(bobrvm_vm_t vm);
+
+/** Complete a pending guest authentication request. Safe to call from the main thread. */
+void bobrvm_vm_authentication_complete(
+    bobrvm_vm_t vm,
+    uint64_t request_id,
+    bobrvm_authentication_result_e result
+);
+
+/** Compatibility wrapper for bobrvm_vm_authentication_complete. */
+void bobrvm_vm_touch_id_complete(
+    bobrvm_vm_t vm,
+    uint64_t request_id,
+    bobrvm_touch_id_result_e result
+);
 
 /**
  * Inject an IRQ and force vCPU vcpu_id out of hv_vcpu_run.

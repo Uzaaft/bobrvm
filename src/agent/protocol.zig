@@ -2,10 +2,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const authentication = @import("../auth/main.zig");
 
 pub const protocol_version: u16 = 1;
 pub const payload_bytes_max: u32 = 32 * 1024 * 1024;
 pub const clipboard_text_bytes_max: u32 = 48 * 1024;
+pub const authentication_principal_bytes_max = authentication.principal_bytes_max;
 
 pub const Header = struct {
     pub const magic: u32 = 0x4252_564d;
@@ -27,6 +29,9 @@ pub const MessageKind = enum(u16) {
     file_chunk = 35,
     file_complete = 36,
     file_cancel = 37,
+    authentication_request = 48,
+    authentication_cancel = 49,
+    authentication_result = 50,
     _,
 };
 
@@ -47,12 +52,55 @@ pub const CodecError = Allocator.Error || error{
     UnsupportedVersion,
     UnsupportedFlags,
     PayloadTooLarge,
-};
+} || authentication.CodecError;
 
 pub const Capability = struct {
     pub const clipboard: u64 = 1 << 0;
     pub const file_transfer: u64 = 1 << 1;
+    pub const host_authentication: u64 = 1 << 2;
+    pub const authentication_bind: u64 = AuthenticationCapability.bind << 3;
+    pub const authentication_authenticate: u64 = AuthenticationCapability.authenticate << 3;
+    pub const authentication_match_on_device: u64 =
+        AuthenticationCapability.match_on_device << 3;
+    pub const authentication_cancellation: u64 = AuthenticationCapability.cancellation << 3;
+    pub const authentication_fingerprint: u64 = AuthenticationCapability.fingerprint << 3;
+    pub const authentication_v1: u64 = host_authentication |
+        authentication_bind |
+        authentication_authenticate |
+        authentication_match_on_device |
+        authentication_cancellation |
+        authentication_fingerprint;
 };
+
+pub const AuthenticationCapability = authentication.Capability;
+pub const AuthenticationOperation = authentication.Operation;
+pub const AuthenticationResult = authentication.Result;
+pub const AuthenticationRequest = authentication.Request;
+pub const AuthenticationResponse = authentication.Response;
+pub const AuthenticationFrontendSession = authentication.FrontendSession;
+
+pub fn authenticationCapabilities(capabilities: u64) u64 {
+    if (capabilities & Capability.host_authentication == 0) return 0;
+    return (capabilities >> 3) & 0x1f;
+}
+
+test "authentication capabilities retain the negotiated feature set" {
+    const testing = std.testing;
+    const features = authenticationCapabilities(Capability.authentication_v1);
+    try testing.expect(features & AuthenticationCapability.bind != 0);
+    try testing.expect(features & AuthenticationCapability.authenticate != 0);
+    try testing.expect(features & AuthenticationCapability.match_on_device != 0);
+    try testing.expect(features & AuthenticationCapability.cancellation != 0);
+    try testing.expect(features & AuthenticationCapability.fingerprint != 0);
+}
+
+test "authentication wire identifiers remain backward compatible" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(u16, 48), @intFromEnum(MessageKind.authentication_request));
+    try testing.expectEqual(@as(u16, 49), @intFromEnum(MessageKind.authentication_cancel));
+    try testing.expectEqual(@as(u16, 50), @intFromEnum(MessageKind.authentication_result));
+    try testing.expectEqual(@as(u64, 1 << 2), Capability.host_authentication);
+}
 
 pub const Clipboard = struct {
     pub fn decode(payload: []const u8) CodecError![]const u8 {

@@ -152,6 +152,7 @@
                 management.enable = true;
                 clipboard.enable = true;
                 fileTransfer.enable = true;
+                touchID.enable = true;
                 quiescedSnapshots.enable = true;
                 sharedFolder.enable = true;
                 docker.enable = true;
@@ -177,6 +178,7 @@
         guestVsockConfig = guestVsockSystem.config;
       in {
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) bobrvm-tools;
+        touch-id-fprintd = guestConfig.services.fprintd.package;
         guest-module = assert guestConfig.services.qemuGuest.enable;
         assert guestConfig.services.spice-vdagentd.enable;
         assert lib.hasSuffix "/bin/bobrvm-session-agent"
@@ -184,6 +186,11 @@
         assert guestConfig.fileSystems."/mnt/bobrvm".fsType == "9p";
         assert lib.hasInfix "--inbox /var/lib/bobrvm/inbox"
         guestConfig.systemd.services.bobrvm-agentd.serviceConfig.ExecStart;
+        assert lib.hasSuffix "--touch-id"
+        guestConfig.systemd.services.bobrvm-agentd.serviceConfig.ExecStart;
+        assert guestConfig.services.fprintd.enable;
+        assert guestConfig.systemd.services.fprintd.environment.FP_BOBRVM_TOUCH_ID
+        == "/run/bobrvm/touch-id.sock";
         assert guestConfig.virtualisation.docker.enable;
         assert lib.elem "10.0.2.15:2375"
         guestConfig.virtualisation.docker.listenOptions;

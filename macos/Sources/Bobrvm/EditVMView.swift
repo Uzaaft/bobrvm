@@ -16,6 +16,7 @@ struct EditVMView: View {
     @State private var resolution: DisplayResolution
     @State private var retinaEnabled: Bool
     @State private var networkEnabled: Bool
+    @State private var touchIDEnabled: Bool
     @State private var sharedFolderPath: String
     @State private var diskSizeGB: Double
     @State private var showingError = false
@@ -45,6 +46,7 @@ struct EditVMView: View {
             ))
         _retinaEnabled = State(initialValue: vmInstance.retinaEnabled)
         _networkEnabled = State(initialValue: vmInstance.config.networkEnabled)
+        _touchIDEnabled = State(initialValue: vmInstance.config.touchIDEnabled)
         _sharedFolderPath = State(initialValue: vmInstance.config.sharedFolderPath ?? "")
         _diskSizeGB = State(
             initialValue: Double(
@@ -68,6 +70,7 @@ struct EditVMView: View {
                     resourcesSection
                     graphicsSection
                     networkSection
+                    touchIDSection
                     informationSection
                 }
                 .formStyle(.grouped)
@@ -146,6 +149,7 @@ struct EditVMView: View {
             .onChange(of: backend) { _, selected in
                 if selected == .virtualization {
                     sharedFolderPath = ""
+                    touchIDEnabled = false
                 }
                 hasChanges = true
             }
@@ -332,6 +336,31 @@ struct EditVMView: View {
         }
     }
 
+    @ViewBuilder
+    private var touchIDSection: some View {
+        if vmInstance.guestSystem == .linux {
+            Section {
+                Toggle("Attach fingerprint reader", isOn: $touchIDEnabled)
+                    .disabled(isRunning || backend != .hypervisor)
+                    .onChange(of: touchIDEnabled) { hasChanges = true }
+            } header: {
+                LockableSectionHeader(title: "Devices", isLocked: isRunning)
+            } footer: {
+                Text(touchIDFooter)
+            }
+        }
+    }
+
+    private var touchIDFooter: String {
+        if isRunning {
+            return "Stop the VM to add or remove its Touch ID device."
+        }
+        if backend != .hypervisor {
+            return "The fingerprint reader requires the Bobrvm Hypervisor backend."
+        }
+        return "The reader uses this Mac’s native Touch ID prompt for Linux authentication."
+    }
+
     private var informationSection: some View {
         Section("Information") {
             LabeledContent("VM ID") {
@@ -463,6 +492,7 @@ struct EditVMView: View {
                     displayHeight: Int(resolution.height),
                     retinaEnabled: retinaEnabled,
                     networkEnabled: networkEnabled,
+                    touchIDEnabled: touchIDEnabled,
                     sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
                     diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil,
                     backend: backend

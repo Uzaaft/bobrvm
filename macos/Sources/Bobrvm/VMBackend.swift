@@ -66,6 +66,9 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
         guard supports(guestSystem) else {
             throw VMBackendError.unsupportedGuest(backend: self, guest: guestSystem)
         }
+        guard !config.touchIDEnabled || (self == .hypervisor && guestSystem == .linux) else {
+            throw VMBackendError.touchIDRequiresLinuxHypervisor
+        }
         guard self == .virtualization, guestSystem == .linux else { return }
         guard let diskPath = config.diskPath else {
             throw VMBackendError.diskRequired
@@ -81,6 +84,7 @@ enum VMBackendError: LocalizedError {
     case unsupportedGuest(backend: VMBackend, guest: GuestSystem)
     case diskRequired
     case rawDiskRequired
+    case touchIDRequiresLinuxHypervisor
 
     var errorDescription: String? {
         switch self {
@@ -90,6 +94,8 @@ enum VMBackendError: LocalizedError {
             return "Apple Virtualization requires a boot disk."
         case .rawDiskRequired:
             return "Apple Virtualization supports raw Linux disk images only."
+        case .touchIDRequiresLinuxHypervisor:
+            return "Mac Touch ID requires a Linux VM using Bobrvm Hypervisor."
         }
     }
 }

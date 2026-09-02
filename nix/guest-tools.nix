@@ -19,7 +19,10 @@
         ../src/callback.zig
         ../src/agent/native.zig
         ../src/agent/protocol.zig
+        ../src/auth
+        ../src/guest_protocol.zig
         ../src/guest_tools
+        ../pkg/libfprint-bobrvm/bobrvm_transport.h
       ];
     };
     nativeBuildInputs = [zig_0_16];

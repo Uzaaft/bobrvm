@@ -25,6 +25,7 @@ Import the module from the same pinned bobrvm flake input used to build the host
             management.enable = true;
             clipboard.enable = true;
             fileTransfer.enable = true;
+            touchID.enable = true;
             quiescedSnapshots.enable = true;
             sharedFolder.enable = true;
             docker.enable = true;
@@ -52,6 +53,7 @@ QGA command execution and file RPCs and therefore requires
 | Text copy and paste in X11 sessions | `clipboard.enable` | SPICE vdagent |
 | Text copy and paste in Wayland sessions | `clipboard.enable` | bobrvm session agent |
 | Host-to-guest file delivery | `fileTransfer.enable` | bobrvm native agent |
+| Mac Touch ID fingerprint authentication | `touchID.enable` | fprintd and bobrvm native agent |
 | Filesystem-consistent snapshots | `quiescedSnapshots.enable` | QGA fsfreeze |
 | Persistent host folder | `sharedFolder.enable` | virtio-9p |
 | Host Docker CLI and Compose | `docker.enable` | private host Unix socket |
@@ -62,6 +64,63 @@ The native file channel accepts one regular file at a time, uses acknowledged
 arrive atomically in `/var/lib/bobrvm/inbox` by default; set
 `fileTransfer.directory` to another absolute path if required. Existing files
 are never overwritten.
+
+`touchID.enable` installs a libfprint device named `Mac Touch ID`, enables
+fprintd and its normal PAM integration, and connects it to the VM's native
+agent. Attach Mac Touch ID in the VM's hardware settings as well, then enroll
+each Linux account once with `fprintd-enroll`. Later fprintd or PAM verification
+opens the standard macOS Touch ID confirmation panel.
+
+Touch ID is a match-on-device authenticator: macOS never exposes fingerprint
+images or templates. The guest therefore stores an opaque libfprint enrollment
+record, while every scan is matched by macOS and only its bounded result is
+returned to Linux. Password and Apple Watch fallback are not requested. This
+device is currently available only to Linux VMs using the Bobrvm Hypervisor
+backend.
+
+The reusable host-authentication domain, wire protocol, request broker,
+Unix-socket transport, validation, timeout, and cancellation state machines
+are implemented in Zig. The core models opaque `bind` and `authenticate`
+operations rather than fingerprint samples, so other host authenticators and
+guest frontends can implement the same compile-time interface. A small C
+adapter is retained only for libfprint's required GObject driver ABI, while
+the macOS adapter invokes LocalAuthentication through Swift.
+
+New hosts implement the compile-time `Backend` contract with `available`,
+`start`, and `cancel`. New guest device integrations implement `Frontend` with
+`available`, `complete`, and `close`. The negotiated feature set distinguishes
+binding, authentication, cancellation, match-on-device operation, and
+fingerprint modality. Wire identifiers 48–50 and capability bit 2 retain their
+original values so pre-generalization host and guest builds remain compatible.
+
+### Test Touch ID authentication
+
+Build the Zig library and macOS application:
+
+```sh
+zig build test
+zig build xcframework ghostty-lib
+xcodebuild -project macos/Bobrvm.xcodeproj -scheme Bobrvm
+```
+
+In the VM editor, stop the VM, enable **Attach fingerprint reader**, and start it again. The
+guest must import this flake's NixOS module with `touchID.enable = true`, then be rebuilt and
+rebooted. That module supplies the libfprint driver and agent services; no separate guest kernel
+or macOS driver is required.
+
+Inside the guest, enroll and verify the current account:
+
+```sh
+systemctl status bobrvm-agentd fprintd
+fprintd-enroll
+fprintd-verify
+sudo -k
+sudo true
+```
+
+Both verification commands should open macOS's native Touch ID panel. `fprintd-list "$USER"`
+shows the guest-side opaque enrollment. If the panel does not appear, use `bobrvm-toolbox doctor`
+and inspect `journalctl -u bobrvm-agentd -u fprintd`.
 
 The host folder has mount tag `host` and defaults to `/mnt/bobrvm`. Select the
 host directory in the macOS VM settings or pass `--share /absolute/path` to the

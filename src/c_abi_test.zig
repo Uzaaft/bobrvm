@@ -1,5 +1,6 @@
 const std = @import("std");
 const apprt = @import("apprt/main.zig");
+const authentication = @import("auth/main.zig");
 const macos_runtime = @import("runtime/macos.zig");
 const c = @cImport({
     @cInclude("bobrvm.h");
@@ -35,13 +36,36 @@ test "C ABI shared struct layouts match Zig" {
 }
 
 test "C ABI enum values match Zig" {
-    try std.testing.expectEqual(@as(c_int, @intFromEnum(apprt.MouseButton.left)), c.BOBRVM_MOUSE_LEFT);
-    try std.testing.expectEqual(@as(c_int, @intFromEnum(apprt.MouseButton.right)), c.BOBRVM_MOUSE_RIGHT);
-    try std.testing.expectEqual(@as(c_int, @intFromEnum(apprt.MouseButton.middle)), c.BOBRVM_MOUSE_MIDDLE);
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(apprt.MouseButton.left)),
+        c.BOBRVM_MOUSE_LEFT,
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(apprt.MouseButton.right)),
+        c.BOBRVM_MOUSE_RIGHT,
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(apprt.MouseButton.middle)),
+        c.BOBRVM_MOUSE_MIDDLE,
+    );
     try std.testing.expectEqual(@as(c_int, 0), c.BOBRVM_BUILD_MODE_DEBUG);
     try std.testing.expectEqual(@as(c_int, 3), c.BOBRVM_BUILD_MODE_RELEASE_SMALL);
     try std.testing.expectEqual(@as(c_int, 0), c.BOBRVM_OK);
     try std.testing.expectEqual(@as(c_int, 13), c.BOBRVM_ERROR_INVALID_STATE);
     try std.testing.expectEqual(@as(c_int, 0), c.BOBRVM_VM_STATE_STOPPED);
     try std.testing.expectEqual(@as(c_int, 6), c.BOBRVM_VM_STATE_FAILED);
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(authentication.Operation.bind)),
+        c.BOBRVM_AUTHENTICATION_BIND,
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(authentication.Operation.authenticate)),
+        c.BOBRVM_AUTHENTICATION_AUTHENTICATE,
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(authentication.Result.locked)),
+        c.BOBRVM_AUTHENTICATION_LOCKED,
+    );
+    try std.testing.expectEqual(c.BOBRVM_AUTHENTICATION_BIND, c.BOBRVM_TOUCH_ID_ENROLL);
+    try std.testing.expectEqual(c.BOBRVM_AUTHENTICATION_SUCCESS, c.BOBRVM_TOUCH_ID_SUCCESS);
 }
