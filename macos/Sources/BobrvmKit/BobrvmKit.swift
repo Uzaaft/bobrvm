@@ -1021,11 +1021,11 @@ public final class MacVM: ObservableObject {
         guard let handle else { return }
         switch bobrvm_macos_vm_state(handle) {
         case BOBRVM_VM_STATE_RUNNING:
-            state = .running
+            if state != .running { state = .running }
         case BOBRVM_VM_STATE_PAUSED:
-            state = .paused
+            if state != .paused { state = .paused }
         case BOBRVM_VM_STATE_STOPPED, BOBRVM_VM_STATE_FAILED:
-            state = .stopped
+            if state != .stopped { state = .stopped }
             stateTimer?.cancel()
             stateTimer = nil
         default:
