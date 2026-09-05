@@ -420,6 +420,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     @Published public var surface: Surface?
 
     private var runtimeStateCancellable: AnyCancellable?
+    private var sshPortCancellable: AnyCancellable?
     @Published private(set) var sshError: String?
 
     var sshAlias: String { "bobrvm-\(id.uuidString.lowercased())" }
@@ -637,17 +638,18 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     private func observeRuntime() {
         runtimeStateCancellable = runtime?.stateChanges.sink { [weak self] _ in
             self?.objectWillChange.send()
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let port = self.sshPort
-                guard port != 0, self.ssh.automatic, self.ssh.port != port else {
-                    return
-                }
+        }
+        sshPortCancellable = runtimeVM?.$forwardedPorts
+            .map { $0.first ?? 0 }
+            .removeDuplicates()
+            .sink { [weak self] port in
+                guard let self, self.ssh.enabled, self.ssh.automatic,
+                    port != 0, self.ssh.port != port
+                else { return }
                 self.ssh.port = port
                 do { try VMStorage.saveVM(self) }
                 catch { self.sshError = error.localizedDescription }
             }
-        }
     }
 }
 

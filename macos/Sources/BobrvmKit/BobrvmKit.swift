@@ -464,7 +464,7 @@ public final class App {
             guard let vmHandle = bobrvm_vm_new(appHandle, cfgPtr) else {
                 throw BobrvmError.vmCreateFailed
             }
-            return VM(handle: vmHandle, app: self)
+            return VM(handle: vmHandle, app: self, forwardCount: config.portForwards.count)
         }
 
         vms.append(vm)
@@ -532,7 +532,7 @@ public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
     @Published public private(set) var isStopping = false
     @Published public private(set) var guestToolsStatus = GuestToolsStatus.disconnected
-    @Published public private(set) var forwardedPorts: [UInt16] = Array(repeating: 0, count: 8)
+    @Published public private(set) var forwardedPorts: [UInt16]
     private(set) var consoleOutputData = Data()
 
     public var consoleOutput: String {
@@ -548,9 +548,10 @@ public final class VM: ObservableObject {
         consoleEventSubject.eraseToAnyPublisher()
     }
 
-    init(handle: bobrvm_vm_t, app: App) {
+    init(handle: bobrvm_vm_t, app: App, forwardCount: Int) {
         self.handle = handle
         self.app = app
+        self.forwardedPorts = Array(repeating: 0, count: forwardCount)
     }
 
     func matches(_ candidate: bobrvm_vm_t) -> Bool {
@@ -572,11 +573,12 @@ public final class VM: ObservableObject {
 
     func refreshGuestToolsStatus() {
         guard !isStopping else { return }
-        for slot in forwardedPorts.indices {
-            let port = if let handle, state == .running {
-                bobrvm_vm_forwarded_port(handle, UInt8(slot))
-            } else { UInt16(0) }
-            if forwardedPorts[slot] != port { forwardedPorts[slot] = port }
+        // Device setup publishes asynchronously; listeners keep their ports until stop.
+        if let handle, state == .running {
+            for slot in forwardedPorts.indices where forwardedPorts[slot] == 0 {
+                let port = bobrvm_vm_forwarded_port(handle, UInt8(slot))
+                if port != 0 { forwardedPorts[slot] = port }
+            }
         }
         guard let handle else {
             guestToolsStatus = .disconnected
@@ -758,7 +760,7 @@ public final class VM: ObservableObject {
     private func beginStop() -> SendableVMHandle? {
         guard !isStopping, state != .stopped, let handle else { return nil }
         isStopping = true
-        forwardedPorts = Array(repeating: 0, count: 8)
+        forwardedPorts = Array(repeating: 0, count: forwardedPorts.count)
         if let app {
             app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)
         }
