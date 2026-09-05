@@ -20,3 +20,22 @@ The default kernel command line is
 
 `download.sh` extracts the raw ARM64 image from Alpine's EFI-stub
 `vmlinuz-virt`.
+
+For CLI and MCP tests, build the shell fixture:
+
+```sh
+./tests/integration/alpine/download.sh
+nix shell nixpkgs#squashfsTools -c bash tests/integration/alpine/create-minimal-initramfs.sh
+python3 tests/integration/mcp/mcp-sandbox-test.py
+```
+
+The builder needs Python 3.9+ and `unsquashfs` on the host. It retains the boot
+initramfs's module set and adds 9p with its dependencies from Alpine's matching
+`modloop-virt` archive. It rejects mismatched kernel releases. The archive is a
+build input; only selected modules enter `initramfs-minimal`.
+
+The MCP test requires a mounted host folder before taking its warm snapshot.
+It verifies ordinary forks can read the share, while isolated forks deny host
+reads and writes after restoring the mount. Missing drivers fail the test.
+Rebuild existing fixtures with the commands above; downloading a new bundle
+invalidates `initramfs-minimal`. Regenerate warm snapshots after changing images.

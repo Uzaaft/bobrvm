@@ -42,6 +42,7 @@ echo "$OUT" | grep -q "hello world" || fail "multi-word args ($OUT)"
 
 "$BIN" exec -- sh -c 'exit 7' >/dev/null 2>&1
 [ $? -eq 7 ] || fail "exit code passthrough"
+[ -z "$(ls -A "$STATE_DIR/forks")" ] || fail "failed command left a clone behind"
 
 "$BIN" exec -- sh -c 'echo x > /mark' >/dev/null 2>&1
 OUT=$("$BIN" exec -- cat /mark 2>&1)

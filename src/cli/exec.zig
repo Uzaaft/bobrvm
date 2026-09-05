@@ -44,6 +44,12 @@ fn monotonicNs() u64 {
 }
 
 pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
+    const exit_code = try run(alloc, args);
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
+/// Return the guest status only after VM and clone cleanup have unwound.
+fn run(alloc: Allocator, args: *std.process.Args.Iterator) !u8 {
     const profile = ExecProfile.init();
     defer profile.mark("complete");
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -56,7 +62,7 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     while (args.next()) |arg| {
         if (!saw_separator and (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h"))) {
             printHelp();
-            return;
+            return 0;
         }
         if (!saw_separator and std.mem.eql(u8, arg, "--")) {
             saw_separator = true;
@@ -90,7 +96,7 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
         profile.mark("global state released");
     }
 
-    const clone = try fork.prepare(arena, &proj);
+    const clone = try fork.prepare(arena, &proj, null);
     defer {
         fork.deleteTree(clone.dir);
         profile.mark("clone deleted");
@@ -119,7 +125,7 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     }
     profile.mark("vCPU spawned");
 
-    if (!session.waitForPrompt(alloc, 30_000)) {
+    if (!session.waitForPrompt(alloc, 30_000, .restored)) {
         log.err("guest did not reach a shell prompt", .{});
         return error.ExecTimeout;
     }
@@ -129,10 +135,8 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     defer alloc.free(result.output);
     _ = std.c.write(std.posix.STDOUT_FILENO, result.output.ptr, result.output.len);
     profile.mark("command complete");
-    if (result.exit_code != 0) {
-        log.info("exit code {d}", .{result.exit_code});
-        std.process.exit(@intCast(@as(u8, @truncate(@as(u64, @bitCast(result.exit_code))))));
-    }
+    if (result.exit_code != 0) log.info("exit code {d}", .{result.exit_code});
+    return @intCast(result.exit_code);
 }
 
 fn machineMain(hw: *machine.Machine) void {

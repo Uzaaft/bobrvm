@@ -6,20 +6,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$SCRIPT_DIR/out"
-WORK_DIR="$OUT_DIR/minimal-initramfs-work"
 
-# Clean up any previous work
-rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR"
+command -v unsquashfs >/dev/null || {
+    echo "unsquashfs is required; run this script in nix shell nixpkgs#squashfsTools." >&2
+    exit 1
+}
+
+WORK_DIR=$(mktemp -d "$OUT_DIR/minimal-initramfs.XXXXXX")
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 # Extract busybox from Alpine initramfs
 echo "Extracting busybox from Alpine initramfs..."
 cd "$WORK_DIR"
-gunzip -c "$OUT_DIR/initramfs-virt" | cpio -idm 2>/dev/null || true
+tar -xf "$OUT_DIR/initramfs-virt"
 
 # Create minimal initramfs structure
-MINI_DIR="$OUT_DIR/mini-root"
-rm -rf "$MINI_DIR"
+MINI_DIR="$WORK_DIR/mini-root"
 mkdir -p "$MINI_DIR"/{bin,dev,proc,sys,etc,lib}
 
 # Copy busybox
@@ -28,11 +30,11 @@ cp "$WORK_DIR/bin/busybox" "$MINI_DIR/bin/"
 # Copy necessary libraries (busybox is dynamically linked to musl;
 # kmod's modprobe needs libzstd/liblzma from usr/lib)
 if [ -d "$WORK_DIR/lib" ]; then
-    cp -a "$WORK_DIR/lib/"* "$MINI_DIR/lib/" 2>/dev/null || true
+    cp -a "$WORK_DIR/lib/." "$MINI_DIR/lib/"
 fi
 if [ -d "$WORK_DIR/usr/lib" ]; then
     mkdir -p "$MINI_DIR/usr/lib"
-    cp -a "$WORK_DIR/usr/lib/"* "$MINI_DIR/usr/lib/" 2>/dev/null || true
+    cp -a "$WORK_DIR/usr/lib/." "$MINI_DIR/usr/lib/"
 fi
 
 # Copy sbin/modprobe if available
@@ -47,13 +49,59 @@ if [ ! -f "$MINI_DIR/sbin/modprobe" ]; then
     ln -sf ../bin/busybox "$MINI_DIR/sbin/modprobe"
 fi
 
-# Copy the full module tree so modprobe can resolve dependencies
-# (virtio_mmio/virtio_blk plus virtio_gpu with its DRM stack).
-KERN_VERSION=$(ls "$WORK_DIR/lib/modules" | head -1)
-if [ -n "$KERN_VERSION" ]; then
-    mkdir -p "$MINI_DIR/lib/modules"
-    cp -a "$WORK_DIR/lib/modules/$KERN_VERSION" "$MINI_DIR/lib/modules/" 2>/dev/null || true
-fi
+# The boot initramfs omits 9p. Use modules from the matching netboot module archive,
+# retaining the boot module set and adding only 9p and its dependency closure.
+[ -f "$OUT_DIR/modloop-virt" ] || {
+    echo "Run $SCRIPT_DIR/download.sh first to fetch matching kernel modules." >&2
+    exit 1
+}
+python3 - "$WORK_DIR" "$MINI_DIR" "$OUT_DIR/modloop-virt" <<'PY'
+import pathlib
+import shutil
+import subprocess
+import sys
+
+work, root, archive = map(pathlib.Path, sys.argv[1:])
+versions = list((work / "lib/modules").iterdir())
+if len(versions) != 1:
+    raise SystemExit("Expected exactly one initramfs kernel release")
+original = versions[0]
+source = work / "modloop/modules" / original.name
+metadata = f"modules/{original.name}"
+dep_text = subprocess.check_output(
+    ["unsquashfs", "-cat", str(archive), f"{metadata}/modules.dep"], text=True,
+)
+deps = {}
+for line in dep_text.splitlines():
+    module, dependencies = line.split(":", 1)
+    deps[module] = dependencies.split()
+by_name = {pathlib.Path(module).name.removesuffix(".gz"): module for module in deps}
+required = {p.name.removesuffix(".gz") for p in original.rglob("*.ko*")}
+required.update(("9p.ko", "9pnet_virtio.ko"))
+pending = [by_name[name] for name in required]
+selected = set()
+while pending:
+    module = pending.pop()
+    if module not in selected:
+        selected.add(module)
+        pending.extend(deps[module])
+# Select before extraction: the full archive contains case-distinct netfilter
+# filenames that collide on the default macOS filesystem.
+subprocess.run([
+    "unsquashfs", "-no-progress", "-d", str(work / "modloop"), str(archive),
+    f"{metadata}/modules.*", *(f"{metadata}/{module}" for module in sorted(selected)),
+], check=True)
+destination = root / "lib/modules" / original.name
+shutil.rmtree(destination)
+destination.mkdir()
+for metadata in source.glob("modules.*"):
+    shutil.copy2(metadata, destination / metadata.name)
+for module in selected:
+    target = destination / module
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / module, target)
+print(f"Included {len(selected)} modules for {original.name}, including 9p")
+PY
 
 # Create symlinks for basic commands
 cd "$MINI_DIR/bin"
@@ -83,17 +131,14 @@ mknod -m 666 /dev/ttyAMA0 c 204 64 2>/dev/null || true
 echo "Loading virtio modules..." >/dev/ttyAMA0 2>&1
 KVER=$(uname -r)
 echo "Kernel: $KVER" >/dev/ttyAMA0 2>&1
-if [ -f "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" ]; then
-    echo "Loading virtio modules..." >/dev/ttyAMA0 2>&1
-    modprobe virtio_mmio 2>/dev/ttyAMA0
-    echo "virtio_mmio: $?" >/dev/ttyAMA0 2>&1
+if modprobe virtio_mmio 2>/dev/ttyAMA0; then
     modprobe virtio_blk 2>/dev/ttyAMA0
     echo "virtio_blk: $?" >/dev/ttyAMA0 2>&1
     modprobe virtio-gpu 2>/dev/ttyAMA0
     echo "virtio_gpu: $?" >/dev/ttyAMA0 2>&1
     sleep 1
 else
-    echo "virtio_mmio.ko not found for $KVER" >/dev/ttyAMA0 2>&1
+    echo "Could not load virtio_mmio for $KVER" >/dev/ttyAMA0 2>&1
     ls -la /lib/modules/ >/dev/ttyAMA0 2>&1
 fi
 
@@ -126,13 +171,11 @@ chmod +x "$MINI_DIR/init"
 # Create initramfs
 echo "Creating minimal initramfs..."
 cd "$MINI_DIR"
-find . | cpio -o -H newc 2>/dev/null | gzip > "$OUT_DIR/initramfs-minimal"
+find . | cpio -o -H newc 2>/dev/null | gzip > "$WORK_DIR/initramfs-minimal"
+mv "$WORK_DIR/initramfs-minimal" "$OUT_DIR/initramfs-minimal"
 
 echo ""
 echo "Created: $OUT_DIR/initramfs-minimal"
 echo ""
 echo "Test with:"
 echo "  ./zig-out/bin/bobrvm --kernel $OUT_DIR/Image --initrd $OUT_DIR/initramfs-minimal"
-
-# Clean up
-rm -rf "$WORK_DIR" "$MINI_DIR"

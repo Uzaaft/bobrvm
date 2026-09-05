@@ -97,6 +97,8 @@ pub const P9Server = struct {
     /// write through a share the host declared read-only. The guest
     /// mount option is advisory; this is the real boundary.
     read_only: bool = false,
+    /// Fixed before restore: disabled shares neither reopen fids nor dispatch requests.
+    access_enabled: bool = true,
 
     pub fn init(alloc: Allocator, root_path: []const u8) !P9Server {
         const root = try alloc.dupe(u8, root_path);
@@ -147,6 +149,7 @@ pub const P9Server = struct {
         open_flags: ?u32,
     ) !void {
         _ = alloc;
+        if (!self.access_enabled) return;
         const owned = try self.alloc.dupe(u8, rel);
         errdefer self.alloc.free(owned);
         var fid = Fid{ .rel = owned, .open_linux_flags = open_flags };
@@ -490,6 +493,7 @@ pub const P9Server = struct {
         // Host-side read-only enforcement: reject mutating requests
         // before touching the filesystem. error.Access maps to EACCES,
         // which the guest surfaces on the write/create/unlink.
+        if (!self.access_enabled) return error.Access;
         if (self.read_only and isMutating(msg_type)) return error.Access;
         switch (msg_type) {
             Tversion => {
@@ -1339,4 +1343,22 @@ test "p9: read-only share rejects mutating requests but allows reads" {
     const got_n = try f.readPositionalAll(io, &got, 0);
     try testing.expectEqualStrings("host content", got[0..got_n]);
     try testing.expect(std.Io.Dir.cwd().access(io, root ++ "/new.txt", .{}) == error.FileNotFound);
+}
+
+test "p9: isolated share refuses restored fids and all requests" {
+    var server = try P9Server.init(testing.allocator, ".zig-cache/p9-isolated-missing-root");
+    defer server.deinit();
+    server.access_enabled = false;
+    // A disabled share must not reopen even a snapshot's write-intent handle.
+    try server.restoreFid(testing.allocator, 7, "unopened.txt", L_O_WRONLY | L_O_TRUNC);
+    try testing.expectEqual(@as(usize, 0), server.fids.count());
+    var response: [MSIZE_MAX]u8 = undefined;
+    for ([_]u8{ Tversion, Tattach, Tread, Twrite, Tlopen, Tlcreate }) |kind| {
+        const request = try tmsg(testing.allocator, kind, 42, &.{});
+        defer testing.allocator.free(request);
+        const len = server.handle(request, &response);
+        try testing.expectEqual(@as(usize, 11), len);
+        try testing.expectEqual(@as(u16, 42), std.mem.readInt(u16, response[5..7], .little));
+        try testing.expectEqual(L_EACCES, std.mem.readInt(u32, response[7..11], .little));
+    }
 }

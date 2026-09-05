@@ -43,7 +43,7 @@ DerivedData/
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
-tests/integration/alpine/out/initramfs-minimal
+tests/integration/alpine/out/
 vgcore.*
 
 # Ghostty-compatible generated fixtures

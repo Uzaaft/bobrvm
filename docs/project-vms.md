@@ -54,3 +54,37 @@ set `ssh-user` and run sshd in the guest.
 
 The server provides `sandbox_start`, `sandbox_exec`, `sandbox_output`,
 `sandbox_list`, and `sandbox_stop`. It requires native-engine warm state.
+
+MCP sandboxes preserve the warm guest's device layout, but disable host network
+connections, port forwards, Docker socket forwarding, and host-directory access
+before restore. The 9p device refuses requests and does not reopen saved host
+file handles. Writable disks and RAM use private clones. Read-only disk images
+remain shared. Data already present in the warm guest's RAM or disks remains
+available; prepare the warm image with the data you intend agents to have.
+Ordinary `fork` and `exec` retain the project's host-access settings.
+
+Each `sandbox_exec` runs a separate `sh -c` with stdin redirected from `/dev/null`.
+Scripts can include newlines, quotes, comments, and `exit`; working-directory
+changes and shell variables do not carry into the next call. Files in the sandbox
+do persist until it is stopped. Scripts are limited to 768 bytes, with NUL
+rejected and an additional 1023-byte limit on the encoded console line. Oversized
+scripts fail before execution. Put larger scripts in the warm image and invoke
+them by path. The warm guest must be parked at an idle, cooperative shell prompt;
+console framing is not authentication against a malicious guest. Commands that
+alter the console itself can still disrupt subsequent execution.
+
+The server admits one tool call at a time. Ping and MCP cancellation remain
+responsive during execution; other tool calls return a busy error. A matching
+`sandbox_stop` interrupts the active command. Timeout, execution transport failure,
+and cancellation destroy the entire affected sandbox, including background
+processes. Create a new sandbox after one of these outcomes. Other sandboxes stay
+alive. Invalid arguments leave the sandbox intact.
+
+Cancel an active request with an MCP `notifications/cancelled` notification whose
+`params.requestId` matches the original request ID (including its string or integer
+type). Cancellation notifications receive no reply and suppress the cancelled
+call's reply when it has not already been sent, following the
+[MCP cancellation contract](https://modelcontextprotocol.io/specification/2024-11-05/basic/utilities/cancellation).
+Closing MCP stdin also cancels active work and disposes of all sandboxes. Shutdown
+allows two seconds for graceful VM cleanup before forced child termination; the
+parent owns the fork directory so it can remove private state after either path.

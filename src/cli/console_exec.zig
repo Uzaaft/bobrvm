@@ -1,12 +1,9 @@
 //! Run a command in a guest over its interactive console, with no
 //! guest agent required.
 //!
-//! The command line is injected into the shell on hvc0 followed by an
-//! `echo` of a unique completion marker carrying the exit code;
-//! capture ends when the marker followed by digits appears. The tty
-//! echo of the injected line carries the marker with a literal "$?",
-//! which is deliberately not matched. Both `bobrvm exec` (in-process)
-//! and the MCP server (across a child pipe) share this matcher.
+//! Scripts are encoded for a separate shell with stdin disconnected. The outer
+//! console shell emits the exit marker, so script syntax cannot swallow it.
+//! Both in-process sessions and MCP child pipes share encoding and matching.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -32,9 +29,51 @@ pub const Transport = struct {
     wait_ready: *const fn (context: *anyopaque, timeout_ns: u64) bool,
 };
 
-/// Format the completion marker for a given sequence number into `buf`.
-pub fn markerText(buf: []u8, seq: u32) []const u8 {
-    return std.fmt.bufPrint(buf, MARKER_PREFIX ++ "{d}_RC_", .{seq}) catch unreachable;
+/// A random nonce avoids collisions with script text and output from older calls.
+pub fn markerText(buf: []u8, nonce: [16]u8) []const u8 {
+    return std.fmt.bufPrint(buf, MARKER_PREFIX ++ "{s}_RC_", .{
+        std.fmt.bytesToHex(nonce, .lower),
+    }) catch unreachable;
+}
+
+/// Bound both source bytes and the encoded line for small interactive shells.
+pub const COMMAND_BYTES_MAX: usize = 768;
+const COMMAND_LINE_BYTES_MAX: usize = 1023;
+
+/// The outer shell owns both output fences. Quote printable script bytes as
+/// data, and encode control bytes so tty editing cannot interpret them.
+pub fn commandLine(
+    alloc: Allocator,
+    command: []const u8,
+    marker: []const u8,
+) error{ CommandTooLong, InvalidCommand, OutOfMemory }![]u8 {
+    if (command.len > COMMAND_BYTES_MAX) return error.CommandTooLong;
+    if (std.mem.indexOfScalar(u8, command, 0) != null) return error.InvalidCommand;
+    var encoded: [COMMAND_BYTES_MAX * 5]u8 = undefined;
+    var length: usize = 0;
+    for (command) |byte| {
+        if (byte == '\\' or byte == '\'') {
+            const escaped = if (byte == '\\') "\\\\" else "'\\''";
+            @memcpy(encoded[length..][0..escaped.len], escaped);
+            length += escaped.len;
+        } else if (byte >= 0x20 and byte <= 0x7e) {
+            encoded[length] = byte;
+            length += 1;
+        } else {
+            encoded[length..][0..5].* = .{
+                '\\', '0', '0' + (byte >> 6), '0' + ((byte >> 3) & 7), '0' + (byte & 7),
+            };
+            length += 5;
+        }
+    }
+    const format = "printf '\\036{s}BEGIN\\037'; " ++
+        "sh -c \"$(printf '%b' '{s}')\" </dev/null; echo {s}$?\n";
+    const line = try std.fmt.allocPrint(alloc, format, .{ marker, encoded[0..length], marker });
+    if (line.len > COMMAND_LINE_BYTES_MAX) {
+        alloc.free(line);
+        return error.CommandTooLong;
+    }
+    return line;
 }
 
 /// Find a complete marker and shell exit status terminated by CR or LF. The command echo
@@ -59,23 +98,19 @@ pub fn findMarker(window: []const u8, marker_text: []const u8) ?MarkerHit {
     return null;
 }
 
-/// Drop the tty echo through the line carrying `marker_text$?`. A restored
-/// shell may print a prompt immediately before that echo, so the marker is a
-/// more reliable boundary than the first line.
+/// Drop everything through the emitted begin fence, including wrapped tty
+/// echoes and restored prompts. The injected line contains escaped controls,
+/// so only the executed printf can produce this fence.
 pub fn stripCommandEcho(output: []const u8, marker_text: []const u8) []const u8 {
-    var content_start: ?usize = null;
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, output, search, marker_text)) |marker| {
-        const suffix_start = marker + marker_text.len;
-        const suffix = output[suffix_start..];
-        if (std.mem.startsWith(u8, suffix, "$?")) {
-            if (std.mem.indexOfScalar(u8, suffix[2..], '\n')) |newline| {
-                content_start = suffix_start + 2 + newline + 1;
-            }
-        }
-        search = marker + 1;
+        const end = marker + marker_text.len;
+        if (marker > 0 and output[marker - 1] == '\x1e' and
+            std.mem.startsWith(u8, output[end..], "BEGIN\x1f"))
+            return output[end + "BEGIN\x1f".len ..];
+        search = end;
     }
-    return if (content_start) |start| output[start..] else output;
+    return output;
 }
 
 /// An in-process console-exec session over one Machine: buffers the
@@ -88,7 +123,6 @@ pub const Session = struct {
     mutex: std.Io.Mutex = .init,
     output_cond: std.Io.Condition = .init,
     output: std.ArrayListUnmanaged(u8) = .empty,
-    next_seq: u32 = 1,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(alloc: Allocator, hw: *machine.Machine) Session {
@@ -142,10 +176,11 @@ pub const Session = struct {
     ) !Result {
         const io = global.io();
         var marker_buf: [48]u8 = undefined;
-        const marker = markerText(&marker_buf, self.next_seq);
-        self.next_seq += 1;
+        var nonce: [16]u8 = undefined;
+        io.random(&nonce);
+        const marker = markerText(&marker_buf, nonce);
 
-        const line = try std.fmt.allocPrint(alloc, "{s} ; echo {s}$?\n", .{ command, marker });
+        const line = try commandLine(alloc, command, marker);
         defer alloc.free(line);
 
         if (self.cancelled.load(.acquire)) return error.ExecCancelled;
@@ -189,12 +224,18 @@ pub const Session = struct {
     /// command. The durable machine notification prevents the probe from
     /// being overwritten by restore. Returns false on timeout or startup
     /// failure.
-    pub fn waitForPrompt(self: *Session, alloc: Allocator, timeout_ms: u32) bool {
+    pub fn waitForPrompt(
+        self: *Session,
+        alloc: Allocator,
+        timeout_ms: u32,
+        mode: enum { boot, restored },
+    ) bool {
         if (self.cancelled.load(.acquire)) return false;
         const timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
         const deadline_ns = monotonicNs() +| timeout_ns;
         if (!self.transport.wait_ready(self.transport.context, timeout_ns)) return false;
-        if (!self.waitForShellHint(deadline_ns)) return false;
+        // A restored idle shell may emit nothing until it receives input.
+        if (mode == .boot and !self.waitForShellHint(deadline_ns)) return false;
 
         const now_ns = monotonicNs();
         if (now_ns >= deadline_ns) return false;
@@ -241,7 +282,7 @@ pub const Session = struct {
 
 /// Run first-boot provisioning commands in order over a console session.
 pub fn provision(session: *Session, steps: []const []const u8) void {
-    if (!session.waitForPrompt(session.alloc, 60_000)) {
+    if (!session.waitForPrompt(session.alloc, 60_000, .boot)) {
         log.err("provisioning: guest did not reach a shell prompt", .{});
         return;
     }
@@ -281,14 +322,16 @@ const testing = std.testing;
 
 test "console_exec: marker matches digits but not the command echo" {
     var buf: [48]u8 = undefined;
-    const marker = markerText(&buf, 7);
-    try testing.expectEqualStrings("__BRVM_7_RC_", marker);
+    const generated = markerText(&buf, @splat(7));
+    try testing.expectEqualStrings("__BRVM_07070707070707070707070707070707_RC_", generated);
+    const marker = "__BRVM_7_RC_";
 
     // The echoed command carries the marker with a literal $?.
     const echo_only = "run me ; echo __BRVM_7_RC_$?\r\n";
     try testing.expect(findMarker(echo_only, marker) == null);
 
-    const done = "run me ; echo __BRVM_7_RC_$?\r\nhello\r\n__BRVM_7_RC_2\r\n";
+    const done = "run me ; echo __BRVM_7_RC_$?\r\n" ++
+        "\x1e__BRVM_7_RC_BEGIN\x1fhello\r\n__BRVM_7_RC_2\r\n";
     const hit = findMarker(done, marker).?;
     try testing.expectEqual(@as(i64, 2), hit.exit_code);
     try testing.expectEqualStrings("hello\r\n", stripCommandEcho(done[0..hit.start], marker));
@@ -324,4 +367,26 @@ test "console_exec: completion waits for the entire exit status" {
     try testing.expect(findMarker(marker ++ "999999999999999999999999\n", marker) == null);
     try testing.expect(findMarker(marker ++ "2garbage\n", marker) == null);
     try testing.expectEqual(@as(i64, 0), findMarker(marker ++ "999\n" ++ marker ++ "0\n", marker).?.exit_code);
+}
+
+test "console_exec: scripts are data and console lines are bounded" {
+    const script = "echo 'quoted'\nexit 7 # trailing comment\t\\";
+    const line = try commandLine(testing.allocator, script, "__BRVM_1_RC_");
+    defer testing.allocator.free(line);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    try testing.expect(std.mem.indexOf(u8, line, script) == null);
+    try testing.expect(std.mem.endsWith(u8, line, "</dev/null; echo __BRVM_1_RC_$?\n"));
+    const longest = try commandLine(
+        testing.allocator,
+        &(@as([COMMAND_BYTES_MAX]u8, @splat('x'))),
+        "__BRVM_4294967295_RC_",
+    );
+    defer testing.allocator.free(longest);
+    try testing.expect(longest.len <= COMMAND_LINE_BYTES_MAX);
+    try testing.expectError(error.InvalidCommand, commandLine(testing.allocator, "a\x00b", "m"));
+    try testing.expectError(error.CommandTooLong, commandLine(
+        testing.allocator,
+        &(@as([COMMAND_BYTES_MAX + 1]u8, @splat('x'))),
+        "m",
+    ));
 }

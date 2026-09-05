@@ -154,7 +154,7 @@ fn measuredTrial(alloc: Allocator, arena: Allocator, proj: *const project.Projec
 /// One trial: restore a fork, time until the VM is live (pure restore)
 /// and until the guest shell responds to a command.
 fn trial(alloc: Allocator, arena: Allocator, proj: *const project.Project) !Timing {
-    const clone = try fork.prepare(arena, proj);
+    const clone = try fork.prepare(arena, proj, null);
     defer fork.deleteTree(clone.dir);
 
     const start_ns = nowNs();
@@ -176,7 +176,7 @@ fn trial(alloc: Allocator, arena: Allocator, proj: *const project.Project) !Timi
     if (!hw.waitUntilRunning(30 * std.time.ns_per_s)) return error.ExecTimeout;
     const restore_ns = nowNs() - start_ns;
 
-    if (!session.waitForPrompt(alloc, 30_000)) return error.ExecTimeout;
+    if (!session.waitForPrompt(alloc, 30_000, .restored)) return error.ExecTimeout;
     const ready_ns = nowNs() - start_ns;
     const command_started_ns = nowNs();
     const result = try session.run(alloc, "true", 30_000);

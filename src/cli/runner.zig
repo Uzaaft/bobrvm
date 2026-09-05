@@ -79,6 +79,7 @@ pub fn runWithReadyMarker(
         .enable_gpu = config.enable_gpu,
         .enable_virgl = config.enable_virgl,
         .enable_net = config.enable_net,
+        .isolate_host = config.isolate_host,
         .enable_snd = config.enable_snd,
         .forwards = forwards_buf[0..config.forward_count],
         .docker_socket_path = config.docker_socket_path,

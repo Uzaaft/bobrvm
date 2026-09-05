@@ -31,7 +31,7 @@ pub const Clone = struct {
 /// derive the config that runs it: restore from the cloned image,
 /// write to cloned disks, no suspend target, no host port forwards
 /// (concurrent forks would collide on the ports).
-pub fn prepare(arena: Allocator, proj: *const project.Project) !Clone {
+pub fn prepare(arena: Allocator, proj: *const project.Project, name: ?[]const u8) !Clone {
     if (proj.engine != .native) {
         log.err("fork and mcp sandboxes need the native engine (this project sets engine = \"vz\")", .{});
         return error.UnsupportedEngine;
@@ -44,12 +44,15 @@ pub fn prepare(arena: Allocator, proj: *const project.Project) !Clone {
         return error.NoWarmState;
     }
 
-    var seed_bytes: [8]u8 = undefined;
+    var seed_bytes: [16]u8 = undefined;
     if (getentropy(&seed_bytes, seed_bytes.len) != 0) return error.Unexpected;
-    const dir = std.fmt.allocPrint(arena, "{s}/forks/{x:0>16}", .{
-        proj.state_dir, std.mem.readInt(u64, &seed_bytes, .little),
-    }) catch return error.OutOfMemory;
-    try std.Io.Dir.cwd().createDirPath(global.io(), dir);
+    const generated_name = std.fmt.bytesToHex(seed_bytes, .lower);
+    const forks_dir = try std.fs.path.join(arena, &.{ proj.state_dir, "forks" });
+    try std.Io.Dir.cwd().createDirPath(global.io(), forks_dir);
+    const dir = try std.fs.path.join(arena, &.{ forks_dir, name orelse &generated_name });
+    // MCP reserves its directory before spawning, so the parent can clean it
+    // after a forced termination. Interactive forks own their own directory.
+    if (name == null) try std.Io.Dir.cwd().createDir(global.io(), dir, .default_dir);
     errdefer deleteTree(dir);
 
     var config = proj.config;
@@ -93,10 +96,21 @@ pub fn deleteTree(path: []const u8) void {
 
 pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     var ready_marker: ?[]const u8 = null;
+    var isolate_host = false;
+    var fork_name: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
+        } else if (std.mem.eql(u8, arg, "--fork-name")) {
+            const name = args.next() orelse return error.InvalidArgument;
+            if (name.len != 32) return error.InvalidArgument;
+            for (name) |byte| if (!std.ascii.isHex(byte)) return error.InvalidArgument;
+            fork_name = name;
+            continue;
+        } else if (std.mem.eql(u8, arg, "--isolate-host")) {
+            isolate_host = true;
+            continue;
         } else if (std.mem.eql(u8, arg, "--ready-marker")) {
             const marker = args.next() orelse return error.InvalidArgument;
             if (marker.len == 0 or marker.len > 128) return error.InvalidArgument;
@@ -121,7 +135,12 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     };
     const proj = try project.load(arena, root);
 
-    const clone = try prepare(arena, &proj);
+    var clone = try prepare(arena, &proj, fork_name);
+    clone.config.isolate_host = isolate_host;
+    if (isolate_host) {
+        clone.config.docker_enabled = false;
+        clone.config.docker_socket_path = null;
+    }
     defer deleteTree(clone.dir);
 
     log.info("fork: {s} — disposable clone of the warm state (Ctrl-] to quit)", .{

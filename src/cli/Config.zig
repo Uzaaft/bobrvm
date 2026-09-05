@@ -29,6 +29,8 @@ enable_gpu: bool = false,
 enable_virgl: bool = false,
 kitty_display: bool = false,
 enable_net: bool = false,
+/// Internal MCP policy: preserve device topology but deny host network and 9p access.
+isolate_host: bool = false,
 /// Expose the guest Docker API through a private host Unix socket.
 docker_enabled: bool = false,
 /// Use Virtualization.framework virtio-vsock instead of MiniNat TCP.

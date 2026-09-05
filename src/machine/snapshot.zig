@@ -1544,3 +1544,41 @@ test "snapshot: VcpuState is a stable extern layout" {
     try testing.expectEqual(@as(usize, 70 * 8 + 512), @sizeOf(VcpuState));
     try testing.expectEqual(sys_regs.len, @as(usize, 35));
 }
+
+test "snapshot: isolated P9 restore retains queues without reopening host fids" {
+    const io = @import("../global.zig").io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    {
+        const file = try tmp.dir.createFile(io, "host.txt", .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "host content", 0);
+    }
+    const dev = try virtio.P9.init(testing.allocator, "host", root, false);
+    defer dev.deinit();
+    dev.transport.queues[0].ready = true;
+    dev.last_avail = 47;
+    try dev.server.restoreFid(testing.allocator, 9, "host.txt", 0);
+    // A snapshot can carry write/truncate flags. Isolation must apply before
+    // restore attempts any host open, not only to subsequent guest requests.
+    dev.server.fids.getPtr(9).?.open_linux_flags = 0o1001;
+    const data = try serializeP9(testing.allocator, dev);
+    defer testing.allocator.free(data);
+
+    const restored = try virtio.P9.init(testing.allocator, "host", root, false);
+    defer restored.deinit();
+    restored.server.access_enabled = false;
+    try deserializeP9(testing.allocator, restored, data);
+    try testing.expect(restored.transport.queues[0].ready);
+    try testing.expectEqual(@as(u16, 47), restored.last_avail);
+    try testing.expect(!restored.server.access_enabled);
+    try testing.expectEqual(@as(usize, 0), restored.server.fids.count());
+    const file = try tmp.dir.openFile(io, "host.txt", .{});
+    defer file.close(io);
+    var content: [32]u8 = undefined;
+    const len = try file.readPositionalAll(io, &content, 0);
+    try testing.expectEqualStrings("host content", content[0..len]);
+}

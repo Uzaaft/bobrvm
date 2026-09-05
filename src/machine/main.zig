@@ -207,6 +207,9 @@ pub const MachineConfig = struct {
     /// Enable the virtio-net device (built-in NAT backend).
     enable_net: bool = false,
 
+    /// Deny host networking and shared filesystem access without changing slots.
+    isolate_host: bool = false,
+
     /// Expose host-backed local authentication on the native agent port.
     enable_touch_id: bool = false,
 
@@ -2908,14 +2911,16 @@ pub const Machine = struct {
             self.nat.setRxReady(
                 callback_binding.Handler0(Machine, bool, natRxReadyCallback).bind(self),
             );
-            try self.initializeForwards();
-            if (self.config.docker_socket_path) |path| {
-                self.nat.addUnixForward(path, 2375) catch |err| {
-                    log.err("Docker socket forward {s} failed: {}", .{ path, err });
-                    return error.Unexpected;
-                };
+            if (!self.config.isolate_host) {
+                try self.initializeForwards();
+                if (self.config.docker_socket_path) |path| {
+                    self.nat.addUnixForward(path, 2375) catch |err| {
+                        log.err("Docker socket forward {s} failed: {}", .{ path, err });
+                        return error.Unexpected;
+                    };
+                }
+                try self.nat.start();
             }
-            try self.nat.start();
             self.net.?.setTxCallback(
                 callback_binding.Handler1(Machine, []const u8, void, netTxCallback).bind(self),
             );
@@ -2938,6 +2943,7 @@ pub const Machine = struct {
         if (self.config.shared_dir) |dir| {
             self.p9_slot = self.rng_slot + 1;
             self.p9 = try virtio.P9.init(self.alloc, "host", dir, self.config.share_read_only);
+            self.p9.?.server.access_enabled = !self.config.isolate_host;
             self.registerVirtioMmioDevice(
                 self.p9_slot,
                 .{ .p9 = self.p9.? },
@@ -3563,7 +3569,7 @@ pub const Machine = struct {
     /// Guest → host frame: hand to the NAT responder (vCPU thread,
     /// machine lock held).
     fn netTxCallback(self: *Machine, frame: []const u8) void {
-        self.nat.handleFrame(frame);
+        if (!self.config.isolate_host) self.nat.handleFrame(frame);
     }
 
     /// NAT responder → guest frame.
