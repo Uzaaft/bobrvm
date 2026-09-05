@@ -37,7 +37,7 @@ pub fn markerText(buf: []u8, seq: u32) []const u8 {
     return std.fmt.bufPrint(buf, MARKER_PREFIX ++ "{d}_RC_", .{seq}) catch unreachable;
 }
 
-/// Find `marker_text` followed by at least one digit. The command echo
+/// Find a complete marker and shell exit status terminated by CR or LF. The command echo
 /// carries the marker with a literal "$?" and so does not match.
 pub fn findMarker(window: []const u8, marker_text: []const u8) ?MarkerHit {
     var search: usize = 0;
@@ -45,8 +45,13 @@ pub fn findMarker(window: []const u8, marker_text: []const u8) ?MarkerHit {
         const tail = window[idx + marker_text.len ..];
         var digits: usize = 0;
         while (digits < tail.len and std.ascii.isDigit(tail[digits])) digits += 1;
-        if (digits > 0) {
-            const exit_code = std.fmt.parseInt(i64, tail[0..digits], 10) catch 0;
+        if (digits > 0 and digits < tail.len and
+            (tail[digits] == '\r' or tail[digits] == '\n'))
+        {
+            const exit_code = std.fmt.parseInt(u8, tail[0..digits], 10) catch {
+                search = idx + marker_text.len + digits;
+                continue;
+            };
             return .{ .start = idx, .exit_code = exit_code };
         }
         search = idx + 1;
@@ -307,4 +312,16 @@ test "console_exec: shell hints require a prompt or cursor query" {
     try testing.expect(!hasShellHint("booting\nStarting Docker"));
     try testing.expect(hasShellHint("\r\n~ # \x1b[6n"));
     try testing.expect(hasShellHint("\n# "));
+}
+
+test "console_exec: completion waits for the entire exit status" {
+    const marker = "__BRVM_7_RC_";
+    const complete = marker ++ "127\r\n";
+    for (0..complete.len - 1) |length| {
+        try testing.expect(findMarker(complete[0..length], marker) == null);
+    }
+    try testing.expectEqual(@as(i64, 127), findMarker(complete, marker).?.exit_code);
+    try testing.expect(findMarker(marker ++ "999999999999999999999999\n", marker) == null);
+    try testing.expect(findMarker(marker ++ "2garbage\n", marker) == null);
+    try testing.expectEqual(@as(i64, 0), findMarker(marker ++ "999\n" ++ marker ++ "0\n", marker).?.exit_code);
 }

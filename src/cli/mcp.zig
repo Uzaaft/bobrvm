@@ -29,6 +29,7 @@ const OUTPUT_CAP: usize = 1024 * 1024;
 const EXEC_TIMEOUT_DEFAULT_MS: u32 = 30_000;
 const EXEC_TIMEOUT_MAX_MS: u32 = 600_000;
 const SANDBOX_MAX: usize = 8;
+const READY_MARKER = "\x1eBOBRVM_READY\x1e";
 
 const Sandbox = struct {
     id: u32,
@@ -39,14 +40,8 @@ const Sandbox = struct {
     out_cond: std.Io.Condition = .init,
     output: std.ArrayListUnmanaged(u8) = .empty,
     output_base: u64 = 0,
-    ready_marker: [64]u8 = undefined,
-    ready_marker_len: usize = 0,
     ready: bool = false,
     reader_done: bool = false,
-
-    fn marker(self: *const Sandbox) []const u8 {
-        return self.ready_marker[0..self.ready_marker_len];
-    }
 
     fn appendOutput(self: *Sandbox, data: []const u8) void {
         const io = global.io();
@@ -54,11 +49,11 @@ const Sandbox = struct {
         defer self.out_mutex.unlock(io);
         self.output.appendSlice(self.alloc, data) catch return;
         if (!self.ready) {
-            if (std.mem.indexOf(u8, self.output.items, self.marker())) |index| {
-                const tail = index + self.ready_marker_len;
+            if (std.mem.indexOf(u8, self.output.items, READY_MARKER)) |index| {
+                const tail = index + READY_MARKER.len;
                 std.mem.copyForwards(u8, self.output.items[index..], self.output.items[tail..]);
                 self.output.shrinkRetainingCapacity(
-                    self.output.items.len - self.ready_marker_len,
+                    self.output.items.len - READY_MARKER.len,
                 );
                 self.ready = true;
             }
@@ -116,9 +111,8 @@ const Sandbox = struct {
 };
 
 /// Drain the child's console (stdout pipe) into the output buffer.
-fn sandboxReader(sandbox: *Sandbox) void {
+fn sandboxReader(sandbox: *Sandbox, stdout: std.Io.File) void {
     defer sandbox.finishReader();
-    const stdout = sandbox.child.stdout orelse return;
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = std.posix.read(stdout.handle, &buf) catch break;
@@ -137,8 +131,6 @@ pub const Server = struct {
     /// Io cannot allocate, and std.process.spawn allocates the argv and
     /// environment blocks through its Io's allocator.
     proc_io: std.Io,
-    proj: ?project.Project = null,
-    proj_arena: std.heap.ArenaAllocator,
     child_environ: ?*const std.process.Environ.Map = null,
     sandboxes: [SANDBOX_MAX]?*Sandbox = @splat(null),
     next_id: u32 = 1,
@@ -148,7 +140,6 @@ pub const Server = struct {
         return .{
             .alloc = alloc,
             .proc_io = proc_io,
-            .proj_arena = std.heap.ArenaAllocator.init(alloc),
         };
     }
 
@@ -157,28 +148,23 @@ pub const Server = struct {
             if (slot.*) |sandbox| self.destroySandbox(sandbox);
             slot.* = null;
         }
-        self.proj_arena.deinit();
-    }
-
-    /// Load the project lazily (the first sandbox tool call), so the
-    /// protocol handshake works even outside a project directory.
-    fn projectRef(self: *Server) !*const project.Project {
-        if (self.proj == null) {
-            const arena = self.proj_arena.allocator();
-            var cwd_buf: [1024]u8 = undefined;
-            const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
-            const cwd = std.mem.span(@as([*:0]u8, @ptrCast(cwd_ptr)));
-            const root = (try project.findRoot(arena, cwd)) orelse return error.NoProjectFile;
-            self.proj = try project.load(arena, root);
-        }
-        return &self.proj.?;
     }
 
     fn startSandbox(self: *Server) !*Sandbox {
-        // Fail early with a useful error when there is no warm state;
-        // the child would discover it too, but only in its logs.
-        const proj = try self.projectRef();
-        if (!project.fileExists(proj.warm_image)) return error.NoWarmState;
+        // Check the current project on every start, matching the child. Retain
+        // useful preflight errors without caching a second project configuration.
+        {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            var cwd_buf: [1024]u8 = undefined;
+            const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+            const cwd = std.mem.span(@as([*:0]u8, @ptrCast(cwd_ptr)));
+            const root = (try project.findRoot(arena.allocator(), cwd)) orelse
+                return error.NoProjectFile;
+            const proj = try project.load(arena.allocator(), root);
+            if (proj.engine != .native) return error.UnsupportedEngine;
+            if (!project.fileExists(proj.warm_image)) return error.NoWarmState;
+        }
 
         const slot = for (&self.sandboxes) |*candidate| {
             if (candidate.* == null) break candidate;
@@ -197,15 +183,8 @@ pub const Server = struct {
             .child = undefined,
             .reader_thread = undefined,
         };
-        const ready_marker = std.fmt.bufPrint(
-            &sandbox.ready_marker,
-            "\x1eBOBRVM_READY_{d}\x1e",
-            .{sandbox.id},
-        ) catch return error.Unexpected;
-        sandbox.ready_marker_len = ready_marker.len;
-
         sandbox.child = std.process.spawn(self.proc_io, .{
-            .argv = &.{ exe, "fork", "--ready-marker", ready_marker },
+            .argv = &.{ exe, "fork", "--ready-marker", READY_MARKER },
             .environ_map = self.child_environ,
             .stdin = .pipe,
             .stdout = .pipe,
@@ -217,15 +196,11 @@ pub const Server = struct {
         var reader_started = false;
         errdefer {
             sandbox.child.kill(self.proc_io);
-            if (sandbox.child.stdin) |stdin| {
-                stdin.close(self.proc_io);
-                sandbox.child.stdin = null;
-            }
             if (reader_started) sandbox.reader_thread.join();
-            _ = sandbox.child.wait(self.proc_io) catch {};
+            sandbox.output.deinit(self.alloc);
         }
 
-        sandbox.reader_thread = std.Thread.spawn(.{}, sandboxReader, .{sandbox}) catch
+        sandbox.reader_thread = std.Thread.spawn(.{}, sandboxReader, .{ sandbox, sandbox.child.stdout.? }) catch
             return error.Unexpected;
         reader_started = true;
         if (!sandbox.waitReady(30 * std.time.ns_per_s)) return error.SandboxNotReady;
@@ -340,10 +315,6 @@ pub const Server = struct {
         }
     }
 };
-
-// =============================================================================
-// JSON-RPC / MCP protocol
-// =============================================================================
 
 const SERVER_INFO =
     \\{"name":"bobrvm","version":"0.1.0"}
@@ -477,24 +448,28 @@ fn handleToolCall(
         const args = arguments orelse
             return try textResult(alloc, id_json, "missing arguments", true);
         const id = argInt(args, "id") orelse
-            return try textResult(alloc, id_json, "missing sandbox id", true);
+            return try textResult(alloc, id_json, "invalid sandbox id", true);
         const command_value = args.get("command") orelse
             return try textResult(alloc, id_json, "missing command", true);
         if (command_value != .string)
             return try textResult(alloc, id_json, "missing command", true);
-        const timeout: u32 = @intCast(std.math.clamp(
-            argInt(args, "timeout_ms") orelse EXEC_TIMEOUT_DEFAULT_MS,
-            1,
-            EXEC_TIMEOUT_MAX_MS,
-        ));
-        const sandbox = server.findSandbox(@intCast(id)) orelse
+        for (command_value.string) |byte| {
+            if (std.ascii.isControl(byte))
+                return try textResult(alloc, id_json, "command contains console control bytes", true);
+        }
+        const timeout = if (args.contains("timeout_ms"))
+            argInt(args, "timeout_ms") orelse
+                return try textResult(alloc, id_json, "invalid timeout_ms", true)
+        else
+            EXEC_TIMEOUT_DEFAULT_MS;
+        const sandbox = server.findSandbox(id) orelse
             return try textResult(alloc, id_json, "no such sandbox", true);
 
         const outcome = server.execInSandbox(
             alloc,
             sandbox,
             command_value.string,
-            timeout,
+            std.math.clamp(timeout, 1, EXEC_TIMEOUT_MAX_MS),
         ) catch |err| {
             const text = try std.fmt.allocPrint(alloc, "exec failed: {s}", .{@errorName(err)});
             defer alloc.free(text);
@@ -512,15 +487,16 @@ fn handleToolCall(
         const args = arguments orelse
             return try textResult(alloc, id_json, "missing arguments", true);
         const id = argInt(args, "id") orelse
-            return try textResult(alloc, id_json, "missing sandbox id", true);
-        const sandbox = server.findSandbox(@intCast(id)) orelse
+            return try textResult(alloc, id_json, "invalid sandbox id", true);
+        const sandbox = server.findSandbox(id) orelse
             return try textResult(alloc, id_json, "no such sandbox", true);
         const io = global.io();
         sandbox.out_mutex.lockUncancelable(io);
-        const items = sandbox.output.items;
-        const window = items[items.len - @min(items.len, 64 * 1024) ..];
-        const copy = try alloc.dupe(u8, window);
-        sandbox.out_mutex.unlock(io);
+        const copy = blk: {
+            defer sandbox.out_mutex.unlock(io);
+            const items = sandbox.output.items;
+            break :blk try alloc.dupe(u8, items[items.len - @min(items.len, 64 * 1024) ..]);
+        };
         defer alloc.free(copy);
         return try textResult(alloc, id_json, copy, false);
     }
@@ -543,8 +519,8 @@ fn handleToolCall(
         const args = arguments orelse
             return try textResult(alloc, id_json, "missing arguments", true);
         const id = argInt(args, "id") orelse
-            return try textResult(alloc, id_json, "missing sandbox id", true);
-        if (server.stopSandbox(@intCast(id))) {
+            return try textResult(alloc, id_json, "invalid sandbox id", true);
+        if (server.stopSandbox(id)) {
             return try textResult(alloc, id_json, "sandbox stopped and deleted", false);
         }
         return try textResult(alloc, id_json, "no such sandbox", true);
@@ -553,10 +529,10 @@ fn handleToolCall(
     return try textResult(alloc, id_json, "unknown tool", true);
 }
 
-fn argInt(args: std.json.ObjectMap, key: []const u8) ?i64 {
+fn argInt(args: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = args.get(key) orelse return null;
     if (value != .integer or value.integer < 0) return null;
-    return value.integer;
+    return std.math.cast(u32, value.integer);
 }
 
 pub fn execute(
@@ -587,27 +563,22 @@ pub fn execute(
     server.child_environ = &child_environ;
     defer server.deinit();
 
-    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer line_buf.deinit(alloc);
-    var read_buf: [4096]u8 = undefined;
+    const read_buf = try alloc.alloc(u8, LINE_MAX + 1);
+    defer alloc.free(read_buf);
+    var reader = std.Io.File.stdin().readerStreaming(io_impl.io(), read_buf);
+    var write_buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writerStreaming(io_impl.io(), &write_buf);
+    try serve(&server, alloc, &reader.interface, &writer.interface);
+}
 
-    while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &read_buf) catch break;
-        if (n == 0) break; // client closed: shut everything down
-        var remaining: []const u8 = read_buf[0..n];
-        while (std.mem.indexOfScalar(u8, remaining, '\n')) |newline| {
-            if (line_buf.items.len + newline <= LINE_MAX) {
-                try line_buf.appendSlice(alloc, remaining[0..newline]);
-                if (try handleMessage(&server, alloc, line_buf.items)) |response| {
-                    defer alloc.free(response);
-                    _ = std.c.write(std.posix.STDOUT_FILENO, response.ptr, response.len);
-                }
-            }
-            line_buf.clearRetainingCapacity();
-            remaining = remaining[newline + 1 ..];
-        }
-        if (line_buf.items.len + remaining.len <= LINE_MAX) {
-            try line_buf.appendSlice(alloc, remaining);
+/// Oversized messages terminate the stream: no suffix may become a new request.
+fn serve(server: *Server, alloc: Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+    while (try reader.takeDelimiter('\n')) |line| {
+        if (line.len > LINE_MAX) return error.StreamTooLong;
+        if (try handleMessage(server, alloc, line)) |response| {
+            defer alloc.free(response);
+            try writer.writeAll(response);
+            try writer.flush();
         }
     }
 }
@@ -668,7 +639,6 @@ test "mcp: protocol handshake, tool list, and errors" {
 }
 
 test "mcp: split readiness marker is removed from guest output" {
-    const marker = "\x1eBOBRVM_READY_7\x1e";
     var sandbox = Sandbox{
         .id = 7,
         .alloc = testing.allocator,
@@ -676,13 +646,55 @@ test "mcp: split readiness marker is removed from guest output" {
         .reader_thread = undefined,
     };
     defer sandbox.output.deinit(testing.allocator);
-    @memcpy(sandbox.ready_marker[0..marker.len], marker);
-    sandbox.ready_marker_len = marker.len;
 
     sandbox.appendOutput("guest prefix\x1eBOBRVM_");
     try testing.expect(!sandbox.ready);
-    sandbox.appendOutput("READY_7\x1eguest suffix");
+    sandbox.appendOutput("READY\x1eguest suffix");
 
     try testing.expect(sandbox.ready);
     try testing.expectEqualStrings("guest prefixguest suffix", sandbox.output.items);
+}
+
+test "mcp: rejects out-of-range ids and console control input" {
+    var server = Server.init(testing.allocator, global.io());
+    defer server.deinit();
+    for ([_][]const u8{ "sandbox_exec", "sandbox_output", "sandbox_stop" }) |tool| {
+        const request = try std.fmt.allocPrint(testing.allocator,
+            \\{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{s}",
+            \\"arguments":{{"id":4294967296,"command":"true"}}}}}}
+        , .{tool});
+        defer testing.allocator.free(request);
+        try expectResponse(&server, request, "invalid sandbox id");
+    }
+    try expectResponse(&server,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sandbox_exec",
+        \\"arguments":{"id":1,"command":"true\nexit"}}}
+    , "console control bytes");
+    try expectResponse(&server,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sandbox_exec",
+        \\"arguments":{"id":1,"command":"true","timeout_ms":"fast"}}}
+    , "invalid timeout_ms");
+}
+
+test "mcp: stream emits complete responses and stops on oversized requests" {
+    var server = Server.init(testing.allocator, global.io());
+    defer server.deinit();
+    const ping = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n";
+    var reader = std.Io.Reader.fixed(ping ++ ping);
+    var writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer writer.deinit();
+    try serve(&server, testing.allocator, &reader, &writer.writer);
+    const response = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n";
+    try testing.expectEqualStrings(response ++ response, writer.written());
+
+    const oversized = try testing.allocator.alloc(u8, LINE_MAX + 1 + ping.len);
+    defer testing.allocator.free(oversized);
+    @memset(oversized[0 .. LINE_MAX + 1], ' ');
+    @memcpy(oversized[LINE_MAX + 1 ..], ping);
+    reader = std.Io.Reader.fixed(oversized);
+    try testing.expectError(
+        error.StreamTooLong,
+        serve(&server, testing.allocator, &reader, &writer.writer),
+    );
+    try testing.expectEqualStrings(response ++ response, writer.written());
 }
