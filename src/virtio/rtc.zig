@@ -71,20 +71,6 @@ pub const Rtc = struct {
     }
 };
 
-pub fn mmioRead(context: *anyopaque, offset: u64, size: u8) u64 {
-    assert(size == 1 or size == 2 or size == 4 or size == 8);
-    assert(offset < 0x1000);
-    const rtc: *Rtc = @ptrCast(@alignCast(context));
-    return rtc.read(@truncate(offset));
-}
-
-pub fn mmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
-    assert(size == 1 or size == 2 or size == 4 or size == 8);
-    assert(offset < 0x1000);
-    const rtc: *Rtc = @ptrCast(@alignCast(context));
-    rtc.write(@truncate(offset), @truncate(value));
-}
-
 test "PL031 reports host wall clock and PrimeCell identity" {
     var rtc = Rtc.init();
     const before = @divFloor(std.Io.Clock.real.now(global.io()).nanoseconds, std.time.ns_per_s);

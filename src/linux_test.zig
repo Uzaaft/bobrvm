@@ -17,7 +17,6 @@ test {
     _ = @import("linux/Preferences.zig");
     _ = std.testing.refAllDecls(@import("pci/virtio_pci.zig"));
     _ = std.testing.refAllDecls(@import("pci/x86_config.zig"));
-    _ = std.testing.refAllDecls(@import("worker/main.zig"));
     _ = std.testing.refAllDecls(@import("virtio/queue.zig"));
     _ = std.testing.refAllDecls(@import("virtio/mmio.zig"));
     _ = std.testing.refAllDecls(@import("virtio/console.zig"));

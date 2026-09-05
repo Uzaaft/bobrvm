@@ -634,8 +634,7 @@ pub const VM = struct {
             }
         }
 
-        // Run the synchronous vCPU loop on a dedicated thread (the same
-        // proven loop the CLI uses; the async VMRunner path is legacy).
+        // Run the same vCPU loop as the CLI on a dedicated thread.
         self.hw_machine.?.prepareStart();
         self.vcpu_thread = std.Thread.spawn(.{}, vcpuThreadMain, .{self.hw_machine.?}) catch |err| {
             log.warn("failed to spawn vCPU thread: {}", .{err});
@@ -851,20 +850,6 @@ pub const VM = struct {
         }
     }
 
-    /// Kick a specific vCPU to wake it from WFI/sleep.
-    pub fn kickVcpu(self: *VM, vcpu_id: u32) void {
-        if (self.hw_machine) |hw| {
-            hw.kickVcpu(vcpu_id);
-        }
-    }
-
-    /// Force all vCPUs to exit from hv_vcpu_run (for debugging).
-    pub fn forceExitAll(self: *VM) void {
-        if (self.hw_machine) |hw| {
-            hw.forceExitAllVcpus();
-        }
-    }
-
     pub fn writeConsole(self: *VM, data: []const u8) console.Session.WriteError!void {
         try self.console_session.write(data);
     }
@@ -926,9 +911,6 @@ pub const Surface = struct {
     vm: *VM,
     vm_prev: ?*Surface,
     vm_next: ?*Surface,
-    mtl_device: *anyopaque,
-    mtl_layer: *anyopaque,
-    mtl_queue: *anyopaque,
     width: u32,
     height: u32,
     content_scale: ContentScale,
@@ -953,14 +935,11 @@ pub const Surface = struct {
             .vm = vm,
             .vm_prev = null,
             .vm_next = null,
-            .mtl_device = mtl_device,
-            .mtl_layer = mtl_layer,
-            .mtl_queue = mtl_queue,
             .width = 0,
             .height = 0,
             .content_scale = .{},
             .focused = false,
-            .render = renderer.Renderer.init(vm.alloc, mtl_device, mtl_layer, mtl_queue),
+            .render = renderer.Renderer.init(mtl_device, mtl_layer, mtl_queue),
             .render_started = false,
             .presentation_generation_seen = std.math.maxInt(u64),
         };
@@ -1051,14 +1030,10 @@ pub const Surface = struct {
         assert(y > 0.0);
 
         self.content_scale = .{ .x = x, .y = y };
-
-        // Notify renderer
-        self.render.setContentScale(x, y);
     }
 
     pub fn setFocus(self: *Surface, focused: bool) void {
         self.focused = focused;
-        self.render.setFocus(focused);
     }
 
     /// Start the renderer thread.

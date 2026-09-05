@@ -671,7 +671,6 @@ pub const GpuDevice = struct {
 
                 .clear => {
                     const clear_cmd = try virgl.decoder.Clear.decode(&dec, header.length);
-                    ctx.clear(clear_cmd);
                     // Execute the clear against the bound framebuffer's first
                     // color target: framebuffer cbuf[0] → surface → resource →
                     // MTLTexture. Only color clears are handled for now.
@@ -798,7 +797,6 @@ pub const GpuDevice = struct {
 
                 .draw_vbo => {
                     const draw_cmd = try virgl.decoder.DrawVbo.decode(&dec, header.length);
-                    ctx.draw(draw_cmd);
                     // Route the draw: rasterize the bound vertex buffer into the
                     // bound framebuffer color target. Shading is the passthrough
                     // stand-in (solid white) until TGSI→MSL lands.

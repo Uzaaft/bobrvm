@@ -908,30 +908,6 @@ pub const Gic = struct {
 };
 
 // =============================================================================
-// MMIO Callback Wrappers
-// =============================================================================
-
-pub fn distMmioRead(context: *anyopaque, offset: u64, size: u8) u64 {
-    const gic: *Gic = @ptrCast(@alignCast(context));
-    return gic.distRead(offset, size);
-}
-
-pub fn distMmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
-    const gic: *Gic = @ptrCast(@alignCast(context));
-    gic.distWrite(offset, size, value);
-}
-
-pub fn redistMmioRead(context: *anyopaque, offset: u64, size: u8) u64 {
-    const gic: *Gic = @ptrCast(@alignCast(context));
-    return gic.redistRead(offset, size);
-}
-
-pub fn redistMmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
-    const gic: *Gic = @ptrCast(@alignCast(context));
-    gic.redistWrite(offset, size, value);
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 

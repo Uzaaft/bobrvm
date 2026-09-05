@@ -17,7 +17,6 @@ pub const logging = @import("logging.zig");
 pub const machine = @import("machine/main.zig");
 pub const os = @import("os/main.zig");
 pub const virtio = @import("virtio/main.zig");
-pub const worker = @import("worker/main.zig");
 pub const gpu = @import("gpu/main.zig");
 pub const renderer = @import("renderer/main.zig");
 pub const runtime = @import("runtime/main.zig");
@@ -41,7 +40,6 @@ test {
         _ = @import("linux/Preferences.zig");
         _ = std.testing.refAllDecls(@import("pci/virtio_pci.zig"));
         _ = std.testing.refAllDecls(@import("pci/x86_config.zig"));
-        _ = std.testing.refAllDecls(worker);
         _ = std.testing.refAllDecls(@import("virtio/queue.zig"));
         _ = std.testing.refAllDecls(@import("virtio/mmio.zig"));
         _ = std.testing.refAllDecls(@import("virtio/console.zig"));

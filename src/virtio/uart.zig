@@ -204,19 +204,6 @@ pub const Uart = struct {
     }
 };
 
-// MMIO callback wrappers for runner
-pub fn mmioRead(context: *anyopaque, offset: u64, size: u8) u64 {
-    const uart: *Uart = @ptrCast(@alignCast(context));
-    _ = size;
-    return uart.read(@truncate(offset));
-}
-
-pub fn mmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
-    const uart: *Uart = @ptrCast(@alignCast(context));
-    _ = size;
-    uart.write(@truncate(offset), @truncate(value));
-}
-
 // =============================================================================
 // Tests
 // =============================================================================

@@ -8,16 +8,12 @@ const std = @import("std");
 pub const c = @import("c.zig");
 pub const vm = @import("vm.zig");
 pub const vcpu = @import("vcpu.zig");
-pub const runner = @import("runner.zig");
+pub const load_store = @import("load_store.zig");
 
 pub const VM = vm.VM;
 pub const Vcpu = vcpu.Vcpu;
 pub const MemoryFlags = vm.MemoryFlags;
 pub const FileOverlay = vm.FileOverlay;
-pub const VMRunner = runner.VMRunner;
-pub const VcpuRunner = runner.VcpuRunner;
-pub const MmioHandler = runner.MmioHandler;
-pub const MmioAccess = runner.MmioAccess;
 
 pub const MEM_READ = vm.MEM_READ;
 pub const MEM_READ_WRITE = vm.MEM_READ_WRITE;
@@ -39,5 +35,5 @@ test {
     _ = c;
     _ = vm;
     _ = vcpu;
-    _ = runner;
+    _ = load_store;
 }

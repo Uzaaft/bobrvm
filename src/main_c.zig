@@ -316,19 +316,6 @@ pub export fn bobrvm_vm_console_resize(
     return 0;
 }
 
-/// Force a vCPU to exit from hv_vcpu_run (for debugging stuck vCPUs).
-/// This injects an IRQ and forces an exit, useful when vCPU is stuck in WFI.
-pub export fn bobrvm_vm_kick_vcpu(vm: ?*apprt.VM, vcpu_id: u32) void {
-    const v = vm orelse return;
-    v.kickVcpu(vcpu_id);
-}
-
-/// Force all vCPUs to exit from hv_vcpu_run (for debugging).
-pub export fn bobrvm_vm_force_exit_all(vm: ?*apprt.VM) void {
-    const v = vm orelse return;
-    v.forceExitAll();
-}
-
 pub const VMState = enum(c_int) {
     stopped = 0,
     starting = 1,

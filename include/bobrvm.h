@@ -371,14 +371,6 @@ void bobrvm_vm_touch_id_complete(
     bobrvm_touch_id_result_e result
 );
 
-/**
- * Inject an IRQ and force vCPU vcpu_id out of hv_vcpu_run.
- */
-void bobrvm_vm_kick_vcpu(bobrvm_vm_t vm, uint32_t vcpu_id);
-
-/** Force all vCPUs out of hv_vcpu_run. */
-void bobrvm_vm_force_exit_all(bobrvm_vm_t vm);
-
 /* macOS guest runtime. */
 
 bobrvm_macos_vm_t bobrvm_macos_vm_new(const bobrvm_macos_vm_config_s* cfg);

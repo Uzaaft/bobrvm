@@ -449,22 +449,6 @@ pub const Context = struct {
         self.index_size = size;
         self.index_offset = offset;
     }
-
-    // =========================================================================
-    // Drawing
-    // =========================================================================
-
-    pub fn draw(self: *Context, cmd: decoder.DrawCommand) void {
-        // TODO: Translate to Metal draw call
-        _ = self;
-        _ = cmd;
-    }
-
-    pub fn clear(self: *Context, cmd: decoder.ClearCommand) void {
-        // TODO: Translate to Metal clear
-        _ = self;
-        _ = cmd;
-    }
 };
 
 // =============================================================================

@@ -148,8 +148,6 @@ static void test_null_handles(void) {
     assert(bobrvm_vm_snapshot_quiesced(NULL, NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
     assert(bobrvm_vm_send_file(NULL, NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
     bobrvm_vm_host_clipboard_changed(NULL);
-    bobrvm_vm_kick_vcpu(NULL, UINT32_MAX);
-    bobrvm_vm_force_exit_all(NULL);
     bobrvm_vm_stop(NULL);
     bobrvm_vm_request_stop(NULL);
     bobrvm_vm_finish_stop(NULL);

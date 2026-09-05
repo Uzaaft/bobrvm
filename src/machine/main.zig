@@ -398,9 +398,6 @@ pub const Machine = struct {
     /// Hypervisor VM.
     hv_vm: ?*hypervisor.VM = null,
 
-    /// VM runner (manages vCPU threads).
-    runner: ?hypervisor.VMRunner = null,
-
     /// Guest RAM (host-mapped).
     ram: ?[]align(4096) u8 = null,
 
@@ -711,10 +708,6 @@ pub const Machine = struct {
         if (self.ecam_host) |ecam| {
             ecam.deinit();
             self.ecam_host = null;
-        }
-
-        if (self.runner) |*runner| {
-            runner.deinit();
         }
 
         // Clean up hypervisor (vCPUs then VM)
@@ -1080,80 +1073,6 @@ pub const Machine = struct {
         self.console_userdata = userdata;
     }
 
-    /// Start the machine.
-    pub fn start(self: *Machine) Error!void {
-        if (self.running.load(.acquire)) return;
-        errdefer {
-            self.stop_requested.store(true, .release);
-            self.start_pipe.signal();
-        }
-
-        log.info("starting machine", .{});
-
-        // Create hypervisor VM
-        self.hv_vm = try hypervisor.VM.create(self.alloc);
-        errdefer self.cleanupHypervisor();
-
-        const vm = self.hv_vm.?;
-
-        // Map pflash regions if firmware boot
-        if (self.config.isFirmwareBoot()) {
-            try self.mapPflashRegions(vm);
-            try self.loadFirmware();
-        }
-
-        // Map guest RAM
-        try self.mapGuestRam(vm);
-        log.debug("mapped RAM: 0x{x} - 0x{x}", .{
-            MemoryLayout.RAM_BASE,
-            MemoryLayout.RAM_BASE + self.config.ram_size,
-        });
-
-        // Load kernel/initrd/DTB only when booting fresh — a restore
-        // overwrites all of RAM from the suspend image anyway.
-        if (self.config.restore_path == null) {
-            // Generate and load DTB
-            try self.generateDtb();
-        }
-
-        // Initialize GIC (interrupt controller)
-        try self.initGic();
-
-        // Initialize virtio devices
-        try self.initVirtioDevices();
-
-        // Set current machine for guest memory access (used by vCPU threads)
-        current_machine = self;
-
-        // Create runner
-        self.runner = hypervisor.VMRunner.init(self.alloc, vm);
-
-        // Register MMIO handlers
-        try self.registerMmioHandlers();
-
-        // Add vCPU slots - vCPUs will be created on their own threads
-        // (Apple Hypervisor requires hv_vcpu_create on the same thread as hv_vcpu_run)
-        for (0..self.config.vcpu_count) |_| {
-            try self.runner.?.addVcpuSlot(vcpuSetupCallback, self);
-        }
-
-        // Start execution (vCPUs created on their threads)
-        try self.runner.?.start();
-
-        if (!self.markRunning()) {
-            self.runner.?.stop();
-            return error.StartCancelled;
-        }
-        log.info("machine started", .{});
-    }
-
-    /// Callback to set up vCPU initial state.
-    /// Called on each vCPU's thread after creation.
-    fn vcpuSetupCallback(vcpu: *hypervisor.Vcpu, id: u32, userdata: ?*anyopaque) hypervisor.Vcpu.Error!void {
-        const self: *Machine = @ptrCast(@alignCast(userdata));
-        try self.setupVcpuState(vcpu, id);
-    }
-
     /// Clean up hypervisor resources.
     /// VM.destroy() handles vCPU cleanup internally.
     fn cleanupHypervisor(self: *Machine) void {
@@ -1217,10 +1136,6 @@ pub const Machine = struct {
         if (!self.running.load(.acquire)) return;
 
         log.info("stopping machine", .{});
-
-        if (self.runner) |*runner| {
-            runner.stop();
-        }
 
         self.running.store(false, .release);
 
@@ -1788,21 +1703,6 @@ pub const Machine = struct {
         return true;
     }
 
-    /// Kick a specific vCPU to wake it from WFI/sleep.
-    /// Injects an IRQ and forces an exit from hv_vcpu_run.
-    pub fn kickVcpu(self: *Machine, vcpu_id: u32) void {
-        if (self.runner) |*runner| {
-            runner.kickVcpu(vcpu_id);
-        }
-    }
-
-    /// Force all vCPUs to exit from hv_vcpu_run (for debugging).
-    pub fn forceExitAllVcpus(self: *Machine) void {
-        if (self.runner) |*runner| {
-            runner.forceExitAll();
-        }
-    }
-
     /// Start and run the machine synchronously on the current thread.
     /// vCPU is created and run on the same thread (required by Apple Hypervisor).
     pub fn startSync(self: *Machine) Error!void {
@@ -2281,10 +2181,10 @@ pub const Machine = struct {
         const pc = try vcpu.getReg(.pc);
         const instr_ptr = self.hv_vm.?.guestToHost(pc) orelse return error.InvalidAddress;
         const instr = @as(*align(1) const u32, @ptrCast(instr_ptr)).*;
-        return switch (hypervisor.runner.decodeLoadStore(instr)) {
+        return switch (hypervisor.load_store.decodeLoadStore(instr)) {
             .load_store => |load_store| access: {
                 if (load_store.writeback_rn) |rn| {
-                    try hypervisor.runner.applyLoadStoreWriteback(
+                    try hypervisor.load_store.applyLoadStoreWriteback(
                         vcpu,
                         rn,
                         load_store.writeback_imm,
@@ -2441,11 +2341,12 @@ pub const Machine = struct {
         try vcpu.setReg(.x0, context_id);
     }
 
-    /// Join all secondary vCPU threads (after running=false).
+    /// Stop execution before joining: a secondary may be waiting on its WFI
+    /// pipe or the startup barrier rather than inside hv_vcpu_run.
     fn joinSecondaryVcpus(self: *Machine) void {
+        self.requestStop();
         for (self.cpu_states, 0..) |*state, i| {
             if (i == 0) continue;
-            if (state.vcpu) |v| v.forceExit() catch {};
             if (state.thread) |thread| {
                 thread.join();
                 state.thread = null;
@@ -3392,109 +3293,6 @@ pub const Machine = struct {
         return false;
     }
 
-    fn registerMmioHandlers(self: *Machine) !void {
-        var runner = &self.runner.?;
-        // Two GIC regions, UART, RTC, three virtio slots, ECAM, and the PCI BAR.
-        try runner.reserveMmioHandlers(9);
-
-        // Register GIC Distributor MMIO handler
-        if (self.gic_device) |gic_dev| {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(gic_dev),
-                .base = MemoryLayout.GIC_DIST_BASE,
-                .size = 0x10000, // 64KB for distributor
-                .read = gic.distMmioRead,
-                .write = gic.distMmioWrite,
-            });
-
-            // Register GIC Redistributor MMIO handler
-            // Size depends on number of CPUs: 2 * 64KB per CPU
-            const redist_size = @as(u64, self.config.vcpu_count) * 2 * 0x10000;
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(gic_dev),
-                .base = MemoryLayout.GIC_REDIST_BASE,
-                .size = redist_size,
-                .read = gic.redistMmioRead,
-                .write = gic.redistMmioWrite,
-            });
-        }
-
-        // Register UART MMIO handler (PL011)
-        try runner.registerMmioHandler(.{
-            .context = @ptrCast(&self.uart),
-            .base = MemoryLayout.UART_BASE,
-            .size = MemoryLayout.UART_SIZE,
-            .read = virtio.uart.mmioRead,
-            .write = virtio.uart.mmioWrite,
-        });
-
-        // Register RTC MMIO handler (PL031)
-        try runner.registerMmioHandler(.{
-            .context = @ptrCast(&self.rtc),
-            .base = MemoryLayout.RTC_BASE,
-            .size = MemoryLayout.RTC_SIZE,
-            .read = virtio.rtc.mmioRead,
-            .write = virtio.rtc.mmioWrite,
-        });
-
-        // Register console MMIO handler (slot 0)
-        if (self.console) |console| {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(console),
-                .base = MemoryLayout.virtioBase(0),
-                .size = MemoryLayout.VIRTIO_SIZE,
-                .read = consoleMmioRead,
-                .write = consoleMmioWrite,
-            });
-        }
-
-        // Register block MMIO handler (slot 1)
-        if (self.block) |block| {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(block),
-                .base = MemoryLayout.virtioBase(1),
-                .size = MemoryLayout.VIRTIO_SIZE,
-                .read = blockMmioRead,
-                .write = blockMmioWrite,
-            });
-        }
-
-        // Register block2 MMIO handler (slot 2)
-        if (self.block2) |block2| {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(block2),
-                .base = MemoryLayout.virtioBase(2),
-                .size = MemoryLayout.VIRTIO_SIZE,
-                .read = blockMmioRead,
-                .write = blockMmioWrite,
-            });
-        }
-
-        // Register PCIe ECAM MMIO handler
-        if (self.ecam_host != null or self.pci_block != null or
-            self.pci_block2 != null or self.pci_gpu != null)
-        {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(self),
-                .base = MemoryLayout.ECAM_BASE,
-                .size = MemoryLayout.ECAM_SIZE,
-                .read = ecamMmioRead,
-                .write = ecamMmioWrite,
-            });
-        }
-
-        // Register PCI BAR0 MMIO handler (virtio-pci devices)
-        if (self.pci_block != null or self.pci_block2 != null or self.pci_gpu != null) {
-            try runner.registerMmioHandler(.{
-                .context = @ptrCast(self),
-                .base = MemoryLayout.PCI_MMIO_BASE,
-                .size = MemoryLayout.PCI_MMIO_SIZE,
-                .read = pciBarMmioRead,
-                .write = pciBarMmioWrite,
-            });
-        }
-    }
-
     fn ecamMmioRead(ctx: *anyopaque, offset: u64, size: u8) u64 {
         const self: *Machine = @ptrCast(@alignCast(ctx));
         const addr = MemoryLayout.ECAM_BASE + offset;
@@ -3653,34 +3451,6 @@ pub const Machine = struct {
         const pfr0 = try vcpu.getSysReg(.id_aa64pfr0_el1);
         try vcpu.setSysReg(.id_aa64pfr0_el1, withGicSystemRegisters(pfr0));
         try vcpu.setSysReg(.cpacr_el1, 3 << 20);
-    }
-
-    // =========================================================================
-    // MMIO Callbacks
-    // =========================================================================
-
-    fn consoleMmioRead(context: *anyopaque, offset: u64, size: u8) u64 {
-        const console: *virtio.Console = @ptrCast(@alignCast(context));
-        _ = size;
-        return console.read(@truncate(offset));
-    }
-
-    fn consoleMmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
-        const console: *virtio.Console = @ptrCast(@alignCast(context));
-        _ = size;
-        console.write(@truncate(offset), @truncate(value));
-    }
-
-    fn blockMmioRead(context: *anyopaque, offset: u64, size: u8) u64 {
-        const block: *virtio.Block = @ptrCast(@alignCast(context));
-        _ = size;
-        return block.read(@truncate(offset));
-    }
-
-    fn blockMmioWrite(context: *anyopaque, offset: u64, size: u8, value: u64) void {
-        const block: *virtio.Block = @ptrCast(@alignCast(context));
-        _ = size;
-        block.write(@truncate(offset), @truncate(value));
     }
 
     fn getGuestMemoryWrapper(addr: u64, len: usize) ?[]u8 {
