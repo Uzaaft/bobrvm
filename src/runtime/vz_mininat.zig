@@ -65,7 +65,7 @@ pub fn create(alloc: Allocator, config: Config) !*Bridge {
             vz_process_policy.Controller.activity,
         ).bind(policy));
     }
-    for (config.forwards) |forward| try self.nat.addForward(forward);
+    for (config.forwards) |forward| _ = try self.nat.addForward(forward);
     if (config.docker_socket_path) |path| try self.nat.addUnixForward(path, 2375);
     self.running.store(true, .release);
     errdefer self.running.store(false, .release);

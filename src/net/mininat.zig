@@ -112,9 +112,12 @@ const TcpState = enum {
 };
 
 /// A host→guest port forward rule.
-pub const Forward = struct {
+pub const Forward = extern struct {
     host_port: u16,
     guest_port: u16,
+    allow_lan: bool = false,
+    /// Reuse a previously allocated port when possible, otherwise bind port zero.
+    automatic: bool = false,
 };
 
 /// A listening host socket for one forward rule.
@@ -436,8 +439,8 @@ pub const MiniNat = struct {
 
     /// Add a host→guest port forward: connections accepted on the host's
     /// TCP host_port are proxied to the guest's guest_port. Must be called
-    /// before start().
-    pub fn addForward(self: *MiniNat, fwd: Forward) !void {
+    /// before start(). Returns the actual listening port.
+    pub fn addForward(self: *MiniNat, fwd: Forward) !u16 {
         const sock = try net_compat.socketCreate(
             std.posix.AF.INET,
             std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
@@ -447,16 +450,25 @@ pub const MiniNat = struct {
         net_compat.setReuseAddr(sock);
         var addr = std.posix.sockaddr.in{
             .port = std.mem.nativeToBig(u16, fwd.host_port),
-            .addr = 0, // INADDR_ANY
+            .addr = if (fwd.allow_lan) 0 else std.mem.nativeToBig(u32, 0x7f000001),
         };
-        try net_compat.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+        net_compat.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch |err| {
+            if (!fwd.automatic or fwd.host_port == 0 or
+                std.c.errno(@as(c_int, -1)) != .ADDRINUSE) return err;
+            addr.port = 0;
+            try net_compat.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+        };
         try net_compat.listen(sock, listener_backlog);
+        var address_len: std.posix.socklen_t = @sizeOf(@TypeOf(addr));
+        if (std.c.getsockname(sock, @ptrCast(&addr), &address_len) != 0) return error.Unexpected;
+        const port = std.mem.bigToNative(u16, addr.port);
         try self.listeners.append(self.alloc, .{
             .socket = sock,
             .guest_port = fwd.guest_port,
-            .host_port = fwd.host_port,
+            .host_port = port,
         });
-        log.info("forwarding host tcp/{} -> guest tcp/{}", .{ fwd.host_port, fwd.guest_port });
+        log.info("forwarding host tcp/{} -> guest tcp/{}", .{ port, fwd.guest_port });
+        return port;
     }
 
     /// Add a private Unix-socket listener that enters the guest as TCP.
@@ -2365,6 +2377,44 @@ test "mininat: Unix listener forwards only to its configured guest port" {
     );
 }
 
+test "mininat: automatic forwards use loopback and recover from occupied ports" {
+    var nat = MiniNat.init(testing.allocator, Reply.initRaw(testReply, null));
+    defer nat.stop();
+    const first_port = try nat.addForward(.{
+        .host_port = 0,
+        .guest_port = 22,
+        .automatic = true,
+    });
+    try testing.expect(first_port != 0);
+    var address: std.posix.sockaddr.in = undefined;
+    var length: std.posix.socklen_t = @sizeOf(@TypeOf(address));
+    try testing.expectEqual(@as(c_int, 0), std.c.getsockname(
+        nat.listeners.items[0].socket,
+        @ptrCast(&address),
+        &length,
+    ));
+    try testing.expectEqual(std.mem.nativeToBig(u32, 0x7f000001), address.addr);
+    try testing.expectEqual(first_port, std.mem.bigToNative(u16, address.port));
+    try testing.expectError(error.Unexpected, nat.addForward(.{
+        .host_port = first_port,
+        .guest_port = 22,
+    }));
+    const fallback_port = try nat.addForward(.{
+        .host_port = first_port,
+        .guest_port = 22,
+        .automatic = true,
+    });
+    try testing.expect(fallback_port != first_port);
+    try testing.expect(fallback_port != 0);
+    _ = try nat.addForward(.{ .host_port = 0, .guest_port = 80, .allow_lan = true });
+    try testing.expectEqual(@as(c_int, 0), std.c.getsockname(
+        nat.listeners.items[2].socket,
+        @ptrCast(&address),
+        &length,
+    ));
+    try testing.expectEqual(@as(u32, 0), address.addr);
+}
+
 test "mininat: port forward — accept, handshake, and guest->host relay" {
     test_alloc = testing.allocator;
     defer clearReplies();
@@ -2383,7 +2433,7 @@ test "mininat: port forward — accept, handshake, and guest->host relay" {
     }
 
     // Listener on an ephemeral host port (0 = kernel-assigned).
-    try nat.addForward(.{ .host_port = 0, .guest_port = 22 });
+    _ = try nat.addForward(.{ .host_port = 0, .guest_port = 22 });
     var sa: std.posix.sockaddr.in = undefined;
     var sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
     try testing.expect(std.c.getsockname(nat.listeners.items[0].socket, @ptrCast(&sa), &sa_len) == 0);

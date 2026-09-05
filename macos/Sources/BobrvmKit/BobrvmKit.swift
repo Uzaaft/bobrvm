@@ -119,6 +119,28 @@ enum ConsoleEvent: Sendable {
 
 // MARK: - VM Configuration
 
+public struct TCPForward: Codable, Equatable, Identifiable {
+    public init() {}
+    public var id = UUID()
+    public var hostPort: UInt16 = 8080
+    public var guestPort: UInt16 = 8080
+    public var allowLAN = false
+    public var automatic = false
+
+    private enum CodingKeys: String, CodingKey {
+        case id, hostPort, guestPort, allowLAN, automatic
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        hostPort = try values.decode(UInt16.self, forKey: .hostPort)
+        guestPort = try values.decode(UInt16.self, forKey: .guestPort)
+        allowLAN = try values.decode(Bool.self, forKey: .allowLAN)
+        automatic = try values.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
+    }
+}
+
 public struct VMConfig {
     public var memoryBytes: UInt64
     public var vcpuCount: UInt8
@@ -127,6 +149,7 @@ public struct VMConfig {
     public var gpuMemoryBytes: UInt64
     public var networkEnabled: Bool
     public var touchIDEnabled: Bool
+    public var portForwards: [TCPForward]
     public var sharedFolderPath: String?
     /// UEFI firmware path (e.g., QEMU_EFI.fd). If set, boots via firmware.
     public var firmwarePath: String?
@@ -150,6 +173,7 @@ public struct VMConfig {
         gpuMemoryBytes: UInt64? = nil,
         networkEnabled: Bool? = nil,
         touchIDEnabled: Bool = false,
+        portForwards: [TCPForward] = [],
         sharedFolderPath: String? = nil,
         firmwarePath: String? = nil,
         varsPath: String? = nil,
@@ -169,6 +193,7 @@ public struct VMConfig {
         self.gpuMemoryBytes = gpuMemoryBytes ?? defaults.gpu_memory_bytes
         self.networkEnabled = networkEnabled ?? defaults.enable_net
         self.touchIDEnabled = touchIDEnabled
+        self.portForwards = portForwards
         self.sharedFolderPath = sharedFolderPath
         self.firmwarePath = firmwarePath
         self.varsPath = varsPath
@@ -181,7 +206,16 @@ public struct VMConfig {
         self.isoReadOnly = isoReadOnly
     }
 
-    func withCConfig<T>(_ body: (UnsafePointer<bobrvm_vm_config_s>) throws -> T) rethrows -> T {
+    public func validate() throws {
+        try withCConfig { pointer in
+            let code = bobrvm_vm_config_validate(pointer)
+            guard code.rawValue == BOBRVM_OK.rawValue else {
+                throw BobrvmError(code: Int32(code.rawValue))
+            }
+        }
+    }
+
+    func withCConfig<T>(_ body: (UnsafePointer<bobrvm_vm_config_s>) throws -> T) throws -> T {
         var config = bobrvm_vm_config_s()
         config.memory_bytes = memoryBytes
         config.vcpu_count = vcpuCount
@@ -192,6 +226,17 @@ public struct VMConfig {
         config.enable_touch_id = touchIDEnabled
         config.disk_read_only = diskReadOnly
         config.disk2_read_only = isoReadOnly
+        try withUnsafeMutableBytes(of: &config.port_forwards) { bytes in
+            let slots = bytes.bindMemory(to: bobrvm_port_forward_s.self)
+            guard portForwards.count <= slots.count else { throw BobrvmError.invalidArgument }
+            for (index, forward) in portForwards.enumerated() {
+                slots[index] = bobrvm_port_forward_s(
+                    host_port: forward.hostPort, guest_port: forward.guestPort,
+                    allow_lan: forward.allowLAN, automatic: forward.automatic
+                )
+            }
+        }
+        config.port_forward_count = UInt8(portForwards.count)
 
         func withOptionalCString<R>(
             _ string: String?,
@@ -487,6 +532,7 @@ public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
     @Published public private(set) var isStopping = false
     @Published public private(set) var guestToolsStatus = GuestToolsStatus.disconnected
+    @Published public private(set) var forwardedPorts: [UInt16] = Array(repeating: 0, count: 8)
     private(set) var consoleOutputData = Data()
 
     public var consoleOutput: String {
@@ -525,6 +571,13 @@ public final class VM: ObservableObject {
     }
 
     func refreshGuestToolsStatus() {
+        guard !isStopping else { return }
+        for slot in forwardedPorts.indices {
+            let port = if let handle, state == .running {
+                bobrvm_vm_forwarded_port(handle, UInt8(slot))
+            } else { UInt16(0) }
+            if forwardedPorts[slot] != port { forwardedPorts[slot] = port }
+        }
         guard let handle else {
             guestToolsStatus = .disconnected
             return
@@ -705,6 +758,7 @@ public final class VM: ObservableObject {
     private func beginStop() -> SendableVMHandle? {
         guard !isStopping, state != .stopped, let handle else { return nil }
         isStopping = true
+        forwardedPorts = Array(repeating: 0, count: 8)
         if let app {
             app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)
         }

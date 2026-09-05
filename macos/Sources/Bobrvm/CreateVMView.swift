@@ -23,6 +23,7 @@ struct CreateVMView: View {
     @State private var resolution = DisplayResolution.defaultValue
     @State private var retinaEnabled = true
     @State private var touchIDEnabled = false
+    @State private var ssh = SSHSettings()
     @State private var diskSizeGB = 64.0
     @State private var isCreating = false
     @State private var installationProgress = 0.0
@@ -116,6 +117,7 @@ struct CreateVMView: View {
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
                 touchIDEnabled: $touchIDEnabled,
+                ssh: $ssh,
                 backend: $backend,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
                 systemInfo: systemInfo
@@ -291,6 +293,7 @@ struct CreateVMView: View {
             try vmManager.createVM(
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                 config: config,
+                ssh: backend == .hypervisor ? ssh : SSHSettings(),
                 isoPath: source == .installFromISO ? isoPath : nil,
                 retinaEnabled: retinaEnabled,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
@@ -711,6 +714,7 @@ private struct HardwareStepView: View {
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
     @Binding var touchIDEnabled: Bool
+    @Binding var ssh: SSHSettings
     @Binding var backend: VMBackend
     let guestSystem: GuestSystem
     let systemInfo: SystemInfo
@@ -815,6 +819,18 @@ private struct HardwareStepView: View {
 
     @ViewBuilder
     private var deviceSettings: some View {
+        if backend == .hypervisor {
+            SettingsGroup(title: "SSH", systemImage: "terminal") {
+                Toggle("SSH access from this Mac", isOn: $ssh.enabled)
+                if ssh.enabled {
+                    TextField("Guest username", text: $ssh.username)
+                    Text("A local port is chosen automatically. Enable SSH and configure "
+                        + "login credentials inside the guest after installation.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
         if guestSystem == .linux {
             SettingsGroup(title: "Devices", systemImage: "touchid") {
                 Toggle("Fingerprint reader", isOn: $touchIDEnabled)

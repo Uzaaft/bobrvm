@@ -34,6 +34,30 @@ helper. All build paths require Zig 0.16.
 Configure an Apple Development or Developer ID team in Xcode before
 distribution.
 
+## SSH and TCP forwarding
+
+For a VM using Bobrvm Hypervisor, enable **SSH access from this Mac** during creation or in
+**Virtual Machine Settings > SSH and Port Forwarding**. Enter an existing guest username. The
+guest must have an SSH server enabled and a password or authorized public key configured.
+For NixOS, enable `services.openssh.enable = true` and configure the chosen user's credentials.
+The host option only supplies connectivity; it does not provision the guest.
+
+After boot, the VM details show **SSH** and **Copy command**. Automatic mode asks the OS for a
+free localhost port, remembers it, and reuses it on later boots when available. A busy remembered
+port triggers allocation of another free port. Manual ports fail startup if unavailable.
+
+The SSH button opens Terminal with the same command shown in the VM details. Copy that command
+for another terminal or IDE. `HostKeyAlias` uses the VM UUID so port changes do not change the
+guest's SSH identity; normal host-key verification remains enabled. A cloned VM receives its
+own identity.
+
+The settings also support up to seven additional TCP forwarding rules. Each defaults to
+`127.0.0.1`; **Allow LAN access** binds that rule to all IPv4 interfaces. SSH's preset remains
+localhost-only. Stop the VM before changing rules. Bridged networking and these forwarding
+controls for Apple Virtualization are not implemented.
+
+The CLI's existing `--forward` and `forwards` rules now also bind localhost by default.
+
 ## Permissions
 
 The app is not sandboxed because disks and removable images may live outside

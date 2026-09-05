@@ -66,6 +66,11 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
         guard supports(guestSystem) else {
             throw VMBackendError.unsupportedGuest(backend: self, guest: guestSystem)
         }
+        if !config.portForwards.isEmpty {
+            guard self == .hypervisor else { throw VMBackendError.invalidForwarding }
+            do { try config.validate() }
+            catch { throw VMBackendError.invalidForwarding }
+        }
         guard !config.touchIDEnabled || (self == .hypervisor && guestSystem == .linux) else {
             throw VMBackendError.touchIDRequiresLinuxHypervisor
         }
@@ -85,9 +90,16 @@ enum VMBackendError: LocalizedError {
     case diskRequired
     case rawDiskRequired
     case touchIDRequiresLinuxHypervisor
+    case invalidForwarding
+    case invalidSSHUsername
 
     var errorDescription: String? {
         switch self {
+        case .invalidSSHUsername:
+            return "Enter a valid guest SSH username."
+        case .invalidForwarding:
+            return "Forwarding requires Bobrvm Hypervisor, networking, "
+                + "and distinct host ports from 1024 to 65535. Guest ports must be nonzero."
         case .unsupportedGuest(let backend, let guest):
             return "\(backend.displayName) does not support \(guest.displayName) guests."
         case .diskRequired:
@@ -243,4 +255,33 @@ struct LinuxVirtualMachineView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: NSView, context: Context) {}
+}
+
+public struct SSHSettings: Codable, Equatable {
+    public init() {}
+    public var enabled = false
+    public var automatic = true
+    public var port: UInt16 = 0
+    public var username = "user"
+
+    public var validUsername: Bool {
+        !username.isEmpty && username.utf8.count <= 64
+            && username.utf8.allSatisfy {
+                (65...90).contains($0) || (97...122).contains($0)
+                    || (48...57).contains($0) || $0 == 45 || $0 == 46 || $0 == 95
+            }
+            && username.first != "-"
+    }
+
+    func applying(to config: VMConfig) throws -> VMConfig {
+        guard enabled else { return config }
+        guard validUsername else { throw VMBackendError.invalidSSHUsername }
+        var result = config
+        var forward = TCPForward()
+        forward.hostPort = port
+        forward.guestPort = 22
+        forward.automatic = automatic
+        result.portForwards.insert(forward, at: 0)
+        return result
+    }
 }

@@ -446,6 +446,8 @@ pub const Machine = struct {
     net: ?*virtio.Net = null,
     net_slot: u8 = 0,
     nat: mininat.MiniNat = undefined,
+    /// Published by device setup and read by the application thread.
+    forwarded_ports: [8]std.atomic.Value(u16) = @splat(std.atomic.Value(u16).init(0)),
 
     /// Virtio entropy device (always present; instant guest RNG seeding).
     rng: ?*virtio.Rng = null,
@@ -895,6 +897,24 @@ pub const Machine = struct {
 
     fn waylandAgentFeed(self: *Machine, data: []const u8) void {
         if (self.wayland_agent) |native| native.feed(data);
+    }
+
+    fn initializeForwards(self: *Machine) Error!void {
+        // Reserve manual ports before automatic SSH can reuse a remembered port.
+        for ([_]bool{ false, true }) |automatic| {
+            for (self.config.forwards, 0..) |forward, index| {
+                if (forward.guest_port == 0 or forward.automatic != automatic) continue;
+                const port = self.nat.addForward(forward) catch |err| {
+                    log.err("port forward {}->{} failed: {} (port in use?)", .{
+                        forward.host_port, forward.guest_port, err,
+                    });
+                    return error.Unexpected;
+                };
+                if (index < self.forwarded_ports.len) {
+                    self.forwarded_ports[index].store(port, .release);
+                }
+            }
+        }
     }
 
     pub fn guestToolsStatus(self: *const Machine) agent.native.Status {
@@ -2987,13 +3007,7 @@ pub const Machine = struct {
             self.nat.setRxReady(
                 callback_binding.Handler0(Machine, bool, natRxReadyCallback).bind(self),
             );
-            for (self.config.forwards) |fwd| {
-                self.nat.addForward(fwd) catch |err| {
-                    log.err("port forward {}->{} failed: {} (port in use?)", .{
-                        fwd.host_port, fwd.guest_port, err,
-                    });
-                };
-            }
+            try self.initializeForwards();
             if (self.config.docker_socket_path) |path| {
                 self.nat.addUnixForward(path, 2375) catch |err| {
                     log.err("Docker socket forward {s} failed: {}", .{ path, err });
@@ -3977,6 +3991,35 @@ test "MachineConfig.blockDeviceCount" {
     try testing.expectEqual(@as(u8, 2), two_disks.blockDeviceCount());
 }
 
+test "GUI forwarding publishes the configured slots after reserving manual ports" {
+    const testing = std.testing;
+    const forwards = [_]mininat.Forward{
+        .{ .host_port = 0, .guest_port = 22, .automatic = true },
+        .{ .host_port = 0, .guest_port = 80 },
+        .{ .host_port = 0, .guest_port = 0 },
+    };
+    const machine = try Machine.init(testing.allocator, .{ .forwards = &forwards });
+    defer machine.deinit();
+    machine.nat = mininat.MiniNat.init(
+        testing.allocator,
+        callback_binding.Handler1(Machine, []const u8, void, Machine.natReplyCallback).bind(machine),
+    );
+    defer machine.nat.stop();
+    try machine.initializeForwards();
+    try testing.expectEqual(@as(usize, 2), machine.nat.listeners.items.len);
+    try testing.expectEqual(@as(u16, 80), machine.nat.listeners.items[0].guest_port);
+    try testing.expectEqual(@as(u16, 22), machine.nat.listeners.items[1].guest_port);
+    try testing.expectEqual(
+        machine.nat.listeners.items[1].host_port,
+        machine.forwarded_ports[0].load(.acquire),
+    );
+    try testing.expectEqual(
+        machine.nat.listeners.items[0].host_port,
+        machine.forwarded_ports[1].load(.acquire),
+    );
+    try testing.expectEqual(@as(u16, 0), machine.forwarded_ports[2].load(.acquire));
+}
+
 test "Machine and CPU states allocation profile" {
     const testing = std.testing;
     var counted = testing.FailingAllocator.init(testing.allocator, .{});
@@ -3991,7 +4034,8 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    try testing.expect(@sizeOf(Machine) <= 6240);
+    // Includes 16 bytes for eight atomically published forwarding ports.
+    try testing.expect(@sizeOf(Machine) <= 6256);
 }
 
 test "stop before synchronous thread entry cancels startup" {

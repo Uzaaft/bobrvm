@@ -17,6 +17,8 @@ struct EditVMView: View {
     @State private var retinaEnabled: Bool
     @State private var networkEnabled: Bool
     @State private var touchIDEnabled: Bool
+    @State private var ssh: SSHSettings
+    @State private var portForwards: [TCPForward]
     @State private var sharedFolderPath: String
     @State private var diskSizeGB: Double
     @State private var showingError = false
@@ -47,6 +49,8 @@ struct EditVMView: View {
         _retinaEnabled = State(initialValue: vmInstance.retinaEnabled)
         _networkEnabled = State(initialValue: vmInstance.config.networkEnabled)
         _touchIDEnabled = State(initialValue: vmInstance.config.touchIDEnabled)
+        _ssh = State(initialValue: vmInstance.ssh)
+        _portForwards = State(initialValue: vmInstance.config.portForwards)
         _sharedFolderPath = State(initialValue: vmInstance.config.sharedFolderPath ?? "")
         _diskSizeGB = State(
             initialValue: Double(
@@ -70,6 +74,7 @@ struct EditVMView: View {
                     resourcesSection
                     graphicsSection
                     networkSection
+                    forwardingSection
                     touchIDSection
                     informationSection
                 }
@@ -150,6 +155,8 @@ struct EditVMView: View {
                 if selected == .virtualization {
                     sharedFolderPath = ""
                     touchIDEnabled = false
+                    ssh.enabled = false
+                    portForwards = []
                 }
                 hasChanges = true
             }
@@ -337,6 +344,49 @@ struct EditVMView: View {
     }
 
     @ViewBuilder
+    private var forwardingSection: some View {
+        if backend == .hypervisor {
+            Section {
+                Toggle("SSH access from this Mac", isOn: $ssh.enabled)
+                if ssh.enabled {
+                    TextField("Guest username", text: $ssh.username)
+                    Toggle("Choose SSH port automatically", isOn: $ssh.automatic)
+                    if !ssh.automatic {
+                        TextField("SSH host port", value: $ssh.port, format: .number)
+                    }
+                }
+                ForEach($portForwards) { $forward in
+                    VStack(alignment: .leading) {
+                        HStack {
+                            TextField("Host port", value: $forward.hostPort, format: .number)
+                            Image(systemName: "arrow.right")
+                            TextField("Guest port", value: $forward.guestPort, format: .number)
+                            Button("Remove", systemImage: "minus.circle") {
+                                portForwards.removeAll { $0.id == forward.id }
+                            }
+                            .labelStyle(.iconOnly)
+                        }
+                        Toggle("Allow LAN access", isOn: $forward.allowLAN)
+                    }
+                }
+                Button("Add TCP port forward", systemImage: "plus") {
+                    portForwards.append(TCPForward())
+                }
+                .disabled(portForwards.count >= 7)
+            } header: {
+                LockableSectionHeader(title: "SSH and Port Forwarding", isLocked: isRunning)
+            } footer: {
+                Text("Enable SSH and configure login credentials inside the guest first. "
+                    + "Ports are accessible only from this Mac unless LAN access is enabled. "
+                    + "Stop the VM to edit these settings.")
+            }
+            .disabled(isRunning || !networkEnabled)
+            .onChange(of: ssh) { hasChanges = true }
+            .onChange(of: portForwards) { hasChanges = true }
+        }
+    }
+
+    @ViewBuilder
     private var touchIDSection: some View {
         if vmInstance.guestSystem == .linux {
             Section {
@@ -493,6 +543,8 @@ struct EditVMView: View {
                     retinaEnabled: retinaEnabled,
                     networkEnabled: networkEnabled,
                     touchIDEnabled: touchIDEnabled,
+                    ssh: ssh,
+                    portForwards: portForwards,
                     sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
                     diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil,
                     backend: backend

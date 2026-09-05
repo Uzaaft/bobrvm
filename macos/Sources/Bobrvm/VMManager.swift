@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -36,6 +37,7 @@ public final class VMManager: ObservableObject {
                 id: stored.id,
                 name: stored.name,
                 config: stored.vmConfig,
+                ssh: stored.ssh ?? SSHSettings(),
                 app: app,
                 isoPath: stored.isoPath,
                 retinaEnabled: stored.retinaEnabled ?? true,
@@ -54,6 +56,7 @@ public final class VMManager: ObservableObject {
     public func createVM(
         name: String,
         config: VMConfig,
+        ssh: SSHSettings = SSHSettings(),
         isoPath: String? = nil,
         retinaEnabled: Bool = true,
         guestSystem: GuestSystem = .linux,
@@ -64,12 +67,14 @@ public final class VMManager: ObservableObject {
         }
 
         let selectedBackend = backend ?? VMBackend.defaultValue(for: guestSystem)
-        try selectedBackend.validate(guestSystem: guestSystem, config: config)
-        let vm = selectedBackend == .hypervisor ? try app.createVM(config: config) : nil
+        let runtimeConfig = try ssh.applying(to: config)
+        try selectedBackend.validate(guestSystem: guestSystem, config: runtimeConfig)
+        let vm = selectedBackend == .hypervisor ? try app.createVM(config: runtimeConfig) : nil
         do {
             let instance = VMInstance(
                 name: name,
                 config: config,
+                ssh: ssh,
                 app: app,
                 vm: vm,
                 isoPath: isoPath,
@@ -158,6 +163,8 @@ public final class VMManager: ObservableObject {
         retinaEnabled: Bool,
         networkEnabled: Bool,
         touchIDEnabled: Bool,
+        ssh: SSHSettings,
+        portForwards: [TCPForward],
         sharedFolderPath: String?,
         diskSizeGB: Int?,
         backend: VMBackend
@@ -180,6 +187,7 @@ public final class VMManager: ObservableObject {
             networkEnabled: networkEnabled,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && instance.guestSystem == .linux,
+            portForwards: portForwards,
             sharedFolderPath: effectiveSharedFolder,
             firmwarePath: instance.config.firmwarePath,
             varsPath: instance.config.varsPath,
@@ -196,6 +204,7 @@ public final class VMManager: ObservableObject {
             instance,
             name: name,
             config: newConfig,
+            ssh: ssh,
             isoPath: isoPath,
             retinaEnabled: retinaEnabled,
             backend: backend
@@ -219,6 +228,7 @@ public final class VMManager: ObservableObject {
             instance,
             name: instance.name,
             config: newConfig,
+            ssh: instance.ssh,
             isoPath: path,
             retinaEnabled: instance.retinaEnabled,
             backend: instance.backend
@@ -285,6 +295,7 @@ public final class VMManager: ObservableObject {
         _ instance: VMInstance,
         name: String,
         config: VMConfig,
+        ssh: SSHSettings,
         isoPath: String?,
         retinaEnabled: Bool,
         backend: VMBackend
@@ -298,15 +309,17 @@ public final class VMManager: ObservableObject {
         }
 
         guard let app else { throw BobrvmError.invalidArgument }
-        try backend.validate(guestSystem: instance.guestSystem, config: config)
+        let runtimeConfig = try ssh.applying(to: config)
+        try backend.validate(guestSystem: instance.guestSystem, config: runtimeConfig)
         let newVM =
             backend == .hypervisor
-            ? try app.createVM(config: config)
+            ? try app.createVM(config: runtimeConfig)
             : nil
         let updatedInstance = VMInstance(
             id: instance.id,
             name: name,
             config: config,
+            ssh: ssh,
             app: app,
             vm: newVM,
             isoPath: isoPath,
@@ -393,6 +406,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
     public let id: UUID
     @Published public private(set) var name: String
+    @Published public private(set) var ssh: SSHSettings
     @Published public private(set) var config: VMConfig
     private let app: App
     private var runtime: (any VMRuntime)?
@@ -406,11 +420,44 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     @Published public var surface: Surface?
 
     private var runtimeStateCancellable: AnyCancellable?
+    @Published private(set) var sshError: String?
+
+    var sshAlias: String { "bobrvm-\(id.uuidString.lowercased())" }
+
+    var sshPort: UInt16 {
+        guard ssh.enabled, state == .running,
+            runtimeVM?.isStopping == false
+        else { return 0 }
+        return runtimeVM?.forwardedPorts.first ?? 0
+    }
+
+    var sshCommand: String {
+        "ssh -o HostKeyAlias=\(sshAlias) -p \(sshPort) \(ssh.username)@127.0.0.1"
+    }
+
+    func openSSH() {
+        guard sshPort != 0, ssh.validUsername else { return }
+        let directory = DiskManager.appSupportDir.appendingPathComponent("ssh", isDirectory: true)
+        let script = directory.appendingPathComponent("\(id.uuidString).command")
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true
+            )
+            try "#!/bin/sh\nexec /usr/bin/\(sshCommand)\n"
+                .write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: script.path
+            )
+            NSWorkspace.shared.open(script)
+            sshError = nil
+        } catch { sshError = error.localizedDescription }
+    }
 
     public init(
         id: UUID = UUID(),
         name: String,
         config: VMConfig,
+        ssh: SSHSettings = SSHSettings(),
         app: App,
         vm: VM? = nil,
         isoPath: String? = nil,
@@ -423,6 +470,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         self.id = id
         self.name = name
         self.config = config
+        self.ssh = ssh
         self.app = app
         self.runtime = vm
         self.isoPath = isoPath
@@ -484,7 +532,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
 
     public func start() throws {
-        try backend.validate(guestSystem: guestSystem, config: config)
+        try backend.validate(guestSystem: guestSystem, config: ssh.applying(to: config))
         let runtime: any VMRuntime
         if let existing = self.runtime {
             runtime = existing
@@ -571,7 +619,7 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
 
     private func makeRuntime() throws -> any VMRuntime {
         if backend == .hypervisor {
-            return try app.createVM(config: config)
+            return try app.createVM(config: ssh.applying(to: config))
         }
         if guestSystem == .macOS {
             guard let macOSPlatform else {
@@ -589,6 +637,16 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     private func observeRuntime() {
         runtimeStateCancellable = runtime?.stateChanges.sink { [weak self] _ in
             self?.objectWillChange.send()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let port = self.sshPort
+                guard port != 0, self.ssh.automatic, self.ssh.port != port else {
+                    return
+                }
+                self.ssh.port = port
+                do { try VMStorage.saveVM(self) }
+                catch { self.sshError = error.localizedDescription }
+            }
         }
     }
 }
@@ -619,6 +677,8 @@ enum VMStorage {
         let retinaEnabled: Bool?
         let networkEnabled: Bool?
         let touchIDEnabled: Bool?
+        let ssh: SSHSettings?
+        let portForwards: [TCPForward]?
         let sharedFolderPath: String?
         let guestSystem: GuestSystem?
         let backend: VMBackend?
@@ -672,6 +732,7 @@ enum VMStorage {
                 gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
                 networkEnabled: networkEnabled ?? true,
                 touchIDEnabled: touchIDEnabled ?? false,
+                portForwards: portForwards ?? [],
                 sharedFolderPath: sharedFolderPath,
                 firmwarePath: effectiveFirmwarePath,
                 varsPath: effectiveVarsPath,
@@ -705,6 +766,8 @@ enum VMStorage {
             self.retinaEnabled = instance.retinaEnabled
             self.networkEnabled = instance.config.networkEnabled
             self.touchIDEnabled = instance.config.touchIDEnabled
+            self.ssh = instance.ssh
+            self.portForwards = instance.config.portForwards
             self.sharedFolderPath = instance.config.sharedFolderPath
             self.guestSystem = instance.guestSystem
             self.backend = instance.backend

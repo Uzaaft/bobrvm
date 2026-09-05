@@ -4,6 +4,111 @@ import XCTest
 @testable import Bobrvm
 
 final class BobrvmKitTests: XCTestCase {
+    func testForwardingPreservesCSlotsAndCodableSettings() throws {
+        var ssh = SSHSettings()
+        ssh.enabled = true
+        ssh.username = "alice"
+        ssh.port = 2222
+        var forward = TCPForward()
+        forward.hostPort = 8443
+        forward.guestPort = 443
+        forward.allowLAN = true
+        let config = try ssh.applying(to: VMConfig(networkEnabled: true, portForwards: [forward]))
+        try config.withCConfig { pointer in
+            XCTAssertEqual(pointer.pointee.port_forward_count, 2)
+            let slots = pointer.pointee.port_forwards
+            XCTAssertEqual(slots.0.host_port, 2222)
+            XCTAssertEqual(slots.0.guest_port, 22)
+            XCTAssertTrue(slots.0.automatic)
+            XCTAssertFalse(slots.0.allow_lan)
+            XCTAssertEqual(slots.1.host_port, 8443)
+            XCTAssertEqual(slots.1.guest_port, 443)
+            XCTAssertTrue(slots.1.allow_lan)
+            XCTAssertEqual(slots.7.guest_port, 0)
+        }
+        XCTAssertEqual(
+            try JSONDecoder().decode(SSHSettings.self, from: JSONEncoder().encode(ssh)), ssh
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(TCPForward.self, from: JSONEncoder().encode(forward)), forward
+        )
+    }
+
+    func testSSHRejectsConfigInjectionAndInvalidForwarding() throws {
+        var ssh = SSHSettings()
+        ssh.enabled = true
+        for username in ["", "-oProxyCommand=bad", "alice\nProxyCommand bad", "a b", "a'b"] {
+            ssh.username = username
+            XCTAssertFalse(ssh.validUsername)
+            XCTAssertThrowsError(try ssh.applying(to: VMConfig()))
+        }
+        ssh.username = "alice"
+        var config = VMConfig(networkEnabled: true)
+        XCTAssertNoThrow(try VMBackend.hypervisor.validate(
+            guestSystem: .linux, config: ssh.applying(to: config)
+        ))
+        XCTAssertThrowsError(try VMBackend.virtualization.validate(
+            guestSystem: .linux, config: ssh.applying(to: config)
+        ))
+        config.networkEnabled = false
+        XCTAssertThrowsError(try ssh.applying(to: config).validate())
+        config.networkEnabled = true
+        ssh.automatic = false
+        XCTAssertThrowsError(try ssh.applying(to: config).validate())
+        ssh.port = 8080
+        config.portForwards = [TCPForward()]
+        XCTAssertThrowsError(try ssh.applying(to: config).validate())
+    }
+
+    func testGenericForwardingUsesAllSlotsAndRejectsOverflow() throws {
+        var config = VMConfig(networkEnabled: true)
+        config.portForwards = (0..<8).map { index in
+            var forward = TCPForward()
+            forward.hostPort = UInt16(8000 + index)
+            return forward
+        }
+        XCTAssertNoThrow(try config.validate())
+        try config.withCConfig { pointer in
+            XCTAssertEqual(pointer.pointee.port_forward_count, 8)
+            XCTAssertEqual(pointer.pointee.port_forwards.0.guest_port, 8080)
+            XCTAssertEqual(pointer.pointee.port_forwards.7.host_port, 8007)
+        }
+        config.portForwards.append(TCPForward())
+        XCTAssertThrowsError(try config.validate())
+    }
+
+    func testStoredForwardingDefaultsToManualForLegacyRules() throws {
+        let json = """
+            {"id":"01234567-89AB-CDEF-0123-456789ABCDEF",
+             "hostPort":8080,"guestPort":80,"allowLAN":false}
+            """
+        let forward = try JSONDecoder().decode(TCPForward.self, from: Data(json.utf8))
+        XCTAssertFalse(forward.automatic)
+        XCTAssertEqual(forward.guestPort, 80)
+    }
+
+    @MainActor
+    func testStoredVMKeepsSSHSeparateFromRuntimeForwarding() throws {
+        let app = try App()
+        var ssh = SSHSettings()
+        ssh.enabled = true
+        ssh.username = "alice"
+        ssh.port = 2222
+        let config = VMConfig(networkEnabled: true, portForwards: [TCPForward()])
+        let instance = VMInstance(name: "SSH", config: config, ssh: ssh, app: app)
+        let stored = try JSONDecoder().decode(
+            VMStorage.StoredVM.self,
+            from: JSONEncoder().encode(VMStorage.StoredVM(from: instance))
+        )
+        XCTAssertEqual(stored.ssh, ssh)
+        XCTAssertEqual(stored.vmConfig.portForwards, config.portForwards)
+        let runtimeConfig = try XCTUnwrap(stored.ssh).applying(to: stored.vmConfig)
+        XCTAssertEqual(runtimeConfig.portForwards.count, 2)
+        XCTAssertEqual(runtimeConfig.portForwards[0].guestPort, 22)
+        XCTAssertEqual(runtimeConfig.portForwards[0].hostPort, 2222)
+        XCTAssertEqual(runtimeConfig.portForwards[1], config.portForwards[0])
+    }
+
     func testErrorCodesMapToStableFailures() {
         let expected: [(Int32, String)] = [
             (1, "Invalid argument"),
@@ -71,7 +176,7 @@ final class BobrvmKitTests: XCTestCase {
         XCTAssertTrue(status.supportsManagement)
     }
 
-    func testVMConfigPreservesScalarAndStringFields() {
+    func testVMConfigPreservesScalarAndStringFields() throws {
         let config = VMConfig(
             memoryBytes: 3_221_225_472,
             vcpuCount: 7,
@@ -92,7 +197,7 @@ final class BobrvmKitTests: XCTestCase {
             isoReadOnly: false
         )
 
-        config.withCConfig { pointer in
+        try config.withCConfig { pointer in
             let c = pointer.pointee
             XCTAssertEqual(c.memory_bytes, config.memoryBytes)
             XCTAssertEqual(c.vcpu_count, config.vcpuCount)
@@ -114,10 +219,10 @@ final class BobrvmKitTests: XCTestCase {
         }
     }
 
-    func testVMConfigKeepsAbsentStringsNull() {
+    func testVMConfigKeepsAbsentStringsNull() throws {
         let config = VMConfig()
 
-        config.withCConfig { pointer in
+        try config.withCConfig { pointer in
             let c = pointer.pointee
             XCTAssertNil(c.shared_dir)
             XCTAssertNil(c.firmware_path)

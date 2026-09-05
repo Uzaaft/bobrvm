@@ -139,6 +139,16 @@ typedef bobrvm_authentication_result_e bobrvm_touch_id_result_e;
 
 /* Configuration. */
 
+/** TCP forwarding. Guest ports must be nonzero; host ports must be at least 1024.
+ * Automatic rules may use host port zero and fall back when a remembered port is busy.
+ */
+typedef struct {
+    uint16_t host_port;
+    uint16_t guest_port;
+    bool allow_lan;
+    bool automatic;
+} bobrvm_port_forward_s;
+
 typedef struct {
     uint64_t memory_bytes;
     uint8_t vcpu_count;
@@ -170,7 +180,13 @@ typedef struct {
      * Venus stack; disabled by default.
      */
     bool enable_gpu3d;
+    bobrvm_port_forward_s port_forwards[8];
+    /** Number of active rules, at most eight. Manual host ports must be distinct. */
+    uint8_t port_forward_count;
 } bobrvm_vm_config_s;
+
+/** Actual listening port for a configured slot, or zero when unavailable. */
+uint16_t bobrvm_vm_forwarded_port(bobrvm_vm_t vm, uint8_t slot);
 
 typedef struct {
     uint64_t memory_bytes;

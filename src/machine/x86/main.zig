@@ -740,12 +740,13 @@ pub const Machine = struct {
             callback_binding.Handler0(Machine, bool, natRxReady).bind(self),
         );
         for (forwards) |forward| {
-            self.nat.addForward(forward) catch |err| {
+            _ = self.nat.addForward(forward) catch |err| {
                 log.err("port forward {}->{} failed: {}", .{
                     forward.host_port,
                     forward.guest_port,
                     err,
                 });
+                continue;
             };
         }
         self.nat.start() catch |err| {

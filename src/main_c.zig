@@ -249,6 +249,14 @@ pub export fn bobrvm_vm_send_file(vm: ?*apprt.VM, path: ?[*:0]const u8) c_int {
     return 0;
 }
 
+pub export fn bobrvm_vm_forwarded_port(vm: ?*apprt.VM, slot: u8) u16 {
+    const v = vm orelse return 0;
+    const hw = v.hw_machine orelse return 0;
+    if (!hw.isRunning()) return 0;
+    if (slot >= hw.forwarded_ports.len) return 0;
+    return hw.forwarded_ports[slot].load(.acquire);
+}
+
 pub export fn bobrvm_vm_host_clipboard_changed(vm: ?*apprt.VM) void {
     const v = vm orelse return;
     v.hostClipboardChanged();

@@ -107,6 +107,11 @@ pub const VMConfig = extern struct {
     /// venus capset when built with -Dgpu-venus). Off by default: a 2D-only
     /// scanout is the safe path, and 3D needs the venus host stack present.
     enable_gpu3d: bool = false,
+    port_forwards: [8]@import("../net/mininat.zig").Forward = @splat(.{
+        .host_port = 0,
+        .guest_port = 0,
+    }),
+    port_forward_count: u8 = 0,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
@@ -123,6 +128,18 @@ pub const VMConfig = extern struct {
             .disk2_path = optionalString(self.disk2_path),
             .disk2_read_only = self.disk2_read_only,
         }) catch return false;
+        if (self.port_forward_count > self.port_forwards.len) return false;
+        if (self.port_forward_count != 0 and !self.enable_net) return false;
+        const forwards = self.port_forwards[0..self.port_forward_count];
+        for (forwards, 0..) |forward, index| {
+            if (forward.guest_port == 0) return false;
+            if (forward.host_port < 1024 and
+                !(forward.automatic and forward.host_port == 0)) return false;
+            if (forward.automatic) continue;
+            for (forwards[0..index]) |previous| {
+                if (!previous.automatic and previous.host_port == forward.host_port) return false;
+            }
+        }
         if (optionalString(self.shared_dir)) |path| {
             if (!std.fs.path.isAbsolute(path)) return false;
         }
@@ -215,6 +232,8 @@ pub const VMConfig = extern struct {
             .display_height = self.display_height,
             .gpu_memory_bytes = self.gpu_memory_bytes,
             .enable_gpu3d = self.enable_gpu3d,
+            .port_forwards = self.port_forwards,
+            .port_forward_count = self.port_forward_count,
         };
     }
 };
@@ -240,6 +259,11 @@ pub const OwnedVMConfig = struct {
     display_height: u32 = 0,
     gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
     enable_gpu3d: bool = false,
+    port_forwards: [8]@import("../net/mininat.zig").Forward = @splat(.{
+        .host_port = 0,
+        .guest_port = 0,
+    }),
+    port_forward_count: u8 = 0,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.string_storage.len > 0) alloc.free(self.string_storage);
@@ -555,6 +579,7 @@ pub const VM = struct {
                 .enable_gpu = true,
                 .enable_virgl = self.config.enable_gpu3d,
                 .enable_net = self.config.enable_net,
+                .forwards = self.config.port_forwards[0..self.config.port_forward_count],
                 .enable_touch_id = self.config.enable_touch_id,
                 .shared_dir = self.config.shared_dir,
                 .display_width = if (self.config.display_width != 0)
@@ -680,6 +705,10 @@ pub const VM = struct {
         }
         if (self.hw_machine) |hw| {
             self.console_session.detach();
+            for (&self.config.port_forwards, 0..) |*forward, index| {
+                const port = hw.forwarded_ports[index].load(.acquire);
+                if (forward.automatic and port != 0) forward.host_port = port;
+            }
             // Must fully deinit to release hypervisor (only one VM per process).
             hw.deinit();
             self.hw_machine = null;
@@ -1288,6 +1317,52 @@ test "App VM registry does not allocate" {
     try std.testing.expectEqual(@as(usize, 1), counted.allocations);
     vm.destroy();
     app.alloc = base_alloc;
+}
+
+test "forwarding validation rejects invalid rules before creating a VM" {
+    var config = VMConfig{ .enable_net = true, .port_forward_count = 1 };
+    const forward = &config.port_forwards[0];
+    forward.* = .{ .host_port = 8080, .guest_port = 0 };
+    try std.testing.expect(!config.validate());
+    forward.guest_port = 22;
+    forward.host_port = 1023;
+    try std.testing.expect(!config.validate());
+    forward.host_port = 0;
+    try std.testing.expect(!config.validate());
+    forward.automatic = true;
+    try std.testing.expect(config.validate());
+    forward.host_port = 22;
+    try std.testing.expect(!config.validate());
+    forward.host_port = 8080;
+    config.port_forward_count = 2;
+    config.port_forwards[1] = .{ .host_port = 8080, .guest_port = 80 };
+    // An automatic rule can fall back when a manual rule reserves its port.
+    try std.testing.expect(config.validate());
+    forward.automatic = false;
+    try std.testing.expect(!config.validate());
+    config.port_forwards[1].host_port = 8081;
+    try std.testing.expect(config.validate());
+    config.port_forward_count = 9;
+    try std.testing.expect(!config.validate());
+    config.port_forward_count = 0;
+    config.enable_net = false;
+    try std.testing.expect(config.validate());
+}
+
+test "forwarding configuration is owned and requires networking" {
+    var config = VMConfig{};
+    config.port_forward_count = 1;
+    config.port_forwards[0] = .{ .host_port = 2222, .guest_port = 22, .automatic = true };
+    try std.testing.expect(!config.validate());
+    config.enable_net = true;
+    try std.testing.expect(config.validate());
+    var owned = try config.dupe(std.testing.allocator);
+    defer owned.deinit(std.testing.allocator);
+    config.port_forwards[0].host_port = 9999;
+    try std.testing.expectEqual(@as(u8, 1), owned.port_forward_count);
+    try std.testing.expectEqual(@as(u16, 2222), owned.port_forwards[0].host_port);
+    try std.testing.expect(owned.port_forwards[0].automatic);
+    try std.testing.expectEqual(@as(u16, 0), owned.port_forwards[7].guest_port);
 }
 
 test "VM object and configuration storage share one allocation" {

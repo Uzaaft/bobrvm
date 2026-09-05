@@ -203,6 +203,28 @@ struct VMOverviewView: View {
                         label: "Network",
                         value: vmInstance.config.networkEnabled ? "Connected" : "Disconnected"
                     )
+                    if vmInstance.ssh.enabled {
+                        if vmInstance.sshPort != 0 {
+                            Text(vmInstance.sshCommand)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                            HStack {
+                                Button("SSH", systemImage: "terminal") { vmInstance.openSSH() }
+                                Button("Copy command", systemImage: "doc.on.doc") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(
+                                        vmInstance.sshCommand, forType: .string
+                                    )
+                                }
+                            }
+                        } else {
+                            Text("SSH forwarding is available after the VM starts.")
+                                .font(.caption)
+                        }
+                        if let error = vmInstance.sshError {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
+                    }
                 }
             }
 
