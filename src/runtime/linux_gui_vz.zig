@@ -146,7 +146,7 @@ fn createConfiguration(config: *const Config) Backend.InitError!Object {
     const configuration = try newObject("VZVirtualMachineConfiguration");
     configuration.msgSend(void, "setBootLoader:", .{(try createBootLoader(config)).value});
     configuration.msgSend(void, "setPlatform:", .{(try createPlatform(config)).value});
-    configureCompute(configuration, config);
+    vz_objc.configureCompute(configuration, config.vcpu_count, config.memory_bytes);
     try configureStorage(configuration, config);
     try configureGraphicsAndInput(configuration, config);
     try configureNetwork(configuration, config);
@@ -203,28 +203,10 @@ fn createVariableStore(path: [*:0]const u8) ObjectError!Object {
 fn createPlatform(config: *const Config) Backend.InitError!Object {
     const machine_path = config.machine_id_path orelse return error.InvalidConfig;
     const platform = try newObject("VZGenericPlatformConfiguration");
-    platform.msgSend(void, "setMachineIdentifier:", .{
-        (try loadOrCreateMachineId(machine_path)).value,
-    });
+    const identifier = try vz_objc.loadOrCreateMachineId(machine_path);
+    if (!identifier.persisted) return error.FrameworkObjectCreationFailed;
+    platform.msgSend(void, "setMachineIdentifier:", .{identifier.object.value});
     return platform;
-}
-
-fn configureCompute(configuration: Object, config: *const Config) void {
-    const class = objc.getClass("VZVirtualMachineConfiguration").?;
-    const cpu_min = class.msgSend(NSUInteger, "minimumAllowedCPUCount", .{});
-    const cpu_max = class.msgSend(NSUInteger, "maximumAllowedCPUCount", .{});
-    const memory_min = class.msgSend(u64, "minimumAllowedMemorySize", .{});
-    const memory_max = class.msgSend(u64, "maximumAllowedMemorySize", .{});
-    configuration.msgSend(void, "setCPUCount:", .{std.math.clamp(
-        @as(NSUInteger, config.vcpu_count),
-        cpu_min,
-        cpu_max,
-    )});
-    configuration.msgSend(void, "setMemorySize:", .{std.math.clamp(
-        config.memory_bytes,
-        memory_min,
-        memory_max,
-    )});
 }
 
 fn configureStorage(configuration: Object, config: *const Config) Backend.InitError!void {
@@ -294,29 +276,6 @@ fn createDiskAttachment(path: [*:0]const u8, read_only: bool) ObjectError!Object
         return error.FrameworkObjectCreationFailed;
     }
     return result.msgSend(Object, "autorelease", .{});
-}
-
-fn loadOrCreateMachineId(path: [*:0]const u8) ObjectError!Object {
-    const existing = objc.getClass("NSData").?.msgSend(
-        Object,
-        "dataWithContentsOfFile:",
-        .{string(path).value},
-    );
-    if (existing.value != null) {
-        return initObject(
-            "VZGenericMachineIdentifier",
-            "initWithDataRepresentation:",
-            .{existing.value},
-        );
-    }
-    const identifier = try newObject("VZGenericMachineIdentifier");
-    const data = identifier.msgSend(Object, "dataRepresentation", .{});
-    if (data.value == null) return error.FrameworkObjectCreationFailed;
-    if (!boolResult(data.msgSend(BOOL, "writeToFile:atomically:", .{
-        string(path).value,
-        boolParam(true),
-    }))) return error.FrameworkObjectCreationFailed;
-    return identifier;
 }
 
 fn logNSError(message: []const u8, error_object: id) void {

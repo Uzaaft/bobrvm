@@ -262,7 +262,7 @@ fn createConfiguration(
     const configuration = try newObject("VZVirtualMachineConfiguration");
     configuration.msgSend(void, "setBootLoader:", .{(try newObject("VZMacOSBootLoader")).value});
     configuration.msgSend(void, "setPlatform:", .{platform.value});
-    configureCompute(configuration, config);
+    vz_objc.configureCompute(configuration, config.vcpu_count, config.memory_bytes);
     finishStartupStep(&profile.configuration_ns, &step_started_ns);
     try configureStorageAndGraphics(configuration, config);
     finishStartupStep(&profile.storage_graphics_ns, &step_started_ns);
@@ -321,24 +321,6 @@ fn createPlatform(config: *const MacOSConfig) Backend.InitError!Object {
     platform.msgSend(void, "setMachineIdentifier:", .{identifier.value});
     platform.msgSend(void, "setAuxiliaryStorage:", .{auxiliary.value});
     return platform;
-}
-
-fn configureCompute(configuration: Object, config: *const MacOSConfig) void {
-    const configuration_class = objc.getClass("VZVirtualMachineConfiguration").?;
-    const cpu_min = configuration_class.msgSend(NSUInteger, "minimumAllowedCPUCount", .{});
-    const cpu_max = configuration_class.msgSend(NSUInteger, "maximumAllowedCPUCount", .{});
-    const memory_min = configuration_class.msgSend(u64, "minimumAllowedMemorySize", .{});
-    const memory_max = configuration_class.msgSend(u64, "maximumAllowedMemorySize", .{});
-    configuration.msgSend(void, "setCPUCount:", .{std.math.clamp(
-        @as(NSUInteger, config.vcpu_count),
-        cpu_min,
-        cpu_max,
-    )});
-    configuration.msgSend(void, "setMemorySize:", .{std.math.clamp(
-        config.memory_bytes,
-        memory_min,
-        memory_max,
-    )});
 }
 
 fn configureStorageAndGraphics(configuration: Object, config: *const MacOSConfig) Backend.InitError!void {

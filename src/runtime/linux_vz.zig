@@ -462,9 +462,11 @@ fn createConfiguration(
 
     if (config.machine_id_path) |path| {
         const platform = try newObject("VZGenericPlatformConfiguration");
-        platform.msgSend(void, "setMachineIdentifier:", .{
-            (try loadOrCreateMachineId(path)).value,
-        });
+        const identifier = try vz_objc.loadOrCreateMachineId(path);
+        if (!identifier.persisted) {
+            log.warn("could not persist machine identifier to {s}", .{path});
+        }
+        platform.msgSend(void, "setMachineIdentifier:", .{identifier.object.value});
         configuration.msgSend(void, "setPlatform:", .{platform.value});
     }
     finishStartupStep(&profile.platform_ns, &step_started_ns);
@@ -520,33 +522,6 @@ fn createDiskDevice(
         "initWithAttachment:",
         .{attachment.msgSend(Object, "autorelease", .{}).value},
     );
-}
-
-/// Load the persisted machine identifier, creating and persisting a
-/// fresh one on first use.
-fn loadOrCreateMachineId(path: [:0]const u8) ObjectError!Object {
-    const existing = objc.getClass("NSData").?.msgSend(
-        Object,
-        "dataWithContentsOfFile:",
-        .{string(path).value},
-    );
-    if (existing.value != null) {
-        return initObject(
-            "VZGenericMachineIdentifier",
-            "initWithDataRepresentation:",
-            .{existing.value},
-        );
-    }
-    const identifier = try newObject("VZGenericMachineIdentifier");
-    const data = identifier.msgSend(Object, "dataRepresentation", .{});
-    if (data.value == null) return error.FrameworkObjectCreationFailed;
-    if (!boolResult(data.msgSend(BOOL, "writeToFile:atomically:", .{
-        string(path).value,
-        boolParam(true),
-    }))) {
-        log.warn("could not persist machine identifier to {s}", .{path});
-    }
-    return identifier;
 }
 
 fn logNSError(message: []const u8, error_object: id) void {
