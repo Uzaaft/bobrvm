@@ -4,6 +4,38 @@ import XCTest
 @testable import Bobrvm
 
 final class BobrvmKitTests: XCTestCase {
+    func testBootConfigurationSelectsOneBootPath() throws {
+        var config = VMConfig(firmwarePath: "/firmware", varsPath: "/variables")
+        var boot = BootConfiguration(config: config)
+        boot.mode = .kernel
+        boot.kernel = "/kernel"
+        boot.initrd = "/initrd"
+        boot.arguments = "console=hvc0 root=/dev/vda"
+        config = try boot.applying(to: config)
+        XCTAssertNil(config.firmwarePath)
+        XCTAssertNil(config.varsPath)
+        XCTAssertEqual(config.kernelPath, "/kernel")
+        XCTAssertEqual(config.initrdPath, "/initrd")
+        XCTAssertEqual(config.cmdline, boot.arguments)
+        try config.withCConfig { pointer in
+            XCTAssertEqual(String(cString: pointer.pointee.kernel_path), "/kernel")
+            XCTAssertNil(pointer.pointee.firmware_path)
+        }
+        XCTAssertThrowsError(try VMBackend.virtualization.validate(
+            guestSystem: .linux, config: config
+        ))
+        boot.mode = .uefi
+        config = try boot.applying(to: config)
+        XCTAssertEqual(config.firmwarePath, "/firmware")
+        XCTAssertEqual(config.varsPath, "/variables")
+        XCTAssertNil(config.kernelPath)
+        XCTAssertNil(config.initrdPath)
+        XCTAssertNil(config.cmdline)
+        boot.mode = .kernel
+        boot.kernel = ""
+        XCTAssertThrowsError(try boot.applying(to: config))
+    }
+
     func testForwardingPreservesCSlotsAndCodableSettings() throws {
         var ssh = SSHSettings()
         ssh.enabled = true

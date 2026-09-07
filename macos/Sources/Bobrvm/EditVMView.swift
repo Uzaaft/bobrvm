@@ -7,6 +7,7 @@ struct EditVMView: View {
 
     let vmInstance: VMInstance
 
+    @State private var boot: BootConfiguration
     @State private var name: String
     @State private var backend: VMBackend
     @State private var isoPath: String
@@ -34,6 +35,7 @@ struct EditVMView: View {
 
     init(vmInstance: VMInstance) {
         self.vmInstance = vmInstance
+        _boot = State(initialValue: BootConfiguration(config: vmInstance.config))
         _name = State(initialValue: vmInstance.name)
         _backend = State(initialValue: vmInstance.backend)
         _isoPath = State(initialValue: vmInstance.isoPath ?? "")
@@ -70,6 +72,7 @@ struct EditVMView: View {
                 Form {
                     generalSection
                     backendSection
+                    bootSection
                     storageSection
                     resourcesSection
                     graphicsSection
@@ -164,6 +167,22 @@ struct EditVMView: View {
             LockableSectionHeader(title: "Virtualization Backend", isLocked: isRunning)
         } footer: {
             Text("Changing backend performs a cold boot; backend-specific state is not reused.")
+        }
+    }
+
+    @ViewBuilder
+    private var bootSection: some View {
+        if vmInstance.guestSystem == .linux && backend == .hypervisor {
+            Section("Boot") {
+                BootConfigurationFields(boot: $boot)
+            }
+            .disabled(isRunning)
+            .onChange(of: boot.mode) { hasChanges = true }
+            .onChange(of: boot.kernel) { hasChanges = true }
+            .onChange(of: boot.initrd) { hasChanges = true }
+            .onChange(of: boot.arguments) { hasChanges = true }
+            .onChange(of: boot.firmware) { hasChanges = true }
+            .onChange(of: boot.variables) { hasChanges = true }
         }
     }
 
@@ -547,7 +566,8 @@ struct EditVMView: View {
                     portForwards: portForwards,
                     sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
                     diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil,
-                    backend: backend
+                    backend: backend,
+                    boot: vmInstance.guestSystem == .linux && backend == .hypervisor ? boot : nil
                 )
             }
             dismiss()

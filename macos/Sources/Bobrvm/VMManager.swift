@@ -167,7 +167,8 @@ public final class VMManager: ObservableObject {
         portForwards: [TCPForward],
         sharedFolderPath: String?,
         diskSizeGB: Int?,
-        backend: VMBackend
+        backend: VMBackend,
+        boot: BootConfiguration? = nil
     ) throws {
         guard instance.state == .stopped else {
             throw BobrvmError.invalidState
@@ -178,7 +179,7 @@ public final class VMManager: ObservableObject {
         }
 
         let effectiveSharedFolder = backend == .hypervisor ? sharedFolderPath : nil
-        let newConfig = VMConfig(
+        var newConfig = VMConfig(
             memoryBytes: UInt64(memoryGB) * 1024 * 1024 * 1024,
             vcpuCount: UInt8(vcpuCount),
             displayWidth: UInt32(displayWidth),
@@ -199,6 +200,8 @@ public final class VMManager: ObservableObject {
             isoPath: isoPath,
             isoReadOnly: true
         )
+
+        if let boot { newConfig = try boot.applying(to: newConfig) }
 
         try replaceVM(
             instance,

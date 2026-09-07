@@ -66,6 +66,9 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
         guard supports(guestSystem) else {
             throw VMBackendError.unsupportedGuest(backend: self, guest: guestSystem)
         }
+        if config.kernelPath != nil && (self != .hypervisor || guestSystem != .linux) {
+            throw VMBackendError.directBootRequiresLinuxHypervisor
+        }
         if !config.portForwards.isEmpty {
             guard self == .hypervisor else { throw VMBackendError.invalidForwarding }
             do { try config.validate() }
@@ -88,6 +91,8 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
 enum VMBackendError: LocalizedError {
     case unsupportedGuest(backend: VMBackend, guest: GuestSystem)
     case diskRequired
+    case directBootRequiresLinuxHypervisor
+    case bootImageRequired
     case rawDiskRequired
     case touchIDRequiresLinuxHypervisor
     case invalidForwarding
@@ -102,6 +107,10 @@ enum VMBackendError: LocalizedError {
                 + "and distinct host ports from 1024 to 65535. Guest ports must be nonzero."
         case .unsupportedGuest(let backend, let guest):
             return "\(backend.displayName) does not support \(guest.displayName) guests."
+        case .directBootRequiresLinuxHypervisor:
+            return "Direct kernel boot requires Linux with Bobrvm Hypervisor."
+        case .bootImageRequired:
+            return "Choose a kernel for direct boot or firmware for UEFI boot."
         case .diskRequired:
             return "Apple Virtualization requires a boot disk."
         case .rawDiskRequired:
@@ -283,5 +292,69 @@ public struct SSHSettings: Codable, Equatable {
         forward.automatic = automatic
         result.portForwards.insert(forward, at: 0)
         return result
+    }
+}
+
+/// Editable boot inputs; applying a mode clears inputs for the other boot path.
+public struct BootConfiguration {
+    enum Mode: String, CaseIterable, Identifiable {
+        case uefi = "UEFI"
+        case kernel = "Linux kernel"
+        var id: Self { self }
+    }
+
+    var mode: Mode
+    var firmware: String
+    var variables: String
+    var kernel: String
+    var initrd: String
+    var arguments: String
+
+    init(config: VMConfig) {
+        mode = config.kernelPath == nil ? .uefi : .kernel
+        firmware = config.firmwarePath ?? Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd") ?? ""
+        variables = config.varsPath ?? ""
+        kernel = config.kernelPath ?? ""
+        initrd = config.initrdPath ?? ""
+        arguments = config.cmdline ?? "console=hvc0 earlycon=pl011,0x09000000"
+    }
+
+    func applying(to config: VMConfig) throws -> VMConfig {
+        guard !(mode == .kernel ? kernel : firmware).isEmpty else {
+            throw VMBackendError.bootImageRequired
+        }
+        var result = config
+        result.firmwarePath = mode == .uefi ? firmware : nil
+        result.varsPath = mode == .uefi && !variables.isEmpty ? variables : nil
+        result.kernelPath = mode == .kernel ? kernel : nil
+        result.initrdPath = mode == .kernel && !initrd.isEmpty ? initrd : nil
+        result.cmdline = mode == .kernel ? arguments : nil
+        return result
+    }
+}
+
+struct BootConfigurationFields: View {
+    @Binding var boot: BootConfiguration
+    var allowsModeChange = true
+
+    var body: some View {
+        if allowsModeChange {
+            Picker("Boot method", selection: $boot.mode) {
+                ForEach(BootConfiguration.Mode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+        }
+        if boot.mode == .kernel {
+            FilePickerField(label: "Kernel image", path: $boot.kernel, types: [])
+            FilePickerField(label: "Initrd (optional)", path: $boot.initrd, types: [])
+            TextField("Kernel arguments", text: $boot.arguments, axis: .vertical)
+                .lineLimit(2...6)
+            Text("Use an ARM64 Linux kernel. Set root= for disk-backed guests.")
+                .font(.caption).foregroundStyle(.secondary)
+        } else {
+            FilePickerField(label: "UEFI firmware", path: $boot.firmware, types: [])
+            FilePickerField(label: "UEFI variables", path: $boot.variables, types: [])
+        }
     }
 }

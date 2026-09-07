@@ -13,6 +13,7 @@ struct CreateVMView: View {
     @State private var backend = VMBackend.hypervisor
     @State private var source = VMSource.installFromISO
     @State private var name = "Linux"
+    @State private var boot = BootConfiguration(config: VMConfig())
     @State private var isoPath = ""
     @State private var ipswPath = ""
     @State private var macOSRestoreSource = MacOSRestoreSource.latest
@@ -82,6 +83,12 @@ struct CreateVMView: View {
                 diskSizeGB = max(diskSizeGB, 64)
             }
         }
+        .onChange(of: source) { _, source in
+            if source == .directKernel {
+                boot.mode = .kernel
+                backend = .hypervisor
+            }
+        }
         .alert(
             "Couldn’t Create Virtual Machine",
             isPresented: Binding(
@@ -107,7 +114,8 @@ struct CreateVMView: View {
                 isoPath: $isoPath,
                 ipswPath: $ipswPath,
                 macOSRestoreSource: $macOSRestoreSource,
-                existingDiskPath: $existingDiskPath
+                existingDiskPath: $existingDiskPath,
+                boot: $boot
             )
         case .hardware:
             HardwareStepView(
@@ -120,7 +128,8 @@ struct CreateVMView: View {
                 ssh: $ssh,
                 backend: $backend,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
-                systemInfo: systemInfo
+                systemInfo: systemInfo,
+                directBoot: source == .directKernel
             )
         case .storage:
             StorageStepView(
@@ -236,6 +245,7 @@ struct CreateVMView: View {
             switch source {
             case .installFromISO: return !isoPath.isEmpty
             case .existingDisk: return !existingDiskPath.isEmpty
+            case .directKernel: return !boot.kernel.isEmpty
             case .installMacOS:
                 return macOSRestoreSource == .latest || !ipswPath.isEmpty
             }
@@ -289,7 +299,7 @@ struct CreateVMView: View {
                 diskPath = existingDiskPath
             }
 
-            let config = makeConfig(diskPath: diskPath)
+            let config = try makeConfig(diskPath: diskPath)
             try vmManager.createVM(
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                 config: config,
@@ -309,12 +319,12 @@ struct CreateVMView: View {
         }
     }
 
-    private func makeConfig(diskPath: String) -> VMConfig {
+    private func makeConfig(diskPath: String) throws -> VMConfig {
         let safeName = DiskManager.safeFilename(name)
         let varsPath = DiskManager.appSupportDir
             .appendingPathComponent("\(safeName)_vars.fd")
             .path
-        return VMConfig(
+        let config = VMConfig(
             memoryBytes: UInt64(memoryGB * 1024 * 1024 * 1024),
             vcpuCount: UInt8(vcpuCount),
             displayWidth: resolution.width,
@@ -325,11 +335,12 @@ struct CreateVMView: View {
                 && operatingSystem == .linux,
             firmwarePath: Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd"),
             varsPath: varsPath,
-            diskPath: diskPath,
+            diskPath: diskPath.isEmpty ? nil : diskPath,
             diskReadOnly: false,
             isoPath: source == .installFromISO ? isoPath : nil,
             isoReadOnly: true
         )
+        return source == .directKernel ? try boot.applying(to: config) : config
     }
 
     private func updateDefaultName(to operatingSystem: CreationOperatingSystem) {
@@ -418,6 +429,7 @@ private enum CreationOperatingSystem: String, CaseIterable, Identifiable {
 private enum VMSource: String, CaseIterable, Identifiable {
     case installFromISO
     case existingDisk
+    case directKernel
     case installMacOS
 
     var id: Self { self }
@@ -579,6 +591,7 @@ private struct InstallationStepView: View {
     @Binding var ipswPath: String
     @Binding var macOSRestoreSource: MacOSRestoreSource
     @Binding var existingDiskPath: String
+    @Binding var boot: BootConfiguration
     @State private var showingWindowsDownloader = false
 
     var body: some View {
@@ -625,6 +638,17 @@ private struct InstallationStepView: View {
             VStack(spacing: 12) {
                 isoInstallationOption
                 existingDiskOption
+                if operatingSystem == .linux {
+                    SourceCard(
+                        title: "Boot a Linux kernel",
+                        detail: "Use a kernel and optional initrd without UEFI firmware.",
+                        icon: "terminal", selected: source == .directKernel
+                    ) { source = .directKernel }
+                    if source == .directKernel {
+                        BootConfigurationFields(boot: $boot, allowsModeChange: false)
+                        FilePickerField(label: "Disk (optional)", path: $existingDiskPath, types: [])
+                    }
+                }
             }
             if operatingSystem == .windows {
                 InformationLabel(text: "Windows installation media must support Arm64.")
@@ -700,7 +724,7 @@ private struct InstallationStepView: View {
         case .macOS:
             return "Choose where Bobrvm should obtain the macOS restore image."
         case .linux:
-            return "Install Linux from an ISO or use an existing virtual disk."
+            return "Install from ISO, use an existing disk, or boot a Linux kernel."
         case .windows:
             return "Install Windows for Arm from an ISO or use an existing virtual disk."
         }
@@ -718,6 +742,7 @@ private struct HardwareStepView: View {
     @Binding var backend: VMBackend
     let guestSystem: GuestSystem
     let systemInfo: SystemInfo
+    var directBoot = false
 
     var body: some View {
         WizardPage(
@@ -734,7 +759,9 @@ private struct HardwareStepView: View {
     private var backendSettings: some View {
         SettingsGroup(title: "Virtualization Backend", systemImage: "server.rack") {
             if guestSystem == .linux {
-                VMBackendSelectionView(selection: $backend, guestSystem: guestSystem)
+                VMBackendSelectionView(
+                    selection: $backend, guestSystem: guestSystem, disabled: directBoot
+                )
             } else {
                 SummaryRow(label: "Backend", value: backend.displayName)
                 Text("\(guestSystem.displayName) uses \(backend.frameworkName).")
@@ -864,12 +891,12 @@ private struct StorageStepView: View {
     var body: some View {
         WizardPage(
             title: "Configure storage",
-            subtitle: source != .existingDisk
+            subtitle: source != .existingDisk && source != .directKernel
                 ? "The disk is sparse and consumes space only as data is written."
                 : "Bobrvm will attach the selected disk without changing its contents."
         ) {
             SettingsGroup(title: "Virtual Disk", systemImage: "internaldrive") {
-                if source != .existingDisk {
+                if source != .existingDisk && source != .directKernel {
                     SettingSlider(
                         title: "Maximum disk size",
                         valueText: "\(Int(diskSizeGB)) GB",
@@ -887,7 +914,8 @@ private struct StorageStepView: View {
                 } else {
                     SummaryRow(
                         label: "Virtual disk",
-                        value: URL(fileURLWithPath: existingDiskPath).lastPathComponent
+                        value: existingDiskPath.isEmpty ? "None"
+                            : URL(fileURLWithPath: existingDiskPath).lastPathComponent
                     )
                     Text(existingDiskPath)
                         .font(.system(.caption, design: .monospaced))
@@ -961,9 +989,10 @@ private struct SummaryStepView: View {
                 Divider()
                 SummaryRow(
                     label: "Disk",
-                    value: source != .existingDisk
+                    value: source != .existingDisk && source != .directKernel
                         ? "\(diskSizeGB) GB sparse disk"
-                        : URL(fileURLWithPath: existingDiskPath).lastPathComponent
+                        : existingDiskPath.isEmpty ? "None"
+                            : URL(fileURLWithPath: existingDiskPath).lastPathComponent
                 )
             }
             SettingsGroup(title: "Installation Media", systemImage: "opticaldisc") {
@@ -992,6 +1021,8 @@ private struct SummaryStepView: View {
                 : URL(fileURLWithPath: ipswPath).lastPathComponent
         case .existingDisk:
             return "Empty"
+        case .directKernel:
+            return "Direct kernel boot"
         }
     }
 }

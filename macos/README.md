@@ -34,6 +34,16 @@ helper. All build paths require Zig 0.16.
 Configure an Apple Development or Developer ID team in Xcode before
 distribution.
 
+## Direct Linux boot
+
+Choose **Boot a Linux kernel** in the creation wizard to select an ARM64
+kernel, an optional initrd, kernel arguments, and an optional existing disk.
+Direct boot uses Bobrvm Hypervisor. A diskless initrd guest is supported.
+
+For a stopped Linux VM, **Settings > Boot** switches between direct kernel
+boot and UEFI and edits the corresponding paths. Switching methods clears
+the other method's inputs; disk contents are preserved.
+
 ## SSH and TCP forwarding
 
 For a VM using Bobrvm Hypervisor, enable **SSH access from this Mac** during creation or in
