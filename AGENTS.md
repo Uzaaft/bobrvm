@@ -2,7 +2,19 @@
 
 bobrvm is Linux virtualization software for macOS with OpenGL 4.3 and Vulkan support.
 
+## Workflow
+
+- Finish authorized work and make routine decisions independently. Ask only when ambiguity changes
+  the outcome or new authority is needed. Finish authorized preparation before requesting approval.
+- Preserve unrelated work and existing commits. Commit or publish only when requested.
+- Update callers and remove obsolete code; add compatibility paths only when explicitly requested.
+- User instructions take precedence over skill guidelines. Explain any instruction that blocks work.
+- Run relevant checks and report the result and validation gaps concisely. Broaden testing only when
+  changes, failures, or concerns justify it. For documentation, review the diff and formatting.
+
 ## Commands
+
+Choose commands relevant to the change; this is a reference, not a required checklist.
 
 ```bash
 # Zig/Nix
@@ -48,18 +60,18 @@ The main components are:
 
 ## Code Style
 
-Follow TigerBeetle's TIGER_STYLE and established Ghostty patterns. Prioritize safety, then
-performance, then developer experience.
+Follow surrounding code and the rules below; use TIGER_STYLE and Ghostty as references where these
+rules leave room for judgment. Prioritize safety, then performance, then developer experience.
+Use four-space indentation and keep lines within 100 columns.
 
 For Zig:
 
 - Put the `@This()` declaration first, then standard-library imports, then local imports.
 - Use explicit error sets and `errdefer` for partial initialization.
 - Pair `init`/`deinit` and `create`/`destroy`; make ownership apparent at call sites.
-- Bound guest-controlled lengths, loops, queues, and memory accesses.
 - Avoid allocation in hot paths; preallocate at initialization when practical.
 - Keep functions under 70 lines, avoid recursion, and push conditional checks before loops.
-- Put units last in names, such as `latency_ns_max`.
+- Put units last in names, such as `latency_max_ns`.
 - Order struct fields before nested types and methods.
 - Use assertions for invariants, not guest input validation.
 
@@ -68,20 +80,12 @@ explicit.
 
 ### Comments
 
-Write comments in the style of Ghostty's Zig sources:
-
-- Document public contracts and the purpose of substantial modules.
-- Explain ownership, invariants, protocol semantics, platform quirks, and non-obvious choices.
-- Record why a workaround or ordering constraint exists; include a primary-source link when useful.
-- Do not narrate the next statement, restate a name or type, add section banners, or preserve
-  implementation history that version control already records.
-- Prefer a short precise comment. Use a longer comment only when the constraint cannot be made clear
-  in code.
+Document public contracts, ownership, invariants, and non-obvious protocol or platform constraints.
+Link primary sources for workarounds when useful. Avoid restating code or recording history.
 
 ## Constraints
 
-- Keep lines within 100 columns and use four-space indentation.
-- Validate all guest-controlled data before use.
+- Validate guest-controlled data before use; bound lengths, loops, queues, and memory accesses.
 - Keep host/guest transitions batched and use zero-copy paths where practical.
 - Do not add external runtime dependencies. Vendor required C libraries under `pkg`; prefer Zig
   implementations when feasible.
@@ -94,19 +98,9 @@ Direct Linux boot loads the kernel at `0x40200000`, passes the DTB in `x0`, and 
 UEFI boot requires a PCIe ECAM host bridge and virtio-pci devices; QEMU EDK2 firmware does not use
 the DTB's virtio-mmio nodes.
 
-The guest-visible memory map follows QEMU `virt`:
-
-| Region | Address | Size |
-| --- | ---: | ---: |
-| Flash firmware | `0x00000000` | 64 MiB |
-| Flash variables | `0x04000000` | 64 MiB |
-| GIC distributor | `0x08000000` | 64 KiB |
-| GIC redistributor | `0x080A0000` | 128 KiB/CPU |
-| PL011 UART | `0x09000000` | 4 KiB |
-| Virtio MMIO | `0x0A000000` | 512 B/device |
-| PCI MMIO | `0x10000000` | 768 MiB |
-| PCI ECAM | `0x3C000000` | 64 MiB |
-| RAM | `0x40000000` | configurable |
+The guest-visible memory map follows QEMU `virt`. See `MemoryLayout` in
+[src/machine/main.zig](src/machine/main.zig) for addresses and sizes, and
+[src/machine/dtb.zig](src/machine/dtb.zig) for the device-tree configuration.
 
 ## References
 
