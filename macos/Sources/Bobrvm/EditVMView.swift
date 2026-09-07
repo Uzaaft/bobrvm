@@ -14,6 +14,8 @@ struct EditVMView: View {
     @State private var memoryGB: Double
     @State private var vcpuCount: Double
     @State private var vramMB: Double
+    @State private var gpu3DEnabled: Bool
+    @State private var diskReadOnly: Bool
     @State private var resolution: DisplayResolution
     @State private var retinaEnabled: Bool
     @State private var networkEnabled: Bool
@@ -43,6 +45,8 @@ struct EditVMView: View {
             initialValue: Double(vmInstance.config.memoryBytes) / (1024 * 1024 * 1024))
         _vcpuCount = State(initialValue: Double(vmInstance.config.vcpuCount))
         _vramMB = State(initialValue: Double(vmInstance.vramMB))
+        _gpu3DEnabled = State(initialValue: vmInstance.config.gpu3DEnabled)
+        _diskReadOnly = State(initialValue: vmInstance.config.diskReadOnly)
         _resolution = State(
             initialValue: DisplayResolution(
                 width: vmInstance.config.displayWidth,
@@ -156,6 +160,7 @@ struct EditVMView: View {
             )
             .onChange(of: backend) { _, selected in
                 if selected == .virtualization {
+                    gpu3DEnabled = false
                     sharedFolderPath = ""
                     touchIDEnabled = false
                     ssh.enabled = false
@@ -190,6 +195,11 @@ struct EditVMView: View {
         Section {
             if let diskPath = vmInstance.config.diskPath {
                 diskImageRow(path: diskPath)
+                if vmInstance.guestSystem == .linux {
+                    Toggle("Read-only disk", isOn: $diskReadOnly)
+                        .disabled(isRunning)
+                        .onChange(of: diskReadOnly) { hasChanges = true }
+                }
 
                 if canGrowDisk && !isRunning {
                     SettingSlider(
@@ -273,6 +283,11 @@ struct EditVMView: View {
 
     private var graphicsSection: some View {
         Section {
+            if backend == .hypervisor {
+                Toggle("3D acceleration", isOn: $gpu3DEnabled)
+                    .disabled(isRunning)
+                    .onChange(of: gpu3DEnabled) { hasChanges = true }
+            }
             graphicsMemoryRow
             displayControls
         } header: {
@@ -483,9 +498,9 @@ struct EditVMView: View {
     }
 
     private var canGrowDisk: Bool {
-        vmInstance.config.diskPath.map {
+        !diskReadOnly && (vmInstance.config.diskPath.map {
             URL(fileURLWithPath: $0).pathExtension.lowercased() == "raw"
-        } ?? false
+        } ?? false)
     }
 
     private var memoryRangeGB: ClosedRange<Double> {
@@ -567,7 +582,9 @@ struct EditVMView: View {
                     sharedFolderPath: sharedFolderPath.isEmpty ? nil : sharedFolderPath,
                     diskSizeGB: canGrowDisk ? Int(diskSizeGB) : nil,
                     backend: backend,
-                    boot: vmInstance.guestSystem == .linux && backend == .hypervisor ? boot : nil
+                    boot: vmInstance.guestSystem == .linux && backend == .hypervisor ? boot : nil,
+                    gpu3DEnabled: gpu3DEnabled,
+                    diskReadOnly: diskReadOnly
                 )
             }
             dismiss()

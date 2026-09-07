@@ -168,7 +168,9 @@ public final class VMManager: ObservableObject {
         sharedFolderPath: String?,
         diskSizeGB: Int?,
         backend: VMBackend,
-        boot: BootConfiguration? = nil
+        boot: BootConfiguration? = nil,
+        gpu3DEnabled: Bool? = nil,
+        diskReadOnly: Bool? = nil
     ) throws {
         guard instance.state == .stopped else {
             throw BobrvmError.invalidState
@@ -185,6 +187,8 @@ public final class VMManager: ObservableObject {
             displayWidth: UInt32(displayWidth),
             displayHeight: UInt32(displayHeight),
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+            gpu3DEnabled: backend == .hypervisor
+                && (gpu3DEnabled ?? instance.config.gpu3DEnabled),
             networkEnabled: networkEnabled,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && instance.guestSystem == .linux,
@@ -196,7 +200,7 @@ public final class VMManager: ObservableObject {
             initrdPath: instance.config.initrdPath,
             cmdline: instance.config.cmdline,
             diskPath: instance.config.diskPath,
-            diskReadOnly: instance.config.diskReadOnly,
+            diskReadOnly: diskReadOnly ?? instance.config.diskReadOnly,
             isoPath: isoPath,
             isoReadOnly: true
         )
@@ -695,6 +699,7 @@ enum VMStorage {
         let diskReadOnly: Bool
         let isoPath: String?
         let vramMB: Int
+        let gpu3DEnabled: Bool?
         let displayWidth: UInt32?
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
@@ -753,6 +758,7 @@ enum VMStorage {
                 displayWidth: displayWidth ?? 1280,
                 displayHeight: displayHeight ?? 800,
                 gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+                gpu3DEnabled: gpu3DEnabled ?? false,
                 networkEnabled: networkEnabled ?? true,
                 touchIDEnabled: touchIDEnabled ?? false,
                 portForwards: portForwards ?? [],
@@ -784,6 +790,7 @@ enum VMStorage {
             self.diskReadOnly = instance.config.diskReadOnly
             self.isoPath = instance.config.isoPath ?? instance.isoPath
             self.vramMB = instance.vramMB
+            self.gpu3DEnabled = instance.config.gpu3DEnabled
             self.displayWidth = instance.config.displayWidth
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled

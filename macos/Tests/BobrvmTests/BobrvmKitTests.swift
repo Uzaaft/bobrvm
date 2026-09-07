@@ -4,6 +4,23 @@ import XCTest
 @testable import Bobrvm
 
 final class BobrvmKitTests: XCTestCase {
+    @MainActor
+    func testHardwareSettingsReachCoreAndSurviveStorage() throws {
+        let app = try App()
+        let config = VMConfig(gpu3DEnabled: true, diskPath: "/disk.raw", diskReadOnly: true)
+        let instance = VMInstance(name: "Hardware", config: config, app: app)
+        let stored = try JSONDecoder().decode(
+            VMStorage.StoredVM.self,
+            from: JSONEncoder().encode(VMStorage.StoredVM(from: instance))
+        )
+        XCTAssertTrue(stored.vmConfig.gpu3DEnabled)
+        XCTAssertTrue(stored.vmConfig.diskReadOnly)
+        try stored.vmConfig.withCConfig { pointer in
+            XCTAssertTrue(pointer.pointee.enable_gpu3d)
+            XCTAssertTrue(pointer.pointee.disk_read_only)
+        }
+    }
+
     func testCLIInventoryPreservesRecordsAndQuotesLaunchCommands() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         XCTAssertTrue(try CLIInventoryEntry.read(directory: directory).isEmpty)
@@ -390,6 +407,7 @@ final class BobrvmKitTests: XCTestCase {
 
         XCTAssertNil(stored.backend)
         XCTAssertEqual(stored.effectiveBackend, .hypervisor)
+        XCTAssertFalse(stored.vmConfig.gpu3DEnabled)
     }
 
     @MainActor

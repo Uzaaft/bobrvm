@@ -81,6 +81,12 @@ controls for Apple Virtualization are not implemented.
 
 The CLI's existing `--forward` and `forwards` rules now also bind localhost by default.
 
+## Hardware settings
+
+For Bobrvm Hypervisor VMs, **3D acceleration** in creation and settings enables the same
+graphics path as CLI `--virgl`. It defaults to off. Linux disk settings also expose
+**Read-only disk**; enabling it disables disk growth. Stop the VM before changing either.
+
 ## VM discovery
 
 The **Command Line VMs** sidebar lists configurations from `~/.config/bobrvm/vms`, including

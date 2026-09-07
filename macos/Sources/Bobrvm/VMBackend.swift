@@ -69,6 +69,9 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
         if config.kernelPath != nil && (self != .hypervisor || guestSystem != .linux) {
             throw VMBackendError.directBootRequiresLinuxHypervisor
         }
+        if config.gpu3DEnabled && self != .hypervisor {
+            throw VMBackendError.gpu3DRequiresHypervisor
+        }
         if !config.portForwards.isEmpty {
             guard self == .hypervisor else { throw VMBackendError.invalidForwarding }
             do { try config.validate() }
@@ -92,6 +95,7 @@ enum VMBackendError: LocalizedError {
     case unsupportedGuest(backend: VMBackend, guest: GuestSystem)
     case diskRequired
     case directBootRequiresLinuxHypervisor
+    case gpu3DRequiresHypervisor
     case bootImageRequired
     case rawDiskRequired
     case touchIDRequiresLinuxHypervisor
@@ -109,6 +113,8 @@ enum VMBackendError: LocalizedError {
             return "\(backend.displayName) does not support \(guest.displayName) guests."
         case .directBootRequiresLinuxHypervisor:
             return "Direct kernel boot requires Linux with Bobrvm Hypervisor."
+        case .gpu3DRequiresHypervisor:
+            return "This 3D acceleration setting requires Bobrvm Hypervisor."
         case .bootImageRequired:
             return "Choose a kernel for direct boot or firmware for UEFI boot."
         case .diskRequired:

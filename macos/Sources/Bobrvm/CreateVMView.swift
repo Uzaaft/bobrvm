@@ -21,6 +21,7 @@ struct CreateVMView: View {
     @State private var memoryGB = 4.0
     @State private var vcpuCount = 2.0
     @State private var vramMB = 512.0
+    @State private var gpu3DEnabled = false
     @State private var resolution = DisplayResolution.defaultValue
     @State private var retinaEnabled = true
     @State private var touchIDEnabled = false
@@ -122,6 +123,7 @@ struct CreateVMView: View {
                 memoryGB: $memoryGB,
                 vcpuCount: $vcpuCount,
                 vramMB: $vramMB,
+                gpu3DEnabled: $gpu3DEnabled,
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
                 touchIDEnabled: $touchIDEnabled,
@@ -149,6 +151,7 @@ struct CreateVMView: View {
                 memoryGB: Int(memoryGB),
                 vcpuCount: Int(vcpuCount),
                 vramMB: Int(vramMB),
+                gpu3DEnabled: gpu3DEnabled,
                 backend: backend,
                 resolution: resolution,
                 retinaEnabled: retinaEnabled,
@@ -330,6 +333,7 @@ struct CreateVMView: View {
             displayWidth: resolution.width,
             displayHeight: resolution.height,
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
+            gpu3DEnabled: gpu3DEnabled && backend == .hypervisor,
             networkEnabled: true,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && operatingSystem == .linux,
@@ -735,6 +739,7 @@ private struct HardwareStepView: View {
     @Binding var memoryGB: Double
     @Binding var vcpuCount: Double
     @Binding var vramMB: Double
+    @Binding var gpu3DEnabled: Bool
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
     @Binding var touchIDEnabled: Bool
@@ -792,6 +797,7 @@ private struct HardwareStepView: View {
             )
             if guestSystem != .macOS && backend == .hypervisor {
                 Divider()
+                Toggle("3D acceleration", isOn: $gpu3DEnabled)
                 SettingSlider(
                     title: "Shared graphics memory",
                     valueText: "\(Int(vramMB)) MB",
@@ -938,6 +944,7 @@ private struct SummaryStepView: View {
     let memoryGB: Int
     let vcpuCount: Int
     let vramMB: Int
+    let gpu3DEnabled: Bool
     let backend: VMBackend
     let resolution: DisplayResolution
     let retinaEnabled: Bool
@@ -1008,7 +1015,8 @@ private struct SummaryStepView: View {
         if backend == .virtualization {
             return "Compatibility display, \(resolution.label)"
         }
-        return "Accelerated OpenGL/Vulkan, \(vramMB) MB, \(resolution.label)"
+        let graphics = gpu3DEnabled ? "Accelerated 3D" : "2D display"
+        return "\(graphics), \(vramMB) MB, \(resolution.label)"
     }
 
     private var installationMediaName: String {
