@@ -1,7 +1,7 @@
 //! `bobrvm list` discovers saved CLI and native-app VMs without importing them.
 
 const std = @import("std");
-const Inventory = @import("Inventory.zig");
+const Inventory = @import("../inventory.zig");
 
 pub fn execute(alloc: std.mem.Allocator) !void {
     var inventory = try Inventory.discover(alloc);

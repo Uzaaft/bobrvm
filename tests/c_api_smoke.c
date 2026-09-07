@@ -69,6 +69,35 @@ static void test_logging_configuration(void) {
     assert(!bobrvm_log_enabled((bobrvm_log_level_e)4));
 }
 
+static void collect_inventory(void* userdata, const bobrvm_inventory_entry_s* entry) {
+    size_t* count = userdata;
+    assert(strcmp(entry->id, "cli:sample") == 0);
+    assert(strcmp(entry->name, "sample") == 0);
+    assert(entry->memory_bytes == 1024ULL * 1024 * 1024);
+    assert(entry->cpus == 2);
+    assert(entry->source == 0);
+    assert(entry->disk_status == 0);
+    assert(entry->disk_path == NULL);
+    ++*count;
+}
+
+static void test_inventory(void) {
+    char directory[] = "/tmp/bobrvm-inventory-XXXXXX";
+    char path[128];
+    size_t count = 0;
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(path, sizeof(path), "%s/sample.json", directory) > 0);
+    FILE* file = fopen(path, "w");
+    assert(file != NULL);
+    assert(fputs("{\"memory_mb\":1024,\"vcpu_count\":2}", file) >= 0);
+    assert(fclose(file) == 0);
+    assert(bobrvm_inventory_read(directory, NULL, collect_inventory, &count) == BOBRVM_OK);
+    assert(count == 1);
+    assert(bobrvm_inventory_read(directory, NULL, NULL, NULL) == BOBRVM_ERROR_INVALID_ARGUMENT);
+    assert(unlink(path) == 0);
+    assert(rmdir(directory) == 0);
+}
+
 static void test_filename_sanitization(void) {
     char output[32] = {0};
     size_t length = 0;
@@ -198,6 +227,7 @@ int main(void) {
             build_mode == BOBRVM_BUILD_MODE_RELEASE_SAFE));
     test_logging_configuration();
     test_configuration();
+    test_inventory();
     test_filename_sanitization();
     test_disk_errors();
     test_disk_operations();

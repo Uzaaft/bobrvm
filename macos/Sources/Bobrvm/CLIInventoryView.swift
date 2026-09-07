@@ -15,31 +15,38 @@ struct CLIInventoryEntry: Identifiable, Sendable {
         "bobrvm start '" + name.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    private struct Record: Decodable {
-        let memory_mb: UInt64?
-        let vcpu_count: UInt8?
-        let disk_path: String?
+    private final class Collector {
+        var entries: [CLIInventoryEntry] = []
     }
 
-    static func read(directory: URL) throws -> [CLIInventoryEntry] {
-        let manager = FileManager.default
-        guard manager.fileExists(atPath: directory.path) else { return [] }
-        let files = try manager.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]
-        )
-        return files.filter { $0.pathExtension == "json" }.compactMap { file in
-            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                values.isRegularFile == true, let size = values.fileSize, size <= 1024 * 1024,
-                let data = try? Data(contentsOf: file),
-                let record = try? JSONDecoder().decode(Record.self, from: data)
-            else { return nil }
-            return CLIInventoryEntry(
-                name: file.deletingPathExtension().lastPathComponent,
-                file: file, memoryMB: record.memory_mb ?? 512,
-                cpuCount: record.vcpu_count ?? 2, disk: record.disk_path,
-                diskExists: record.disk_path.map { manager.fileExists(atPath: $0) } ?? true
-            )
-        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    static func read(directory: URL? = nil) throws -> [CLIInventoryEntry] {
+        let collector = Collector()
+        let receive: bobrvm_inventory_callback_f = { context, pointer in
+            guard let context, let pointer else { return }
+            let collector = Unmanaged<Collector>.fromOpaque(context).takeUnretainedValue()
+            let entry = pointer.pointee
+            guard entry.source == 0 else { return }
+            collector.entries.append(CLIInventoryEntry(
+                name: String(cString: entry.name),
+                file: URL(fileURLWithPath: String(cString: entry.config_path)),
+                memoryMB: entry.memory_bytes / (1024 * 1024), cpuCount: entry.cpus,
+                disk: entry.disk_path.map { String(cString: $0) },
+                diskExists: entry.disk_status == 0 || entry.disk_status == 1
+            ))
+        }
+        let context = Unmanaged.passUnretained(collector).toOpaque()
+        let code: bobrvm_error_e
+        if let directory {
+            code = directory.path.withCString {
+                bobrvm_inventory_read($0, nil, receive, context)
+            }
+        } else {
+            code = bobrvm_inventory_read(nil, nil, receive, context)
+        }
+        guard code.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+        return collector.entries
     }
 }
 
@@ -48,11 +55,6 @@ struct CLIInventoryView: View {
     @State private var entries: [CLIInventoryEntry] = []
     @State private var errorMessage: String?
     @State private var refreshID = UUID()
-
-    private var directory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/bobrvm/vms", isDirectory: true)
-    }
 
     var body: some View {
         List {
@@ -102,10 +104,9 @@ struct CLIInventoryView: View {
             Button("Refresh", systemImage: "arrow.clockwise") { refreshID = UUID() }
         }
         .task(id: refreshID) {
-            let path = directory
             do {
                 let found = try await Task.detached {
-                    try CLIInventoryEntry.read(directory: path)
+                    try CLIInventoryEntry.read()
                 }.value
                 guard !Task.isCancelled else { return }
                 entries = found

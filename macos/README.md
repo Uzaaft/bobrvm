@@ -99,6 +99,8 @@ records whose disk is missing. It provides a quoted start command and reveals th
 identical names. Start CLI VMs by their original name; start app VMs in Bobrvm.
 Discovery reads both stores without importing or rewriting them. Cross-frontend lifecycle
 control is not implemented.
+Both frontends use Zig's inventory reader; the app consumes its C API. Snapshot-directory
+validation and disk replacement are likewise shared with CLI `--restore`.
 
 ## Permissions
 

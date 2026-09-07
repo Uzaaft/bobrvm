@@ -10,6 +10,7 @@ const config = lib.config;
 const disk = lib.disk;
 const macos_runtime = lib.runtime.macos;
 const linux_gui_vz = lib.runtime.linux_gui_vz;
+const Inventory = @import("inventory.zig");
 
 const log = std.log.scoped(.main);
 
@@ -30,6 +31,20 @@ pub export fn bobrvm_deinit() void {
 
 pub export fn bobrvm_version() [*:0]const u8 {
     return lib.version;
+}
+
+pub export fn bobrvm_inventory_read(
+    cli_root: ?[*:0]const u8,
+    app_root: ?[*:0]const u8,
+    callback: ?*const fn (?*anyopaque, *const Inventory.CEntry) callconv(.c) void,
+    userdata: ?*anyopaque,
+) c_int {
+    const visit = callback orelse return 1;
+    Inventory.visit(.{
+        .cli = if (cli_root) |p| std.mem.span(p) else null,
+        .app = if (app_root) |p| std.mem.span(p) else null,
+    }, visit, userdata) catch |err| return if (err == error.OutOfMemory) 2 else 9;
+    return 0;
 }
 
 /// Build mode enum matching bobrvm_build_mode_e in C header.

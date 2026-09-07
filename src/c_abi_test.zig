@@ -28,6 +28,7 @@ fn expectStructLayout(comptime Zig: type, comptime C: type) !void {
 }
 
 test "C ABI shared struct layouts match Zig" {
+    try expectStructLayout(@import("inventory.zig").CEntry, c.bobrvm_inventory_entry_s);
     try expectStructLayout(@import("net/mininat.zig").Forward, c.bobrvm_port_forward_s);
     try expectStructLayout(apprt.RuntimeConfig, c.bobrvm_runtime_config_s);
     try expectStructLayout(apprt.VMConfig, c.bobrvm_vm_config_s);

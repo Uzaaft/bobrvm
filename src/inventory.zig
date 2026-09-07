@@ -4,9 +4,9 @@ const Inventory = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const Config = @import("Config.zig");
-const global = @import("../global.zig");
-const file_compat = @import("../compat/file.zig");
+const Config = @import("cli/Config.zig");
+const global = @import("global.zig");
+const file_compat = @import("compat/file.zig");
 
 arena: std.heap.ArenaAllocator,
 entries: []const Entry,
@@ -31,6 +31,46 @@ pub const Roots = struct {
     cli: ?[]const u8 = null,
     app: ?[]const u8 = null,
 };
+
+/// C projection; every pointer remains valid only during visit's callback.
+pub const CEntry = extern struct {
+    id: [*:0]const u8,
+    name: [*:0]const u8,
+    backend: [*:0]const u8,
+    config_path: [*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    memory_bytes: u64,
+    cpus: u8,
+    source: u8,
+    disk_status: u8,
+};
+
+pub fn visit(
+    roots: Roots,
+    callback: *const fn (?*anyopaque, *const CEntry) callconv(.c) void,
+    userdata: ?*anyopaque,
+) !void {
+    var inventory = if (roots.cli == null and roots.app == null)
+        try discover(std.heap.c_allocator)
+    else
+        try load(std.heap.c_allocator, roots);
+    defer inventory.deinit();
+    const alloc = inventory.arena.allocator();
+    for (inventory.entries) |entry| {
+        const projection = CEntry{
+            .id = try alloc.dupeZ(u8, entry.id),
+            .name = try alloc.dupeZ(u8, entry.name),
+            .backend = try alloc.dupeZ(u8, entry.backend),
+            .config_path = try alloc.dupeZ(u8, entry.config_path),
+            .disk_path = if (entry.disk_path) |p| try alloc.dupeZ(u8, p) else null,
+            .memory_bytes = entry.memory_bytes,
+            .cpus = entry.cpus,
+            .source = @intFromEnum(entry.source),
+            .disk_status = @intFromEnum(entry.disk_status),
+        };
+        callback(userdata, &projection);
+    }
+}
 
 const AppRecord = struct {
     id: []const u8,

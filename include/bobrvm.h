@@ -56,6 +56,26 @@ typedef enum {
     BOBRVM_ERROR_INVALID_STATE = 13,
 } bobrvm_error_e;
 
+typedef struct {
+    const char* id;
+    const char* name;
+    const char* backend;
+    const char* config_path;
+    const char* disk_path;
+    uint64_t memory_bytes;
+    uint8_t cpus;
+    /** 0 = CLI, 1 = native app. */
+    uint8_t source;
+    /** 0 = no disk, 1 = available, 2 = missing, 3 = inaccessible. */
+    uint8_t disk_status;
+} bobrvm_inventory_entry_s;
+
+/** Entry pointers are borrowed only for the synchronous callback. */
+typedef void (*bobrvm_inventory_callback_f)(void* userdata, const bobrvm_inventory_entry_s* entry);
+/** Null roots omit a store; both null discover the default CLI and native-app stores. */
+bobrvm_error_e bobrvm_inventory_read(const char* cli_root, const char* app_root,
+    bobrvm_inventory_callback_f callback, void* userdata);
+
 typedef enum {
     BOBRVM_VM_STATE_STOPPED = 0,
     BOBRVM_VM_STATE_STARTING = 1,

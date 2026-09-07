@@ -46,15 +46,24 @@ pub fn runWithReadyMarker(
     var allocation_counter = AllocationCounter.init(alloc);
     const machine_alloc = if (allocation_benchmark) allocation_counter.allocator() else alloc;
 
-    // --restore <snapshot dir>: revert disks (clonefile the snapshot's
-    // copies back over the originals) and point the machine at the
-    // directory's state.img. A plain file path is used as-is.
-    var restore_buf: [1024]u8 = undefined;
-    var restore_path = config.restore_path;
-    if (config.restore_path) |rp| {
-        if (isDirectory(rp)) {
-            try revertSnapshotDisks(alloc, rp);
-            restore_path = try std.fmt.bufPrint(&restore_buf, "{s}/state.img", .{rp});
+    var directory_state: ?[]u8 = null;
+    defer if (directory_state) |path| alloc.free(path);
+    if (config.restore_path) |path| {
+        if (isDirectory(path)) {
+            directory_state = try @import("../machine/snapshot_directory.zig").restore(
+                alloc,
+                path,
+                .{
+                    .disks = .{
+                        if (config.disk_read_only) null else config.disk_path,
+                        if (config.disk2_read_only) null else config.disk2_path,
+                    },
+                    .ram_bytes = config.memory_mb * 1024 * 1024,
+                    .vcpu_count = config.vcpu_count,
+                    .block_present = .{ config.disk_path != null, config.disk2_path != null },
+                    .gpu_present = config.enable_gpu,
+                },
+            );
         }
     }
 
@@ -85,7 +94,7 @@ pub fn runWithReadyMarker(
         .docker_socket_path = config.docker_socket_path,
         .shared_dir = config.shared_dir,
         .share_read_only = config.share_read_only,
-        .restore_path = restore_path,
+        .restore_path = directory_state orelse config.restore_path,
         .display_width = config.display_width,
         .display_height = config.display_height,
         .gpu_memory_bytes = config.gpu_memory_mb * 1024 * 1024,
@@ -427,32 +436,6 @@ fn isDirectory(path: []const u8) bool {
     const directory = std.Io.Dir.cwd().openDir(global.io(), path, .{}) catch return false;
     directory.close(global.io());
     return true;
-}
-
-/// Revert every disk recorded in a snapshot's meta.json: clonefile the
-/// snapshot copy back over the original path (destructive by design —
-/// that's what reverting to a snapshot means).
-fn revertSnapshotDisks(alloc: Allocator, dir: []const u8) !void {
-    const file_compat = @import("../compat/file.zig");
-    var path_buf: [1024]u8 = undefined;
-    const meta_path = try std.fmt.bufPrint(&path_buf, "{s}/meta.json", .{dir});
-    const meta_file = try std.Io.Dir.cwd().openFile(global.io(), meta_path, .{ .mode = .read_only });
-    defer meta_file.close(global.io());
-    const meta_bytes = try file_compat.readToEndAlloc(meta_file, alloc, 1024 * 1024);
-    defer alloc.free(meta_bytes);
-
-    const Meta = struct {
-        disks: []struct { orig: []const u8, copy: []const u8 },
-    };
-    var parsed = try std.json.parseFromSlice(Meta, alloc, meta_bytes, .{});
-    defer parsed.deinit();
-
-    for (parsed.value.disks) |disk| {
-        var copy_buf: [1024]u8 = undefined;
-        const copy_path = try std.fmt.bufPrint(&copy_buf, "{s}/{s}", .{ dir, disk.copy });
-        log.info("reverting disk {s} from snapshot", .{disk.orig});
-        try machine.Machine.cloneFile(alloc, copy_path, disk.orig);
-    }
 }
 
 /// Take a live snapshot; VM keeps running (BOBRVM_TEST_SNAPSHOT hook).
