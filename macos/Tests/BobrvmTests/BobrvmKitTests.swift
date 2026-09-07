@@ -7,7 +7,10 @@ final class BobrvmKitTests: XCTestCase {
     @MainActor
     func testHardwareSettingsReachCoreAndSurviveStorage() throws {
         let app = try App()
-        let config = VMConfig(gpu3DEnabled: true, diskPath: "/disk.raw", diskReadOnly: true)
+        let config = VMConfig(
+            gpu3DEnabled: true, soundEnabled: true, sharedFolderReadOnly: true,
+            sharedFolderPath: "/shared", diskPath: "/disk.raw", diskReadOnly: true
+        )
         let instance = VMInstance(name: "Hardware", config: config, app: app)
         let stored = try JSONDecoder().decode(
             VMStorage.StoredVM.self,
@@ -15,9 +18,13 @@ final class BobrvmKitTests: XCTestCase {
         )
         XCTAssertTrue(stored.vmConfig.gpu3DEnabled)
         XCTAssertTrue(stored.vmConfig.diskReadOnly)
+        XCTAssertTrue(stored.vmConfig.soundEnabled)
+        XCTAssertTrue(stored.vmConfig.sharedFolderReadOnly)
         try stored.vmConfig.withCConfig { pointer in
             XCTAssertTrue(pointer.pointee.enable_gpu3d)
             XCTAssertTrue(pointer.pointee.disk_read_only)
+            XCTAssertTrue(pointer.pointee.enable_snd)
+            XCTAssertTrue(pointer.pointee.share_read_only)
         }
     }
 
@@ -408,6 +415,8 @@ final class BobrvmKitTests: XCTestCase {
         XCTAssertNil(stored.backend)
         XCTAssertEqual(stored.effectiveBackend, .hypervisor)
         XCTAssertFalse(stored.vmConfig.gpu3DEnabled)
+        XCTAssertFalse(stored.vmConfig.soundEnabled)
+        XCTAssertFalse(stored.vmConfig.sharedFolderReadOnly)
     }
 
     @MainActor

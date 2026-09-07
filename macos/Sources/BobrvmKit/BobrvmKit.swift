@@ -148,6 +148,8 @@ public struct VMConfig {
     public var displayHeight: UInt32
     public var gpuMemoryBytes: UInt64
     public var gpu3DEnabled: Bool
+    public var soundEnabled: Bool
+    public var sharedFolderReadOnly: Bool
     public var networkEnabled: Bool
     public var touchIDEnabled: Bool
     public var portForwards: [TCPForward]
@@ -173,6 +175,8 @@ public struct VMConfig {
         displayHeight: UInt32? = nil,
         gpuMemoryBytes: UInt64? = nil,
         gpu3DEnabled: Bool = false,
+        soundEnabled: Bool = false,
+        sharedFolderReadOnly: Bool = false,
         networkEnabled: Bool? = nil,
         touchIDEnabled: Bool = false,
         portForwards: [TCPForward] = [],
@@ -194,6 +198,8 @@ public struct VMConfig {
         self.displayHeight = displayHeight ?? defaults.display_height
         self.gpuMemoryBytes = gpuMemoryBytes ?? defaults.gpu_memory_bytes
         self.gpu3DEnabled = gpu3DEnabled
+        self.soundEnabled = soundEnabled
+        self.sharedFolderReadOnly = sharedFolderReadOnly
         self.networkEnabled = networkEnabled ?? defaults.enable_net
         self.touchIDEnabled = touchIDEnabled
         self.portForwards = portForwards
@@ -226,6 +232,8 @@ public struct VMConfig {
         config.display_height = displayHeight
         config.gpu_memory_bytes = gpuMemoryBytes
         config.enable_gpu3d = gpu3DEnabled
+        config.enable_snd = soundEnabled
+        config.share_read_only = sharedFolderReadOnly
         config.enable_net = networkEnabled
         config.enable_touch_id = touchIDEnabled
         config.disk_read_only = diskReadOnly

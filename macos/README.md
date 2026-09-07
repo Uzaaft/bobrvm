@@ -87,6 +87,10 @@ For Bobrvm Hypervisor VMs, **3D acceleration** in creation and settings enables 
 graphics path as CLI `--virgl`. It defaults to off. Linux disk settings also expose
 **Read-only disk**; enabling it disables disk growth. Stop the VM before changing either.
 
+**Sound playback** attaches the CLI's opt-in virtio-snd device. Shared-folder settings also
+offer **Read-only shared folder**, enforced by the host's 9p server. These settings require
+Bobrvm Hypervisor and a stopped VM.
+
 ## VM discovery
 
 The **Command Line VMs** sidebar lists configurations from `~/.config/bobrvm/vms`, including

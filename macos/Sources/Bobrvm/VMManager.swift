@@ -170,7 +170,9 @@ public final class VMManager: ObservableObject {
         backend: VMBackend,
         boot: BootConfiguration? = nil,
         gpu3DEnabled: Bool? = nil,
-        diskReadOnly: Bool? = nil
+        diskReadOnly: Bool? = nil,
+        soundEnabled: Bool? = nil,
+        sharedFolderReadOnly: Bool? = nil
     ) throws {
         guard instance.state == .stopped else {
             throw BobrvmError.invalidState
@@ -189,6 +191,8 @@ public final class VMManager: ObservableObject {
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
             gpu3DEnabled: backend == .hypervisor
                 && (gpu3DEnabled ?? instance.config.gpu3DEnabled),
+            soundEnabled: backend == .hypervisor && (soundEnabled ?? instance.config.soundEnabled),
+            sharedFolderReadOnly: sharedFolderReadOnly ?? instance.config.sharedFolderReadOnly,
             networkEnabled: networkEnabled,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && instance.guestSystem == .linux,
@@ -700,6 +704,8 @@ enum VMStorage {
         let isoPath: String?
         let vramMB: Int
         let gpu3DEnabled: Bool?
+        let soundEnabled: Bool?
+        let sharedFolderReadOnly: Bool?
         let displayWidth: UInt32?
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
@@ -759,6 +765,8 @@ enum VMStorage {
                 displayHeight: displayHeight ?? 800,
                 gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
                 gpu3DEnabled: gpu3DEnabled ?? false,
+                soundEnabled: soundEnabled ?? false,
+                sharedFolderReadOnly: sharedFolderReadOnly ?? false,
                 networkEnabled: networkEnabled ?? true,
                 touchIDEnabled: touchIDEnabled ?? false,
                 portForwards: portForwards ?? [],
@@ -791,6 +799,8 @@ enum VMStorage {
             self.isoPath = instance.config.isoPath ?? instance.isoPath
             self.vramMB = instance.vramMB
             self.gpu3DEnabled = instance.config.gpu3DEnabled
+            self.soundEnabled = instance.config.soundEnabled
+            self.sharedFolderReadOnly = instance.config.sharedFolderReadOnly
             self.displayWidth = instance.config.displayWidth
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled

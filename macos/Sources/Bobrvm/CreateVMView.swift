@@ -22,6 +22,7 @@ struct CreateVMView: View {
     @State private var vcpuCount = 2.0
     @State private var vramMB = 512.0
     @State private var gpu3DEnabled = false
+    @State private var soundEnabled = false
     @State private var resolution = DisplayResolution.defaultValue
     @State private var retinaEnabled = true
     @State private var touchIDEnabled = false
@@ -124,6 +125,7 @@ struct CreateVMView: View {
                 vcpuCount: $vcpuCount,
                 vramMB: $vramMB,
                 gpu3DEnabled: $gpu3DEnabled,
+                soundEnabled: $soundEnabled,
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
                 touchIDEnabled: $touchIDEnabled,
@@ -334,6 +336,7 @@ struct CreateVMView: View {
             displayHeight: resolution.height,
             gpuMemoryBytes: UInt64(vramMB) * 1024 * 1024,
             gpu3DEnabled: gpu3DEnabled && backend == .hypervisor,
+            soundEnabled: soundEnabled && backend == .hypervisor,
             networkEnabled: true,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && operatingSystem == .linux,
@@ -740,6 +743,7 @@ private struct HardwareStepView: View {
     @Binding var vcpuCount: Double
     @Binding var vramMB: Double
     @Binding var gpu3DEnabled: Bool
+    @Binding var soundEnabled: Bool
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
     @Binding var touchIDEnabled: Bool
@@ -798,6 +802,7 @@ private struct HardwareStepView: View {
             if guestSystem != .macOS && backend == .hypervisor {
                 Divider()
                 Toggle("3D acceleration", isOn: $gpu3DEnabled)
+                Toggle("Sound playback", isOn: $soundEnabled)
                 SettingSlider(
                     title: "Shared graphics memory",
                     valueText: "\(Int(vramMB)) MB",

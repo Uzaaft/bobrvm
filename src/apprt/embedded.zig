@@ -112,6 +112,8 @@ pub const VMConfig = extern struct {
         .guest_port = 0,
     }),
     port_forward_count: u8 = 0,
+    enable_snd: bool = false,
+    share_read_only: bool = false,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
@@ -234,6 +236,8 @@ pub const VMConfig = extern struct {
             .enable_gpu3d = self.enable_gpu3d,
             .port_forwards = self.port_forwards,
             .port_forward_count = self.port_forward_count,
+            .enable_snd = self.enable_snd,
+            .share_read_only = self.share_read_only,
         };
     }
 };
@@ -264,6 +268,8 @@ pub const OwnedVMConfig = struct {
         .guest_port = 0,
     }),
     port_forward_count: u8 = 0,
+    enable_snd: bool = false,
+    share_read_only: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.string_storage.len > 0) alloc.free(self.string_storage);
@@ -584,6 +590,8 @@ pub const VM = struct {
                 .forwards = self.config.port_forwards[0..self.config.port_forward_count],
                 .enable_touch_id = self.config.enable_touch_id,
                 .shared_dir = self.config.shared_dir,
+                .enable_snd = self.config.enable_snd,
+                .share_read_only = self.config.share_read_only,
                 .display_width = if (self.config.display_width != 0)
                     self.config.display_width
                 else
@@ -1298,6 +1306,8 @@ test "VMConfig owns strings in one allocation" {
         .disk_path = "disk.raw",
         .disk2_path = "install.iso",
         .shared_dir = "/Users/example/Shared",
+        .enable_snd = true,
+        .share_read_only = true,
     };
 
     var owned = try cfg.dupe(alloc);
@@ -1308,6 +1318,8 @@ test "VMConfig owns strings in one allocation" {
     try std.testing.expectEqualStrings("console=hvc0", owned.cmdline.?);
     try std.testing.expectEqualStrings("install.iso", owned.disk2_path.?);
     try std.testing.expectEqualStrings("/Users/example/Shared", owned.shared_dir.?);
+    try std.testing.expect(owned.enable_snd);
+    try std.testing.expect(owned.share_read_only);
 }
 
 test "App VM registry does not allocate" {

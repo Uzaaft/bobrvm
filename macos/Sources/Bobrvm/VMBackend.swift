@@ -72,6 +72,9 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
         if config.gpu3DEnabled && self != .hypervisor {
             throw VMBackendError.gpu3DRequiresHypervisor
         }
+        if config.soundEnabled && self != .hypervisor {
+            throw VMBackendError.soundRequiresHypervisor
+        }
         if !config.portForwards.isEmpty {
             guard self == .hypervisor else { throw VMBackendError.invalidForwarding }
             do { try config.validate() }
@@ -96,6 +99,7 @@ enum VMBackendError: LocalizedError {
     case diskRequired
     case directBootRequiresLinuxHypervisor
     case gpu3DRequiresHypervisor
+    case soundRequiresHypervisor
     case bootImageRequired
     case rawDiskRequired
     case touchIDRequiresLinuxHypervisor
@@ -115,6 +119,8 @@ enum VMBackendError: LocalizedError {
             return "Direct kernel boot requires Linux with Bobrvm Hypervisor."
         case .gpu3DRequiresHypervisor:
             return "This 3D acceleration setting requires Bobrvm Hypervisor."
+        case .soundRequiresHypervisor:
+            return "This sound playback setting requires Bobrvm Hypervisor."
         case .bootImageRequired:
             return "Choose a kernel for direct boot or firmware for UEFI boot."
         case .diskRequired:

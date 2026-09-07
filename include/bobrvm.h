@@ -183,6 +183,10 @@ typedef struct {
     bobrvm_port_forward_s port_forwards[8];
     /** Number of active rules, at most eight. Manual host ports must be distinct. */
     uint8_t port_forward_count;
+    /** Attach virtio-snd playback. */
+    bool enable_snd;
+    /** Export shared_dir without guest write access. */
+    bool share_read_only;
 } bobrvm_vm_config_s;
 
 /** Actual listening port for a configured slot, or zero when unavailable. */

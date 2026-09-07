@@ -16,6 +16,8 @@ struct EditVMView: View {
     @State private var vramMB: Double
     @State private var gpu3DEnabled: Bool
     @State private var diskReadOnly: Bool
+    @State private var soundEnabled: Bool
+    @State private var sharedFolderReadOnly: Bool
     @State private var resolution: DisplayResolution
     @State private var retinaEnabled: Bool
     @State private var networkEnabled: Bool
@@ -47,6 +49,8 @@ struct EditVMView: View {
         _vramMB = State(initialValue: Double(vmInstance.vramMB))
         _gpu3DEnabled = State(initialValue: vmInstance.config.gpu3DEnabled)
         _diskReadOnly = State(initialValue: vmInstance.config.diskReadOnly)
+        _soundEnabled = State(initialValue: vmInstance.config.soundEnabled)
+        _sharedFolderReadOnly = State(initialValue: vmInstance.config.sharedFolderReadOnly)
         _resolution = State(
             initialValue: DisplayResolution(
                 width: vmInstance.config.displayWidth,
@@ -80,6 +84,13 @@ struct EditVMView: View {
                     storageSection
                     resourcesSection
                     graphicsSection
+                    if backend == .hypervisor {
+                        Section("Audio") {
+                            Toggle("Sound playback", isOn: $soundEnabled)
+                                .disabled(isRunning)
+                                .onChange(of: soundEnabled) { hasChanges = true }
+                        }
+                    }
                     networkSection
                     forwardingSection
                     touchIDSection
@@ -161,6 +172,7 @@ struct EditVMView: View {
             .onChange(of: backend) { _, selected in
                 if selected == .virtualization {
                     gpu3DEnabled = false
+                    soundEnabled = false
                     sharedFolderPath = ""
                     touchIDEnabled = false
                     ssh.enabled = false
@@ -228,6 +240,9 @@ struct EditVMView: View {
                     )
                     .disabled(isRunning)
                     .onChange(of: sharedFolderPath) { hasChanges = true }
+                    Toggle("Read-only shared folder", isOn: $sharedFolderReadOnly)
+                        .disabled(isRunning || sharedFolderPath.isEmpty)
+                        .onChange(of: sharedFolderReadOnly) { hasChanges = true }
                 } else {
                     LabeledContent("Shared folder") {
                         Text("Not available with Apple Virtualization")
@@ -584,7 +599,9 @@ struct EditVMView: View {
                     backend: backend,
                     boot: vmInstance.guestSystem == .linux && backend == .hypervisor ? boot : nil,
                     gpu3DEnabled: gpu3DEnabled,
-                    diskReadOnly: diskReadOnly
+                    diskReadOnly: diskReadOnly,
+                    soundEnabled: soundEnabled,
+                    sharedFolderReadOnly: sharedFolderReadOnly
                 )
             }
             dismiss()
