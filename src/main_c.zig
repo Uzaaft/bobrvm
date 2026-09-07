@@ -283,6 +283,15 @@ pub export fn bobrvm_vm_send_file(vm: ?*apprt.VM, path: ?[*:0]const u8) c_int {
     return 0;
 }
 
+pub export fn bobrvm_vm_guest_ipv4(vm: ?*apprt.VM) u32 {
+    const instance = vm orelse return 0;
+    const hw = instance.hw_machine orelse return 0;
+    if (!hw.isRunning()) return 0;
+    const shared = hw.shared_network orelse return 0;
+    if (!shared.running.load(.acquire)) return 0;
+    return shared.ipv4.load(.acquire);
+}
+
 pub export fn bobrvm_vm_forwarded_port(vm: ?*apprt.VM, slot: u8) u16 {
     const v = vm orelse return 0;
     const hw = v.hw_machine orelse return 0;

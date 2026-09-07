@@ -203,7 +203,15 @@ struct VMOverviewView: View {
                         label: "Network",
                         value: vmInstance.config.networkEnabled ? "Connected" : "Disconnected"
                     )
-                    if vmInstance.ssh.enabled {
+                    if vmInstance.config.sharedNetworking && vmInstance.backend == .hypervisor {
+                        DetailRow(
+                            label: "Guest IP",
+                            value: vmInstance.guestIPv4 ?? "Waiting for guest network")
+                        if vmInstance.state == .stopped { NetworkHelperControls() }
+                    }
+                    if vmInstance.ssh.enabled
+                        || (vmInstance.config.sharedNetworking && vmInstance.backend == .hypervisor)
+                    {
                         if vmInstance.sshPort != 0 {
                             Text(vmInstance.sshCommand)
                                 .font(.caption.monospaced())
@@ -218,8 +226,12 @@ struct VMOverviewView: View {
                                 }
                             }
                         } else {
-                            Text("SSH forwarding is available after the VM starts.")
-                                .font(.caption)
+                            Text(
+                                vmInstance.config.sharedNetworking
+                                    ? "SSH is available after the guest acquires an IP address."
+                                    : "SSH forwarding is available after the VM starts."
+                            )
+                            .font(.caption)
                         }
                         if let error = vmInstance.sshError {
                             Text(error).font(.caption).foregroundStyle(.red)
@@ -671,7 +683,8 @@ struct RestoreSnapshotButton: View {
 
         let alert = NSAlert()
         alert.messageText = "Restore \(vmInstance.name)?"
-        alert.informativeText = "This replaces the VM’s writable disks with the copies in "
+        alert.informativeText =
+            "This replaces the VM’s writable disks with the copies in "
             + "\(directory.path) and resumes its saved memory. Changes since that snapshot "
             + "will be lost. The snapshot must belong to this VM."
         alert.alertStyle = .warning

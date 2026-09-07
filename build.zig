@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Build and run the native app");
     const macos_app_step = b.step("macos-app", "Build the macOS app");
     const xcframework_step = b.step("xcframework", "Build BobrvmKit.xcframework");
+    var network_helper_install: ?*std.Build.Step = null;
     const ghostty_step = b.step("ghostty-lib", "Build ghostty-vt.xcframework");
     const bare_metal_integration_step = b.step(
         "test-bare-metal",
@@ -291,6 +292,24 @@ pub fn build(b: *std.Build) !void {
     b.getInstallStep().dependOn(&install_cli.step);
 
     if (target.result.os.tag == .macos) {
+        const helper_module = b.createModule(.{
+            .root_source_file = b.path("src/network_helper_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        helper_module.addImport("objc", objc_dependency.?.module("objc"));
+        helper_module.linkFramework("vmnet", .{});
+        helper_module.linkSystemLibrary("objc", .{});
+        if (environmentVariable(b, "SDKROOT")) |sdk| {
+            helper_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+            helper_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+        }
+        const helper = b.addExecutable(.{ .name = "bobrvm-network-helper", .root_module = helper_module });
+        const install_helper = b.addInstallArtifact(helper, .{});
+        b.getInstallStep().dependOn(&install_helper.step);
+        network_helper_install = &install_helper.step;
+        b.step("network-helper", "Build the privileged shared-network helper").dependOn(&install_helper.step);
         const docker_launcher_module = b.createModule(.{
             .root_source_file = b.path("src/docker_launcher_main.zig"),
             .target = target,
@@ -836,6 +855,7 @@ pub fn build(b: *std.Build) !void {
 
         const xcodebuild = XcodebuildStep.create(b, xcframework, optimize);
         xcodebuild.build.step.dependOn(ghostty_steps.install_root_step);
+        xcodebuild.build.step.dependOn(network_helper_install.?);
         macos_app_step.dependOn(&xcodebuild.build.step);
         if (emit_macos_app) b.default_step.dependOn(macos_app_step);
 

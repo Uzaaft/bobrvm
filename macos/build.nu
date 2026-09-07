@@ -8,7 +8,7 @@ def prepare-frameworks [
     optimize: string
 ] {
     cd $repo_root
-    ^zig build xcframework ghostty-lib -Demit-macos-app=false $"-Doptimize=($optimize)"
+    ^zig build xcframework ghostty-lib network-helper -Demit-macos-app=false $"-Doptimize=($optimize)"
     if $env.LAST_EXIT_CODE != 0 {
         exit $env.LAST_EXIT_CODE
     }

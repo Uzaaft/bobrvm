@@ -21,6 +21,7 @@ struct EditVMView: View {
     @State private var resolution: DisplayResolution
     @State private var retinaEnabled: Bool
     @State private var networkEnabled: Bool
+    @State private var sharedNetworking: Bool
     @State private var touchIDEnabled: Bool
     @State private var ssh: SSHSettings
     @State private var portForwards: [TCPForward]
@@ -58,6 +59,7 @@ struct EditVMView: View {
             ))
         _retinaEnabled = State(initialValue: vmInstance.retinaEnabled)
         _networkEnabled = State(initialValue: vmInstance.config.networkEnabled)
+        _sharedNetworking = State(initialValue: vmInstance.config.sharedNetworking)
         _touchIDEnabled = State(initialValue: vmInstance.config.touchIDEnabled)
         _ssh = State(initialValue: vmInstance.ssh)
         _portForwards = State(initialValue: vmInstance.config.portForwards)
@@ -381,9 +383,24 @@ struct EditVMView: View {
                 .disabled(isRunning)
                 .onChange(of: networkEnabled) { hasChanges = true }
 
+            if backend == .hypervisor {
+                Picker("Networking", selection: $sharedNetworking) {
+                    Text("Shared with this Mac").tag(true)
+                    Text("User networking (port forwards)").tag(false)
+                }
+                .disabled(isRunning)
+                .onChange(of: sharedNetworking) {
+                    if sharedNetworking { portForwards.removeAll() }
+                    hasChanges = true
+                }
+                if sharedNetworking { NetworkHelperControls() }
+            }
             LabeledContent("Connection") {
-                Text(backend == .virtualization ? "Apple NAT" : "Share with my Mac")
-                    .foregroundStyle(.secondary)
+                Text(
+                    backend == .virtualization
+                        ? "Apple NAT" : sharedNetworking ? "Shared network" : "User NAT"
+                )
+                .foregroundStyle(.secondary)
             }
         } header: {
             LockableSectionHeader(title: "Network", isLocked: isRunning)
@@ -396,38 +413,45 @@ struct EditVMView: View {
     private var forwardingSection: some View {
         if backend == .hypervisor {
             Section {
-                Toggle("SSH access from this Mac", isOn: $ssh.enabled)
-                if ssh.enabled {
+                if !sharedNetworking { Toggle("SSH access from this Mac", isOn: $ssh.enabled) }
+                if ssh.enabled || sharedNetworking {
                     TextField("Guest username", text: $ssh.username)
-                    Toggle("Choose SSH port automatically", isOn: $ssh.automatic)
-                    if !ssh.automatic {
-                        TextField("SSH host port", value: $ssh.port, format: .number)
-                    }
-                }
-                ForEach($portForwards) { $forward in
-                    VStack(alignment: .leading) {
-                        HStack {
-                            TextField("Host port", value: $forward.hostPort, format: .number)
-                            Image(systemName: "arrow.right")
-                            TextField("Guest port", value: $forward.guestPort, format: .number)
-                            Button("Remove", systemImage: "minus.circle") {
-                                portForwards.removeAll { $0.id == forward.id }
-                            }
-                            .labelStyle(.iconOnly)
+                    if !sharedNetworking {
+                        Toggle("Choose SSH port automatically", isOn: $ssh.automatic)
+                        if !ssh.automatic {
+                            TextField("SSH host port", value: $ssh.port, format: .number)
                         }
-                        Toggle("Allow LAN access", isOn: $forward.allowLAN)
                     }
                 }
-                Button("Add TCP port forward", systemImage: "plus") {
-                    portForwards.append(TCPForward())
+                if !sharedNetworking {
+                    ForEach($portForwards) { $forward in
+                        VStack(alignment: .leading) {
+                            HStack {
+                                TextField("Host port", value: $forward.hostPort, format: .number)
+                                Image(systemName: "arrow.right")
+                                TextField("Guest port", value: $forward.guestPort, format: .number)
+                                Button("Remove", systemImage: "minus.circle") {
+                                    portForwards.removeAll { $0.id == forward.id }
+                                }
+                                .labelStyle(.iconOnly)
+                            }
+                            Toggle("Allow LAN access", isOn: $forward.allowLAN)
+                        }
+                    }
+                    Button("Add TCP port forward", systemImage: "plus") {
+                        portForwards.append(TCPForward())
+                    }
+                    .disabled(portForwards.count >= 7)
                 }
-                .disabled(portForwards.count >= 7)
             } header: {
                 LockableSectionHeader(title: "SSH and Port Forwarding", isLocked: isRunning)
             } footer: {
-                Text("Enable SSH and configure login credentials inside the guest first. "
-                    + "Ports are accessible only from this Mac unless LAN access is enabled. "
-                    + "Stop the VM to edit these settings.")
+                Text(
+                    "Enable SSH and configure login credentials inside the guest first. "
+                        + (sharedNetworking
+                            ? "Shared VMs are reachable from this Mac and other VMs on the shared network. "
+                            : "Ports are accessible only from this Mac unless LAN access is enabled. ")
+                        + "Stop the VM to edit these settings.")
             }
             .disabled(isRunning || !networkEnabled)
             .onChange(of: ssh) { hasChanges = true }
@@ -513,9 +537,10 @@ struct EditVMView: View {
     }
 
     private var canGrowDisk: Bool {
-        !diskReadOnly && (vmInstance.config.diskPath.map {
-            URL(fileURLWithPath: $0).pathExtension.lowercased() == "raw"
-        } ?? false)
+        !diskReadOnly
+            && (vmInstance.config.diskPath.map {
+                URL(fileURLWithPath: $0).pathExtension.lowercased() == "raw"
+            } ?? false)
     }
 
     private var memoryRangeGB: ClosedRange<Double> {
@@ -591,6 +616,7 @@ struct EditVMView: View {
                     displayHeight: Int(resolution.height),
                     retinaEnabled: retinaEnabled,
                     networkEnabled: networkEnabled,
+                    sharedNetworking: sharedNetworking,
                     touchIDEnabled: touchIDEnabled,
                     ssh: ssh,
                     portForwards: portForwards,

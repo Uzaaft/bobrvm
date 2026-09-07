@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        B0B111111111111111111101 /* bobrvm-network-helper in Resources */ = {isa = PBXBuildFile; fileRef = B0B111111111111111111102; };
+        B0B111111111111111111103 /* manage-network-helper.sh in Resources */ = {isa = PBXBuildFile; fileRef = B0B111111111111111111104; };
 		A11000000000000000000001 /* BobrvmKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11000000000000000000002 /* BobrvmKitTests.swift */; };
 		A1100000000000000000001C /* TerminalEmulatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1100000000000000000001D /* TerminalEmulatorTests.swift */; };
 		8C0A30A63E02459EA9C8A11B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F4A5E5F7B684F5F9D1D3B2C /* AppDelegate.swift */; };
@@ -36,6 +38,8 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+        B0B111111111111111111102 = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = "../zig-out/bin/bobrvm-network-helper"; sourceTree = SOURCE_ROOT; };
+        B0B111111111111111111104 = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "network-helper/manage-network-helper.sh"; sourceTree = SOURCE_ROOT; };
 		A11000000000000000000002 /* BobrvmKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmKitTests.swift; sourceTree = "<group>"; };
 		A1100000000000000000001D /* TerminalEmulatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalEmulatorTests.swift; sourceTree = "<group>"; };
 		A11000000000000000000003 /* BobrvmTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BobrvmTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -275,6 +279,8 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			files = (
 				B0B000000000000000000001 /* Assets.xcassets in Resources */,
+                B0B111111111111111111101,
+                B0B111111111111111111103,
 				UEFI00000000000000000001 /* QEMU_EFI.fd in Resources */,
 				UEFI00000000000000000004 /* QEMU_VARS.fd in Resources */,
 			);

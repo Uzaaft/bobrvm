@@ -185,6 +185,10 @@ typedef struct {
     /** Defaults to read-only for ISO media. */
     bool disk2_read_only;
     bool enable_net;
+    /** Shared vmnet networking requires the installed privileged helper. */
+    bool network_shared;
+    /** Persistent locally administered unicast MAC for shared networking. */
+    uint8_t network_mac[6];
     /** Attach the host-backed macOS Touch ID authentication device. */
     bool enable_touch_id;
     /** Host directory exported through virtio-9p with mount tag "host". */
@@ -211,6 +215,8 @@ typedef struct {
 
 /** Actual listening port for a configured slot, or zero when unavailable. */
 uint16_t bobrvm_vm_forwarded_port(bobrvm_vm_t vm, uint8_t slot);
+/** Observed guest IPv4 in host byte order, zero until discovered or disconnected. */
+uint32_t bobrvm_vm_guest_ipv4(bobrvm_vm_t vm);
 
 typedef struct {
     uint64_t memory_bytes;

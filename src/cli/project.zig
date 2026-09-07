@@ -203,6 +203,7 @@ const Key = enum {
     docker,
     docker_vsock,
     share,
+    network,
     ssh_user,
     forwards,
     display,
@@ -233,6 +234,7 @@ const key_map = std.StaticStringMap(Key).initComptime(.{
     .{ "docker", .docker },
     .{ "docker-vsock", .docker_vsock },
     .{ "share", .share },
+    .{ "network", .network },
     .{ "ssh-user", .ssh_user },
     .{ "forwards", .forwards },
     .{ "display", .display },
@@ -324,6 +326,14 @@ fn mapTable(
                     },
                 }
             },
+            .network => {
+                const mode = try wantString(key_name, value);
+                if (std.mem.eql(u8, mode, "shared")) {
+                    config.network_shared = true;
+                } else if (std.mem.eql(u8, mode, "user")) {
+                    config.network_shared = false;
+                } else return error.ProjectFileInvalid;
+            },
             .ssh_user => config.ssh_user = try wantString(key_name, value),
             .forwards => try mapForwards(&config, key_name, value),
             .display => try mapDisplay(&config, key_name, value),
@@ -357,6 +367,7 @@ fn mapTable(
     if (config.docker_enabled) try prependDockerMount(arena, &config, engine_out.*);
     if (config.enable_virgl) config.enable_gpu = true;
     if (config.kitty_display) config.enable_gpu = true;
+    if (table.map.contains("network") and !table.map.contains("net")) config.enable_net = true;
     if (config.forward_count > 0) config.enable_net = true;
     if (config.docker_enabled) config.enable_net = true;
 
@@ -377,6 +388,7 @@ fn mapTable(
         }
     }
 
+    config.network_mac = @import("../net/shared.zig").macForIdentity(root);
     config.validate() catch return error.ProjectFileInvalid;
     return config;
 }
@@ -714,4 +726,20 @@ test "project: vz engine parses Docker devices and rejects graphics" {
 
     var bogus = try toml.parse(arena, "engine = \"qemu\"\n", null);
     try testing.expectError(error.ProjectFileInvalid, mapTable(arena, "/proj", &bogus, &engine));
+}
+
+test "project: shared networking has a stable identity and rejects forwards" {
+    if (@import("builtin").os.tag != .macos) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var table = try toml.parse(arena, "network = \"shared\"\n", null);
+    var engine: Engine = .native;
+    const config = try mapTable(arena, "/project", &table, &engine);
+    try std.testing.expect(config.enable_net);
+    try std.testing.expect(config.network_shared);
+    try std.testing.expectEqual(@import("../net/shared.zig").macForIdentity("/project"), config.network_mac);
+    var invalid = config;
+    invalid.forward_count = 1;
+    try std.testing.expectError(error.InvalidArgument, invalid.validate());
 }

@@ -17,7 +17,7 @@ const builtin = @import("builtin");
 const objc = @import("objc");
 const global = @import("../global.zig");
 const mininat = @import("../net/mininat.zig");
-const vz_mininat = @import("vz_mininat.zig");
+const vz_network = @import("vz_network.zig");
 const vz_objc = @import("vz_objc.zig");
 const vz_process_policy = @import("vz_process_policy.zig");
 const vz_vsock = @import("vz_vsock.zig");
@@ -66,6 +66,8 @@ pub const Config = struct {
     disk2_path: ?[:0]const u8 = null,
     disk2_read_only: bool = true,
     enable_net: bool = false,
+    network_shared: bool = false,
+    network_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 },
     forwards: []const mininat.Forward = &.{},
     docker_socket_path: ?[]const u8 = null,
     docker_vsock: bool = false,
@@ -93,7 +95,7 @@ pub const State = enum(NSInteger) {
 
 pub const Machine = struct {
     vm: Object,
-    network: ?*vz_mininat.Bridge,
+    network: ?*vz_network.Bridge,
     docker: ?*vz_vsock.Bridge,
     performance_policy: ?*vz_process_policy.Controller,
     startup_started_ns: u64,
@@ -157,7 +159,9 @@ pub const Machine = struct {
         errdefer if (docker) |bridge| bridge.destroy();
 
         const network = if (config.enable_net)
-            vz_mininat.Bridge.create(std.heap.c_allocator, .{
+            vz_network.Bridge.create(std.heap.c_allocator, .{
+                .network_shared = config.network_shared,
+                .network_mac = config.network_mac,
                 .forwards = config.forwards,
                 .docker_socket_path = if (config.docker_vsock)
                     null
@@ -324,7 +328,7 @@ fn finishStartupStep(field: *u64, step_started_ns: *u64) void {
 
 fn createConfiguration(
     config: *const Config,
-    network: ?*vz_mininat.Bridge,
+    network: ?*vz_network.Bridge,
     profile: *Machine.StartupProfile,
 ) Machine.InitError!Object {
     if (config.memory_bytes == 0 or config.vcpu_count == 0) {
@@ -420,10 +424,15 @@ fn createConfiguration(
         );
         const device = try newObject("VZVirtioNetworkDeviceConfiguration");
         device.msgSend(void, "setAttachment:", .{network_attachment.value});
+        var mac_buffer: [18]u8 = undefined;
+        const mac = if (config.network_shared) config.network_mac else mininat.GUEST_MAC;
+        const mac_string = std.fmt.bufPrintZ(&mac_buffer, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        }) catch return error.NetworkSetupFailed;
         device.msgSend(void, "setMACAddress:", .{(try initObject(
             "VZMACAddress",
             "initWithString:",
-            .{string("52:54:00:12:34:56").value},
+            .{string(mac_string).value},
         )).value});
         configuration.msgSend(void, "setNetworkDevices:", .{array(&.{device}).value});
     }

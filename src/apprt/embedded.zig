@@ -94,6 +94,8 @@ pub const VMConfig = extern struct {
     disk2_read_only: bool = true,
     /// Enable virtio-net with host-side NAT (DHCP/DNS/TCP/UDP).
     enable_net: bool = false,
+    network_shared: bool = false,
+    network_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 },
     /// Attach the host-backed macOS Touch ID authentication device.
     enable_touch_id: bool = false,
     /// Host directory exported through virtio-9p with mount tag "host".
@@ -130,6 +132,8 @@ pub const VMConfig = extern struct {
             .disk2_path = optionalString(self.disk2_path),
             .disk2_read_only = self.disk2_read_only,
         }) catch return false;
+        if (self.network_shared and
+            (self.network_mac[0] & 3 != 2 or self.port_forward_count != 0)) return false;
         if (self.port_forward_count > self.port_forwards.len) return false;
         if (self.port_forward_count != 0 and !self.enable_net) return false;
         const forwards = self.port_forwards[0..self.port_forward_count];
@@ -228,6 +232,8 @@ pub const VMConfig = extern struct {
             .disk2_path = owned_strings[6],
             .disk2_read_only = self.disk2_read_only,
             .enable_net = self.enable_net,
+            .network_shared = self.network_shared,
+            .network_mac = self.network_mac,
             .enable_touch_id = self.enable_touch_id,
             .shared_dir = owned_strings[7],
             .display_width = self.display_width,
@@ -257,6 +263,8 @@ pub const OwnedVMConfig = struct {
     disk2_path: ?[]const u8 = null,
     disk2_read_only: bool = true,
     enable_net: bool = false,
+    network_shared: bool = false,
+    network_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 },
     enable_touch_id: bool = false,
     shared_dir: ?[]const u8 = null,
     display_width: u32 = 0,
@@ -587,6 +595,8 @@ pub const VM = struct {
                 .enable_gpu = true,
                 .enable_virgl = self.config.enable_gpu3d,
                 .enable_net = self.config.enable_net,
+                .network_shared = self.config.network_shared,
+                .network_mac = self.config.network_mac,
                 .forwards = self.config.port_forwards[0..self.config.port_forward_count],
                 .enable_touch_id = self.config.enable_touch_id,
                 .shared_dir = self.config.shared_dir,

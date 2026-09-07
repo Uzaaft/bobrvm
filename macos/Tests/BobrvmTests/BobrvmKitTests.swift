@@ -106,7 +106,7 @@ final class BobrvmKitTests: XCTestCase {
         forward.hostPort = 8443
         forward.guestPort = 443
         forward.allowLAN = true
-        let config = try ssh.applying(to: VMConfig(networkEnabled: true, portForwards: [forward]))
+        let config = try ssh.applying(to: VMConfig(networkEnabled: true, sharedNetworking: false, portForwards: [forward]))
         try config.withCConfig { pointer in
             XCTAssertEqual(pointer.pointee.port_forward_count, 2)
             let slots = pointer.pointee.port_forwards
@@ -127,6 +127,29 @@ final class BobrvmKitTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testSharedNetworkingPersistsIdentityWithoutSSHForwarding() throws {
+        let app = try App()
+        let config = VMConfig(networkEnabled: true)
+        XCTAssertTrue(config.sharedNetworking)
+        XCTAssertEqual(config.networkMAC.count, 6)
+        XCTAssertEqual(config.networkMAC[0] & 3, 2)
+        XCTAssertNotEqual(config.networkMAC, VMConfig().networkMAC)
+        let ssh = SSHSettings()
+        XCTAssertTrue(try ssh.applying(to: config).portForwards.isEmpty)
+        let instance = VMInstance(name: "Shared", config: config, app: app)
+        let stored = try JSONDecoder().decode(VMStorage.StoredVM.self,
+            from: JSONEncoder().encode(VMStorage.StoredVM(from: instance)))
+        XCTAssertTrue(stored.vmConfig.sharedNetworking)
+        XCTAssertEqual(stored.vmConfig.networkMAC, config.networkMAC)
+        try stored.vmConfig.withCConfig { pointer in
+            XCTAssertTrue(pointer.pointee.network_shared)
+            XCTAssertEqual(pointer.pointee.network_mac.0, config.networkMAC[0])
+            XCTAssertEqual(pointer.pointee.port_forward_count, 0)
+        }
+    }
+
+    @MainActor
     func testSSHRejectsConfigInjectionAndInvalidForwarding() throws {
         var ssh = SSHSettings()
         ssh.enabled = true
@@ -136,7 +159,7 @@ final class BobrvmKitTests: XCTestCase {
             XCTAssertThrowsError(try ssh.applying(to: VMConfig()))
         }
         ssh.username = "alice"
-        var config = VMConfig(networkEnabled: true)
+        var config = VMConfig(networkEnabled: true, sharedNetworking: false)
         XCTAssertNoThrow(try VMBackend.hypervisor.validate(
             guestSystem: .linux, config: ssh.applying(to: config)
         ))
@@ -154,7 +177,7 @@ final class BobrvmKitTests: XCTestCase {
     }
 
     func testGenericForwardingUsesAllSlotsAndRejectsOverflow() throws {
-        var config = VMConfig(networkEnabled: true)
+        var config = VMConfig(networkEnabled: true, sharedNetworking: false)
         config.portForwards = (0..<8).map { index in
             var forward = TCPForward()
             forward.hostPort = UInt16(8000 + index)
@@ -187,7 +210,7 @@ final class BobrvmKitTests: XCTestCase {
         ssh.enabled = true
         ssh.username = "alice"
         ssh.port = 2222
-        let config = VMConfig(networkEnabled: true, portForwards: [TCPForward()])
+        let config = VMConfig(networkEnabled: true, sharedNetworking: false, portForwards: [TCPForward()])
         let instance = VMInstance(name: "SSH", config: config, ssh: ssh, app: app)
         let stored = try JSONDecoder().decode(
             VMStorage.StoredVM.self,

@@ -162,6 +162,7 @@ public final class VMManager: ObservableObject {
         displayHeight: Int,
         retinaEnabled: Bool,
         networkEnabled: Bool,
+        sharedNetworking: Bool,
         touchIDEnabled: Bool,
         ssh: SSHSettings,
         portForwards: [TCPForward],
@@ -194,6 +195,8 @@ public final class VMManager: ObservableObject {
             soundEnabled: backend == .hypervisor && (soundEnabled ?? instance.config.soundEnabled),
             sharedFolderReadOnly: sharedFolderReadOnly ?? instance.config.sharedFolderReadOnly,
             networkEnabled: networkEnabled,
+            sharedNetworking: sharedNetworking,
+            networkMAC: instance.config.networkMAC,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && instance.guestSystem == .linux,
             portForwards: portForwards,
@@ -432,11 +435,15 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
 
     private var runtimeStateCancellable: AnyCancellable?
     private var sshPortCancellable: AnyCancellable?
+    private var guestIPCancellable: AnyCancellable?
     @Published private(set) var sshError: String?
 
     var sshAlias: String { "bobrvm-\(id.uuidString.lowercased())" }
 
+    var guestIPv4: String? { runtimeVM?.guestIPv4 }
+
     var sshPort: UInt16 {
+        if config.sharedNetworking { return state == .running && guestIPv4 != nil ? 22 : 0 }
         guard ssh.enabled, state == .running,
             runtimeVM?.isStopping == false
         else { return 0 }
@@ -444,7 +451,8 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     }
 
     var sshCommand: String {
-        "ssh -o HostKeyAlias=\(sshAlias) -p \(sshPort) \(ssh.username)@127.0.0.1"
+        let host = config.sharedNetworking ? (guestIPv4 ?? "<guest-ip>") : "127.0.0.1"
+        return "ssh -o HostKeyAlias=\(sshAlias) -p \(sshPort) \(ssh.username)@\(host)"
     }
 
     func openSSH() {
@@ -668,6 +676,9 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         runtimeStateCancellable = runtime?.stateChanges.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        guestIPCancellable = runtimeVM?.$guestIPv4
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.objectWillChange.send() }
         sshPortCancellable = runtimeVM?.$forwardedPorts
             .map { $0.first ?? 0 }
             .removeDuplicates()
@@ -676,8 +687,9 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
                     port != 0, self.ssh.port != port
                 else { return }
                 self.ssh.port = port
-                do { try VMStorage.saveVM(self) }
-                catch { self.sshError = error.localizedDescription }
+                do { try VMStorage.saveVM(self) } catch {
+                    self.sshError = error.localizedDescription
+                }
             }
     }
 }
@@ -710,6 +722,8 @@ enum VMStorage {
         let displayHeight: UInt32?
         let retinaEnabled: Bool?
         let networkEnabled: Bool?
+        let sharedNetworking: Bool?
+        let networkMAC: [UInt8]?
         let touchIDEnabled: Bool?
         let ssh: SSHSettings?
         let portForwards: [TCPForward]?
@@ -768,6 +782,8 @@ enum VMStorage {
                 soundEnabled: soundEnabled ?? false,
                 sharedFolderReadOnly: sharedFolderReadOnly ?? false,
                 networkEnabled: networkEnabled ?? true,
+                sharedNetworking: sharedNetworking ?? false,
+                networkMAC: networkMAC,
                 touchIDEnabled: touchIDEnabled ?? false,
                 portForwards: portForwards ?? [],
                 sharedFolderPath: sharedFolderPath,
@@ -805,6 +821,8 @@ enum VMStorage {
             self.displayHeight = instance.config.displayHeight
             self.retinaEnabled = instance.retinaEnabled
             self.networkEnabled = instance.config.networkEnabled
+            self.sharedNetworking = instance.config.sharedNetworking
+            self.networkMAC = instance.config.networkMAC
             self.touchIDEnabled = instance.config.touchIDEnabled
             self.ssh = instance.ssh
             self.portForwards = instance.config.portForwards

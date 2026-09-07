@@ -27,6 +27,7 @@ struct CreateVMView: View {
     @State private var retinaEnabled = true
     @State private var touchIDEnabled = false
     @State private var ssh = SSHSettings()
+    @State private var sharedNetworking = true
     @State private var diskSizeGB = 64.0
     @State private var isCreating = false
     @State private var installationProgress = 0.0
@@ -130,6 +131,7 @@ struct CreateVMView: View {
                 retinaEnabled: $retinaEnabled,
                 touchIDEnabled: $touchIDEnabled,
                 ssh: $ssh,
+                sharedNetworking: $sharedNetworking,
                 backend: $backend,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
                 systemInfo: systemInfo,
@@ -338,6 +340,7 @@ struct CreateVMView: View {
             gpu3DEnabled: gpu3DEnabled && backend == .hypervisor,
             soundEnabled: soundEnabled && backend == .hypervisor,
             networkEnabled: true,
+            sharedNetworking: sharedNetworking,
             touchIDEnabled: touchIDEnabled && backend == .hypervisor
                 && operatingSystem == .linux,
             firmwarePath: Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd"),
@@ -653,7 +656,8 @@ private struct InstallationStepView: View {
                     ) { source = .directKernel }
                     if source == .directKernel {
                         BootConfigurationFields(boot: $boot, allowsModeChange: false)
-                        FilePickerField(label: "Disk (optional)", path: $existingDiskPath, types: [])
+                        FilePickerField(
+                            label: "Disk (optional)", path: $existingDiskPath, types: [])
                     }
                 }
             }
@@ -748,6 +752,7 @@ private struct HardwareStepView: View {
     @Binding var retinaEnabled: Bool
     @Binding var touchIDEnabled: Bool
     @Binding var ssh: SSHSettings
+    @Binding var sharedNetworking: Bool
     @Binding var backend: VMBackend
     let guestSystem: GuestSystem
     let systemInfo: SystemInfo
@@ -859,13 +864,20 @@ private struct HardwareStepView: View {
     private var deviceSettings: some View {
         if backend == .hypervisor {
             SettingsGroup(title: "SSH", systemImage: "terminal") {
-                Toggle("SSH access from this Mac", isOn: $ssh.enabled)
-                if ssh.enabled {
+                Picker("Networking", selection: $sharedNetworking) {
+                    Text("Shared with this Mac").tag(true)
+                    Text("User networking (port forwards)").tag(false)
+                }
+                if !sharedNetworking { Toggle("SSH access from this Mac", isOn: $ssh.enabled) }
+                if ssh.enabled || sharedNetworking {
                     TextField("Guest username", text: $ssh.username)
-                    Text("A local port is chosen automatically. Enable SSH and configure "
-                        + "login credentials inside the guest after installation.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if sharedNetworking { NetworkHelperControls() }
+                    Text(
+                        "Enable SSH and configure "
+                            + "login credentials inside the guest after installation."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
             }
         }
@@ -925,7 +937,8 @@ private struct StorageStepView: View {
                 } else {
                     SummaryRow(
                         label: "Virtual disk",
-                        value: existingDiskPath.isEmpty ? "None"
+                        value: existingDiskPath.isEmpty
+                            ? "None"
                             : URL(fileURLWithPath: existingDiskPath).lastPathComponent
                     )
                     Text(existingDiskPath)
@@ -1003,7 +1016,8 @@ private struct SummaryStepView: View {
                     label: "Disk",
                     value: source != .existingDisk && source != .directKernel
                         ? "\(diskSizeGB) GB sparse disk"
-                        : existingDiskPath.isEmpty ? "None"
+                        : existingDiskPath.isEmpty
+                            ? "None"
                             : URL(fileURLWithPath: existingDiskPath).lastPathComponent
                 )
             }

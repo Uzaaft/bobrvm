@@ -88,3 +88,6 @@ call's reply when it has not already been sent, following the
 Closing MCP stdin also cancels active work and disposes of all sandboxes. Shutdown
 allows two seconds for graceful VM cleanup before forced child termination; the
 parent owns the fork directory so it can remove private state after either path.
+
+For direct host-to-guest connectivity without port forwards, use `network = "shared"`
+and install the bundled privileged helper. See [Networking](networking.md).

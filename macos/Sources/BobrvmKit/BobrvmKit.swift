@@ -151,6 +151,8 @@ public struct VMConfig {
     public var soundEnabled: Bool
     public var sharedFolderReadOnly: Bool
     public var networkEnabled: Bool
+    public var sharedNetworking: Bool
+    public var networkMAC: [UInt8]
     public var touchIDEnabled: Bool
     public var portForwards: [TCPForward]
     public var sharedFolderPath: String?
@@ -178,6 +180,8 @@ public struct VMConfig {
         soundEnabled: Bool = false,
         sharedFolderReadOnly: Bool = false,
         networkEnabled: Bool? = nil,
+        sharedNetworking: Bool = true,
+        networkMAC: [UInt8]? = nil,
         touchIDEnabled: Bool = false,
         portForwards: [TCPForward] = [],
         sharedFolderPath: String? = nil,
@@ -201,6 +205,11 @@ public struct VMConfig {
         self.soundEnabled = soundEnabled
         self.sharedFolderReadOnly = sharedFolderReadOnly
         self.networkEnabled = networkEnabled ?? defaults.enable_net
+        self.sharedNetworking = sharedNetworking
+        var identity = UUID().uuid
+        var generatedMAC = withUnsafeBytes(of: &identity) { Array($0.prefix(6)) }
+        generatedMAC[0] = (generatedMAC[0] & 0xfc) | 2
+        self.networkMAC = networkMAC ?? generatedMAC
         self.touchIDEnabled = touchIDEnabled
         self.portForwards = portForwards
         self.sharedFolderPath = sharedFolderPath
@@ -235,6 +244,9 @@ public struct VMConfig {
         config.enable_snd = soundEnabled
         config.share_read_only = sharedFolderReadOnly
         config.enable_net = networkEnabled
+        config.network_shared = sharedNetworking
+        guard networkMAC.count == 6 else { throw BobrvmError.invalidArgument }
+        withUnsafeMutableBytes(of: &config.network_mac) { $0.copyBytes(from: networkMAC) }
         config.enable_touch_id = touchIDEnabled
         config.disk_read_only = diskReadOnly
         config.disk2_read_only = isoReadOnly
@@ -544,6 +556,7 @@ public final class VM: ObservableObject {
     @Published public private(set) var state: VMState = .stopped
     @Published public private(set) var isStopping = false
     @Published public private(set) var guestToolsStatus = GuestToolsStatus.disconnected
+    @Published public private(set) var guestIPv4: String?
     @Published public private(set) var forwardedPorts: [UInt16]
     private(set) var consoleOutputData = Data()
 
@@ -588,6 +601,9 @@ public final class VM: ObservableObject {
         guard !isStopping else { return }
         // Device setup publishes asynchronously; listeners keep their ports until stop.
         if let handle, state == .running {
+            let ip = bobrvm_vm_guest_ipv4(handle)
+            guestIPv4 =
+                ip == 0 ? nil : "\(ip >> 24).\((ip >> 16) & 255).\((ip >> 8) & 255).\(ip & 255)"
             for slot in forwardedPorts.indices where forwardedPorts[slot] == 0 {
                 let port = bobrvm_vm_forwarded_port(handle, UInt8(slot))
                 if port != 0 { forwardedPorts[slot] = port }
@@ -739,7 +755,8 @@ public final class VM: ObservableObject {
         let path = directory.path
         let task = Task.detached(priority: .userInitiated) {
             path.withCString { directoryPath in
-                let code = quiesced
+                let code =
+                    quiesced
                     ? bobrvm_vm_snapshot_quiesced(sendableHandle.value, directoryPath)
                     : bobrvm_vm_snapshot(sendableHandle.value, directoryPath)
                 return Int32(code.rawValue)
@@ -813,6 +830,7 @@ public final class VM: ObservableObject {
     private func beginStop() -> SendableVMHandle? {
         guard !isStopping, state != .stopped, let handle else { return nil }
         isStopping = true
+        guestIPv4 = nil
         forwardedPorts = Array(repeating: 0, count: forwardedPorts.count)
         if let app {
             app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)

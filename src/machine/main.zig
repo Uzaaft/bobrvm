@@ -25,6 +25,7 @@ const virtio = @import("../virtio/main.zig");
 const gic = @import("../gic/main.zig");
 const icc = @import("../gic/icc.zig");
 const mininat = @import("../net/mininat.zig");
+const SharedNetwork = @import("../net/shared.zig");
 const pci = @import("../pci/main.zig");
 const dtb = @import("dtb.zig");
 const agent = @import("../agent/main.zig");
@@ -204,8 +205,10 @@ pub const MachineConfig = struct {
     /// Advertise virgl 3D acceleration (experimental translator).
     enable_virgl: bool = false,
 
-    /// Enable the virtio-net device (built-in NAT backend).
+    /// Enable the virtio-net device with shared or user networking.
     enable_net: bool = false,
+    network_shared: bool = false,
+    network_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 },
 
     /// Deny host networking and shared filesystem access without changing slots.
     isolate_host: bool = false,
@@ -446,6 +449,7 @@ pub const Machine = struct {
     net: ?*virtio.Net = null,
     net_slot: u8 = 0,
     nat: mininat.MiniNat = undefined,
+    shared_network: ?*SharedNetwork = null,
     /// Published by device setup and read by the application thread.
     forwarded_ports: [8]std.atomic.Value(u16) = @splat(std.atomic.Value(u16).init(0)),
 
@@ -635,6 +639,10 @@ pub const Machine = struct {
         }
 
         if (self.net) |net| {
+            if (self.shared_network) |shared| {
+                shared.destroy(self.alloc);
+                self.shared_network = null;
+            }
             self.nat.stop();
             net.deinit();
             self.net = null;
@@ -2909,7 +2917,20 @@ pub const Machine = struct {
             self.nat.setRxReady(
                 callback_binding.Handler0(Machine, bool, natRxReadyCallback).bind(self),
             );
-            if (!self.config.isolate_host) {
+            if (self.config.network_shared) self.net.?.config.mac = self.config.network_mac;
+            if (!self.config.isolate_host and self.config.network_shared) {
+                if (self.config.forwards.len != 0 or self.config.docker_socket_path != null)
+                    return error.Unexpected;
+                self.shared_network = SharedNetwork.create(
+                    self.alloc,
+                    self.config.network_mac,
+                    callback_binding.Handler1(Machine, []const u8, void, natReplyCallback).bind(self),
+                ) catch |err| {
+                    log.err("shared networking failed: {}. " ++
+                        "Install the network helper or select user networking", .{err});
+                    return error.Unexpected;
+                };
+            } else if (!self.config.isolate_host) {
                 try self.initializeForwards();
                 if (self.config.docker_socket_path) |path| {
                     self.nat.addUnixForward(path, 2375) catch |err| {
@@ -3564,10 +3585,11 @@ pub const Machine = struct {
         }
     }
 
-    /// Guest → host frame: hand to the NAT responder (vCPU thread,
+    /// Guest → host frame: hand to the selected backend (vCPU thread,
     /// machine lock held).
     fn netTxCallback(self: *Machine, frame: []const u8) void {
-        if (!self.config.isolate_host) self.nat.handleFrame(frame);
+        if (self.config.isolate_host) return;
+        if (self.shared_network) |shared| shared.send(frame) else self.nat.handleFrame(frame);
     }
 
     /// NAT responder → guest frame.

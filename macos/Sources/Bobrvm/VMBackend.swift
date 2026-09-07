@@ -77,8 +77,7 @@ public enum VMBackend: String, Codable, CaseIterable, Identifiable {
         }
         if !config.portForwards.isEmpty {
             guard self == .hypervisor else { throw VMBackendError.invalidForwarding }
-            do { try config.validate() }
-            catch { throw VMBackendError.invalidForwarding }
+            do { try config.validate() } catch { throw VMBackendError.invalidForwarding }
         }
         guard !config.touchIDEnabled || (self == .hypervisor && guestSystem == .linux) else {
             throw VMBackendError.touchIDRequiresLinuxHypervisor
@@ -295,8 +294,9 @@ public struct SSHSettings: Codable, Equatable {
     }
 
     func applying(to config: VMConfig) throws -> VMConfig {
-        guard enabled else { return config }
+        guard enabled || config.sharedNetworking else { return config }
         guard validUsername else { throw VMBackendError.invalidSSHUsername }
+        if config.sharedNetworking { return config }
         var result = config
         var forward = TCPForward()
         forward.hostPort = port
@@ -324,7 +324,8 @@ public struct BootConfiguration {
 
     init(config: VMConfig) {
         mode = config.kernelPath == nil ? .uefi : .kernel
-        firmware = config.firmwarePath ?? Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd") ?? ""
+        firmware =
+            config.firmwarePath ?? Bundle.main.path(forResource: "QEMU_EFI", ofType: "fd") ?? ""
         variables = config.varsPath ?? ""
         kernel = config.kernelPath ?? ""
         initrd = config.initrdPath ?? ""
@@ -368,5 +369,87 @@ struct BootConfigurationFields: View {
             FilePickerField(label: "UEFI firmware", path: $boot.firmware, types: [])
             FilePickerField(label: "UEFI variables", path: $boot.variables, types: [])
         }
+    }
+}
+
+/// Installation is the only privileged app operation. The daemon authenticates
+/// packet clients using the installing user's kernel-provided UID.
+@MainActor
+struct NetworkHelperControls: View {
+    @State private var installed = FileManager.default.fileExists(
+        atPath: "/Library/PrivilegedHelperTools/as.polymath.bobrvm.network")
+    @State private var working = false
+    @State private var failure: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(
+                installed
+                    ? "Shared networking is installed."
+                    : "Install shared networking once to connect this Mac directly to guest IP addresses."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            HStack {
+                Button(installed ? "Update networking…" : "Install networking…") {
+                    manage(remove: false)
+                }
+                if installed {
+                    Button("Remove networking…") { manage(remove: true) }
+                }
+            }
+            .disabled(working)
+            Text(
+                "Administrator approval is required. Updating or removing networking disconnects shared VMs."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
+        }
+    }
+
+    private func manage(remove: Bool) {
+        guard let script = Bundle.main.path(forResource: "manage-network-helper", ofType: "sh"),
+            let helper = Bundle.main.path(forResource: "bobrvm-network-helper", ofType: nil)
+        else {
+            failure =
+                "This build does not include the networking helper. Rebuild the app dependencies."
+            return
+        }
+        let command =
+            "/bin/sh \(Self.shellQuote(script)) "
+            + (remove ? "remove" : "install \(Self.shellQuote(helper)) \(getuid())")
+        let appleScript =
+            "do shell script \""
+            + command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"") + "\" with administrator privileges"
+        working = true
+        failure = nil
+        Task {
+            let result = await Task.detached {
+                let process = Process()
+                let errors = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", appleScript]
+                process.standardError = errors
+                do {
+                    try process.run()
+                    let data = errors.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    return process.terminationStatus == 0
+                        ? nil
+                        : String(data: data, encoding: .utf8) ?? "Networking installation failed."
+                } catch { return error.localizedDescription }
+            }.value
+            working = false
+            failure = result
+            installed = FileManager.default.fileExists(
+                atPath: "/Library/PrivilegedHelperTools/as.polymath.bobrvm.network")
+        }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

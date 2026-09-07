@@ -57,7 +57,17 @@ captured CPUs, device presence, and recorded disk destinations before writes.
 Disk copies use APFS cloning; replacement is atomic per disk, not across
 multiple disks. Runtime startup errors are currently reported in the log.
 
+## Shared networking and SSH
+
+New VMs use shared networking. Install the bundled networking helper once with
+administrator approval, then use the guest IP and SSH command shown in VM details.
+Set an existing guest username; SSH and credentials remain the guest owner's
+responsibility. See [Networking](../docs/networking.md) for installation, CLI use,
+network modes, and removal.
+
 ## SSH and TCP forwarding
+
+The following applies to **User networking (port forwards)**:
 
 For a VM using Bobrvm Hypervisor, enable **SSH access from this Mac** during creation or in
 **Virtual Machine Settings > SSH and Port Forwarding**. Enter an existing guest username. The

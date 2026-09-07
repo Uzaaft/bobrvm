@@ -58,6 +58,8 @@ pub fn upProject(arena: Allocator, proj: *const project.Project) !void {
         .disk2_path = if (config.disk2_path) |path| try arena.dupeZ(u8, path) else null,
         .disk2_read_only = config.disk2_read_only,
         .enable_net = config.enable_net,
+        .network_shared = config.network_shared,
+        .network_mac = config.network_mac,
         .forwards = forwards[0..config.forward_count],
         .docker_socket_path = config.docker_socket_path,
         .docker_vsock = config.docker_vsock,

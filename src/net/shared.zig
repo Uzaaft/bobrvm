@@ -1,0 +1,184 @@
+//! Unprivileged vmnet client. Packet sockets never block the vCPU thread.
+pub const Client = @This();
+const std = @import("std");
+const protocol = @import("shared_protocol.zig");
+const net = @import("../compat/net.zig");
+const callback = @import("../callback.zig");
+
+control: c_int,
+packets: c_int,
+mac: [6]u8,
+reply: callback.Binding1([]const u8, void),
+thread: ?std.Thread = null,
+running: std.atomic.Value(bool) = .init(true),
+ipv4: std.atomic.Value(u32) = .init(0),
+
+pub const Error = protocol.Error || std.mem.Allocator.Error || std.Thread.SpawnError;
+
+/// Stable local MAC for CLI project/disk identities. GUI persists random MACs.
+pub fn macForIdentity(identity: []const u8) [6]u8 {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, std.hash.Wyhash.hash(0x626f6272766d, identity), .big);
+    var mac: [6]u8 = bytes[0..6].*;
+    mac[0] = (mac[0] & 0xfc) | 2;
+    return mac;
+}
+
+/// Queries the helper's active session without opening a second interface.
+pub fn lookup(mac: [6]u8) protocol.Error!u32 {
+    if (@import("builtin").os.tag != .macos) return error.HelperUnavailable;
+    const control = net.socketCreate(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch
+        return error.HelperUnavailable;
+    defer net.socketClose(control);
+    try protocol.configure(control);
+    var address = protocol.address();
+    if (std.c.connect(control, @ptrCast(&address), @sizeOf(@TypeOf(address))) != 0 or
+        protocol.peerUid(control) != 0) return error.HelperUnavailable;
+    const hello = protocol.Hello{ .mac = mac, .version = "BOBRIP01".* };
+    if (std.c.send(control, &hello, @sizeOf(@TypeOf(hello)), 0) != @sizeOf(@TypeOf(hello)))
+        return error.ProtocolError;
+    var bytes: [4]u8 = undefined;
+    try protocol.readExact(control, &bytes);
+    return std.mem.readInt(u32, &bytes, .big);
+}
+
+pub const Connection = struct { control: c_int, packets: c_int };
+
+/// Returns two owned descriptors. The caller must retain control until the
+/// guest-facing packet attachment has stopped using packets.
+pub fn connect(mac: [6]u8) protocol.Error!Connection {
+    if (@import("builtin").os.tag != .macos) return error.HelperUnavailable;
+    const hello = protocol.Hello{ .mac = mac };
+    if (!hello.valid()) return error.ProtocolError;
+    const control = net.socketCreate(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch
+        return error.HelperUnavailable;
+    errdefer net.socketClose(control);
+    try protocol.configure(control);
+    var address = protocol.address();
+    if (std.c.connect(control, @ptrCast(&address), @sizeOf(@TypeOf(address))) != 0 or
+        protocol.peerUid(control) != 0) return error.HelperUnavailable;
+    if (std.c.send(control, &hello, @sizeOf(@TypeOf(hello)), 0) != @sizeOf(@TypeOf(hello)))
+        return error.ProtocolError;
+    const packets = try protocol.receiveDescriptor(control);
+    errdefer net.socketClose(packets);
+    return .{ .control = control, .packets = packets };
+}
+
+pub fn create(
+    alloc: std.mem.Allocator,
+    mac: [6]u8,
+    reply: callback.Binding1([]const u8, void),
+) Error!*Client {
+    const connection = try connect(mac);
+    const control = connection.control;
+    const packets = connection.packets;
+    errdefer net.socketClose(control);
+    errdefer net.socketClose(packets);
+    const self = try alloc.create(Client);
+    errdefer alloc.destroy(self);
+    self.* = .{ .control = control, .packets = packets, .mac = mac, .reply = reply };
+    self.thread = try std.Thread.spawn(.{}, receive, .{self});
+    return self;
+}
+
+pub fn destroy(self: *Client, alloc: std.mem.Allocator) void {
+    self.running.store(false, .release);
+    _ = std.c.shutdown(self.control, 2);
+    if (self.thread) |thread| thread.join();
+    net.socketClose(self.packets);
+    net.socketClose(self.control);
+    alloc.destroy(self);
+}
+
+pub fn send(self: *Client, frame: []const u8) void {
+    if (!self.running.load(.acquire) or frame.len < 14 or
+        frame.len > protocol.frame_bytes_max) return;
+    if (sourceAddress(frame, self.mac)) |ip| self.ipv4.store(ip, .release);
+    _ = std.c.send(self.packets, frame.ptr, frame.len, std.posix.MSG.DONTWAIT);
+}
+
+fn receive(self: *Client) void {
+    defer {
+        self.running.store(false, .release);
+        self.ipv4.store(0, .release);
+    }
+    var buffer: [protocol.frame_bytes_max + 1]u8 = undefined;
+    while (self.running.load(.acquire)) {
+        var fds = [_]std.c.pollfd{
+            .{ .fd = self.control, .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = self.packets, .events = std.c.POLL.IN, .revents = 0 },
+        };
+        if (std.c.poll(&fds, fds.len, -1) < 0) {
+            if (std.c.errno(@as(c_int, -1)) == .INTR) continue;
+            return;
+        }
+        if (fds[0].revents != 0) return;
+        if (fds[1].revents & std.c.POLL.IN == 0) return;
+        const count = std.c.recv(self.packets, &buffer, buffer.len, std.posix.MSG.DONTWAIT);
+        if (count >= 14 and count <= protocol.frame_bytes_max)
+            self.reply.call(buffer[0..@intCast(count)]);
+    }
+}
+
+/// Observe only this NIC's unicast IPv4/ARP source; never trust lengths from a guest.
+pub fn sourceAddress(frame: []const u8, mac: [6]u8) ?u32 {
+    if (frame.len < 14 or !std.mem.eql(u8, frame[6..12], &mac)) return null;
+    const kind = std.mem.readInt(u16, frame[12..14], .big);
+    const bytes = switch (kind) {
+        0x0800 => blk: {
+            if (frame.len < 34 or frame[14] >> 4 != 4 or frame[14] & 15 < 5) return null;
+            const header_bytes = @as(usize, frame[14] & 15) * 4;
+            const packet_bytes = std.mem.readInt(u16, frame[16..18], .big);
+            if (packet_bytes < header_bytes or packet_bytes > frame.len - 14) return null;
+            break :blk frame[26..30];
+        },
+        0x0806 => blk: {
+            if (frame.len < 42 or !std.mem.eql(u8, frame[14..20], &.{ 0, 1, 8, 0, 6, 4 }) or
+                !std.mem.eql(u8, frame[22..28], &mac)) return null;
+            break :blk frame[28..32];
+        },
+        else => return null,
+    };
+    if (bytes[0] == 0 or bytes[0] == 127 or bytes[0] >= 224 or
+        (bytes[0] == 169 and bytes[1] == 254)) return null;
+    return std.mem.readInt(u32, bytes, .big);
+}
+
+test "shared address discovery bounds frames and matches the guest MAC" {
+    const mac = [6]u8{ 2, 1, 2, 3, 4, 5 };
+    var frame = [_]u8{0} ** 42;
+    @memcpy(frame[6..12], &mac);
+    @memcpy(frame[12..20], &[_]u8{ 8, 6, 0, 1, 8, 0, 6, 4 });
+    @memcpy(frame[22..28], &mac);
+    @memcpy(frame[28..32], &[_]u8{ 192, 168, 64, 2 });
+    try std.testing.expectEqual(@as(?u32, 0xc0a84002), sourceAddress(&frame, mac));
+    for (0..42) |length| {
+        try std.testing.expectEqual(@as(?u32, null), sourceAddress(frame[0..length], mac));
+    }
+    frame[6] = 4;
+    try std.testing.expectEqual(@as(?u32, null), sourceAddress(&frame, mac));
+}
+
+test "shared identities are stable, local, and distinct" {
+    const first = macForIdentity("/projects/first");
+    try std.testing.expectEqual(first, macForIdentity("/projects/first"));
+    try std.testing.expectEqual(@as(u8, 2), first[0] & 3);
+    try std.testing.expect(!std.mem.eql(u8, &first, &macForIdentity("/projects/second")));
+}
+
+test "shared IPv4 discovery rejects unspecified and truncated datagrams" {
+    const mac = [6]u8{ 2, 1, 2, 3, 4, 5 };
+    var frame = [_]u8{0} ** 34;
+    @memcpy(frame[6..12], &mac);
+    frame[12] = 8;
+    frame[14] = 0x45;
+    std.mem.writeInt(u16, frame[16..18], 20, .big);
+    try std.testing.expectEqual(@as(?u32, null), sourceAddress(&frame, mac));
+    @memcpy(frame[26..30], &[_]u8{ 192, 168, 64, 2 });
+    try std.testing.expectEqual(@as(?u32, 0xc0a84002), sourceAddress(&frame, mac));
+    frame[14] = 0x46;
+    try std.testing.expectEqual(@as(?u32, null), sourceAddress(&frame, mac));
+    frame[14] = 0x45;
+    std.mem.writeInt(u16, frame[16..18], 21, .big);
+    try std.testing.expectEqual(@as(?u32, null), sourceAddress(&frame, mac));
+}

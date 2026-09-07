@@ -18,6 +18,8 @@ pub fn base(config: *const Config) machine.MachineConfig {
         .disk2_path = config.disk2_path,
         .disk2_read_only = config.disk2_read_only,
         .enable_net = config.enable_net,
+        .network_shared = config.network_shared,
+        .network_mac = config.network_mac,
         .shared_dir = config.shared_dir,
         .share_read_only = config.share_read_only,
         .restore_path = config.restore_path,

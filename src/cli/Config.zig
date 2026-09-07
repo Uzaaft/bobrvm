@@ -29,6 +29,8 @@ enable_gpu: bool = false,
 enable_virgl: bool = false,
 kitty_display: bool = false,
 enable_net: bool = false,
+network_shared: bool = false,
+network_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 },
 /// Internal MCP policy: preserve device topology but deny host network and 9p access.
 isolate_host: bool = false,
 /// Expose the guest Docker API through a private host Unix socket.
@@ -153,6 +155,14 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
             config.kitty_display = true;
         } else if (std.mem.eql(u8, arg, "--sound")) {
             config.enable_snd = true;
+        } else if (std.mem.eql(u8, arg, "--network")) {
+            const mode = args.next() orelse return ParseError.InvalidArgument;
+            if (std.mem.eql(u8, mode, "shared")) {
+                config.network_shared = true;
+            } else if (std.mem.eql(u8, mode, "user")) {
+                config.network_shared = false;
+            } else return ParseError.InvalidArgument;
+            config.enable_net = true;
         } else if (std.mem.eql(u8, arg, "--net")) {
             config.enable_net = true;
         } else if (std.mem.eql(u8, arg, "--share")) {
@@ -225,11 +235,21 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         }
     }
 
+    config.network_mac = @import("../net/shared.zig").macForIdentity(
+        config.disk_path orelse config.vars_path orelse config.kernel_path orelse "bobrvm-cli",
+    );
     try config.validate();
     return config;
 }
 
 pub fn validate(self: *const Config) ParseError!void {
+    if (self.network_shared and (self.forward_count != 0 or self.docker_enabled or
+        self.network_mac[0] & 3 != 2 or @import("builtin").os.tag != .macos))
+    {
+        log.warn("shared networking requires macOS and cannot be combined with " ++
+            "port forwards or Docker sockets", .{});
+        return ParseError.InvalidArgument;
+    }
     if (self.kitty_display and !self.enable_gpu) return ParseError.InvalidArgument;
     const memory_bytes = std.math.mul(u64, self.memory_mb, 1024 * 1024) catch {
         return ParseError.InvalidArgument;
@@ -469,6 +489,7 @@ pub fn printOptions() void {
         \\  --kitty-display       Stream GPU frames to Ghostty (implies --gpu)
         \\  --sound               Attach a virtio-snd playback device
         \\  --net                 Attach a virtio-net adapter (user-mode NAT)
+        \\  --network <mode>      shared (installed helper) or user (port forwards)
         \\  --share <dir>         Export a host directory over virtio-9p (tag "host")
         \\  --forward <h:g>       Forward host TCP port h to guest port g
         \\                        (repeatable, max 8, implies --net)

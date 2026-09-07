@@ -1,11 +1,7 @@
-//! `bobrvm ssh [-- <ssh args>]` - Open an SSH session to the project's
-//! guest through a forwarded port.
-//!
-//! bobrvm does not implement SSH; it selects the forwarded host port
-//! that maps to guest port 22, builds a hardened `ssh` command line,
-//! and execs the system client. The guest must run sshd and the
-//! project must forward a host port to 22 (forwards = ["2222:22"] in
-//! bobrvm.toml); start it first with `bobrvm up` / `up --detach`.
+//! `bobrvm ssh [-- <ssh args>]` opens the project's guest using system SSH.
+//! Shared networking discovers the guest IP through the helper; user networking
+//! selects a host port forwarded to guest port 22. The guest owner configures
+//! sshd and credentials. Start the project with `bobrvm up` first.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -45,7 +41,18 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
     };
     const proj = try project.load(arena, root);
 
-    const host_port = guestPort22Forward(&proj.config) orelse {
+    var host: []const u8 = "127.0.0.1";
+    const host_port: u16 = if (proj.config.network_shared) blk: {
+        const ip = try @import("../net/shared.zig").lookup(proj.config.network_mac);
+        if (ip == 0) {
+            log.err("guest IP not discovered; start the VM and enable networking inside the guest", .{});
+            return error.GuestAddressUnavailable;
+        }
+        host = try std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{
+            ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255,
+        });
+        break :blk 22;
+    } else guestPort22Forward(&proj.config) orelse {
         log.err(
             "no forward to guest port 22; add forwards = [\"2222:22\"] to {s} and re-run bobrvm up",
             .{project.FILE_NAME},
@@ -53,13 +60,13 @@ pub fn execute(alloc: Allocator, args: *std.process.Args.Iterator) !void {
         return error.NoSshForward;
     };
 
-    const argv = try buildArgv(arena, proj.config.ssh_user, host_port, extra.items);
+    const argv = try buildArgv(arena, proj.config.ssh_user, host, host_port, extra.items);
     // Null-terminated argv for execvp.
     var c_argv = try arena.alloc(?[*:0]const u8, argv.len + 1);
     for (argv, 0..) |a, i| c_argv[i] = try arena.dupeZ(u8, a);
     c_argv[argv.len] = null;
 
-    log.info("ssh {s}@127.0.0.1:{d}", .{ proj.config.ssh_user, host_port });
+    log.info("ssh {s}@{s}:{d}", .{ proj.config.ssh_user, host, host_port });
     _ = execvp(c_argv[0].?, @ptrCast(c_argv.ptr));
     // Only reached if exec failed (ssh not installed).
     log.err("cannot exec ssh — is the OpenSSH client installed?", .{});
@@ -82,6 +89,7 @@ fn guestPort22Forward(config: *const Config) ?u16 {
 fn buildArgv(
     arena: Allocator,
     user: []const u8,
+    host: []const u8,
     host_port: u16,
     extra: []const []const u8,
 ) ![]const []const u8 {
@@ -98,7 +106,7 @@ fn buildArgv(
         "LogLevel=ERROR",
         "-o",
         "ServerAliveInterval=30",
-        try std.fmt.allocPrint(arena, "{s}@127.0.0.1", .{user}),
+        try std.fmt.allocPrint(arena, "{s}@{s}", .{ user, host }),
     });
     try argv.appendSlice(arena, extra);
     return argv.items;
@@ -108,9 +116,12 @@ fn printHelp() void {
     const help =
         \\Usage: bobrvm ssh [-- <ssh args>]
         \\
-        \\Open an SSH session to the project's guest through the host port
-        \\forwarded to guest port 22. The guest must run sshd and the
-        \\project must declare the forward:
+        \\Open an SSH session to the project's guest. Shared networking uses
+        \\the guest IP; user networking requires a forward to guest port 22.
+        \\The guest owner must enable sshd and configure login credentials:
+        \\n        \\  network = "shared"        # requires the installed network helper
+        \\  ssh-user = "alice"
+        \\n        \\Or use user networking with an explicit forward:
         \\
         \\  forwards = ["2222:22"]
         \\  ssh-user = "root"          # default: root
@@ -144,7 +155,7 @@ test "ssh: builds a hardened argv with the forwarded port and extra args" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const argv = try buildArgv(arena, "dev", 2222, &.{ "uptime", "-p" });
+    const argv = try buildArgv(arena, "dev", "127.0.0.1", 2222, &.{ "uptime", "-p" });
     try testing.expectEqualStrings("ssh", argv[0]);
     try testing.expectEqualStrings("-p", argv[1]);
     try testing.expectEqualStrings("2222", argv[2]);

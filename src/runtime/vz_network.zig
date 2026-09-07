@@ -1,9 +1,7 @@
-//! Connect Virtualization.framework's virtio-net device to MiniNat.
+//! Connect Virtualization.framework's virtio-net device to host networking.
 //!
-//! VZ owns one end of a datagram socket pair and sends complete Ethernet
-//! frames through it. MiniNat owns the other end, preserving bobrvm's
-//! unprivileged outbound networking, TCP forwards, and private Docker Unix
-//! socket while Apple owns the guest-facing virtio device.
+//! Shared mode hands VZ the helper's packet descriptor and retains its control
+//! connection for the VM lifetime. User mode bridges a socket pair to MiniNat.
 
 pub const Bridge = @This();
 
@@ -21,9 +19,12 @@ alloc: Allocator,
 vz_fd: std.posix.socket_t,
 nat_fd: std.posix.socket_t,
 nat: mininat.MiniNat,
+shared_control: ?c_int = null,
 running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 pub const Config = struct {
+    network_shared: bool = false,
+    network_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 },
     forwards: []const mininat.Forward = &.{},
     docker_socket_path: ?[]const u8 = null,
     performance_policy: ?*vz_process_policy.Controller = null,
@@ -36,6 +37,19 @@ pub fn create(alloc: Allocator, config: Config) !*Bridge {
     const self = try alloc.create(Bridge);
     errdefer alloc.destroy(self);
 
+    if (config.network_shared) {
+        if (config.forwards.len != 0 or config.docker_socket_path != null)
+            return error.InvalidNetworkConfig;
+        const connection = try @import("../net/shared.zig").connect(config.network_mac);
+        self.* = .{
+            .alloc = alloc,
+            .vz_fd = connection.packets,
+            .nat_fd = -1,
+            .nat = undefined,
+            .shared_control = connection.control,
+        };
+        return self;
+    }
     var sockets: [2]std.posix.socket_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.DGRAM, 0, &sockets) != 0) {
         return error.SocketPairFailed;
@@ -75,6 +89,12 @@ pub fn create(alloc: Allocator, config: Config) !*Bridge {
 }
 
 pub fn destroy(self: *Bridge) void {
+    if (self.shared_control) |control| {
+        net_compat.socketClose(self.vz_fd);
+        net_compat.socketClose(control);
+        self.alloc.destroy(self);
+        return;
+    }
     self.nat.stop();
     self.running.store(false, .release);
     net_compat.socketClose(self.nat_fd);
