@@ -12,6 +12,7 @@
 		8C0A30A63E02459EA9C8A11B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F4A5E5F7B684F5F9D1D3B2C /* AppDelegate.swift */; };
 		4C1634DDC4C8428890A068BE /* BobrvmApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C89AC307D3CA49F98C93FE8C /* BobrvmApp.swift */; };
 		666F50031EA548DCA6611421 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AE23A7114FB4192922CFF95 /* ContentView.swift */; };
+		E71000000000000000000001 /* CLIInventoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E71000000000000000000002 /* CLIInventoryView.swift */; };
 		2D542ACE334845D3AF20CC3E /* CreateVMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 696CE6917C14425EB2E8448C /* CreateVMView.swift */; };
 		CD90210F6B3A466388014E3A /* EditVMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C32412F2F9AB4F54828570C1 /* EditVMView.swift */; };
 		4C471C776EA0410496018A2E /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4B19DFF60E047A291BD2726 /* SettingsView.swift */; };
@@ -42,6 +43,7 @@
 		9E5220B2D8584C4D9D4E7F3D /* Bobrvm.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Bobrvm.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C89AC307D3CA49F98C93FE8C /* BobrvmApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BobrvmApp.swift; sourceTree = "<group>"; };
 		9AE23A7114FB4192922CFF95 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		E71000000000000000000002 /* CLIInventoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLIInventoryView.swift; sourceTree = "<group>"; };
 		696CE6917C14425EB2E8448C /* CreateVMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreateVMView.swift; sourceTree = "<group>"; };
 		C32412F2F9AB4F54828570C1 /* EditVMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditVMView.swift; sourceTree = "<group>"; };
 		B4B19DFF60E047A291BD2726 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -112,6 +114,7 @@
 			isa = PBXGroup;
 			children = (
 				9AE23A7114FB4192922CFF95 /* ContentView.swift */,
+				E71000000000000000000002 /* CLIInventoryView.swift */,
 				696CE6917C14425EB2E8448C /* CreateVMView.swift */,
 				C32412F2F9AB4F54828570C1 /* EditVMView.swift */,
 				C3F4A6D1B1CC4E2893A3E0A3 /* TerminalEmulator.swift */,
@@ -296,6 +299,7 @@
 				8C0A30A63E02459EA9C8A11B /* AppDelegate.swift in Sources */,
 				4C1634DDC4C8428890A068BE /* BobrvmApp.swift in Sources */,
 				666F50031EA548DCA6611421 /* ContentView.swift in Sources */,
+				E71000000000000000000001 /* CLIInventoryView.swift in Sources */,
 				2D542ACE334845D3AF20CC3E /* CreateVMView.swift in Sources */,
 				CD90210F6B3A466388014E3A /* EditVMView.swift in Sources */,
 				C3F4A6D2B1CC4E2893A3E0A4 /* TerminalEmulator.swift in Sources */,

@@ -4,6 +4,27 @@ import XCTest
 @testable import Bobrvm
 
 final class BobrvmKitTests: XCTestCase {
+    func testCLIInventoryPreservesRecordsAndQuotesLaunchCommands() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertTrue(try CLIInventoryEntry.read(directory: directory).isEmpty)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("dev's vm.json")
+        let data = Data(#"{"memory_mb":1024,"vcpu_count":4,"disk_path":"/missing-bobrvm-disk"}"#.utf8)
+        try data.write(to: file)
+        try Data("{".utf8).write(to: directory.appendingPathComponent("broken.json"))
+        let entries = try CLIInventoryEntry.read(directory: directory)
+        XCTAssertEqual(entries.count, 1)
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry.id, "cli:dev's vm")
+        XCTAssertEqual(entry.memoryMB, 1024)
+        XCTAssertEqual(entry.cpuCount, 4)
+        XCTAssertFalse(entry.diskExists)
+        XCTAssertEqual(entry.startCommand, "bobrvm start 'dev'\\''s vm'")
+        XCTAssertEqual(try Data(contentsOf: file), data)
+        XCTAssertEqual(try CLIInventoryEntry.read(directory: directory).first?.id, entry.id)
+    }
+
     @MainActor
     func testSnapshotRestoreFailureLeavesVMStopped() async throws {
         let app = try App()

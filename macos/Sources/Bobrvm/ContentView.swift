@@ -4,6 +4,7 @@ import SwiftUI
 
 enum LibrarySelection: Hashable {
     case library
+    case commandLine
     case virtualMachine(UUID)
 }
 
@@ -186,6 +187,8 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         switch selection {
+        case .commandLine:
+            CLIInventoryView(searchText: searchText)
         case .virtualMachine(let id):
             if let vm = vmManager.vms.first(where: { $0.id == id }) {
                 VMOverviewView(vmInstance: vm, delete: { vmToDelete = vm })
@@ -222,6 +225,8 @@ struct ContentView: View {
 
     private var selectedVM: VMInstance? {
         switch selection {
+        case .commandLine:
+            return nil
         case .virtualMachine(let id):
             return vmManager.vms.first { $0.id == id }
         case .library, nil:
@@ -253,6 +258,8 @@ struct VMListView: View {
             Section {
                 Label("Library", systemImage: "square.grid.2x2")
                     .tag(LibrarySelection.library)
+                Label("Command Line VMs", systemImage: "terminal")
+                    .tag(LibrarySelection.commandLine)
             }
 
             Section("Virtual Machines") {

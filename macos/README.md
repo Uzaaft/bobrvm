@@ -81,6 +81,15 @@ controls for Apple Virtualization are not implemented.
 
 The CLI's existing `--forward` and `forwards` rules now also bind localhost by default.
 
+## VM discovery
+
+The **Command Line VMs** sidebar lists configurations from `~/.config/bobrvm/vms`, including
+records whose disk is missing. It provides a quoted start command and reveals the original file.
+`bobrvm list` also lists native-app configurations, with `cli:` and `app:` IDs to distinguish
+identical names. Start CLI VMs by their original name; start app VMs in Bobrvm.
+Discovery reads both stores without importing or rewriting them. Cross-frontend lifecycle
+control is not implemented.
+
 ## Permissions
 
 The app is not sandboxed because disks and removable images may live outside

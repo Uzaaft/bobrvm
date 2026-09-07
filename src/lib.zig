@@ -53,6 +53,7 @@ test {
         _ = std.testing.refAllDecls(@import("virtio/snd.zig"));
         _ = std.testing.refAllDecls(@import("virtio/p9.zig"));
         _ = @import("cli/Config.zig");
+        _ = @import("cli/Inventory.zig");
         return;
     }
 
@@ -74,6 +75,7 @@ test {
     _ = renderer;
     _ = runtime;
     _ = @import("cli/Config.zig");
+    _ = @import("cli/Inventory.zig");
     _ = @import("cli/checkpoint.zig");
     _ = @import("cli/runner.zig");
     _ = @import("cli/toml.zig");
