@@ -44,6 +44,19 @@ For a stopped Linux VM, **Settings > Boot** switches between direct kernel
 boot and UEFI and edits the corresponding paths. Switching methods clears
 the other method's inputs; disk contents are preserved.
 
+## Snapshots
+
+For a running Hypervisor VM, **Guest Tools > Create Snapshot…** captures
+memory and disks without requiring a guest agent. **Create Quiesced
+Snapshot…** also freezes guest filesystems through the guest agent.
+
+For a stopped VM, choose **Restore Snapshot…** in its details toolbar or
+context menu. Select the snapshot directory and confirm replacement of the
+VM's writable disks. Use the same VM configuration: restore checks memory,
+captured CPUs, device presence, and recorded disk destinations before writes.
+Disk copies use APFS cloning; replacement is atomic per disk, not across
+multiple disks. Runtime startup errors are currently reported in the log.
+
 ## SSH and TCP forwarding
 
 For a VM using Bobrvm Hypervisor, enable **SSH access from this Mac** during creation or in

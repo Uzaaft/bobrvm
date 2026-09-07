@@ -548,6 +548,19 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         try runtime.start()
     }
 
+    public func restoreSnapshot(from directory: URL) throws {
+        guard backend == .hypervisor, state == .stopped else {
+            throw BobrvmError.invalidState
+        }
+        try backend.validate(guestSystem: guestSystem, config: ssh.applying(to: config))
+        if runtime == nil {
+            runtime = try makeRuntime()
+            observeRuntime()
+        }
+        guard let vm = runtimeVM else { throw BobrvmError.invalidState }
+        try vm.restoreSnapshot(from: directory)
+    }
+
     public func stop() {
         runtime?.stop()
     }
@@ -579,6 +592,11 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
     public func sendFileToGuest(_ file: URL) throws {
         guard let vm = runtimeVM else { throw BobrvmError.invalidState }
         try vm.sendFileToGuest(file)
+    }
+
+    public func snapshot(to directory: URL, quiesced: Bool) async throws {
+        guard let vm = runtimeVM else { throw BobrvmError.invalidState }
+        try await vm.snapshot(to: directory, quiesced: quiesced)
     }
 
     public func snapshotQuiesced(to directory: URL) async throws {

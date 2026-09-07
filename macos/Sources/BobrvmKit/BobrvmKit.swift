@@ -542,6 +542,7 @@ public final class VM: ObservableObject {
     private var handle: bobrvm_vm_t?
     private weak var app: App?
     private var surfaces: [Surface] = []
+    private var snapshotTask: Task<Int32, Never>?
     private let consoleEventSubject = PassthroughSubject<ConsoleEvent, Never>()
 
     var consoleEventPublisher: AnyPublisher<ConsoleEvent, Never> {
@@ -610,12 +611,30 @@ public final class VM: ObservableObject {
         state = .running
     }
 
+    public func restoreSnapshot(from directory: URL) throws {
+        guard !isStopping, state == .stopped, let handle else {
+            throw BobrvmError.invalidState
+        }
+        let code = directory.path.withCString { path in
+            bobrvm_vm_restore_snapshot(handle, path)
+        }
+        guard code.rawValue == BOBRVM_OK.rawValue else {
+            throw BobrvmError(code: Int32(code.rawValue))
+        }
+        state = .running
+    }
+
     public func stop() {
+        if snapshotTask != nil {
+            Task { await stopAndWait() }
+            return
+        }
         guard let handle = beginStop() else { return }
         Task { await finishStop(handle) }
     }
 
     public func stopAndWait() async {
+        if let snapshotTask { _ = await snapshotTask.value }
         if isStopping {
             while isStopping {
                 try? await Task.sleep(for: .milliseconds(25))
@@ -627,13 +646,13 @@ public final class VM: ObservableObject {
     }
 
     public func pause() {
-        guard !isStopping, let h = handle else { return }
+        guard !isStopping, snapshotTask == nil, let h = handle else { return }
         bobrvm_vm_pause(h)
         state = .paused
     }
 
     public func resume() {
-        guard !isStopping, let h = handle else { return }
+        guard !isStopping, snapshotTask == nil, let h = handle else { return }
         bobrvm_vm_resume(h)
         state = .running
     }
@@ -696,16 +715,29 @@ public final class VM: ObservableObject {
     }
 
     public func snapshotQuiesced(to directory: URL) async throws {
+        try await snapshot(to: directory, quiesced: true)
+    }
+
+    public func snapshot(to directory: URL, quiesced: Bool = false) async throws {
+        guard state == .running, !isStopping, snapshotTask == nil else {
+            throw BobrvmError.invalidState
+        }
         guard let handle else { throw BobrvmError.invalidState }
         let sendableHandle = SendableVMHandle(value: handle)
         let path = directory.path
-        let code = await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             path.withCString { directoryPath in
-                bobrvm_vm_snapshot_quiesced(sendableHandle.value, directoryPath)
+                let code = quiesced
+                    ? bobrvm_vm_snapshot_quiesced(sendableHandle.value, directoryPath)
+                    : bobrvm_vm_snapshot(sendableHandle.value, directoryPath)
+                return Int32(code.rawValue)
             }
-        }.value
-        guard code.rawValue == BOBRVM_OK.rawValue else {
-            throw BobrvmError(code: Int32(code.rawValue))
+        }
+        snapshotTask = task
+        let code = await task.value
+        snapshotTask = nil
+        guard code == Int32(BOBRVM_OK.rawValue) else {
+            throw BobrvmError(code: code)
         }
     }
 
@@ -746,6 +778,15 @@ public final class VM: ObservableObject {
     }
 
     func destroy() {
+        if snapshotTask != nil {
+            // Keep the owning app and C handle alive until the disk capture finishes.
+            Task { [app] in
+                await stopAndWait()
+                destroy()
+                withExtendedLifetime(app) {}
+            }
+            return
+        }
         surfaces.removeAll()
         if let app {
             app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)

@@ -4,6 +4,22 @@ import XCTest
 @testable import Bobrvm
 
 final class BobrvmKitTests: XCTestCase {
+    @MainActor
+    func testSnapshotRestoreFailureLeavesVMStopped() async throws {
+        let app = try App()
+        let vm = try app.createVM(config: VMConfig())
+        defer { vm.destroy() }
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertThrowsError(try vm.restoreSnapshot(from: missing))
+        XCTAssertEqual(vm.state, .stopped)
+        do {
+            try await vm.snapshot(to: missing)
+            XCTFail("A stopped VM cannot be captured")
+        } catch {
+            XCTAssertEqual(vm.state, .stopped)
+        }
+    }
+
     func testBootConfigurationSelectsOneBootPath() throws {
         var config = VMConfig(firmwarePath: "/firmware", varsPath: "/variables")
         var boot = BootConfiguration(config: config)

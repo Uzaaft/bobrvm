@@ -460,6 +460,7 @@ pub const VM = struct {
 
     /// The actual machine (hypervisor + devices).
     hw_machine: ?*machine.Machine = null,
+    restore_path: ?[]u8 = null,
 
     /// Thread running the synchronous vCPU loop.
     vcpu_thread: ?std.Thread = null,
@@ -563,6 +564,7 @@ pub const VM = struct {
             }
 
             const machine_config = machine.MachineConfig{
+                .restore_path = self.restore_path,
                 .ram_size = self.config.memory_bytes,
                 .vcpu_count = self.config.vcpu_count,
                 .firmware_path = self.config.firmware_path,
@@ -638,6 +640,9 @@ pub const VM = struct {
         self.hw_machine.?.prepareStart();
         self.vcpu_thread = std.Thread.spawn(.{}, vcpuThreadMain, .{self.hw_machine.?}) catch |err| {
             log.warn("failed to spawn vCPU thread: {}", .{err});
+            self.console_session.detach();
+            self.hw_machine.?.deinit();
+            self.hw_machine = null;
             return error.MachineStartFailed;
         };
 
@@ -713,6 +718,8 @@ pub const VM = struct {
             self.hw_machine = null;
         }
 
+        if (self.restore_path) |path| self.alloc.free(path);
+        self.restore_path = null;
         self.state = .stopped;
         self.stopping.store(false, .release);
 
@@ -742,6 +749,31 @@ pub const VM = struct {
     pub fn guestManagementReady(self: *const VM) bool {
         if (self.hw_machine) |hw| return hw.guestManagementReady();
         return false;
+    }
+
+    /// Revert matching writable disks and launch the captured machine state.
+    pub fn restoreSnapshot(self: *VM, directory: []const u8) !void {
+        if (self.state != .stopped or self.hw_machine != null) return error.InvalidState;
+        const snapshot_directory = @import("../machine/snapshot_directory.zig");
+        self.restore_path = try snapshot_directory.restore(self.alloc, directory, .{
+            .disks = .{
+                if (self.config.disk_read_only) null else self.config.disk_path,
+                if (self.config.disk2_read_only) null else self.config.disk2_path,
+            },
+            .block_present = .{ self.config.disk_path != null, self.config.disk2_path != null },
+            .ram_bytes = self.config.memory_bytes,
+            .vcpu_count = self.config.vcpu_count,
+        });
+        errdefer {
+            self.alloc.free(self.restore_path.?);
+            self.restore_path = null;
+        }
+        try self.start();
+    }
+
+    pub fn snapshot(self: *VM, directory: []const u8) !void {
+        const hw = self.hw_machine orelse return error.InvalidState;
+        try hw.snapshotTo(directory);
     }
 
     pub fn snapshotQuiesced(self: *VM, dir: []const u8) !void {
@@ -1437,4 +1469,8 @@ test "VM surface registry unlinks arbitrary entries" {
     last.destroy();
     try std.testing.expectEqual(@as(usize, 0), vm.surface_count);
     try std.testing.expect(vm.surfaces_head == null);
+}
+
+test {
+    _ = @import("../machine/snapshot_directory.zig");
 }

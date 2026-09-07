@@ -232,6 +232,14 @@ pub export fn bobrvm_vm_guest_sync_time(vm: ?*apprt.VM) void {
     v.syncGuestTime();
 }
 
+pub export fn bobrvm_vm_snapshot(vm: ?*apprt.VM, dir: ?[*:0]const u8) c_int {
+    const v = vm orelse return 1;
+    const path = dir orelse return 1;
+    if (path[0] == 0) return 1;
+    v.snapshot(std.mem.span(path)) catch return 9;
+    return 0;
+}
+
 pub export fn bobrvm_vm_snapshot_quiesced(
     vm: ?*apprt.VM,
     dir: ?[*:0]const u8,
@@ -239,6 +247,17 @@ pub export fn bobrvm_vm_snapshot_quiesced(
     const v = vm orelse return 1;
     const path = dir orelse return 1;
     v.snapshotQuiesced(std.mem.span(path)) catch return 9;
+    return 0;
+}
+
+pub export fn bobrvm_vm_restore_snapshot(
+    vm: ?*apprt.VM,
+    dir: ?[*:0]const u8,
+) c_int {
+    const v = vm orelse return 1;
+    const path = dir orelse return 1;
+    if (path[0] == 0) return 1;
+    v.restoreSnapshot(std.mem.span(path)) catch return 9;
     return 0;
 }
 

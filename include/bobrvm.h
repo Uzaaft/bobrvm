@@ -346,7 +346,14 @@ bool bobrvm_vm_guest_management_ready(bobrvm_vm_t vm);
 void bobrvm_vm_guest_reboot(bobrvm_vm_t vm);
 void bobrvm_vm_guest_trim(bobrvm_vm_t vm);
 void bobrvm_vm_guest_sync_time(bobrvm_vm_t vm);
+// Capture a paused-machine snapshot without requiring guest tools. Resumes on return.
+bobrvm_error_e bobrvm_vm_snapshot(bobrvm_vm_t vm, const char* directory);
+
 bobrvm_error_e bobrvm_vm_snapshot_quiesced(bobrvm_vm_t vm, const char* directory);
+
+// Requires a stopped VM. Validates and replaces matching writable disks, then starts
+// the captured state asynchronously. The directory string is copied before return.
+bobrvm_error_e bobrvm_vm_restore_snapshot(bobrvm_vm_t vm, const char* directory);
 /** Queue one regular file for delivery to the configured guest inbox. */
 bobrvm_error_e bobrvm_vm_send_file(bobrvm_vm_t vm, const char* path);
 

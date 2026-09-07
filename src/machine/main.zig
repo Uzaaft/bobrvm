@@ -1332,9 +1332,8 @@ pub const Machine = struct {
 
         // Clone writable disks (quiescent: the machine is paused and all
         // blk writes are synchronous on the parked vCPU thread).
-        var meta = std.ArrayListUnmanaged(u8).empty;
-        defer meta.deinit(self.alloc);
-        try meta.appendSlice(self.alloc, "{\"disks\":[");
+        const Disk = struct { orig: []const u8, copy: []const u8 };
+        var disks: [2]Disk = undefined;
         var disk_idx: u32 = 0;
         const candidates = [_]struct { path: ?[]const u8, writable: bool }{
             .{ .path = self.config.disk_path, .writable = !self.config.disk_read_only },
@@ -1343,25 +1342,24 @@ pub const Machine = struct {
         for (candidates) |cand| {
             const disk_path = cand.path orelse continue;
             if (!cand.writable) continue;
-            var name_buf: [64]u8 = undefined;
-            const copy_name = std.fmt.bufPrint(&name_buf, "disk{d}.raw", .{disk_idx}) catch unreachable;
+            const copy_name = if (disk_idx == 0) "disk0.raw" else "disk1.raw";
             var copy_buf: [1024]u8 = undefined;
             const copy_path = try std.fmt.bufPrint(&copy_buf, "{s}/{s}", .{ dir, copy_name });
             try cloneFile(self.alloc, disk_path, copy_path);
-            if (disk_idx > 0) try meta.append(self.alloc, ',');
-            try meta.appendSlice(self.alloc, "{\"orig\":\"");
-            try meta.appendSlice(self.alloc, disk_path);
-            try meta.appendSlice(self.alloc, "\",\"copy\":\"");
-            try meta.appendSlice(self.alloc, copy_name);
-            try meta.appendSlice(self.alloc, "\"}");
+            disks[disk_idx] = .{ .orig = disk_path, .copy = copy_name };
             disk_idx += 1;
         }
-        try meta.appendSlice(self.alloc, "]}");
+        const meta = try std.json.Stringify.valueAlloc(
+            self.alloc,
+            .{ .disks = disks[0..disk_idx] },
+            .{},
+        );
+        defer self.alloc.free(meta);
 
         const meta_path = try std.fmt.bufPrint(&path_buf, "{s}/meta.json", .{dir});
         const meta_file = try std.Io.Dir.cwd().createFile(io, meta_path, .{});
         defer meta_file.close(io);
-        try meta_file.writePositionalAll(io, meta.items, 0);
+        try meta_file.writePositionalAll(io, meta, 0);
 
         log.info("snapshot written to {s} ({} disk clones)", .{ dir, disk_idx });
     }

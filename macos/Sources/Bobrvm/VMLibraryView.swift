@@ -247,6 +247,9 @@ struct VMOverviewView: View {
     private var lifecycleToolbarItems: some View {
         switch vmInstance.state {
         case .stopped:
+            if vmInstance.backend == .hypervisor {
+                RestoreSnapshotButton(vmInstance: vmInstance)
+            }
             Button(action: primaryAction) {
                 Label("Start", systemImage: "play.fill")
             }
@@ -474,6 +477,9 @@ private struct VMLibraryCard: View {
         }
         Button("Show Details", systemImage: "sidebar.right", action: showDetails)
         Button("Settings…", systemImage: "gearshape", action: edit)
+        if vmInstance.backend == .hypervisor {
+            RestoreSnapshotButton(vmInstance: vmInstance)
+        }
         Divider()
         Button("Delete…", systemImage: "trash", role: .destructive, action: delete)
     }
@@ -641,5 +647,44 @@ extension GuestSystem {
     // dark mode; the icon tile handles dark mode by inverting instead.
     var symbolColor: Color {
         self == .macOS ? .primary : presentationColor
+    }
+}
+
+struct RestoreSnapshotButton: View {
+    @ObservedObject var vmInstance: VMInstance
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Restore Snapshot…", systemImage: "clock.arrow.circlepath", action: restore)
+            .disabled(vmInstance.state != .stopped)
+            .help("Restore saved memory and disks, then start this VM")
+    }
+
+    private func restore() {
+        let panel = NSOpenPanel()
+        panel.title = "Restore Snapshot"
+        panel.prompt = "Choose Snapshot"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Restore \(vmInstance.name)?"
+        alert.informativeText = "This replaces the VM’s writable disks with the copies in "
+            + "\(directory.path) and resumes its saved memory. Changes since that snapshot "
+            + "will be lost. The snapshot must belong to this VM."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restore")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[1].keyEquivalent = "\r"
+        alert.buttons[0].keyEquivalent = ""
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try vmInstance.restoreSnapshot(from: directory)
+            openWindow(id: "vm-display", value: vmInstance.id)
+        } catch {
+            presentNativeError(error, title: "Could Not Restore Snapshot")
+        }
     }
 }

@@ -616,8 +616,11 @@ struct VMDetailView: View {
                 vmInstance.trimGuestFilesystems()
             }
             .disabled(!vmInstance.isGuestManagementReady)
-            Button("Create Quiesced Snapshot…", systemImage: "camera") {
-                createQuiescedSnapshot()
+            Button("Create Snapshot…", systemImage: "camera") {
+                createSnapshot(quiesced: false)
+            }
+            Button("Create Quiesced Snapshot…", systemImage: "camera.badge.ellipsis") {
+                createSnapshot(quiesced: true)
             }
             .disabled(!vmInstance.isGuestManagementReady)
             Divider()
@@ -643,7 +646,7 @@ struct VMDetailView: View {
         }
     }
 
-    private func createQuiescedSnapshot() {
+    private func createSnapshot(quiesced: Bool) {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -651,7 +654,7 @@ struct VMDetailView: View {
         guard panel.runModal() == .OK, let directory = panel.url else { return }
         Task {
             do {
-                try await vmInstance.snapshotQuiesced(to: directory)
+                try await vmInstance.snapshot(to: directory, quiesced: quiesced)
             } catch {
                 showError(title: "Could Not Create Snapshot", error: error)
             }
