@@ -7,6 +7,7 @@
 pub const Bridge = @This();
 
 const std = @import("std");
+const socket_copy = @import("../net/socket_copy.zig");
 const objc = @import("objc");
 
 const global = @import("../global.zig");
@@ -21,7 +22,6 @@ const log = std.log.scoped(.vz_vsock);
 const unix_path_bytes_max = @sizeOf(@FieldType(std.posix.sockaddr.un, "path"));
 const docker_port: u32 = 62_375;
 const connection_count_max: usize = 64;
-const copy_buffer_bytes: usize = 64 * 1024;
 const worker_stack_bytes: usize = 256 * 1024;
 
 const DispatchQueue = *anyopaque;
@@ -77,11 +77,6 @@ const Proxy = struct {
     client_fd: std.posix.socket_t,
     connection: Object,
     vsock_fd: std.posix.socket_t,
-};
-
-const Direction = struct {
-    source_fd: std.posix.socket_t,
-    destination_fd: std.posix.socket_t,
 };
 
 const ConnectBlock = objc.Block(struct {
@@ -333,59 +328,15 @@ fn proxyLoop(proxy: *Proxy, slot: usize) void {
     defer proxy.connection.release();
     defer proxy.connection.msgSend(void, "close", .{});
     defer _ = close(proxy.client_fd);
-    const upload = std.Thread.spawn(.{}, copyDirection, .{Direction{
+    const upload = std.Thread.spawn(.{}, socket_copy.copyDirection, .{socket_copy.Direction{
         .source_fd = proxy.client_fd,
         .destination_fd = proxy.vsock_fd,
     }}) catch {
-        shutdownBoth(proxy.client_fd, proxy.vsock_fd);
+        socket_copy.shutdownBoth(proxy.client_fd, proxy.vsock_fd);
         return;
     };
-    copyDirection(.{ .source_fd = proxy.vsock_fd, .destination_fd = proxy.client_fd });
+    socket_copy.copyDirection(.{ .source_fd = proxy.vsock_fd, .destination_fd = proxy.client_fd });
     upload.join();
-}
-
-fn copyDirection(direction: Direction) void {
-    var buffer: [copy_buffer_bytes]u8 = undefined;
-    while (true) {
-        const count = readRetry(direction.source_fd, &buffer) orelse {
-            shutdownBoth(direction.source_fd, direction.destination_fd);
-            return;
-        };
-        if (count == 0) {
-            _ = std.c.shutdown(direction.destination_fd, 1);
-            return;
-        }
-        if (!sendAll(direction.destination_fd, buffer[0..count])) {
-            shutdownBoth(direction.source_fd, direction.destination_fd);
-            return;
-        }
-    }
-}
-
-fn readRetry(fd: std.posix.socket_t, buffer: []u8) ?usize {
-    while (true) {
-        const count = std.c.read(fd, buffer.ptr, buffer.len);
-        if (count >= 0) return @intCast(count);
-        if (std.c.errno(@as(c_int, -1)) != .INTR) return null;
-    }
-}
-
-fn sendAll(fd: std.posix.socket_t, bytes: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const count = std.c.send(
-            fd,
-            bytes[offset..].ptr,
-            bytes.len - offset,
-            std.posix.MSG.NOSIGNAL,
-        );
-        if (count > 0) {
-            offset += @intCast(count);
-        } else if (count == 0 or std.c.errno(@as(c_int, -1)) != .INTR) {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn failRequest(request: *Request) void {
@@ -399,11 +350,6 @@ fn finishRequest(request: *Request, release_connection: bool) void {
     alloc.destroy(request);
     if (release_connection) _ = state.connection_count.fetchSub(1, .acq_rel);
     state.release();
-}
-
-fn shutdownBoth(first: std.posix.socket_t, second: std.posix.socket_t) void {
-    _ = std.c.shutdown(first, 2);
-    _ = std.c.shutdown(second, 2);
 }
 
 fn unlinkSocket(path: []const u8) void {

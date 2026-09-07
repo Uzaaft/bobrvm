@@ -4,6 +4,7 @@
 //! copy loops so Docker's HTTP hijack and half-close behavior remain intact.
 
 const std = @import("std");
+const socket_copy = @import("socket_copy");
 
 const posix = std.posix;
 const linux = std.os.linux;
@@ -14,7 +15,6 @@ const host_cid: u32 = 2;
 const any_cid: u32 = std.math.maxInt(u32);
 const connection_count_max: u32 = 64;
 const backlog: c_int = 64;
-const copy_buffer_bytes: usize = 64 * 1024;
 
 const Error = error{
     AcceptFailed,
@@ -34,11 +34,6 @@ const Config = struct {
 const Connection = struct {
     vsock_fd: posix.socket_t,
     docker_socket: []const u8,
-};
-
-const Direction = struct {
-    source_fd: posix.socket_t,
-    destination_fd: posix.socket_t,
 };
 
 var connection_count = std.atomic.Value(u32).init(0);
@@ -150,14 +145,14 @@ fn serveConnection(connection: Connection) void {
     defer closeSocket(connection.vsock_fd);
     const docker_fd = connectDockerSocket(connection.docker_socket) catch return;
     defer closeSocket(docker_fd);
-    const upload = std.Thread.spawn(.{}, copyDirection, .{Direction{
+    const upload = std.Thread.spawn(.{}, socket_copy.copyDirection, .{socket_copy.Direction{
         .source_fd = connection.vsock_fd,
         .destination_fd = docker_fd,
     }}) catch {
-        shutdownBoth(connection.vsock_fd, docker_fd);
+        socket_copy.shutdownBoth(connection.vsock_fd, docker_fd);
         return;
     };
-    copyDirection(.{ .source_fd = docker_fd, .destination_fd = connection.vsock_fd });
+    socket_copy.copyDirection(.{ .source_fd = docker_fd, .destination_fd = connection.vsock_fd });
     upload.join();
 }
 
@@ -179,59 +174,6 @@ fn connectDockerSocket(path: []const u8) Error!posix.socket_t {
         return error.ConnectFailed;
     }
     return docker_fd;
-}
-
-fn copyDirection(direction: Direction) void {
-    var buffer: [copy_buffer_bytes]u8 = undefined;
-    while (true) {
-        const count = readRetry(direction.source_fd, &buffer) orelse {
-            shutdownBoth(direction.source_fd, direction.destination_fd);
-            return;
-        };
-        if (count == 0) {
-            shutdownSend(direction.destination_fd);
-            return;
-        }
-        if (!sendAll(direction.destination_fd, buffer[0..count])) {
-            shutdownBoth(direction.source_fd, direction.destination_fd);
-            return;
-        }
-    }
-}
-
-fn readRetry(fd: posix.socket_t, buffer: []u8) ?usize {
-    while (true) {
-        const count = std.c.read(fd, buffer.ptr, buffer.len);
-        if (count >= 0) return @intCast(count);
-        if (std.c.errno(@as(c_int, -1)) != .INTR) return null;
-    }
-}
-
-fn sendAll(fd: posix.socket_t, bytes: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const count = std.c.send(
-            fd,
-            bytes[offset..].ptr,
-            bytes.len - offset,
-            posix.MSG.NOSIGNAL,
-        );
-        if (count > 0) {
-            offset += @intCast(count);
-        } else if (count == 0 or std.c.errno(@as(c_int, -1)) != .INTR) {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn shutdownSend(fd: posix.socket_t) void {
-    _ = std.c.shutdown(fd, 1);
-}
-
-fn shutdownBoth(first: posix.socket_t, second: posix.socket_t) void {
-    _ = std.c.shutdown(first, 2);
-    _ = std.c.shutdown(second, 2);
 }
 
 fn closeSocket(fd: posix.socket_t) void {

@@ -21,6 +21,7 @@
         ../src/agent/protocol.zig
         ../src/auth
         ../src/guest_protocol.zig
+        ../src/net/socket_copy.zig
         ../src/guest_tools
         ../pkg/libfprint-bobrvm/bobrvm_transport.h
       ];

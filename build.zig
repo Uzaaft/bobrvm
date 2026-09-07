@@ -879,6 +879,12 @@ fn addGuestTools(
         .{ "bobrvm-session-agent", "src/guest_tools/session_agent.zig" },
         .{ "bobrvm-toolbox", "src/guest_tools/toolbox.zig" },
     };
+    const socket_copy_module = b.createModule(.{
+        .root_source_file = b.path("src/net/socket_copy.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const protocol_module = b.createModule(.{
         .root_source_file = b.path("src/guest_protocol.zig"),
         .target = target,
@@ -917,6 +923,9 @@ fn addGuestTools(
             std.mem.eql(u8, tool[0], "bobrvm-session-agent"))
         {
             module.addImport("guest_protocol", protocol_module);
+        }
+        if (std.mem.eql(u8, tool[0], "bobrvm-docker-proxy")) {
+            module.addImport("socket_copy", socket_copy_module);
         }
         if (std.mem.eql(u8, tool[0], "bobrvm-session-agent")) {
             module.addImport("wayland_client", wayland_module);
