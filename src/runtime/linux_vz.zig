@@ -182,7 +182,9 @@ pub const Machine = struct {
             .{configuration.value},
         );
         if (vm.value == null) return error.FrameworkObjectCreationFailed;
-        if (docker) |bridge| bridge.setSocketDevice(firstSocketDevice(vm));
+        errdefer vm.release();
+        if (docker) |bridge| bridge.setSocketDevice(firstSocketDevice(vm)) catch
+            return error.DockerSetupFailed;
         if (performance_policy) |policy| policy.discover();
         profile.vm_ns = monotonicNs() - vm_started_ns;
         return .{
@@ -251,6 +253,7 @@ pub const Machine = struct {
 
     pub fn resumeVM(self: *Machine) !void {
         try self.performFlag("resumeWithCompletionHandler:", .{});
+        if (self.docker) |docker| docker.resumeReady();
         if (self.performance_policy) |policy| policy.discover();
     }
 

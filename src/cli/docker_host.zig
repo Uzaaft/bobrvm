@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 
 const ctl = @import("ctl.zig");
 const global = @import("../global.zig");
-const net_compat = @import("../compat/net.zig");
+const docker_readiness = @import("docker_readiness.zig");
 const project = @import("project.zig");
 const up = @import("up.zig");
 
@@ -19,8 +19,6 @@ extern "c" fn flock(fd: c_int, operation: c_int) c_int;
 
 const lock_exclusive: c_int = 2;
 const lock_unlock: c_int = 8;
-const ready_timeout_ms: u32 = 30_000;
-const ready_poll_ms: u32 = 50;
 
 pub const Error = project.Error || error{
     DockerHostInvalid,
@@ -208,48 +206,8 @@ fn load(arena: Allocator) Error!project.Project {
 }
 
 fn waitUntilReady(arena: Allocator, host: *const project.Project) !void {
-    var waited_ms: u32 = 0;
-    while (waited_ms < ready_timeout_ms) : (waited_ms += ready_poll_ms) {
-        if (dockerReady(host.config.docker_socket_path.?)) return;
-        if (ctl.runningPid(arena, host) == null) {
-            return error.DockerHostStartFailed;
-        }
-        std.Io.Clock.Duration.sleep(.{
-            .raw = .{ .nanoseconds = ready_poll_ms * std.time.ns_per_ms },
-            .clock = .awake,
-        }, global.io()) catch {};
-    }
-    return error.DockerHostReadyTimeout;
-}
-
-fn dockerReady(path: []const u8) bool {
-    const fd = net_compat.socketCreate(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch
-        return false;
-    defer net_compat.socketClose(fd);
-
-    var address: std.posix.sockaddr.un = undefined;
-    @memset(std.mem.asBytes(&address), 0);
-    address.family = std.posix.AF.UNIX;
-    @memcpy(address.path[0..path.len], path);
-    const address_len = @offsetOf(std.posix.sockaddr.un, "path") + path.len + 1;
-    if (@hasField(std.posix.sockaddr.un, "len")) address.len = @intCast(address_len);
-    net_compat.connect(fd, @ptrCast(&address), @intCast(address_len)) catch return false;
-
-    const request = "GET /_ping HTTP/1.0\r\nHost: docker\r\n\r\n";
-    const sent = std.c.send(fd, request.ptr, request.len, std.posix.MSG.NOSIGNAL);
-    if (sent < 0 or @as(usize, @intCast(sent)) != request.len) return false;
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    if ((std.posix.poll(&poll_fds, 250) catch return false) == 0) return false;
-
-    var response: [1024]u8 = undefined;
-    const count = std.c.read(fd, response[0..].ptr, response.len);
-    if (count <= 0) return false;
-    const bytes = response[0..@intCast(count)];
-    return std.mem.indexOf(u8, bytes, "200 OK") != null;
+    const pid = ctl.runningPid(arena, host) orelse return error.DockerHostStartFailed;
+    try docker_readiness.wait(host.config.docker_socket_path.?, pid, 30 * std.time.ns_per_s);
 }
 
 fn deleteFile(path: []const u8) void {

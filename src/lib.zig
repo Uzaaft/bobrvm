@@ -89,6 +89,7 @@ test {
     _ = @import("cli/bench_command.zig");
     _ = @import("cli/ssh.zig");
     _ = @import("cli/docker.zig");
+    _ = @import("cli/docker_readiness.zig");
     _ = @import("cli/docker_launcher.zig");
     _ = @import("cli/install_cli.zig");
     _ = @import("compat/file.zig");

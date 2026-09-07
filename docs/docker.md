@@ -59,3 +59,16 @@ bobrvm docker-host stop
 
 The first server-side Docker command starts the runtime when necessary. Suspend
 atomically replaces its checkpoint and preserves running containers.
+
+### Startup readiness
+
+The guest `bobrvm-docker-proxy` announces its listening vsock transport to the
+host on port 62376. The host holds early Docker requests until that notification,
+then confirms daemon readiness with one `/_ping` request. Socket publication,
+HTTP response, and runner exit use kernel notifications with a shared 30-second
+deadline; startup does not periodically poll Docker.
+
+Build the host and guest tools together when updating this protocol. Existing
+guests need the updated `bobrvm-docker-proxy` for cold boot. Warm restore first
+tries the restored listener; if the snapshot predates proxy startup, the request
+waits for its startup notification.

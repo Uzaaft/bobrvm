@@ -21,6 +21,7 @@ const id = objc.c.id;
 const log = std.log.scoped(.vz_vsock);
 const unix_path_bytes_max = @sizeOf(@FieldType(std.posix.sockaddr.un, "path"));
 const docker_port: u32 = 62_375;
+const ready_port: u32 = 62_376;
 const connection_count_max: usize = 64;
 const worker_stack_bytes: usize = 256 * 1024;
 
@@ -40,6 +41,11 @@ path: []u8,
 listener: std.posix.socket_t,
 state: *State,
 accept_thread: ?std.Thread = null,
+ready_pipe: net_compat.WakePipe,
+ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+ready_listener: ?Object = null,
+ready_delegate: ?Object = null,
+ready_connection: ?Object = null,
 
 const State = struct {
     alloc: Allocator,
@@ -47,6 +53,9 @@ const State = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     connection_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     socket_device: ?Object = null,
+    // VM-queue owned. A restore can resume before the guest proxy has started.
+    guest_notified: bool = false,
+    pending: [connection_count_max]?*Request = @splat(null),
     performance_policy: ?*vz_process_policy.Controller = null,
     proxies_mutex: std.Io.Mutex = .init,
     proxies: [connection_count_max]?*Proxy = @splat(null),
@@ -70,6 +79,7 @@ const State = struct {
 const Request = struct {
     state: *State,
     client_fd: std.posix.socket_t,
+    guest_notified: bool = false,
 };
 
 const Proxy = struct {
@@ -101,7 +111,10 @@ pub fn create(
         net_compat.socketClose(listener);
         unlinkSocket(owned_path);
     }
+    var ready_pipe = try net_compat.WakePipe.init();
+    errdefer ready_pipe.deinit();
     self.* = .{
+        .ready_pipe = ready_pipe,
         .alloc = alloc,
         .path = owned_path,
         .listener = listener,
@@ -117,10 +130,79 @@ pub fn create(
     return self;
 }
 
-pub fn setSocketDevice(self: *Bridge, device: Object) void {
+pub fn setSocketDevice(self: *Bridge, device: Object) error{ReadyListenerFailed}!void {
     std.debug.assert(self.state.socket_device == null);
     std.debug.assert(device.value != null);
+    const delegate = try createReadyDelegate(self);
+    errdefer delegate.release();
+    const listener = objc.getClass("VZVirtioSocketListener").?.msgSend(Object, "new", .{});
+    if (listener.value == null) return error.ReadyListenerFailed;
+    listener.msgSend(void, "setDelegate:", .{delegate.value});
+    device.msgSend(void, "setSocketListener:forPort:", .{ listener.value, ready_port });
+    self.ready_delegate = delegate;
+    self.ready_listener = listener;
     self.state.socket_device = device.retain();
+}
+
+/// The guest listener survives a saved-state restore. Called on the VM queue
+/// after resume completes; Docker's HTTP response still confirms daemon readiness.
+pub fn resumeReady(self: *Bridge) void {
+    self.ready.store(true, .release);
+    self.ready_pipe.signal();
+}
+
+fn createReadyDelegate(self: *Bridge) error{ReadyListenerFailed}!Object {
+    const name = "BobrvmDockerReadyDelegate";
+    const class = objc.getClass(name) orelse blk: {
+        const class = objc.allocateClassPair(objc.getClass("NSObject"), name) orelse
+            return error.ReadyListenerFailed;
+        errdefer objc.disposeClassPair(class);
+        const alignment_log2 = @ctz(@as(usize, @alignOf(*Bridge)));
+        const added_ivar = objc.c.class_addIvar(
+            class.value,
+            "bridge",
+            @sizeOf(*Bridge),
+            @intCast(alignment_log2),
+            "^v",
+        );
+        if (added_ivar == 0 or
+            !class.addMethod("listener:shouldAcceptNewConnection:fromSocketDevice:", readyNotification))
+        {
+            return error.ReadyListenerFailed;
+        }
+        objc.registerClassPair(class);
+        break :blk class;
+    };
+    const delegate = class.msgSend(Object, "new", .{});
+    if (delegate.value == null) return error.ReadyListenerFailed;
+    _ = objc.c.object_setInstanceVariable(delegate.value, "bridge", self);
+    return delegate;
+}
+
+fn readyNotification(
+    delegate: id,
+    _: objc.c.SEL,
+    _: id,
+    connection: id,
+    _: id,
+) callconv(.c) objc.c.BOOL {
+    var pointer: ?*anyopaque = null;
+    _ = objc.c.object_getInstanceVariable(delegate, "bridge", &pointer);
+    const self: *Bridge = @ptrCast(@alignCast(pointer.?));
+    if (!self.state.running.load(.acquire)) return 0;
+    if (self.ready_connection) |previous| {
+        previous.msgSend(void, "close", .{});
+        previous.release();
+    }
+    self.ready_connection = Object.fromId(connection).retain();
+    self.state.guest_notified = true;
+    for (&self.state.pending) |*slot| {
+        const request = slot.* orelse continue;
+        slot.* = null;
+        connectRequest(request);
+    }
+    self.resumeReady();
+    return 1;
 }
 
 pub fn connectionCount(self: *const Bridge) u32 {
@@ -129,8 +211,24 @@ pub fn connectionCount(self: *const Bridge) u32 {
 
 pub fn destroy(self: *Bridge) void {
     self.state.running.store(false, .release);
+    self.ready_pipe.signal();
+    for (&self.state.pending) |*slot| {
+        if (slot.*) |request| failRequest(request);
+        slot.* = null;
+    }
+    if (self.ready_listener) |listener| {
+        self.state.socket_device.?.msgSend(void, "removeSocketListenerForPort:", .{ready_port});
+        listener.msgSend(void, "setDelegate:", .{@as(id, null)});
+        listener.release();
+    }
+    if (self.ready_delegate) |delegate| delegate.release();
+    if (self.ready_connection) |connection| {
+        connection.msgSend(void, "close", .{});
+        connection.release();
+    }
     wakeAccept(self.path);
     if (self.accept_thread) |thread| thread.join();
+    self.ready_pipe.deinit();
     self.closeActive();
     net_compat.socketClose(self.listener);
     unlinkSocket(self.path);
@@ -153,6 +251,13 @@ fn closeActive(self: *Bridge) void {
 
 fn createListener(path: []const u8) !std.posix.socket_t {
     try net_compat.removeStaleUnixSocket(path);
+    var pending_buffer: [unix_path_bytes_max]u8 = undefined;
+    // A same-length sibling preserves the Unix socket path limit during
+    // atomic publication, including paths that already fill sun_path.
+    const pending = pending_buffer[0..path.len];
+    @memcpy(pending, path);
+    pending[pending.len - 1] = if (pending[pending.len - 1] == '~') '^' else '~';
+    try net_compat.removeStaleUnixSocket(pending);
     const listener = try net_compat.socketCreate(
         std.posix.AF.UNIX,
         std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
@@ -162,16 +267,24 @@ fn createListener(path: []const u8) !std.posix.socket_t {
     var address: std.posix.sockaddr.un = undefined;
     @memset(std.mem.asBytes(&address), 0);
     address.family = std.posix.AF.UNIX;
-    @memcpy(address.path[0..path.len], path);
-    const address_len = @offsetOf(std.posix.sockaddr.un, "path") + path.len + 1;
+    @memcpy(address.path[0..pending.len], pending);
+    const address_len = @offsetOf(std.posix.sockaddr.un, "path") + pending.len + 1;
     try net_compat.bind(listener, @ptrCast(&address), @intCast(address_len));
-    errdefer unlinkSocket(path);
-    try chmodSocket(path);
+    errdefer unlinkSocket(pending);
+    try chmodSocket(pending);
     try net_compat.listen(listener, 32);
+    // Publish only after listen: a directory watcher must never observe a
+    // socket which is bound but still refuses connections.
+    try std.Io.Dir.renameAbsolute(pending, path, global.io());
     return listener;
 }
 
 fn acceptLoop(self: *Bridge) void {
+    // Keep early clients in the Unix listen backlog until the guest proxy can
+    // accept them. Readiness is a latched notification, never a retry timer.
+    while (self.state.running.load(.acquire) and !self.ready.load(.acquire)) {
+        self.ready_pipe.wait(null) catch return;
+    }
     while (self.state.running.load(.acquire)) {
         const client_fd = std.c.accept(self.listener, null, null);
         if (client_fd < 0) {
@@ -224,7 +337,7 @@ fn waitForAccept(listener: std.posix.socket_t) void {
 fn wakeAccept(path: []const u8) void {
     const socket = net_compat.socketCreate(
         std.posix.AF.UNIX,
-        std.posix.SOCK.STREAM,
+        std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
         0,
     ) catch return;
     defer net_compat.socketClose(socket);
@@ -250,6 +363,7 @@ fn connectRequest(context: ?*anyopaque) callconv(.c) void {
     const state = request.state;
     if (!state.running.load(.acquire)) return failRequest(request);
     const device = state.socket_device orelse return failRequest(request);
+    request.guest_notified = state.guest_notified;
     var block = ConnectBlock.init(.{ .request = request }, connectCompletion);
     device.msgSend(void, "connectToPort:completionHandler:", .{ docker_port, &block });
 }
@@ -261,7 +375,18 @@ fn connectCompletion(
 ) callconv(.c) void {
     const request = block.request;
     const state = request.state;
-    if (error_id != null or connection_id == null or !state.running.load(.acquire)) {
+    if (!state.running.load(.acquire)) return failRequest(request);
+    if (error_id != null or connection_id == null) {
+        // Resume is an opportunity to connect, not proof that a snapshot was
+        // taken after proxy startup. Park failures until its actual notification.
+        if (!request.guest_notified and state.guest_notified) return connectRequest(request);
+        if (!state.guest_notified) {
+            for (&state.pending) |*slot| {
+                if (slot.* != null) continue;
+                slot.* = request;
+                return;
+            }
+        }
         return failRequest(request);
     }
     const connection = Object.fromId(connection_id).retain();
@@ -413,4 +538,42 @@ test "VZ vsock bridge refuses to unlink a live Unix listener" {
         createListener(path),
     );
     try std.Io.Dir.accessAbsolute(io, path, .{});
+}
+
+test "VZ vsock bridge stops with early clients filling its backlog" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temporary.dir.realPath(global.io(), &path_buffer);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ path_buffer[0..root_len], "docker.sock" },
+    );
+    defer std.testing.allocator.free(path);
+    const bridge = try Bridge.create(std.testing.allocator, path, null);
+    errdefer bridge.destroy();
+    var clients: [64]?c_int = @splat(null);
+    defer for (clients) |client| {
+        if (client) |fd| net_compat.socketClose(fd);
+    };
+    var address = std.mem.zeroes(std.posix.sockaddr.un);
+    address.family = std.posix.AF.UNIX;
+    @memcpy(address.path[0..path.len], path);
+    const address_len = @offsetOf(std.posix.sockaddr.un, "path") + path.len + 1;
+    var connected: usize = 0;
+    for (&clients) |*client| {
+        const fd = try net_compat.socketCreate(
+            std.posix.AF.UNIX,
+            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
+            0,
+        );
+        client.* = fd;
+        if (std.c.connect(fd, @ptrCast(&address), @intCast(address_len)) == 0) connected += 1;
+    }
+    try std.testing.expect(connected > 0);
+    try std.testing.expectEqual(@as(u32, 0), bridge.connectionCount());
+    // No guest notification was delivered. Teardown must not make a blocking
+    // connection to a full backlog whose accept thread is still gated.
+    bridge.destroy();
 }

@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const docker_socket_default = "/run/docker.sock";
 pub const port_default: u32 = 62_375;
 const host_cid: u32 = 2;
+const ready_port: u32 = 62_376;
 const any_cid: u32 = std.math.maxInt(u32);
 const connection_count_max: u32 = 64;
 const backlog: c_int = 64;
@@ -51,7 +52,21 @@ pub fn main(minimal: std.process.Init.Minimal) Error!void {
     const config = try parseConfig(minimal);
     const listener = try createListener(config.port);
     defer closeSocket(listener);
+    try notifyHost();
     try acceptLoop(listener, config);
+}
+
+/// Listener creation precedes the notification so the host can immediately
+/// connect. The first HTTP request through docker.socket activates dockerd;
+/// its response, rather than this transport notification, proves API readiness.
+fn notifyHost() Error!void {
+    const fd = socket(@intCast(posix.AF.VSOCK), @intCast(posix.SOCK.STREAM | posix.SOCK.CLOEXEC), 0);
+    if (fd < 0) return error.SocketFailed;
+    defer closeSocket(fd);
+    var address = linux.sockaddr.vm{ .port = ready_port, .cid = host_cid, .flags = 0 };
+    if (std.c.connect(fd, @ptrCast(&address), @sizeOf(@TypeOf(address))) != 0) {
+        return error.ConnectFailed;
+    }
 }
 
 fn parseConfig(minimal: std.process.Init.Minimal) Error!Config {
