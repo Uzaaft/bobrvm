@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const global = @import("../global.zig");
+const TestCommandBuilder = @import("virgl/TestCommandBuilder.zig");
 
 const log = std.log.scoped(.gpu);
 
@@ -1302,39 +1303,7 @@ test "GpuDevice renders with translated guest shaders end to end" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}\n0: MOV OUT[0], IMM[0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     // vertex_elements: 1 element {src_offset 0, buffer 0, format r32g32_float}
@@ -1466,39 +1435,7 @@ test "GpuDevice draws indexed with uniform constants (buffer(1) binding)" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n0: MOV OUT[0], CONST[0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5); // vertex_elements
@@ -1635,39 +1572,7 @@ test "GpuDevice samples a guest texture through TEX (fragment texturing)" {
     const fs_text = "FRAG\nDCL IN[0], GENERIC[0]\nDCL OUT[0], COLOR\nDCL SAMP[0]\n0: TEX OUT[0], IN[0], SAMP[0], 2D\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5); // vertex_elements: one r32g32_float element
@@ -1803,20 +1708,8 @@ test "GpuDevice depth-tests draws (far fragment loses to near)" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n0: MOV OUT[0], CONST[0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn consts(self: *@This(), r: f32, g: f32) void {
+    const Commands = struct {
+        fn consts(self: *TestCommandBuilder, r: f32, g: f32) void {
             self.cmd(12, 0, 6);
             self.w(1); // fragment stage
             self.w(0);
@@ -1825,33 +1718,15 @@ test "GpuDevice depth-tests draws (far fragment loses to near)" {
             self.f(0.0);
             self.f(1.0);
         }
-        fn draw(self: *@This(), start: u32) void {
+        fn draw(self: *TestCommandBuilder, start: u32) void {
             self.cmd(8, 0, 12);
             self.w(start);
             self.w(3);
             self.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
             for (0..9) |_| self.w(0);
         }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
     };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5); // vertex_elements: one r32g32b32_float element
@@ -1906,10 +1781,10 @@ test "GpuDevice depth-tests draws (far fragment loses to near)" {
     b.w(0x3FF00000); // depth f64 high = 1.0
     b.w(0);
     // NEAR green first, FAR red second.
-    b.consts(0.0, 1.0);
-    b.draw(0);
-    b.consts(1.0, 0.0);
-    b.draw(3);
+    Commands.consts(&b, 0.0, 1.0);
+    Commands.draw(&b, 0);
+    Commands.consts(&b, 1.0, 0.0);
+    Commands.draw(&b, 3);
 
     try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
 
@@ -1968,39 +1843,7 @@ test "GpuDevice executes TGSI control flow (IF on a uniform)" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\nDCL TEMP[0]\nIMM[0] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}\nIMM[1] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}\n0: IF CONST[0].xxxx :3\n1: MOV TEMP[0], IMM[1]\n2: ELSE :4\n3: MOV TEMP[0], IMM[0]\n4: ENDIF\n5: MOV OUT[0], TEMP[0]\n6: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5);
@@ -2107,20 +1950,8 @@ test "GpuDevice applies guest blend state (additive over)" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n0: MOV OUT[0], CONST[0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn consts(self: *@This(), r: f32, g: f32, bl: f32) void {
+    const Commands = struct {
+        fn consts(self: *TestCommandBuilder, r: f32, g: f32, bl: f32) void {
             self.cmd(12, 0, 6);
             self.w(1);
             self.w(0);
@@ -2129,33 +1960,15 @@ test "GpuDevice applies guest blend state (additive over)" {
             self.f(bl);
             self.f(1.0);
         }
-        fn draw(self: *@This()) void {
+        fn draw(self: *TestCommandBuilder) void {
             self.cmd(8, 0, 12);
             self.w(0);
             self.w(3);
             self.w(@intFromEnum(virgl.protocol.PrimitiveType.triangles));
             for (0..9) |_| self.w(0);
         }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
     };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5);
@@ -2213,10 +2026,10 @@ test "GpuDevice applies guest blend state (additive over)" {
     b.w(0);
     b.w(0);
     // Two additive draws: red then green -> yellow.
-    b.consts(1.0, 0.0, 0.0);
-    b.draw();
-    b.consts(0.0, 1.0, 0.0);
-    b.draw();
+    Commands.consts(&b, 1.0, 0.0, 0.0);
+    Commands.draw(&b);
+    Commands.consts(&b, 0.0, 1.0, 0.0);
+    Commands.draw(&b);
 
     try gpu.submit(1, std.mem.sliceAsBytes(storage[0..b.i]));
 
@@ -2278,39 +2091,7 @@ test "GpuDevice renders to two color attachments (MRT)" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR\nIMM[0] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}\nIMM[1] FLT32 { 1.0000, 0.0000, 0.0000, 1.0000}\n0: MOV OUT[0], IMM[0]\n1: MOV OUT[1], IMM[1]\n2: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5);
@@ -2421,39 +2202,7 @@ test "GpuDevice instanced draw uses gl_InstanceID (SV/INSTANCEID)" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}\n0: MOV OUT[0], IMM[0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const idx = k * 4 + bb;
-                    if (idx < text.len) word |= @as(u32, text[idx]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5);
@@ -2580,39 +2329,7 @@ test "GpuDevice honors primitive restart in indexed triangle strips" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 0.0000, 1.0000, 0.0000, 1.0000}\n0: MOV OUT[0], IMM[0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const ix = k * 4 + bb;
-                    if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5);
@@ -2745,39 +2462,7 @@ test "GpuDevice binds a named UBO (set_uniform_buffer, CONST[1][0])" {
     const fs_text = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[1][0]\n0: MOV OUT[0], CONST[1][0]\n1: END\n";
 
     var storage: [512]u32 = undefined;
-    const B = struct {
-        buf: []u32,
-        i: usize = 0,
-        fn w(self: *@This(), v: u32) void {
-            self.buf[self.i] = v;
-            self.i += 1;
-        }
-        fn cmd(self: *@This(), opcode: u32, objtype: u32, len: u32) void {
-            self.w(opcode | (objtype << 8) | (len << 16));
-        }
-        fn f(self: *@This(), v: f32) void {
-            self.w(@bitCast(v));
-        }
-        fn shader(self: *@This(), handle: u32, text: []const u8) void {
-            const nwords: u32 = @intCast((text.len + 1 + 3) / 4);
-            self.cmd(1, 4, 1 + 4 + nwords);
-            self.w(handle);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            self.w(0);
-            var k: usize = 0;
-            while (k < nwords) : (k += 1) {
-                var word: u32 = 0;
-                inline for (0..4) |bb| {
-                    const ix = k * 4 + bb;
-                    if (ix < text.len) word |= @as(u32, text[ix]) << (bb * 8);
-                }
-                self.w(word);
-            }
-        }
-    };
-    var b = B{ .buf = &storage };
+    var b = TestCommandBuilder{ .buf = &storage };
     b.shader(50, vs_text);
     b.shader(51, fs_text);
     b.cmd(1, 5, 5);
