@@ -23,41 +23,48 @@ struct BobrvmApp: SwiftUI.App {
             if let vmID {
                 VMWindowView(vmID: vmID)
                     .environmentObject(appDelegate.vmManager)
+                    .focusedSceneValue(\.isVMWindow, true)
             }
         }
         .windowToolbarStyle(.unifiedCompact)
         .defaultSize(width: 1_280, height: 800)
-        .commands {
-            BobrvmCommands(vmManager: appDelegate.vmManager)
-        }
 
         WindowGroup("Console", id: "vm-console", for: UUID.self) { $vmID in
             if let vmID {
                 VMConsoleWindowView(vmID: vmID)
                     .environmentObject(appDelegate.vmManager)
+                    .focusedSceneValue(\.isVMWindow, true)
             }
         }
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1_000, height: 600)
-        .commands {
-            BobrvmCommands(vmManager: appDelegate.vmManager)
-        }
 
         Settings {
             SettingsView()
         }
-        .commands {
-            BobrvmCommands(vmManager: appDelegate.vmManager)
-        }
+    }
+}
+
+private struct VMWindowFocusedValueKey: FocusedValueKey {
+    typealias Value = Bool
+}
+
+private extension FocusedValues {
+    var isVMWindow: Bool? {
+        get { self[VMWindowFocusedValueKey.self] }
+        set { self[VMWindowFocusedValueKey.self] = newValue }
     }
 }
 
 private struct BobrvmCommands: Commands {
     @ObservedObject var vmManager: VMManager
+    @FocusedValue(\.isVMWindow) private var isVMWindow
 
     var body: some Commands {
         NewVirtualMachineCommands(vmManager: vmManager)
-        MachineCommands(vmManager: vmManager)
+        if isVMWindow == true {
+            MachineCommands(vmManager: vmManager)
+        }
     }
 }
 
