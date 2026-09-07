@@ -125,7 +125,7 @@ fn serve(session: *Session) ServeError!void {
         try protocol.configure(sockets[0]);
         try protocol.sendDescriptor(session.control, sockets[1]);
     }
-    var buffer: [protocol.frame_bytes_max + 1]u8 = undefined;
+    var batch: @import("net/packet_batch.zig") = .{};
     while (true) {
         var fds = [_]std.c.pollfd{
             .{ .fd = session.control, .events = std.c.POLL.IN, .revents = 0 },
@@ -138,16 +138,14 @@ fn serve(session: *Session) ServeError!void {
         }
         if (fds[0].revents != 0) return;
         if (fds[1].revents & std.c.POLL.IN != 0) {
-            const count = std.c.recv(sockets[0], &buffer, buffer.len, std.posix.MSG.DONTWAIT);
-            if (count >= 14 and count <= protocol.frame_bytes_max and
-                std.mem.eql(u8, buffer[6..12], &session.mac))
-            {
-                const frame = buffer[0..@intCast(count)];
+            const frames = batch.receive(sockets[0], session.mac);
+            for (frames) |frame| {
                 if (@import("net/shared.zig").sourceAddress(frame, session.mac)) |ip|
                     session.ipv4.store(ip, .release);
-                interface.write(frame);
             }
+            interface.writeBatch(frames);
         }
+
         if (fds[2].revents & std.c.POLL.IN != 0) {
             interface.wake.drain();
             interface.read(sockets[0]);

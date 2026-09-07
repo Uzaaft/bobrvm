@@ -2,4 +2,5 @@
 test {
     _ = @import("net/shared_protocol.zig");
     _ = @import("net/shared.zig");
+    _ = @import("net/packet_batch.zig");
 }

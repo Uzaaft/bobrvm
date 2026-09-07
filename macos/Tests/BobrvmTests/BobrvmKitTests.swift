@@ -5,6 +5,24 @@ import XCTest
 
 final class BobrvmKitTests: XCTestCase {
     @MainActor
+    func testGuestIPv4PublishesOnlyAddressChangesAndResets() throws {
+        let app = try App()
+        let vm = try app.createVM(config: VMConfig())
+        defer { vm.destroy() }
+        var addresses: [String?] = []
+        let subscription = vm.$guestIPv4.sink { addresses.append($0) }
+        defer { subscription.cancel() }
+        vm.updateGuestIPv4(0)
+        vm.updateGuestIPv4(0xc0a84002)
+        vm.updateGuestIPv4(0xc0a84002)
+        vm.updateGuestIPv4(0xc0a84003)
+        vm.updateGuestIPv4(0)
+        vm.updateGuestIPv4(0)
+        vm.updateGuestIPv4(0xc0a84003)
+        XCTAssertEqual(addresses, [nil, "192.168.64.2", "192.168.64.3", nil, "192.168.64.3"])
+    }
+
+    @MainActor
     func testHardwareSettingsReachCoreAndSurviveStorage() throws {
         let app = try App()
         let config = VMConfig(

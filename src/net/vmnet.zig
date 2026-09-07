@@ -103,11 +103,19 @@ pub fn deinit(self: *Interface) void {
     dispatch_release(self.queue);
 }
 
-pub fn write(self: *Interface, frame: []u8) void {
-    var iov = std.posix.iovec{ .base = frame.ptr, .len = frame.len };
-    var packet = [_]Packet{.{ .size = frame.len, .iov = &iov }};
-    var count: c_int = 1;
-    _ = vmnet_write(self.handle.?, &packet, &count);
+/// Borrow frame storage for one bounded write; drop packets if vmnet cannot accept them.
+pub fn writeBatch(self: *Interface, frames: []const []u8) void {
+    const capacity = @import("packet_batch.zig").capacity;
+    std.debug.assert(frames.len <= capacity);
+    if (frames.len == 0) return;
+    var iov: [capacity]std.posix.iovec = undefined;
+    var packets: [capacity]Packet = undefined;
+    for (frames, iov[0..frames.len], packets[0..frames.len]) |frame, *vector, *packet| {
+        vector.* = .{ .base = frame.ptr, .len = frame.len };
+        packet.* = .{ .size = frame.len, .iov = vector };
+    }
+    var count: c_int = @intCast(frames.len);
+    _ = vmnet_write(self.handle.?, &packets, &count);
 }
 
 /// Bounded batch per wakeup. Rearm our pipe if more packets may be waiting.

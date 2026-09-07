@@ -8,10 +8,19 @@ const callback = @import("../callback.zig");
 control: c_int,
 packets: c_int,
 mac: [6]u8,
-reply: callback.Binding1([]const u8, void),
+sink: ReceiveSink,
 thread: ?std.Thread = null,
 running: std.atomic.Value(bool) = .init(true),
 ipv4: std.atomic.Value(u32) = .init(0),
+
+/// Each reservation must be committed once or cancelled once before shutdown.
+pub const ReceiveLease = struct { frame: []u8, token: usize };
+/// Callbacks run on the receiver thread; reserve returns the requested capacity.
+pub const ReceiveSink = struct {
+    reserve: callback.Binding1(usize, ?ReceiveLease),
+    commit: callback.Binding1(ReceiveLease, void),
+    cancel: callback.Binding1(ReceiveLease, void),
+};
 
 pub const Error = protocol.Error || std.mem.Allocator.Error || std.Thread.SpawnError;
 
@@ -67,7 +76,7 @@ pub fn connect(mac: [6]u8) protocol.Error!Connection {
 pub fn create(
     alloc: std.mem.Allocator,
     mac: [6]u8,
-    reply: callback.Binding1([]const u8, void),
+    sink: ReceiveSink,
 ) Error!*Client {
     const connection = try connect(mac);
     const control = connection.control;
@@ -76,7 +85,7 @@ pub fn create(
     errdefer net.socketClose(packets);
     const self = try alloc.create(Client);
     errdefer alloc.destroy(self);
-    self.* = .{ .control = control, .packets = packets, .mac = mac, .reply = reply };
+    self.* = .{ .control = control, .packets = packets, .mac = mac, .sink = sink };
     self.thread = try std.Thread.spawn(.{}, receive, .{self});
     return self;
 }
@@ -102,7 +111,6 @@ fn receive(self: *Client) void {
         self.running.store(false, .release);
         self.ipv4.store(0, .release);
     }
-    var buffer: [protocol.frame_bytes_max + 1]u8 = undefined;
     while (self.running.load(.acquire)) {
         var fds = [_]std.c.pollfd{
             .{ .fd = self.control, .events = std.c.POLL.IN, .revents = 0 },
@@ -114,10 +122,25 @@ fn receive(self: *Client) void {
         }
         if (fds[0].revents != 0) return;
         if (fds[1].revents & std.c.POLL.IN == 0) return;
-        const count = std.c.recv(self.packets, &buffer, buffer.len, std.posix.MSG.DONTWAIT);
-        if (count >= 14 and count <= protocol.frame_bytes_max)
-            self.reply.call(buffer[0..@intCast(count)]);
+        self.receivePacket();
     }
+}
+
+/// Receive directly into producer-owned storage, including one byte for oversize detection.
+fn receivePacket(self: *Client) void {
+    var lease = self.sink.reserve.call(protocol.frame_bytes_max + 1) orelse {
+        var discard: [1]u8 = undefined;
+        _ = std.c.recv(self.packets, &discard, discard.len, std.posix.MSG.DONTWAIT);
+        return;
+    };
+    std.debug.assert(lease.frame.len == protocol.frame_bytes_max + 1);
+    const count = std.c.recv(self.packets, lease.frame.ptr, lease.frame.len, std.posix.MSG.DONTWAIT);
+    if (count < 14 or count > protocol.frame_bytes_max) {
+        self.sink.cancel.call(lease);
+        return;
+    }
+    lease.frame = lease.frame[0..@intCast(count)];
+    self.sink.commit.call(lease);
 }
 
 /// Observe only this NIC's unicast IPv4/ARP source; never trust lengths from a guest.
@@ -181,4 +204,63 @@ test "shared IPv4 discovery rejects unspecified and truncated datagrams" {
     frame[14] = 0x45;
     std.mem.writeInt(u16, frame[16..18], 21, .big);
     try std.testing.expectEqual(@as(?u32, null), sourceAddress(&frame, mac));
+}
+
+test "shared receive fills RX pool and recycles rejected datagrams without allocations" {
+    const Net = @import("../virtio/net.zig").Net;
+    const Harness = struct {
+        device: *Net,
+        published: usize = 0,
+
+        fn reserve(self: *@This(), length: usize) ?ReceiveLease {
+            const r = self.device.reserveRxFrame(length) orelse return null;
+            return .{ .frame = r.bytes, .token = r.storage_index };
+        }
+        fn commit(self: *@This(), lease: ReceiveLease) void {
+            self.device.commitRxFrame(.{ .bytes = lease.frame, .storage_index = @intCast(lease.token) });
+            self.published += 1;
+        }
+        fn cancel(self: *@This(), lease: ReceiveLease) void {
+            self.device.cancelRxFrame(.{ .bytes = lease.frame, .storage_index = @intCast(lease.token) });
+        }
+    };
+    const device = try Net.init(std.testing.allocator);
+    defer device.deinit();
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    device.alloc = counted.allocator();
+    var harness = Harness{ .device = device };
+    var sockets: [2]c_int = undefined;
+    try std.testing.expect(std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.DGRAM, 0, &sockets) == 0);
+    defer for (sockets) |fd| net.socketClose(fd);
+    var client = Client{
+        .control = -1,
+        .packets = sockets[0],
+        .mac = .{ 2, 0, 0, 0, 0, 1 },
+        .sink = .{
+            .reserve = callback.Handler1(Harness, usize, ?ReceiveLease, Harness.reserve).bind(&harness),
+            .commit = callback.Handler1(Harness, ReceiveLease, void, Harness.commit).bind(&harness),
+            .cancel = callback.Handler1(Harness, ReceiveLease, void, Harness.cancel).bind(&harness),
+        },
+    };
+    var frame = [_]u8{0xA5} ** (protocol.frame_bytes_max + 2);
+    for ([_]usize{ 0, 13, protocol.frame_bytes_max + 1, frame.len }) |length| {
+        const sent = std.c.send(sockets[1], &frame, length, 0);
+        try std.testing.expectEqual(@as(isize, @intCast(length)), sent);
+        client.receivePacket();
+        try std.testing.expectEqual(0, device.rx_reserved_count);
+        try std.testing.expectEqual(0, device.rx_count);
+    }
+    client.receivePacket(); // EAGAIN must also return its reservation.
+    try std.testing.expectEqual(0, device.rx_reserved_count);
+    for (0..device.rx_frames.len) |_| {
+        try std.testing.expectEqual(42, std.c.send(sockets[1], &frame, 42, 0));
+        client.receivePacket();
+    }
+    try std.testing.expectEqual(device.rx_frames.len, harness.published);
+    try std.testing.expectEqual(42, std.c.send(sockets[1], &frame, 42, 0));
+    client.receivePacket(); // Full pool consumes and drops the datagram.
+    try std.testing.expectEqual(device.rx_frames.len, harness.published);
+    try std.testing.expect(std.c.recv(sockets[0], &frame, frame.len, std.posix.MSG.DONTWAIT) < 0);
+    try std.testing.expectEqual(0, counted.allocations);
+    try std.testing.expect(!counted.has_induced_failure);
 }

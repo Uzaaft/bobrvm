@@ -2924,7 +2924,26 @@ pub const Machine = struct {
                 self.shared_network = SharedNetwork.create(
                     self.alloc,
                     self.config.network_mac,
-                    callback_binding.Handler1(Machine, []const u8, void, natReplyCallback).bind(self),
+                    .{
+                        .reserve = callback_binding.Handler1(
+                            Machine,
+                            usize,
+                            ?SharedNetwork.ReceiveLease,
+                            sharedReserveCallback,
+                        ).bind(self),
+                        .commit = callback_binding.Handler1(
+                            Machine,
+                            SharedNetwork.ReceiveLease,
+                            void,
+                            sharedCommitCallback,
+                        ).bind(self),
+                        .cancel = callback_binding.Handler1(
+                            Machine,
+                            SharedNetwork.ReceiveLease,
+                            void,
+                            sharedCancelCallback,
+                        ).bind(self),
+                    },
                 ) catch |err| {
                     log.err("shared networking failed: {}. " ++
                         "Install the network helper or select user networking", .{err});
@@ -3598,6 +3617,20 @@ pub const Machine = struct {
             net.queueRxFrame(frame);
             self.kickCpu(0);
         }
+    }
+
+    fn sharedReserveCallback(self: *Machine, length: usize) ?SharedNetwork.ReceiveLease {
+        const reservation = (self.net orelse return null).reserveRxFrame(length) orelse return null;
+        return .{ .frame = reservation.bytes, .token = reservation.storage_index };
+    }
+
+    fn sharedCommitCallback(self: *Machine, lease: SharedNetwork.ReceiveLease) void {
+        self.net.?.commitRxFrame(.{ .bytes = lease.frame, .storage_index = @intCast(lease.token) });
+        self.kickCpu(0);
+    }
+
+    fn sharedCancelCallback(self: *Machine, lease: SharedNetwork.ReceiveLease) void {
+        self.net.?.cancelRxFrame(.{ .bytes = lease.frame, .storage_index = @intCast(lease.token) });
     }
 
     fn natReplyReserveCallback(self: *Machine, frame_len: usize) ?mininat.ReplyLease {

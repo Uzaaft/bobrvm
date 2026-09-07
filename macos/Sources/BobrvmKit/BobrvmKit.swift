@@ -206,10 +206,14 @@ public struct VMConfig {
         self.sharedFolderReadOnly = sharedFolderReadOnly
         self.networkEnabled = networkEnabled ?? defaults.enable_net
         self.sharedNetworking = sharedNetworking
-        var identity = UUID().uuid
-        var generatedMAC = withUnsafeBytes(of: &identity) { Array($0.prefix(6)) }
-        generatedMAC[0] = (generatedMAC[0] & 0xfc) | 2
-        self.networkMAC = networkMAC ?? generatedMAC
+        if let networkMAC {
+            self.networkMAC = networkMAC
+        } else {
+            var identity = UUID().uuid
+            var generatedMAC = withUnsafeBytes(of: &identity) { Array($0.prefix(6)) }
+            generatedMAC[0] = (generatedMAC[0] & 0xfc) | 2
+            self.networkMAC = generatedMAC
+        }
         self.touchIDEnabled = touchIDEnabled
         self.portForwards = portForwards
         self.sharedFolderPath = sharedFolderPath
@@ -564,6 +568,7 @@ public final class VM: ObservableObject {
         String(decoding: consoleOutputData, as: UTF8.self)
     }
 
+    private var guestIPv4Value: UInt32 = 0
     private var handle: bobrvm_vm_t?
     private weak var app: App?
     private var surfaces: [Surface] = []
@@ -597,13 +602,18 @@ public final class VM: ObservableObject {
         consoleEventSubject.send(.clear)
     }
 
+    func updateGuestIPv4(_ address: UInt32) {
+        guard address != guestIPv4Value else { return }
+        guestIPv4Value = address
+        guestIPv4 =
+            address == 0 ? nil : "\(address >> 24).\((address >> 16) & 255).\((address >> 8) & 255).\(address & 255)"
+    }
+
     func refreshGuestToolsStatus() {
         guard !isStopping else { return }
         // Device setup publishes asynchronously; listeners keep their ports until stop.
         if let handle, state == .running {
-            let ip = bobrvm_vm_guest_ipv4(handle)
-            guestIPv4 =
-                ip == 0 ? nil : "\(ip >> 24).\((ip >> 16) & 255).\((ip >> 8) & 255).\(ip & 255)"
+            updateGuestIPv4(bobrvm_vm_guest_ipv4(handle))
             for slot in forwardedPorts.indices where forwardedPorts[slot] == 0 {
                 let port = bobrvm_vm_forwarded_port(handle, UInt8(slot))
                 if port != 0 { forwardedPorts[slot] = port }
@@ -830,7 +840,7 @@ public final class VM: ObservableObject {
     private func beginStop() -> SendableVMHandle? {
         guard !isStopping, state != .stopped, let handle else { return nil }
         isStopping = true
-        guestIPv4 = nil
+        updateGuestIPv4(0)
         forwardedPorts = Array(repeating: 0, count: forwardedPorts.count)
         if let app {
             app.delegate?.app(app, didInvalidateTouchIDRequestsFor: self)

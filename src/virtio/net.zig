@@ -232,6 +232,21 @@ pub const Net = struct {
         };
     }
 
+    /// Return an unpublished reservation to the pool without enqueuing a frame.
+    pub fn cancelRxFrame(self: *Net, reservation: RxReservation) void {
+        assert(reservation.storage_index < self.rx_storage.len);
+        self.rx_mutex.lockUncancelable(global.io());
+        defer self.rx_mutex.unlock(global.io());
+        const storage = &self.rx_storage[reservation.storage_index];
+        assert(storage.reserved);
+        assert(storage.bytes().ptr == reservation.bytes.ptr);
+        assert(self.rx_reserved_count > 0);
+        storage.reserved = false;
+        self.rx_reserved_count -= 1;
+        storage.next_free = self.rx_free_head;
+        self.rx_free_head = reservation.storage_index;
+    }
+
     /// Publish a directly-filled RX reservation to the guest queue.
     pub fn commitRxFrame(self: *Net, reservation: RxReservation) void {
         assert(reservation.bytes.len > 0);
