@@ -11,6 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Config = @import("Config.zig");
+const shell = @import("shell.zig");
 const toml = @import("toml.zig");
 const global = @import("../global.zig");
 const file_compat = @import("../compat/file.zig");
@@ -455,7 +456,7 @@ fn resolvePath(arena: Allocator, root: []const u8, path: []const u8) Error![]con
 
 fn prependDockerMount(arena: Allocator, config: *Config, engine: Engine) Error!void {
     const path = config.shared_dir.?;
-    const quoted = try shellQuote(arena, path);
+    const quoted = try shell.quote(arena, path);
     const command = switch (engine) {
         .native => std.fmt.allocPrint(
             arena,
@@ -474,20 +475,6 @@ fn prependDockerMount(arena: Allocator, config: *Config, engine: Engine) Error!v
     steps[0] = command;
     @memcpy(steps[1..], config.provision_steps);
     config.provision_steps = steps;
-}
-
-fn shellQuote(arena: Allocator, value: []const u8) Error![]const u8 {
-    var quoted: std.ArrayListUnmanaged(u8) = .empty;
-    quoted.append(arena, '\'') catch return error.OutOfMemory;
-    for (value) |byte| {
-        if (byte == '\'') {
-            quoted.appendSlice(arena, "'\\''") catch return error.OutOfMemory;
-        } else {
-            quoted.append(arena, byte) catch return error.OutOfMemory;
-        }
-    }
-    quoted.append(arena, '\'') catch return error.OutOfMemory;
-    return quoted.items;
 }
 
 const testing = std.testing;

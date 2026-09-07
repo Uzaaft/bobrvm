@@ -14,6 +14,7 @@ const fork = @import("fork.zig");
 const global = @import("../global.zig");
 const machine_config = @import("machine_config.zig");
 const machine = @import("../machine/main.zig");
+const shell = @import("shell.zig");
 const project = @import("project.zig");
 
 const log = std.log.scoped(.cli);
@@ -78,7 +79,7 @@ fn run(alloc: Allocator, args: *std.process.Args.Iterator) !u8 {
     // Shell-quote each argv element so multi-word arguments survive as
     // one word in the injected command line — otherwise
     // `exec -- sh -c 'a b'` would flatten to `sh -c a b`.
-    const command = try shellJoin(arena, parts.items);
+    const command = try shell.join(arena, parts.items);
     profile.mark("arguments parsed");
 
     var cwd_buf: [1024]u8 = undefined;
@@ -142,39 +143,6 @@ fn run(alloc: Allocator, args: *std.process.Args.Iterator) !u8 {
 
 fn machineMain(hw: *machine.Machine) void {
     hw.startSync() catch |err| log.err("machine failed: {}", .{err});
-}
-
-/// Join argv into a single POSIX-shell command line, single-quoting
-/// each word (embedded single quotes become '\'').
-fn shellJoin(arena: Allocator, parts: []const []const u8) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    for (parts, 0..) |part, i| {
-        if (i > 0) try out.append(arena, ' ');
-        try out.append(arena, '\'');
-        for (part) |byte| {
-            if (byte == '\'') {
-                try out.appendSlice(arena, "'\\''");
-            } else {
-                try out.append(arena, byte);
-            }
-        }
-        try out.append(arena, '\'');
-    }
-    return out.items;
-}
-
-test "shellJoin quotes each argument" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expectEqualStrings(
-        "'sh' '-c' 'exit 7'",
-        try shellJoin(arena, &.{ "sh", "-c", "exit 7" }),
-    );
-    try std.testing.expectEqualStrings(
-        "'echo' 'it'\\''s'",
-        try shellJoin(arena, &.{ "echo", "it's" }),
-    );
 }
 
 fn printHelp() void {
