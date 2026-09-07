@@ -9,6 +9,7 @@ const console_exec = @import("console_exec.zig");
 const global = @import("../global.zig");
 const KittyDisplay = @import("kitty_display.zig");
 const KittyInput = @import("kitty_input.zig");
+const config_mapping = @import("machine_config.zig");
 const machine = @import("../machine/main.zig");
 const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
@@ -73,32 +74,17 @@ pub fn runWithReadyMarker(
         forwards_buf[i] = .{ .host_port = f.host_port, .guest_port = f.guest_port };
     }
 
-    const machine_config = machine.MachineConfig{
-        .ram_size = config.memory_mb * 1024 * 1024,
-        .vcpu_count = config.vcpu_count,
-        .firmware_path = config.firmware_path,
-        .vars_path = config.vars_path,
-        .kernel_path = config.kernel_path,
-        .initrd_path = config.initrd_path,
-        .cmdline = config.cmdline,
-        .disk_path = config.disk_path,
-        .disk_read_only = config.disk_read_only,
-        .disk2_path = config.disk2_path,
-        .disk2_read_only = config.disk2_read_only,
-        .enable_gpu = config.enable_gpu,
-        .enable_virgl = config.enable_virgl,
-        .enable_net = config.enable_net,
-        .isolate_host = config.isolate_host,
-        .enable_snd = config.enable_snd,
-        .forwards = forwards_buf[0..config.forward_count],
-        .docker_socket_path = config.docker_socket_path,
-        .shared_dir = config.shared_dir,
-        .share_read_only = config.share_read_only,
-        .restore_path = directory_state orelse config.restore_path,
-        .display_width = config.display_width,
-        .display_height = config.display_height,
-        .gpu_memory_bytes = config.gpu_memory_mb * 1024 * 1024,
-    };
+    var machine_config = config_mapping.base(config);
+    machine_config.enable_gpu = config.enable_gpu;
+    machine_config.enable_virgl = config.enable_virgl;
+    machine_config.isolate_host = config.isolate_host;
+    machine_config.enable_snd = config.enable_snd;
+    machine_config.forwards = forwards_buf[0..config.forward_count];
+    machine_config.docker_socket_path = config.docker_socket_path;
+    machine_config.restore_path = directory_state orelse config.restore_path;
+    machine_config.display_width = config.display_width;
+    machine_config.display_height = config.display_height;
+    machine_config.gpu_memory_bytes = config.gpu_memory_mb * 1024 * 1024;
 
     log.info("creating VM: {}MB RAM, {} vCPUs", .{
         config.memory_mb,

@@ -12,6 +12,7 @@ const console_exec = @import("console_exec.zig");
 const fork = @import("fork.zig");
 const global = @import("../global.zig");
 const host_metrics = @import("host_metrics.zig");
+const machine_config = @import("machine_config.zig");
 const machine = @import("../machine/main.zig");
 const project = @import("project.zig");
 
@@ -158,7 +159,7 @@ fn trial(alloc: Allocator, arena: Allocator, proj: *const project.Project) !Timi
     defer fork.deleteTree(clone.dir);
 
     const start_ns = nowNs();
-    var hw = try machine.Machine.init(alloc, machineConfig(&clone.config));
+    var hw = try machine.Machine.init(alloc, machine_config.base(&clone.config));
     defer hw.deinit();
 
     var session = console_exec.Session.init(alloc, hw);
@@ -191,26 +192,6 @@ fn trial(alloc: Allocator, arena: Allocator, proj: *const project.Project) !Timi
 
 fn machineMain(hw: *machine.Machine) void {
     hw.startSync() catch |err| log.err("machine failed: {}", .{err});
-}
-
-fn machineConfig(config: *const @import("Config.zig")) machine.MachineConfig {
-    return .{
-        .ram_size = config.memory_mb * 1024 * 1024,
-        .vcpu_count = config.vcpu_count,
-        .firmware_path = config.firmware_path,
-        .vars_path = config.vars_path,
-        .kernel_path = config.kernel_path,
-        .initrd_path = config.initrd_path,
-        .cmdline = config.cmdline,
-        .disk_path = config.disk_path,
-        .disk_read_only = config.disk_read_only,
-        .disk2_path = config.disk2_path,
-        .disk2_read_only = config.disk2_read_only,
-        .enable_net = config.enable_net,
-        .shared_dir = config.shared_dir,
-        .share_read_only = config.share_read_only,
-        .restore_path = config.restore_path,
-    };
 }
 
 const TimingField = enum { restore_ns, ready_ns, command_ns, total_ns };

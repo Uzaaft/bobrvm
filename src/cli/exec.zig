@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const console_exec = @import("console_exec.zig");
 const fork = @import("fork.zig");
 const global = @import("../global.zig");
+const machine_config = @import("machine_config.zig");
 const machine = @import("../machine/main.zig");
 const project = @import("project.zig");
 
@@ -103,7 +104,7 @@ fn run(alloc: Allocator, args: *std.process.Args.Iterator) !u8 {
     }
     profile.mark("clone prepared");
 
-    var hw = try machine.Machine.init(alloc, machineConfig(&clone.config));
+    var hw = try machine.Machine.init(alloc, machine_config.base(&clone.config));
     defer {
         hw.deinit();
         profile.mark("machine deinitialized");
@@ -174,26 +175,6 @@ test "shellJoin quotes each argument" {
         "'echo' 'it'\\''s'",
         try shellJoin(arena, &.{ "echo", "it's" }),
     );
-}
-
-fn machineConfig(config: *const @import("Config.zig")) machine.MachineConfig {
-    return .{
-        .ram_size = config.memory_mb * 1024 * 1024,
-        .vcpu_count = config.vcpu_count,
-        .firmware_path = config.firmware_path,
-        .vars_path = config.vars_path,
-        .kernel_path = config.kernel_path,
-        .initrd_path = config.initrd_path,
-        .cmdline = config.cmdline,
-        .disk_path = config.disk_path,
-        .disk_read_only = config.disk_read_only,
-        .disk2_path = config.disk2_path,
-        .disk2_read_only = config.disk2_read_only,
-        .enable_net = config.enable_net,
-        .shared_dir = config.shared_dir,
-        .share_read_only = config.share_read_only,
-        .restore_path = config.restore_path,
-    };
 }
 
 fn printHelp() void {
