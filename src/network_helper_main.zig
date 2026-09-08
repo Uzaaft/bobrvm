@@ -71,6 +71,14 @@ fn acceptSession(control: c_int, uid: u32) SessionError!void {
     try protocol.configure(control);
     var hello: protocol.Hello = undefined;
     try protocol.readExact(control, std.mem.asBytes(&hello));
+    if (std.mem.eql(u8, &hello.version, protocol.version_query)) {
+        if (!std.mem.allEqual(u8, &hello.mac, 0) or
+            !std.mem.allEqual(u8, &hello.reserved, 0)) return error.InvalidRequest;
+        if (std.c.send(control, &protocol.helper_version, protocol.helper_version.len, 0) !=
+            protocol.helper_version.len) return error.QueryFailed;
+        net.socketClose(control);
+        return;
+    }
     if (std.mem.eql(u8, &hello.version, "BOBRIP01")) {
         var ip: u32 = 0;
         for (&sessions) |*session| {

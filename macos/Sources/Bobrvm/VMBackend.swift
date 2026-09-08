@@ -378,18 +378,17 @@ struct BootConfigurationFields: View {
 struct NetworkHelperControls: View {
     @State private var installed = FileManager.default.fileExists(
         atPath: "/Library/PrivilegedHelperTools/as.polymath.bobrvm.network")
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var helperStatus: bobrvm_network_helper_status_e?
+    @State private var statusGeneration = 0
     @State private var working = false
     @State private var failure: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(
-                installed
-                    ? "Shared networking is installed."
-                    : "Install shared networking once to connect this Mac directly to guest IP addresses."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            Text(statusMessage)
+                .font(.caption)
+                .foregroundStyle(needsUpdate ? Color.orange : Color.secondary)
             HStack {
                 Button(installed ? "Update networking…" : "Install networking…") {
                     manage(remove: false)
@@ -406,6 +405,42 @@ struct NetworkHelperControls: View {
             .foregroundStyle(.secondary)
             if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
         }
+        .task(id: scenePhase) {
+            if scenePhase == .active { await refreshStatus() }
+        }
+    }
+
+    private var needsUpdate: Bool {
+        helperStatus == BOBRVM_NETWORK_HELPER_MISMATCH
+            || helperStatus == BOBRVM_NETWORK_HELPER_UNVERIFIED
+    }
+
+    private var statusMessage: String {
+        switch helperStatus {
+        case BOBRVM_NETWORK_HELPER_CURRENT:
+            return "Shared networking is running the version included with this app."
+        case BOBRVM_NETWORK_HELPER_MISMATCH:
+            return "The running networking helper differs from this app. Update networking."
+        case BOBRVM_NETWORK_HELPER_UNVERIFIED:
+            return "The networking helper version could not be verified. Update networking."
+        case BOBRVM_NETWORK_HELPER_UNAVAILABLE:
+            return installed
+                ? "Shared networking is installed but unavailable. Try updating networking."
+                : "Install shared networking to connect this Mac directly to guest IP addresses."
+        default:
+            return "Checking the running networking helper…"
+        }
+    }
+
+    private func refreshStatus() async {
+        guard !working else { return }
+        statusGeneration += 1
+        let generation = statusGeneration
+        let status = await Task.detached { bobrvm_network_helper_status() }.value
+        guard !working, generation == statusGeneration, !Task.isCancelled else { return }
+        helperStatus = status
+        installed = FileManager.default.fileExists(
+            atPath: "/Library/PrivilegedHelperTools/as.polymath.bobrvm.network")
     }
 
     private func manage(remove: Bool) {
@@ -424,6 +459,7 @@ struct NetworkHelperControls: View {
             + command
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"") + "\" with administrator privileges"
+        statusGeneration += 1
         working = true
         failure = nil
         Task {
@@ -444,8 +480,7 @@ struct NetworkHelperControls: View {
             }.value
             working = false
             failure = result
-            installed = FileManager.default.fileExists(
-                atPath: "/Library/PrivilegedHelperTools/as.polymath.bobrvm.network")
+            await refreshStatus()
         }
     }
 

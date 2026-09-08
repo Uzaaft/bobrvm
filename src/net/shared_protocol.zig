@@ -5,6 +5,8 @@ const net = @import("../compat/net.zig");
 
 pub const socket_path = "/var/run/bobrvm-network/control.sock";
 pub const magic = "BOBRNET1";
+pub const version_query = "BOBRVER1";
+pub const helper_version = @import("../network_helper_version.zig").value;
 pub const frame_bytes_max = 1518;
 pub const Hello = extern struct {
     version: [8]u8 = magic.*,

@@ -26,6 +26,18 @@ The helper is authorized for the installing user's UID. Installing from another
 account replaces that authorization; this initial implementation supports one host
 user at a time.
 
+The app queries the **running** helper over its authenticated control socket and
+warns when its source version differs from the app's expected version. CLI shared
+network startup logs the same warning. The version is a SHA-256 fingerprint of the
+helper sources, so local edits are detected without a release-version bump. A
+mismatch means a different version, not necessarily an older one; networking is
+still allowed when the existing protocol works. Helpers predating the version
+query show an unverified-version warning. An unreachable helper is reported
+separately. Updating restarts the daemon; the app then checks its running version
+again. The fingerprint inputs live in `src/network_helper_version.zig` and must be
+extended when adding helper dependencies. It is a source identity, not a hash of
+the final executable or its toolchain.
+
 For CLI-only installations, build and install from this checkout:
 
 ```sh

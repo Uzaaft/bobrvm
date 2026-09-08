@@ -51,12 +51,63 @@ pub fn lookup(mac: [6]u8) protocol.Error!u32 {
     return std.mem.readInt(u32, &bytes, .big);
 }
 
+/// A failed version exchange is distinct from an absent daemon. In particular,
+/// helpers predating the query close the socket without replying.
+pub const HelperStatus = enum(c_int) { current = 0, mismatch = 1, unavailable = 2, unverified = 3 };
+
+pub fn helperStatus() HelperStatus {
+    const version = queryVersion() catch |err| return switch (err) {
+        error.HelperUnavailable => .unavailable,
+        else => .unverified,
+    };
+    return classifyVersion(version);
+}
+
+fn classifyVersion(version: [64]u8) HelperStatus {
+    for (version) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return .unverified;
+    }
+    return if (std.mem.eql(u8, &version, &protocol.helper_version)) .current else .mismatch;
+}
+
+fn queryVersion() protocol.Error![64]u8 {
+    if (@import("builtin").os.tag != .macos) return error.HelperUnavailable;
+    const control = net.socketCreate(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch
+        return error.HelperUnavailable;
+    defer net.socketClose(control);
+    try protocol.configure(control);
+    var address = protocol.address();
+    if (std.c.connect(control, @ptrCast(&address), @sizeOf(@TypeOf(address))) != 0 or
+        protocol.peerUid(control) != 0) return error.HelperUnavailable;
+    return exchangeVersion(control);
+}
+
+fn exchangeVersion(control: c_int) protocol.Error![64]u8 {
+    const hello = protocol.Hello{ .mac = @splat(0), .version = protocol.version_query.* };
+    if (std.c.send(control, &hello, @sizeOf(@TypeOf(hello)), 0) != @sizeOf(@TypeOf(hello)))
+        return error.ProtocolError;
+    var version: [64]u8 = undefined;
+    try protocol.readExact(control, &version);
+    return version;
+}
+
 pub const Connection = struct { control: c_int, packets: c_int };
 
 /// Returns two owned descriptors. The caller must retain control until the
 /// guest-facing packet attachment has stopped using packets.
 pub fn connect(mac: [6]u8) protocol.Error!Connection {
     if (@import("builtin").os.tag != .macos) return error.HelperUnavailable;
+    switch (helperStatus()) {
+        .current, .unavailable => {},
+        .mismatch => std.log.warn(
+            "network helper version differs from this build; update networking",
+            .{},
+        ),
+        .unverified => std.log.warn(
+            "network helper version could not be verified; update networking",
+            .{},
+        ),
+    }
     const hello = protocol.Hello{ .mac = mac };
     if (!hello.valid()) return error.ProtocolError;
     const control = net.socketCreate(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch
@@ -263,4 +314,53 @@ test "shared receive fills RX pool and recycles rejected datagrams without alloc
     try std.testing.expect(std.c.recv(sockets[0], &frame, frame.len, std.posix.MSG.DONTWAIT) < 0);
     try std.testing.expectEqual(0, counted.allocations);
     try std.testing.expect(!counted.has_induced_failure);
+}
+
+test "helper version distinguishes matching, different and malformed replies" {
+    try std.testing.expectEqual(HelperStatus.current, classifyVersion(protocol.helper_version));
+    var different = protocol.helper_version;
+    different[0] = if (different[0] == '0') '1' else '0';
+    try std.testing.expectEqual(HelperStatus.mismatch, classifyVersion(different));
+    different[0] = 0;
+    try std.testing.expectEqual(HelperStatus.unverified, classifyVersion(different));
+}
+
+test "helper version exchange uses a query without creating an interface" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    var sockets: [2]c_int = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets),
+    );
+    defer net.socketClose(sockets[0]);
+    defer net.socketClose(sockets[1]);
+    try protocol.configure(sockets[0]);
+    try protocol.configure(sockets[1]);
+    try std.testing.expectEqual(@as(isize, 64), std.c.send(sockets[1], &protocol.helper_version, 64, 0));
+    try std.testing.expectEqualSlices(u8, &protocol.helper_version, &try exchangeVersion(sockets[0]));
+    var hello: protocol.Hello = undefined;
+    try protocol.readExact(sockets[1], std.mem.asBytes(&hello));
+    try std.testing.expectEqualSlices(u8, protocol.version_query, &hello.version);
+    try std.testing.expect(std.mem.allEqual(u8, &hello.mac, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &hello.reserved, 0));
+}
+
+test "helper version exchange rejects legacy and truncated replies" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    for ([_]usize{ 0, 12 }) |length| {
+        var sockets: [2]c_int = undefined;
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets),
+        );
+        defer net.socketClose(sockets[0]);
+        defer net.socketClose(sockets[1]);
+        try protocol.configure(sockets[0]);
+        try std.testing.expectEqual(
+            @as(isize, @intCast(length)),
+            std.c.send(sockets[1], &protocol.helper_version, length, 0),
+        );
+        try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(sockets[1], std.posix.SHUT.WR));
+        try std.testing.expectError(error.ProtocolError, exchangeVersion(sockets[0]));
+    }
 }

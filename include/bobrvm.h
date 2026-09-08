@@ -487,6 +487,17 @@ void bobrvm_surface_mouse_pos(bobrvm_surface_t surface, double x, double y);
 
 void bobrvm_surface_mouse_scroll(bobrvm_surface_t surface, double dx, double dy);
 
+/** Running helper status. Queries the authenticated control socket; may block
+ * for the socket timeout. Call off the UI thread. */
+typedef enum {
+    BOBRVM_NETWORK_HELPER_CURRENT = 0,
+    BOBRVM_NETWORK_HELPER_MISMATCH = 1,
+    BOBRVM_NETWORK_HELPER_UNAVAILABLE = 2,
+    BOBRVM_NETWORK_HELPER_UNVERIFIED = 3,
+} bobrvm_network_helper_status_e;
+
+bobrvm_network_helper_status_e bobrvm_network_helper_status(void);
+
 /* Version. */
 
 /** Returns a static string. */

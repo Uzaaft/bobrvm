@@ -29,6 +29,10 @@ pub export fn bobrvm_deinit() void {
     global.state.deinit();
 }
 
+pub export fn bobrvm_network_helper_status() c_int {
+    return @intFromEnum(@import("net/shared.zig").helperStatus());
+}
+
 pub export fn bobrvm_version() [*:0]const u8 {
     return lib.version;
 }
