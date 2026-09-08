@@ -94,7 +94,6 @@ struct EditVMView: View {
                         }
                     }
                     networkSection
-                    forwardingSection
                     touchIDSection
                     informationSection
                 }
@@ -402,6 +401,9 @@ struct EditVMView: View {
                 )
                 .foregroundStyle(.secondary)
             }
+            if backend == .hypervisor && !sharedNetworking {
+                forwardingSettings
+            }
         } header: {
             LockableSectionHeader(title: "Network", isLocked: isRunning)
         } footer: {
@@ -409,54 +411,40 @@ struct EditVMView: View {
         }
     }
 
-    @ViewBuilder
-    private var forwardingSection: some View {
-        if backend == .hypervisor {
-            Section {
-                if !sharedNetworking { Toggle("SSH access from this Mac", isOn: $ssh.enabled) }
-                if ssh.enabled || sharedNetworking {
-                    TextField("Guest username", text: $ssh.username)
-                    if !sharedNetworking {
-                        Toggle("Choose SSH port automatically", isOn: $ssh.automatic)
-                        if !ssh.automatic {
-                            TextField("SSH host port", value: $ssh.port, format: .number)
-                        }
-                    }
+    private var forwardingSettings: some View {
+        DisclosureGroup("Advanced: Port Forwarding") {
+            Toggle("Forward SSH to this Mac", isOn: $ssh.enabled)
+            if ssh.enabled {
+                Toggle("Choose SSH port automatically", isOn: $ssh.automatic)
+                if !ssh.automatic {
+                    TextField("SSH host port", value: $ssh.port, format: .number)
                 }
-                if !sharedNetworking {
-                    ForEach($portForwards) { $forward in
-                        VStack(alignment: .leading) {
-                            HStack {
-                                TextField("Host port", value: $forward.hostPort, format: .number)
-                                Image(systemName: "arrow.right")
-                                TextField("Guest port", value: $forward.guestPort, format: .number)
-                                Button("Remove", systemImage: "minus.circle") {
-                                    portForwards.removeAll { $0.id == forward.id }
-                                }
-                                .labelStyle(.iconOnly)
-                            }
-                            Toggle("Allow LAN access", isOn: $forward.allowLAN)
-                        }
-                    }
-                    Button("Add TCP port forward", systemImage: "plus") {
-                        portForwards.append(TCPForward())
-                    }
-                    .disabled(portForwards.count >= 7)
-                }
-            } header: {
-                LockableSectionHeader(title: "SSH and Port Forwarding", isLocked: isRunning)
-            } footer: {
-                Text(
-                    "Enable SSH and configure login credentials inside the guest first. "
-                        + (sharedNetworking
-                            ? "Shared VMs are reachable from this Mac and other VMs on the shared network. "
-                            : "Ports are accessible only from this Mac unless LAN access is enabled. ")
-                        + "Stop the VM to edit these settings.")
             }
-            .disabled(isRunning || !networkEnabled)
-            .onChange(of: ssh) { hasChanges = true }
-            .onChange(of: portForwards) { hasChanges = true }
+            ForEach($portForwards) { $forward in
+                VStack(alignment: .leading) {
+                    HStack {
+                        TextField("Host port", value: $forward.hostPort, format: .number)
+                        Image(systemName: "arrow.right")
+                        TextField("Guest port", value: $forward.guestPort, format: .number)
+                        Button("Remove", systemImage: "minus.circle") {
+                            portForwards.removeAll { $0.id == forward.id }
+                        }
+                        .labelStyle(.iconOnly)
+                    }
+                    Toggle("Allow LAN access", isOn: $forward.allowLAN)
+                }
+            }
+            Button("Add TCP port forward", systemImage: "plus") {
+                portForwards.append(TCPForward())
+            }
+            .disabled(portForwards.count >= 7)
+            Text("Ports are accessible only from this Mac unless LAN access is enabled.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
+        .disabled(isRunning || !networkEnabled)
+        .onChange(of: ssh) { hasChanges = true }
+        .onChange(of: portForwards) { hasChanges = true }
     }
 
     @ViewBuilder

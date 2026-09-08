@@ -212,27 +212,8 @@ struct VMOverviewView: View {
                     if vmInstance.ssh.enabled
                         || (vmInstance.config.sharedNetworking && vmInstance.backend == .hypervisor)
                     {
-                        if vmInstance.sshPort != 0 {
-                            Text(vmInstance.sshCommand)
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
-                            HStack {
-                                Button("SSH", systemImage: "terminal") { vmInstance.openSSH() }
-                                Button("Copy command", systemImage: "doc.on.doc") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(
-                                        vmInstance.sshCommand, forType: .string
-                                    )
-                                }
-                            }
-                        } else {
-                            Text(
-                                vmInstance.config.sharedNetworking
-                                    ? "SSH is available after the guest acquires an IP address."
-                                    : "SSH forwarding is available after the VM starts."
-                            )
-                            .font(.caption)
-                        }
+                        SSHConnectionView(vmInstance: vmInstance)
+                            .id(vmInstance.id)
                         if let error = vmInstance.sshError {
                             Text(error).font(.caption).foregroundStyle(.red)
                         }
@@ -698,6 +679,61 @@ struct RestoreSnapshotButton: View {
             openWindow(id: "vm-display", value: vmInstance.id)
         } catch {
             presentNativeError(error, title: "Could Not Restore Snapshot")
+        }
+    }
+}
+
+private struct SSHConnectionView: View {
+    @ObservedObject var vmInstance: VMInstance
+    @State private var username: String
+    @State private var errorMessage: String?
+
+    init(vmInstance: VMInstance) {
+        self.vmInstance = vmInstance
+        _username = State(initialValue: vmInstance.ssh.username)
+    }
+
+    private var canConnect: Bool {
+        var settings = vmInstance.ssh
+        settings.username = username
+        return vmInstance.sshPort != 0 && settings.validUsername
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("Guest username", text: $username)
+                .onSubmit { saveUsername() }
+            HStack {
+                Button("Open SSH", systemImage: "terminal") {
+                    guard saveUsername() else { return }
+                    vmInstance.openSSH()
+                }
+                Button("Copy SSH command", systemImage: "doc.on.doc") {
+                    guard saveUsername() else { return }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(vmInstance.sshCommand, forType: .string)
+                }
+            }
+            .disabled(!canConnect)
+            Text("Enable SSH inside the guest before connecting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let errorMessage {
+                Text(errorMessage).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .onChange(of: vmInstance.ssh.username) { _, value in username = value }
+    }
+
+    @discardableResult
+    private func saveUsername() -> Bool {
+        do {
+            try vmInstance.updateSSHUsername(username)
+            errorMessage = nil
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 }

@@ -455,6 +455,22 @@ public final class VMInstance: ObservableObject, Identifiable, Hashable {
         return "ssh -o HostKeyAlias=\(sshAlias) -p \(sshPort) \(ssh.username)@\(host)"
     }
 
+    /// Save a connection preference without changing the running VM's network configuration.
+    func updateSSHUsername(_ username: String) throws {
+        var updated = ssh
+        updated.username = username
+        guard updated.validUsername else { throw VMBackendError.invalidSSHUsername }
+        guard updated != ssh else { return }
+        let previous = ssh
+        ssh = updated
+        do {
+            try VMStorage.saveVM(self)
+        } catch {
+            ssh = previous
+            throw error
+        }
+    }
+
     func openSSH() {
         guard sshPort != 0, ssh.validUsername else { return }
         let directory = DiskManager.appSupportDir.appendingPathComponent("ssh", isDirectory: true)

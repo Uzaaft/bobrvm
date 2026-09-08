@@ -26,7 +26,6 @@ struct CreateVMView: View {
     @State private var resolution = DisplayResolution.defaultValue
     @State private var retinaEnabled = true
     @State private var touchIDEnabled = false
-    @State private var ssh = SSHSettings()
     @State private var sharedNetworking = true
     @State private var diskSizeGB = 64.0
     @State private var isCreating = false
@@ -130,7 +129,6 @@ struct CreateVMView: View {
                 resolution: $resolution,
                 retinaEnabled: $retinaEnabled,
                 touchIDEnabled: $touchIDEnabled,
-                ssh: $ssh,
                 sharedNetworking: $sharedNetworking,
                 backend: $backend,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
@@ -310,7 +308,6 @@ struct CreateVMView: View {
             try vmManager.createVM(
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                 config: config,
-                ssh: backend == .hypervisor ? ssh : SSHSettings(),
                 isoPath: source == .installFromISO ? isoPath : nil,
                 retinaEnabled: retinaEnabled,
                 guestSystem: (operatingSystem ?? .linux).guestSystem,
@@ -751,7 +748,6 @@ private struct HardwareStepView: View {
     @Binding var resolution: DisplayResolution
     @Binding var retinaEnabled: Bool
     @Binding var touchIDEnabled: Bool
-    @Binding var ssh: SSHSettings
     @Binding var sharedNetworking: Bool
     @Binding var backend: VMBackend
     let guestSystem: GuestSystem
@@ -863,22 +859,12 @@ private struct HardwareStepView: View {
     @ViewBuilder
     private var deviceSettings: some View {
         if backend == .hypervisor {
-            SettingsGroup(title: "SSH", systemImage: "terminal") {
+            SettingsGroup(title: "Network", systemImage: "network") {
                 Picker("Networking", selection: $sharedNetworking) {
                     Text("Shared with this Mac").tag(true)
-                    Text("User networking (port forwards)").tag(false)
+                    Text("User networking").tag(false)
                 }
-                if !sharedNetworking { Toggle("SSH access from this Mac", isOn: $ssh.enabled) }
-                if ssh.enabled || sharedNetworking {
-                    TextField("Guest username", text: $ssh.username)
-                    if sharedNetworking { NetworkHelperControls() }
-                    Text(
-                        "Enable SSH and configure "
-                            + "login credentials inside the guest after installation."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
+                if sharedNetworking { NetworkHelperControls() }
             }
         }
         if guestSystem == .linux {
