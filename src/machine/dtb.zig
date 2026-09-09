@@ -54,6 +54,10 @@ pub const DtbConfig = struct {
     initrd_end: u64 = 0,
     /// Number of virtio MMIO devices.
     virtio_count: u8 = 1,
+    /// Slots (bit index) to leave out of the tree: devices that a firmware
+    /// boot exposes through virtio-pci instead, so the guest never binds
+    /// two transports to one device.
+    virtio_skip_mask: u16 = 0,
     /// Virtio MMIO base address.
     virtio_base: u64 = 0x0A00_0000,
     /// Virtio MMIO size per device.
@@ -81,7 +85,12 @@ pub const DtbConfig = struct {
     /// PCIe MMIO base address.
     pcie_mmio_base: u64 = 0x1000_0000,
     /// PCIe MMIO size.
-    pcie_mmio_size: u64 = 0x2c00_0000,
+    pcie_mmio_size: u64 = 0x2bff_0000,
+    /// PCI I/O port window (CPU address of port 0).
+    pcie_io_base: u64 = 0x3bff_0000,
+    pcie_io_size: u64 = 0x1_0000,
+    /// QEMU fw_cfg MMIO registers; 0 omits the node.
+    fw_cfg_base: u64 = 0,
 };
 
 /// DTB builder.
@@ -214,7 +223,10 @@ pub const DtbBuilder = struct {
 
         // PSCI node (Power State Coordination Interface)
         try self.beginNode("psci");
-        try self.prop_string("compatible", "arm,psci-1.0");
+        // EDK2's ArmVirtPsciResetSystemLib matches "arm,psci-0.2" exactly.
+        try self.prop_string_list("compatible", &[_][]const u8{
+            "arm,psci-1.0", "arm,psci-0.2", "arm,psci",
+        });
         try self.prop_string("method", "hvc");
         try self.endNode();
 
@@ -278,9 +290,19 @@ pub const DtbBuilder = struct {
         try self.prop_string("clock-names", "apb_pclk");
         try self.endNode();
 
+        // QEMU fw_cfg: the firmware fetches ACPI tables and ramfb setup here.
+        if (config.fw_cfg_base != 0) {
+            try self.beginNode("fw-cfg@9020000");
+            try self.prop_string("compatible", "qemu,fw-cfg-mmio");
+            try self.prop_reg64(config.fw_cfg_base, 0x18);
+            try self.prop_empty("dma-coherent");
+            try self.endNode();
+        }
+
         // Virtio MMIO devices
         for (0..config.virtio_count) |i| {
             const idx: u32 = @intCast(i);
+            if (config.virtio_skip_mask & (@as(u16, 1) << @intCast(i)) != 0) continue;
             const base = config.virtio_base + idx * config.virtio_size;
 
             var node_name: [32]u8 = undefined;
@@ -317,17 +339,27 @@ pub const DtbBuilder = struct {
         // ECAM configuration space
         try self.prop_reg64(config.pcie_ecam_base, config.pcie_ecam_size);
 
-        // Bus range: 0-255
-        const bus_range = [_]u32{ 0, 0xFF };
+        // Bus range (inclusive): only as many buses as the ECAM window holds.
+        // EDK2's FdtPciHostBridgeLib rejects the host bridge when the range
+        // exceeds `reg`, and it also requires a non-empty I/O range below.
+        const ecam_bus_bytes: u64 = 4096 * 8 * 32;
+        const bus_max: u32 = @intCast(@min(config.pcie_ecam_size / ecam_bus_bytes, 256) - 1);
+        const bus_range = [_]u32{ 0, bus_max };
         try self.prop_u32_array("bus-range", &bus_range);
 
-        // Ranges: PCI MMIO 32-bit space
+        // Ranges: PCI I/O ports, then 32-bit MMIO.
         // Format: phys.hi phys.mid phys.lo cpu_addr.hi cpu_addr.lo size.hi size.lo
         // phys.hi bits: ss=00 (config), 01 (I/O), 10 (32-bit MMIO), 11 (64-bit MMIO)
         //              n=0 (non-prefetchable), p=0 (non-relocatable)
-        // 0x02000000 = 32-bit MMIO space, non-prefetchable
         const ranges = [_]u32{
-            0x02000000, // flags: 32-bit MMIO
+            0x01000000, // flags: I/O space
+            0, // PCI addr high
+            0, // PCI addr low (port 0)
+            @truncate(config.pcie_io_base >> 32), // CPU addr high
+            @truncate(config.pcie_io_base), // CPU addr low
+            @truncate(config.pcie_io_size >> 32), // size high
+            @truncate(config.pcie_io_size), // size low
+            0x02000000, // flags: 32-bit MMIO, non-prefetchable
             0, // PCI addr high
             @truncate(config.pcie_mmio_base), // PCI addr low
             @truncate(config.pcie_mmio_base >> 32), // CPU addr high
@@ -350,29 +382,21 @@ pub const DtbBuilder = struct {
         };
         try self.prop_u32_array("interrupt-map-mask", &interrupt_map_mask);
 
-        // Interrupt map: route each device's INTA# to a distinct GIC SPI.
+        // Interrupt map: INTx pins swizzle onto SPIs 48-51 as on QEMU virt,
+        // irq = 48 + (device + pin) % 4. The mask keeps two device bits, so
+        // four devices' worth of entries cover every slot.
         // Format: child unit, child IRQ, parent phandle, parent unit, parent IRQ.
-        // GIC SPI 48-50 correspond to interrupt IDs 80-82.
-        const interrupt_map = [_]u32{
-            // Device 0, INTA# -> SPI 48
-            0x0000, 0, 0, 1, 0x8001, 0, 0, 0, 48, 4,
-            // Device 0, INTB# -> SPI 49
-            0x0000, 0, 0, 2, 0x8001, 0, 0, 0, 49, 4,
-            // Device 0, INTC# -> SPI 50
-            0x0000, 0, 0, 3, 0x8001, 0, 0, 0, 50, 4,
-            // Device 0, INTD# -> SPI 51
-            0x0000, 0, 0, 4, 0x8001, 0, 0, 0, 51, 4,
-            // Device 1, INTA# -> SPI 49
-            0x0800, 0, 0, 1, 0x8001, 0, 0, 0, 49, 4,
-            // Device 1, INTB# -> SPI 50
-            0x0800, 0, 0, 2, 0x8001, 0, 0, 0, 50, 4,
-            // Device 1, INTC# -> SPI 51
-            0x0800, 0, 0, 3, 0x8001, 0, 0, 0, 51, 4,
-            // Device 1, INTD# -> SPI 48
-            0x0800, 0, 0, 4, 0x8001, 0, 0, 0, 48, 4,
-            // Device 2, INTA# -> SPI 50
-            0x1000, 0, 0, 1, 0x8001, 0, 0, 0, 50, 4,
-        };
+        var interrupt_map: [16 * 10]u32 = undefined;
+        for (0..4) |device| {
+            for (0..4) |pin| {
+                const entry = interrupt_map[(device * 4 + pin) * 10 ..][0..10];
+                entry.* = .{
+                    @as(u32, @intCast(device)) << 11,            0, 0, @as(u32, @intCast(pin + 1)),
+                    0x8001,                                      0, 0, 0,
+                    @as(u32, @intCast(48 + (device + pin) % 4)), 4,
+                };
+            }
+        }
         try self.prop_u32_array("interrupt-map", &interrupt_map);
 
         try self.prop_empty("dma-coherent");

@@ -99,6 +99,8 @@ pub const MAX_VCPUS: u8 = 8;
 /// Redistributor frame size (2 x 64KB frames per CPU).
 pub const GICR_FRAME_SIZE: u32 = 0x20000; // 128KB per redistributor
 
+var trace_gic = std.atomic.Value(u8).init(0);
+
 /// Per-interrupt state.
 const InterruptState = struct {
     enabled: bool = false,
@@ -259,6 +261,26 @@ pub const Gic = struct {
         // If newly pending and enabled, signal the target CPU
         if (pending and !was_pending and spi.enabled) {
             self.checkPendingIrq(spi.target_cpu);
+        }
+    }
+
+    /// BOBRVM_TRACE_GIC=1: log distributor writes.
+    fn traceGic() bool {
+        const state = trace_gic.load(.acquire);
+        if (state != 0) return state == 1;
+        const on = std.c.getenv("BOBRVM_TRACE_GIC") != null;
+        trace_gic.store(if (on) 1 else 2, .release);
+        return on;
+    }
+
+    /// Log every SPI the guest enabled or that is pending (debugging aid).
+    pub fn dumpState(self: *const Gic) void {
+        log.info("GICD_CTLR=0x{x}", .{self.ctlr});
+        for (self.spis, 0..) |spi, idx| {
+            if (!spi.enabled and !spi.pending) continue;
+            log.info("SPI {}: enabled={} pending={} active={} prio=0x{x} cfg={} group={} target_cpu={}", .{
+                idx + 32, spi.enabled, spi.pending, spi.active, spi.priority, spi.config, spi.group, spi.target_cpu,
+            });
         }
     }
 
@@ -462,11 +484,13 @@ pub const Gic = struct {
     // =========================================================================
 
     pub fn distRead(self: *Gic, offset: u64, size: u8) u64 {
-        _ = size;
-        const off: u16 = @truncate(offset);
+        // Registers are 32 bits wide; sub-word accesses (Windows programs
+        // GICD_IPRIORITYR one byte at a time) read the word and pick the lane.
+        const lane: u5 = @intCast((offset & 3) * 8);
+        const off: u16 = @truncate(offset & ~@as(u64, 3));
 
-        return switch (off) {
-            GICD.CTLR => self.ctlr,
+        const reg: u32 = switch (off) {
+            GICD.CTLR => self.ctlr | GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS | GICD.CTLR_DS,
             GICD.TYPER => self.readTyper(),
             GICD.IIDR => 0x0100_043B, // ARM GICv3
             GICD.TYPER2 => 0,
@@ -492,16 +516,27 @@ pub const Gic = struct {
 
             else => 0,
         };
+        if (size >= 4) return reg;
+        return (@as(u64, reg) >> lane) & accessMask(size);
     }
 
     pub fn distWrite(self: *Gic, offset: u64, size: u8, value: u64) void {
-        _ = size;
-        const off: u16 = @truncate(offset);
-        const val: u32 = @truncate(value);
+        if (traceGic()) log.debug("GICD write off=0x{x} size={} value=0x{x}", .{ offset, size, value });
+        // Sub-word writes only touch their lane (see distRead); the byte
+        // mask keeps a one-byte GICD_IPRIORITYR write from clobbering the
+        // three neighbouring interrupts' priorities.
+        const lane: u5 = @intCast((offset & 3) * 8);
+        const off: u16 = @truncate(offset & ~@as(u64, 3));
+        const val: u32 = if (size >= 4) @truncate(value) else @truncate((value & accessMask(size)) << lane);
+        const byte_mask = laneByteMask(offset, size);
 
         switch (off) {
             GICD.CTLR => {
-                self.ctlr = val & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS | GICD.CTLR_ENABLE_G1S | GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS | GICD.CTLR_DS);
+                // Single security state without legacy support: ARE and DS
+                // are RAO/WI (as in QEMU's GICv3), only the group enables
+                // are guest-controlled.
+                self.ctlr = (val & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS | GICD.CTLR_ENABLE_G1S)) |
+                    GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS | GICD.CTLR_DS;
                 log.debug("GICD_CTLR = 0x{x}", .{self.ctlr});
             },
             GICD.SETSPI_NSR => self.setSpiPending(val & 0x3FF, true),
@@ -523,7 +558,7 @@ pub const Gic = struct {
             GICD.ICACTIVER...GICD.ICACTIVER + 0x7C => self.writeBitmapClear(off, GICD.ICACTIVER, val, .active),
 
             // IPRIORITYR
-            GICD.IPRIORITYR...GICD.IPRIORITYR + 0x3FC => self.writePriority(off - GICD.IPRIORITYR, val),
+            GICD.IPRIORITYR...GICD.IPRIORITYR + 0x3FC => self.writePriority(off - GICD.IPRIORITYR, val, byte_mask),
 
             // ICFGR
             GICD.ICFGR...GICD.ICFGR + 0xFC => self.writeConfig(off - GICD.ICFGR, val),
@@ -533,15 +568,34 @@ pub const Gic = struct {
     }
 
     fn readTyper(self: *const Gic) u32 {
-        // ITLinesNumber: (MAX_SPI / 32) - 1
-        const it_lines: u32 = (MAX_SPI / 32);
-        // CPUNumber: num_cpus - 1 (in bits 5-7)
-        const cpu_num: u32 = @as(u32, self.num_cpus - 1) << 5;
-        // SecurityExtn = 0, MBIS = 0, LPIS = 0
-        return it_lines | cpu_num;
+        _ = self;
+        // ITLinesNumber = (max INTID + 1) / 32 - 1 for 32 SGI/PPIs + MAX_SPI.
+        const it_lines: u32 = (32 + MAX_SPI) / 32 - 1;
+        // No1N=1, A3V=1, IDbits=0xF (16-bit INTIDs); CPUNumber is 0 under
+        // affinity routing; SecurityExtn, LPIS, MBIS, DVIS = 0.
+        const no_1n: u32 = 1 << 25;
+        const a3v: u32 = 1 << 24;
+        const id_bits: u32 = 0xF << 19;
+        return no_1n | a3v | id_bits | it_lines;
     }
 
     const BitmapField = enum { enabled, pending, active, group };
+
+    /// Value mask for a 1/2/4-byte MMIO access.
+    fn accessMask(size: u8) u64 {
+        return switch (size) {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            else => 0xFFFF_FFFF,
+        };
+    }
+
+    /// Which bytes of the 32-bit register a sub-word access covers.
+    fn laneByteMask(offset: u64, size: u8) u4 {
+        if (size >= 4) return 0xF;
+        const bytes: u4 = @truncate((@as(u8, 1) << @intCast(size)) - 1);
+        return bytes << @intCast(offset & 3);
+    }
 
     fn readBitmap(self: *const Gic, offset: u16, base: u16, field: BitmapField) u32 {
         const reg_idx = (offset - base) / 4;
@@ -653,13 +707,14 @@ pub const Gic = struct {
         return result;
     }
 
-    fn writePriority(self: *Gic, offset: u16, value: u32) void {
+    fn writePriority(self: *Gic, offset: u16, value: u32, byte_mask: u4) void {
         const start_intid = offset;
 
         var i: u8 = 0;
         while (i < 4) : (i += 1) {
             const intid = start_intid + i;
             if (intid < 32 or intid >= MAX_INTID) continue;
+            if (byte_mask & (@as(u4, 1) << @intCast(i)) == 0) continue;
 
             const priority: u8 = @truncate(value >> (@as(u5, @intCast(i)) * 8));
             self.spis[intid - 32].priority = priority;
@@ -704,8 +759,13 @@ pub const Gic = struct {
     // =========================================================================
 
     pub fn redistRead(self: *Gic, offset: u64, size: u8) u64 {
-        _ = size;
+        const reg = self.redistReadWord(offset & ~@as(u64, 3));
+        if (size >= 4) return reg;
+        const lane: u5 = @intCast((offset & 3) * 8);
+        return (reg >> lane) & accessMask(size);
+    }
 
+    fn redistReadWord(self: *Gic, offset: u64) u64 {
         // Determine which CPU's redistributor
         const cpu_index = offset / GICR_FRAME_SIZE;
         if (cpu_index >= self.num_cpus) return 0;
@@ -744,16 +804,16 @@ pub const Gic = struct {
     }
 
     pub fn redistWrite(self: *Gic, offset: u64, size: u8, value: u64) void {
-        _ = size;
-
         const cpu_index = offset / GICR_FRAME_SIZE;
         if (cpu_index >= self.num_cpus) return;
         const cpu_id: u8 = @intCast(cpu_index);
 
-        const frame_offset: u32 = @intCast(offset % GICR_FRAME_SIZE);
+        const lane: u5 = @intCast((offset & 3) * 8);
+        const frame_offset: u32 = @intCast((offset & ~@as(u64, 3)) % GICR_FRAME_SIZE);
         const is_sgi_frame = frame_offset >= GICR.SGI_OFFSET;
         const reg_offset: u16 = @truncate(if (is_sgi_frame) frame_offset - GICR.SGI_OFFSET else frame_offset);
-        const val: u32 = @truncate(value);
+        const val: u32 = if (size >= 4) @truncate(value) else @truncate((value & accessMask(size)) << lane);
+        const byte_mask = laneByteMask(offset, size);
 
         const redist = &self.redists[cpu_id];
 
@@ -766,7 +826,7 @@ pub const Gic = struct {
                 GICR.ICPENDR0 => self.redistWriteBitmapClear(redist, val, .pending),
                 GICR.ISACTIVER0 => self.redistWriteBitmapSet(redist, val, .active),
                 GICR.ICACTIVER0 => self.redistWriteBitmapClear(redist, val, .active),
-                GICR.IPRIORITYR...GICR.IPRIORITYR + 0x1F => self.redistWritePriority(redist, reg_offset - GICR.IPRIORITYR, val),
+                GICR.IPRIORITYR...GICR.IPRIORITYR + 0x1F => self.redistWritePriority(redist, reg_offset - GICR.IPRIORITYR, val, byte_mask),
                 GICR.ICFGR0 => self.redistWriteConfig(redist, 0, val),
                 GICR.ICFGR1 => self.redistWriteConfig(redist, 16, val),
                 else => {},
@@ -870,12 +930,13 @@ pub const Gic = struct {
         return result;
     }
 
-    fn redistWritePriority(self: *Gic, redist: *RedistState, offset: u16, value: u32) void {
+    fn redistWritePriority(self: *Gic, redist: *RedistState, offset: u16, value: u32, byte_mask: u4) void {
         _ = self;
         var i: u8 = 0;
         while (i < 4) : (i += 1) {
             const intid = offset + i;
             if (intid >= 32) break;
+            if (byte_mask & (@as(u4, 1) << @intCast(i)) == 0) continue;
             redist.sgi_ppi[intid].priority = @truncate(value >> (@as(u5, @intCast(i)) * 8));
         }
     }
@@ -938,6 +999,23 @@ test "Gic SPI pending" {
     try std.testing.expect(gic.spis[1].active);
 }
 
+test "Gic distributor reports affinity routing and a single security state" {
+    const gic = try Gic.init(std.testing.allocator, 2);
+    defer gic.deinit();
+
+    const ctlr = gic.distRead(GICD.CTLR, 4);
+    try std.testing.expect(ctlr & GICD.CTLR_ARE_NS != 0);
+    try std.testing.expect(ctlr & GICD.CTLR_DS != 0);
+    // An OS clearing everything (EDK2 at ExitBootServices) cannot drop ARE.
+    gic.distWrite(GICD.CTLR, 4, 0);
+    try std.testing.expect(gic.distRead(GICD.CTLR, 4) & GICD.CTLR_ARE_NS != 0);
+    try std.testing.expect(gic.distRead(GICD.CTLR, 4) & GICD.CTLR_ENABLE_G1NS == 0);
+
+    const typer = gic.distRead(GICD.TYPER, 4);
+    try std.testing.expectEqual(@as(u64, 0xF), (typer >> 19) & 0x1F); // IDbits
+    try std.testing.expectEqual(@as(u64, (32 + MAX_SPI) / 32 - 1), typer & 0x1F);
+}
+
 test "Gic distributor enables gate their matching interrupt groups" {
     const gic = try Gic.init(std.testing.allocator, 1);
     defer gic.deinit();
@@ -974,6 +1052,31 @@ test "Gic interrupt configuration uses the architectural edge bit" {
     gic.setSpiPending(32, true);
     try std.testing.expectEqual(@as(u32, 32), gic.ackInterruptForGroup(0, 1, 0xFF));
     try std.testing.expectEqual(@as(u64, 1), gic.distRead(GICD.ISPENDR + 4, 4) & 1);
+}
+
+test "Gic priority registers honour byte-sized accesses" {
+    const gic = try Gic.init(std.testing.allocator, 2);
+    defer gic.deinit();
+
+    // Windows programs GICD_IPRIORITYR one byte per interrupt.
+    gic.distWrite(GICD.IPRIORITYR + 80, 4, 0x8080_8080);
+    gic.distWrite(GICD.IPRIORITYR + 83, 1, 0xFFFF_FF40); // upper bits are register junk
+    gic.distWrite(GICD.IPRIORITYR + 81, 1, 0xFFFF_FF70);
+    try std.testing.expectEqual(@as(u8, 0x80), gic.spis[80 - 32].priority);
+    try std.testing.expectEqual(@as(u8, 0x70), gic.spis[81 - 32].priority);
+    try std.testing.expectEqual(@as(u8, 0x80), gic.spis[82 - 32].priority);
+    try std.testing.expectEqual(@as(u8, 0x40), gic.spis[83 - 32].priority);
+    try std.testing.expectEqual(@as(u64, 0x40), gic.distRead(GICD.IPRIORITYR + 83, 1));
+    try std.testing.expectEqual(@as(u64, 0x4080), gic.distRead(GICD.IPRIORITYR + 82, 2));
+    try std.testing.expectEqual(@as(u64, 0x4080_7080), gic.distRead(GICD.IPRIORITYR + 80, 4));
+
+    // Same for the redistributor's SGI/PPI priorities.
+    const sgi_base = GICR.SGI_OFFSET + GICR.IPRIORITYR;
+    gic.redistWrite(sgi_base + 24, 4, 0xA0A0_A0A0);
+    gic.redistWrite(sgi_base + 27, 1, 0x20);
+    try std.testing.expectEqual(@as(u8, 0xA0), gic.redists[0].sgi_ppi[26].priority);
+    try std.testing.expectEqual(@as(u8, 0x20), gic.redists[0].sgi_ppi[27].priority);
+    try std.testing.expectEqual(@as(u64, 0x20), gic.redistRead(sgi_base + 27, 1));
 }
 
 test "Gic redistributor rejects offsets outside the configured CPUs" {

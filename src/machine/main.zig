@@ -21,6 +21,10 @@ const net_compat = @import("../compat/net.zig");
 const thread_compat = @import("../compat/thread.zig");
 
 const hypervisor = @import("../hypervisor/main.zig");
+const Pflash = @import("pflash.zig");
+const FwCfg = @import("fw_cfg.zig");
+const acpi = @import("acpi.zig");
+const Pmu = @import("pmu.zig");
 const virtio = @import("../virtio/main.zig");
 const gic = @import("../gic/main.zig");
 const icc = @import("../gic/icc.zig");
@@ -34,6 +38,9 @@ pub const GuestToolsStatus = agent.native.Status;
 pub const KeyAction = virtio.input.KeyAction;
 
 const log = std.log.scoped(.machine);
+
+/// BOBRVM_TRACE_INPUT state: 0 unchecked, 1 on, 2 off.
+var trace_input = std.atomic.Value(u8).init(0);
 const ID_AA64PFR0_GIC_SHIFT: u6 = 24;
 const ID_AA64PFR0_GIC_MASK: u64 = 0xF << ID_AA64PFR0_GIC_SHIFT;
 const CNTV_CTL_ENABLE: u64 = 1 << 0;
@@ -123,6 +130,10 @@ pub const MemoryLayout = struct {
     pub const RTC_BASE: u64 = 0x0901_0000;
     pub const RTC_SIZE: u64 = 0x1000;
 
+    /// QEMU fw_cfg (firmware configuration) registers.
+    pub const FW_CFG_BASE: u64 = 0x0902_0000;
+    pub const FW_CFG_SIZE: u64 = 0x1000;
+
     /// Virtio MMIO devices (16 slots)
     pub const VIRTIO_BASE: u64 = 0x0A00_0000;
     pub const VIRTIO_SIZE: u64 = 0x200; // Per device
@@ -132,9 +143,15 @@ pub const MemoryLayout = struct {
     pub const ECAM_BASE: u64 = 0x3c00_0000;
     pub const ECAM_SIZE: u64 = 64 * 1024 * 1024; // 64MB
 
-    /// PCIe MMIO region
+    /// PCIe MMIO region (32-bit BAR window)
     pub const PCI_MMIO_BASE: u64 = 0x1000_0000;
-    pub const PCI_MMIO_SIZE: u64 = 0x2c00_0000; // 768MB
+    pub const PCI_MMIO_SIZE: u64 = 0x2bff_0000; // 768MB - 64KB
+
+    /// PCI I/O port window, mapped just below ECAM like QEMU virt. No
+    /// device uses port I/O; the firmware's host bridge driver requires
+    /// the range to exist.
+    pub const PCI_IO_BASE: u64 = PCI_MMIO_BASE + PCI_MMIO_SIZE;
+    pub const PCI_IO_SIZE: u64 = 0x1_0000;
 
     /// RAM starts at 1GB
     pub const RAM_BASE: u64 = 0x4000_0000;
@@ -193,6 +210,15 @@ pub const MachineConfig = struct {
     /// Whether the primary disk image is read-only.
     disk_read_only: bool = false,
 
+    /// Expose the disks as NVMe controllers on PCI instead of virtio-blk.
+    /// Windows and EDK2 carry NVMe drivers; neither has virtio-blk for Arm.
+    storage_nvme: bool = false,
+
+    /// Present a QEMU ramfb (linear framebuffer in guest RAM) through fw_cfg
+    /// instead of a virtio-gpu PCI device. Windows' boot manager draws into
+    /// the UEFI GOP framebuffer directly, which virtio-gpu cannot offer.
+    enable_ramfb: bool = false,
+
     /// Path to secondary disk image (virtio slot 2, typically ISO).
     disk2_path: ?[]const u8 = null,
 
@@ -246,12 +272,12 @@ pub const MachineConfig = struct {
     /// Host graphics-memory budget for 2D resources and the Venus window.
     gpu_memory_bytes: u64 = config_policy.gpu_memory_bytes_default,
 
-    /// Count how many block devices are configured.
+    /// Virtio-mmio slots reserved for block devices. Disk 2 always sits at
+    /// slot 2, so it reserves slot 1 too when there is no primary disk.
     pub fn blockDeviceCount(self: MachineConfig) u8 {
-        var count: u8 = 0;
-        if (self.disk_path != null) count += 1;
-        if (self.disk2_path != null) count += 1;
-        return count;
+        if (self.disk2_path != null) return 2;
+        if (self.disk_path != null) return 1;
+        return 0;
     }
 
     /// Check if firmware boot mode is enabled.
@@ -387,6 +413,10 @@ const VcpuRunState = struct {
     context_id: u64 = 0,
     thread: ?std.Thread = null,
     vcpu: ?*hypervisor.Vcpu = null,
+    /// Trapped PMU registers; only touched by the owning vCPU thread.
+    pmu: Pmu = .{},
+    /// BOBRVM_TRACE_EXITS: decode trapped system registers and PSCI calls.
+    trace_exits: bool = false,
     /// Pending snapshot register operation (see VcpuSnapRequest).
     snap_request: std.atomic.Value(?*VcpuSnapRequest) = std.atomic.Value(?*VcpuSnapRequest).init(null),
 
@@ -412,6 +442,17 @@ pub const Machine = struct {
 
     /// Pflash VARS region (UEFI variables, host-mapped).
     pflash_vars: ?[]align(4096) u8 = null,
+    /// CFI command interface over `pflash_vars`; the firmware's variable
+    /// driver programs the store through it.
+    vars_flash: ?Pflash = null,
+    /// fw_cfg items served to the firmware (ACPI tables, ramfb, ...).
+    fw_cfg: FwCfg = .{},
+    /// ACPI payloads referenced by `fw_cfg`; live as long as the machine.
+    acpi_blobs: ?acpi.Blobs = null,
+    /// Guest-writable fw_cfg "etc/ramfb" configuration (QEMU RAMFBCfg).
+    ramfb_config: [RAMFB_CONFIG_SIZE]u8 = @splat(0),
+    ramfb_ticker: ?std.Thread = null,
+    ramfb_ticker_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// CNTVOFF applied to every vCPU (guest CNTVCT_EL0 =
     /// mach_absolute_time() - vtimer_offset). Zero on a fresh boot;
@@ -506,6 +547,17 @@ pub const Machine = struct {
 
     /// Virtio PCI GPU device (UEFI does not discover virtio-mmio displays).
     pci_gpu: ?*pci.VirtioPciDevice = null,
+    /// NVMe controllers for disk 1 and disk 2 at PCI 00:00.0 / 00:01.0.
+    nvme: [2]?*pci.Nvme = .{ null, null },
+    /// virtio-input over PCI for guests without virtio-mmio drivers
+    /// (Windows): keyboard at 00:03.0, tablet at 00:04.0.
+    pci_keyboard: ?*pci.VirtioPciDevice = null,
+    /// virtio-net mirrored onto PCI for firmware boots (Windows has no
+    /// virtio-mmio driver; NetKVM binds virtio-net-pci).
+    pci_net: ?*pci.VirtioPciDevice = null,
+    pci_mouse: ?*pci.VirtioPciDevice = null,
+    /// Devices currently asserting each shared INTx line (bit = slot / 4).
+    pci_intx_asserted: [4]u8 = .{ 0, 0, 0, 0 },
 
     /// Console output callback.
     console_output: ?*const fn ([]const u8, ?*anyopaque) void = null,
@@ -531,6 +583,9 @@ pub const Machine = struct {
     /// Embedded runtimes prepare this token before spawning the owning thread,
     /// so an immediate Stop cannot be lost before startSyncPrepared enters.
     stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the guest asked for a reboot (PSCI SYSTEM_RESET); the
+    /// embedder decides whether to start a fresh machine.
+    reset_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Paused: vCPU threads park on their wake condvars instead of
     /// entering hv_vcpu_run. All guest state (RAM, registers, devices)
@@ -610,6 +665,13 @@ pub const Machine = struct {
     pub fn deinit(self: *Machine) void {
         self.stop();
         self.mmio_devices = .{null} ** VIRTIO_SLOT_COUNT;
+        if (self.acpi_blobs) |*blobs| blobs.deinit(self.alloc);
+        self.acpi_blobs = null;
+        if (self.ramfb_ticker) |thread| {
+            self.ramfb_ticker_stop.store(true, .release);
+            thread.join();
+            self.ramfb_ticker = null;
+        }
 
         if (self.console) |console| {
             console.deinit();
@@ -715,6 +777,22 @@ pub const Machine = struct {
             pci_gpu.deinit();
             self.pci_gpu = null;
         }
+        for (&self.nvme) |*slot| {
+            if (slot.*) |device| device.deinit();
+            slot.* = null;
+        }
+        if (self.pci_keyboard) |device| {
+            device.deinit();
+            self.pci_keyboard = null;
+        }
+        if (self.pci_mouse) |device| {
+            device.deinit();
+            self.pci_mouse = null;
+        }
+        if (self.pci_net) |device| {
+            device.deinit();
+            self.pci_net = null;
+        }
 
         if (self.ecam_host) |ecam| {
             ecam.deinit();
@@ -768,6 +846,15 @@ pub const Machine = struct {
         if (self.console) |console| console.resize(size.columns, size.rows);
         self.machine_lock.unlock(global.io());
         self.kickCpu(0);
+    }
+
+    /// Log the GIC's SPI state (BOBRVM_KEY_FIFO "g" command).
+    pub fn dumpGicState(self: *Machine) void {
+        const gic_dev = self.gic_device orelse return;
+        self.machine_lock.lockUncancelable(global.io());
+        defer self.machine_lock.unlock(global.io());
+        gic_dev.dumpState();
+        log.info("pci intx asserted: {any}", .{self.pci_intx_asserted});
     }
 
     /// Inject a keyboard event (evdev keycode). Thread-safe.
@@ -1104,6 +1191,11 @@ pub const Machine = struct {
         self.stop_requested.store(true, .release);
         self.running.store(false, .release);
         self.start_pipe.signal();
+        self.wakeAllVcpus();
+    }
+
+    /// Pull every vCPU out of WFI or hv_vcpu_run so it re-checks `running`.
+    fn wakeAllVcpus(self: *Machine) void {
         for (self.cpu_states) |*state| {
             state.wake_pipe.signal();
             if (state.vcpu) |v| v.forceExit() catch {};
@@ -1112,6 +1204,11 @@ pub const Machine = struct {
 
     /// True once startup (including any restore) has finished and the
     /// vCPUs are entering the run loop. Used to time warm restore.
+    /// True once the guest requested a reboot through PSCI SYSTEM_RESET.
+    pub fn resetRequested(self: *const Machine) bool {
+        return self.reset_requested.load(.acquire);
+    }
+
     pub fn isRunning(self: *const Machine) bool {
         return self.running.load(.acquire) and !self.stop_requested.load(.acquire);
     }
@@ -1814,6 +1911,17 @@ pub const Machine = struct {
             try self.generateDtb();
             try self.checkStartupCancelled();
         }
+        if (self.config.isFirmwareBoot()) {
+            try self.publishAcpiTables();
+            if (self.config.enable_ramfb) self.publishRamfb();
+        }
+        if (std.c.getenv("BOBRVM_DUMP_RAM_AFTER")) |seconds_z| {
+            const seconds = std.fmt.parseInt(u64, std.mem.span(seconds_z), 10) catch 0;
+            if (seconds > 0) {
+                const thread = std.Thread.spawn(.{}, timedRamDumpMain, .{ self, seconds }) catch null;
+                if (thread) |t| t.detach();
+            }
+        }
         if (profile) |value| finishStartupStep(&value.dtb_ns, &step_started_ns);
 
         // Initialize GIC (interrupt controller)
@@ -1873,6 +1981,7 @@ pub const Machine = struct {
 
         self.running.store(false, .release);
         self.joinSecondaryVcpus();
+        self.persistVars();
         current_machine = null;
         log.info("machine stopped", .{});
     }
@@ -1886,6 +1995,22 @@ pub const Machine = struct {
     fn runVcpuLoop(self: *Machine, vcpu: *hypervisor.Vcpu, cpu_id: u8) !void {
         var exit_count: u64 = 0;
         const state = &self.cpu_states[cpu_id];
+        const trace_exits = std.c.getenv("BOBRVM_TRACE_EXITS") != null;
+        state.trace_exits = trace_exits;
+        var trace_exit_counter = std.atomic.Value(u64).init(0);
+        var trace_stop = std.atomic.Value(bool).init(false);
+        var trace_thread: ?std.Thread = null;
+        if (trace_exits) {
+            trace_thread = std.Thread.spawn(
+                .{},
+                traceWatchdogMain,
+                .{ vcpu, &trace_exit_counter, &trace_stop },
+            ) catch null;
+        }
+        defer if (trace_thread) |t| {
+            trace_stop.store(true, .release);
+            t.join();
+        };
 
         while (self.running.load(.acquire)) {
             // Pause gate: park until unpaused (or stopping). The 50ms
@@ -1944,6 +2069,20 @@ pub const Machine = struct {
 
             const exit_info = try vcpu.run();
             exit_count += 1;
+            if (trace_exits) {
+                trace_exit_counter.store(exit_count, .release);
+                const pc = vcpu.getPC() catch 0;
+                log.debug("vCPU {} exit {}: reason={} ec=0x{x} pc=0x{x} va=0x{x} pa=0x{x}", .{
+                    cpu_id,
+                    exit_count,
+                    @intFromEnum(exit_info.reason),
+                    @intFromEnum(exit_info.exceptionClass()),
+                    pc,
+                    exit_info.virtual_address,
+                    exit_info.physical_address,
+                });
+                if (exit_info.reason == .canceled) self.traceDumpVcpu(vcpu, cpu_id, pc);
+            }
 
             switch (exit_info.reason) {
                 .canceled => {
@@ -2027,6 +2166,85 @@ pub const Machine = struct {
         log.info("vCPU loop finished after {} exits", .{exit_count});
     }
 
+    fn traceWatchdogMain(
+        vcpu: *hypervisor.Vcpu,
+        counter: *std.atomic.Value(u64),
+        stop_flag: *std.atomic.Value(bool),
+    ) void {
+        var last: u64 = 0;
+        while (!stop_flag.load(.acquire)) {
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = 2 * std.time.ns_per_s },
+                .clock = .awake,
+            }, global.io()) catch {};
+            const now = counter.load(.acquire);
+            if (now == last) vcpu.forceExit() catch {};
+            last = now;
+        }
+    }
+
+    fn traceDumpVcpu(self: *Machine, vcpu: *hypervisor.Vcpu, cpu_id: u8, pc: u64) void {
+        const cpsr = vcpu.getReg(.cpsr) catch 0;
+        const ctl = vcpu.getSysReg(.cntv_ctl_el0) catch 0;
+        const cval = vcpu.getSysReg(.cntv_cval_el0) catch 0;
+        const counter = machTicks() -% self.vtimer_offset;
+        const x0 = vcpu.getReg(.x0) catch 0;
+        const x1 = vcpu.getReg(.x1) catch 0;
+        const x2 = vcpu.getReg(.x2) catch 0;
+        const x19 = vcpu.getReg(.x19) catch 0;
+        const lr = vcpu.getReg(.lr) catch 0;
+        log.debug(
+            "vCPU {} dump: cpsr=0x{x} cntv_ctl=0x{x} cntv_cval=0x{x} cntvct~0x{x} x0=0x{x} x1=0x{x} x2=0x{x} x19=0x{x} lr=0x{x}",
+            .{ cpu_id, cpsr, ctl, cval, counter, x0, x1, x2, x19, lr },
+        );
+        const esr = vcpu.getSysReg(.esr_el1) catch 0;
+        const elr = vcpu.getSysReg(.elr_el1) catch 0;
+        const far = vcpu.getSysReg(.far_el1) catch 0;
+        const vbar = vcpu.getSysReg(.vbar_el1) catch 0;
+        const sctlr = vcpu.getSysReg(.sctlr_el1) catch 0;
+        log.debug("vCPU {} exception state: esr_el1=0x{x} elr_el1=0x{x} far_el1=0x{x} vbar_el1=0x{x} sctlr_el1=0x{x}", .{
+            cpu_id, esr, elr, far, vbar, sctlr,
+        });
+        const ram = self.ram orelse return;
+        if (elr >= MemoryLayout.RAM_BASE and elr + 16 <= MemoryLayout.RAM_BASE + ram.len) {
+            const elr_off: usize = @intCast(elr - MemoryLayout.RAM_BASE);
+            log.debug("vCPU {} code@elr: {x:0>8} {x:0>8} {x:0>8} {x:0>8}", .{
+                cpu_id,
+                std.mem.readInt(u32, ram[elr_off..][0..4], .little),
+                std.mem.readInt(u32, ram[elr_off + 4 ..][0..4], .little),
+                std.mem.readInt(u32, ram[elr_off + 8 ..][0..4], .little),
+                std.mem.readInt(u32, ram[elr_off + 12 ..][0..4], .little),
+            });
+        }
+        // Frame-pointer backtrace (AAPCS64: [fp] = caller fp, [fp+8] = lr).
+        var fp = vcpu.getReg(.fp) catch 0;
+        var frames: [8]u64 = @splat(0);
+        var depth: usize = 0;
+        while (depth < frames.len) : (depth += 1) {
+            if (fp < MemoryLayout.RAM_BASE or fp + 16 > MemoryLayout.RAM_BASE + ram.len) break;
+            if (fp % 8 != 0) break;
+            const fp_off: usize = @intCast(fp - MemoryLayout.RAM_BASE);
+            frames[depth] = std.mem.readInt(u64, ram[fp_off + 8 ..][0..8], .little);
+            fp = std.mem.readInt(u64, ram[fp_off..][0..8], .little);
+        }
+        log.debug("vCPU {} backtrace: {x} {x} {x} {x} {x} {x} {x} {x}", .{
+            cpu_id,    frames[0], frames[1], frames[2], frames[3], frames[4], frames[5],
+            frames[6], frames[7],
+        });
+        if (pc < MemoryLayout.RAM_BASE or pc + 64 > MemoryLayout.RAM_BASE + ram.len) return;
+        const off: usize = @intCast(pc - MemoryLayout.RAM_BASE);
+        var buf: [16]u32 = undefined;
+        for (&buf, 0..) |*w, i| {
+            w.* = std.mem.readInt(u32, ram[off + i * 4 ..][0..4], .little);
+        }
+        log.debug("vCPU {} code@pc: {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}", .{
+            cpu_id, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        });
+        log.debug("vCPU {} code@pc+32: {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}", .{
+            cpu_id, buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        });
+    }
+
     fn handleMmio(self: *Machine, vcpu: *hypervisor.Vcpu, info: hypervisor.ExitInfo) !void {
         const access = try self.decodeMmioAccess(vcpu, info) orelse {
             try vcpu.advancePC(info);
@@ -2038,6 +2256,14 @@ pub const Machine = struct {
         const addr = info.physical_address;
 
         // Note: ECAM-range logging disabled to reduce noise during UEFI boot
+
+        // UEFI variable store flash (CFI command interface)
+        const vars_end = MemoryLayout.PFLASH_VARS_BASE + MemoryLayout.PFLASH_VARS_SIZE;
+        if (addr >= MemoryLayout.PFLASH_VARS_BASE and addr < vars_end) {
+            try self.handlePflashVarsMmio(vcpu, access, addr);
+            try vcpu.advancePC(info);
+            return;
+        }
 
         // GIC Distributor (GICD)
         const gic_dist_end = MemoryLayout.GIC_DIST_BASE + 0x10000;
@@ -2094,6 +2320,20 @@ pub const Machine = struct {
             return;
         }
 
+        // fw_cfg
+        if (addr >= MemoryLayout.FW_CFG_BASE and addr < MemoryLayout.FW_CFG_BASE + MemoryLayout.FW_CFG_SIZE) {
+            const offset = addr - MemoryLayout.FW_CFG_BASE;
+            if (is_write) {
+                const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                self.fw_cfg.write(offset, size, value, GuestMemory.bindGlobal(getGuestMemoryWrapper));
+            } else {
+                const value = self.fw_cfg.read(offset, size);
+                if (srt != 31) try vcpu.setReg(@enumFromInt(srt), value);
+            }
+            try vcpu.advancePC(info);
+            return;
+        }
+
         // RTC (PL031)
         if (addr >= MemoryLayout.RTC_BASE and addr < MemoryLayout.RTC_BASE + MemoryLayout.RTC_SIZE) {
             const offset: u12 = @truncate(addr - MemoryLayout.RTC_BASE);
@@ -2140,6 +2380,20 @@ pub const Machine = struct {
                 ecamMmioWrite(self, offset, size, value);
             } else if (srt != 31) {
                 try vcpu.setReg(@enumFromInt(srt), ecamMmioRead(self, offset, size));
+            }
+            try vcpu.advancePC(info);
+            return;
+        }
+
+        // PCI MMIO region (BAR space) - NVMe controllers (64-bit registers)
+        for (self.nvme) |maybe_nvme| {
+            const device = maybe_nvme orelse continue;
+            const offset = device.barOffset(addr) orelse continue;
+            if (is_write) {
+                const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                device.writeBar(offset, size, value);
+            } else if (srt != 31) {
+                try vcpu.setReg(@enumFromInt(srt), device.readBar(offset, size));
             }
             try vcpu.advancePC(info);
             return;
@@ -2215,6 +2469,14 @@ pub const Machine = struct {
 
     fn handlePsci(self: *Machine, vcpu: *hypervisor.Vcpu, _: hypervisor.ExitInfo) !void {
         const fn_id = try vcpu.getReg(.x0);
+        if (self.cpu_states[0].trace_exits) {
+            log.debug("hvc fn=0x{x} x1=0x{x} x2=0x{x} x3=0x{x}", .{
+                fn_id,
+                vcpu.getReg(.x1) catch 0,
+                vcpu.getReg(.x2) catch 0,
+                vcpu.getReg(.x3) catch 0,
+            });
+        }
 
         const result: u64 = switch (fn_id) {
             // PSCI_VERSION - return v1.0
@@ -2257,13 +2519,19 @@ pub const Machine = struct {
             0x84000008 => blk: {
                 log.info("PSCI SYSTEM_OFF", .{});
                 self.running.store(false, .release);
+                self.wakeAllVcpus();
                 break :blk 0;
             },
 
             // PSCI_SYSTEM_RESET
             0x84000009 => blk: {
                 log.info("PSCI SYSTEM_RESET", .{});
+                self.dumpRamOnReset();
+                self.reset_requested.store(true, .release);
                 self.running.store(false, .release);
+                // The request may come from a secondary CPU while CPU0 sits
+                // in WFI; it has to notice `running` to tear the machine down.
+                self.wakeAllVcpus();
                 break :blk 0;
             },
 
@@ -2366,6 +2634,39 @@ pub const Machine = struct {
     fn handleSysReg(self: *Machine, vcpu: *hypervisor.Vcpu, cpu_id: u8, info: hypervisor.ExitInfo) !void {
         const iss = info.iss();
         const decoded = icc.IccHandler.decodeIss(iss);
+        if (self.cpu_states[cpu_id].trace_exits) {
+            const value = if (decoded.is_read or decoded.rt == 31) 0 else vcpu.getReg(@enumFromInt(decoded.rt)) catch 0;
+            log.debug("sysreg {s} S{}_{}_C{}_C{}_{} (0x{x}) rt=x{} value=0x{x}", .{
+                if (decoded.is_read) "read" else "write",
+                (decoded.reg >> 14) & 3,
+                (decoded.reg >> 11) & 7,
+                (decoded.reg >> 7) & 0xF,
+                (decoded.reg >> 3) & 0xF,
+                decoded.reg & 7,
+                decoded.reg,
+                decoded.rt,
+                value,
+            });
+        }
+
+        if (self.handleTimerSysReg(vcpu, decoded.reg, decoded.rt, decoded.is_read)) {
+            try vcpu.advancePC(info);
+            return;
+        }
+
+        if (Pmu.isPmuReg(decoded.reg)) {
+            const pmu = &self.cpu_states[cpu_id].pmu;
+            const now_ticks = machTicks() -% self.vtimer_offset;
+            if (decoded.is_read) {
+                const value = pmu.read(decoded.reg, now_ticks);
+                if (decoded.rt != 31) try vcpu.setReg(@enumFromInt(decoded.rt), value);
+            } else {
+                const value = if (decoded.rt == 31) 0 else try vcpu.getReg(@enumFromInt(decoded.rt));
+                pmu.write(decoded.reg, value, now_ticks);
+            }
+            try vcpu.advancePC(info);
+            return;
+        }
 
         // Check if this is an ICC register
         if (self.icc_handler) |handler| {
@@ -2381,6 +2682,80 @@ pub const Machine = struct {
         }
 
         try vcpu.advancePC(info);
+    }
+
+    /// Generic-timer registers HVF traps: the physical counter reads as the
+    /// guest's virtual counter (no visible offset), and the EL1 physical
+    /// timer is recorded but never fires (Windows programs the virtual one).
+    fn handleTimerSysReg(self: *Machine, vcpu: *hypervisor.Vcpu, reg: u32, rt: u5, is_read: bool) bool {
+        const CNTPCT_EL0: u32 = 0xDF01;
+        const CNTPCTSS_EL0: u32 = 0xDF05;
+        const CNTVCTSS_EL0: u32 = 0xDF06;
+        const CNTP_TVAL_EL0: u32 = 0xDF10;
+        const CNTP_CTL_EL0: u32 = 0xDF11;
+        const CNTP_CVAL_EL0: u32 = 0xDF12;
+        switch (reg) {
+            CNTPCT_EL0, CNTPCTSS_EL0, CNTVCTSS_EL0 => {
+                if (is_read and rt != 31) {
+                    const counter = machTicks() -% self.vtimer_offset;
+                    vcpu.setReg(@enumFromInt(rt), counter) catch {};
+                }
+                return true;
+            },
+            CNTP_TVAL_EL0, CNTP_CTL_EL0, CNTP_CVAL_EL0 => {
+                if (is_read) {
+                    if (rt != 31) vcpu.setReg(@enumFromInt(rt), 0) catch {};
+                } else if (reg == CNTP_CTL_EL0) {
+                    const value = if (rt == 31) 0 else vcpu.getReg(@enumFromInt(rt)) catch 0;
+                    if (value & 1 != 0) log.warn("guest enabled the EL1 physical timer (unsupported)", .{});
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// BOBRVM_DUMP_RAM_AFTER=<seconds> with BOBRVM_DUMP_RAM_ON_RESET=<path>:
+    /// dump RAM once after the delay, for inspecting a guest that is wedged
+    /// rather than crashing.
+    fn timedRamDumpMain(self: *Machine, seconds: u64) void {
+        std.Io.Clock.Duration.sleep(.{
+            .raw = .{ .nanoseconds = seconds * std.time.ns_per_s },
+            .clock = .awake,
+        }, global.io()) catch {};
+        if (!self.running.load(.acquire)) return;
+        self.dumpRamOnReset();
+    }
+
+    /// BOBRVM_DUMP_RAM_ON_RESET=<path>: write guest RAM out when the guest
+    /// asks for a reset, so a crash (e.g. a Windows bugcheck) can be
+    /// examined offline.
+    fn dumpRamOnReset(self: *Machine) void {
+        const path_z = std.c.getenv("BOBRVM_DUMP_RAM_ON_RESET") orelse return;
+        self.dumpRam(std.mem.span(path_z));
+    }
+
+    /// Write the guest RAM image to `path` (also the BOBRVM_KEY_FIFO "D<path>"
+    /// command, for inspecting a live guest's logs).
+    pub fn dumpRam(self: *Machine, path: []const u8) void {
+        const ram = self.ram orelse return;
+        const io = global.io();
+        const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+            log.err("cannot dump RAM to {s}: {}", .{ path, err });
+            return;
+        };
+        defer file.close(io);
+        // pwrite rejects multi-gigabyte requests; chunk the image.
+        const chunk_bytes: usize = 64 * 1024 * 1024;
+        var offset: usize = 0;
+        while (offset < ram.len) : (offset += chunk_bytes) {
+            const end = @min(offset + chunk_bytes, ram.len);
+            file.writePositionalAll(io, ram[offset..end], offset) catch |err| {
+                log.err("cannot dump RAM to {s}: {}", .{ path, err });
+                return;
+            };
+        }
+        log.info("dumped {} bytes of guest RAM to {s}", .{ ram.len, path });
     }
 
     // =========================================================================
@@ -2475,11 +2850,12 @@ pub const Machine = struct {
             MemoryLayout.PFLASH_CODE_BASE + MemoryLayout.PFLASH_CODE_SIZE,
         });
 
-        // Map VARS region (read-write for UEFI variables)
+        // Map VARS region read-only: guest reads hit memory directly while
+        // writes trap into the CFI command interface (see pflash.zig).
         self.pflash_vars = try vm.map(
             MemoryLayout.PFLASH_VARS_BASE,
             MemoryLayout.PFLASH_VARS_SIZE,
-            hypervisor.MEM_READ_WRITE,
+            hypervisor.MEM_READ,
         );
         log.debug("mapped pflash VARS: 0x{x} - 0x{x}", .{
             MemoryLayout.PFLASH_VARS_BASE,
@@ -2487,6 +2863,55 @@ pub const Machine = struct {
         });
 
         self.erasePflash();
+        self.vars_flash = Pflash.init(self.pflash_vars.?);
+    }
+
+    /// Route a guest access to the VARS flash bank through the CFI device and
+    /// keep the guest mapping in step with its array/command mode.
+    fn handlePflashVarsMmio(
+        self: *Machine,
+        vcpu: *hypervisor.Vcpu,
+        access: MmioAccess,
+        addr: u64,
+    ) !void {
+        const flash = &(self.vars_flash orelse return);
+        const offset = addr - MemoryLayout.PFLASH_VARS_BASE;
+        if (access.is_write) {
+            const value = if (access.srt == 31) 0 else try vcpu.getReg(@enumFromInt(access.srt));
+            const trapped_reads = flash.readsTrap();
+            flash.write(offset, access.size, value);
+            if (flash.readsTrap() != trapped_reads) {
+                const flags: hypervisor.MemoryFlags = if (flash.readsTrap()) .{} else hypervisor.MEM_READ;
+                try self.hv_vm.?.protect(
+                    MemoryLayout.PFLASH_VARS_BASE,
+                    MemoryLayout.PFLASH_VARS_SIZE,
+                    flags,
+                );
+            }
+        } else {
+            const value = flash.read(offset, access.size);
+            if (access.srt != 31) try vcpu.setReg(@enumFromInt(access.srt), value);
+        }
+    }
+
+    /// Write the variable store back to `vars_path` when the guest changed it.
+    fn persistVars(self: *Machine) void {
+        const vars_path = self.config.vars_path orelse return;
+        const flash = &(self.vars_flash orelse return);
+        if (!flash.dirty) return;
+
+        const io = global.io();
+        const file = std.Io.Dir.cwd().createFile(io, vars_path, .{}) catch |err| {
+            log.err("cannot write UEFI vars {s}: {}", .{ vars_path, err });
+            return;
+        };
+        defer file.close(io);
+        file.writePositionalAll(io, flash.storage, 0) catch |err| {
+            log.err("cannot write UEFI vars {s}: {}", .{ vars_path, err });
+            return;
+        };
+        flash.dirty = false;
+        log.info("saved UEFI vars: {} bytes to {s}", .{ flash.storage.len, vars_path });
     }
 
     fn erasePflash(self: *Machine) void {
@@ -2608,6 +3033,118 @@ pub const Machine = struct {
         return true;
     }
 
+    /// Firmware boots get their ACPI tables through fw_cfg; Windows boots
+    /// from nothing else, and EDK2 installs them alongside the DTB.
+    fn publishAcpiTables(self: *Machine) !void {
+        assert(self.acpi_blobs == null);
+        const layout = acpi.Layout{
+            .cpu_count = self.config.vcpu_count,
+            .gicd_base = MemoryLayout.GIC_DIST_BASE,
+            .gicr_base = MemoryLayout.GIC_REDIST_BASE,
+            .uart_base = MemoryLayout.UART_BASE,
+            .uart_gsiv = 32 + 1,
+            .rtc_base = MemoryLayout.RTC_BASE,
+            .rtc_gsiv = 32 + 2,
+            .fw_cfg_base = MemoryLayout.FW_CFG_BASE,
+            .ecam_base = MemoryLayout.ECAM_BASE,
+            .ecam_size = MemoryLayout.ECAM_SIZE,
+            .pci_mmio_base = MemoryLayout.PCI_MMIO_BASE,
+            .pci_mmio_size = MemoryLayout.PCI_MMIO_SIZE,
+            .pci_io_base = MemoryLayout.PCI_IO_BASE,
+            .pci_io_size = MemoryLayout.PCI_IO_SIZE,
+            .pci_intx_gsiv_base = 32 + 48,
+        };
+        var blobs = try acpi.build(self.alloc, layout);
+        errdefer blobs.deinit(self.alloc);
+        // Three short, fixed names on an empty table cannot fail.
+        _ = self.fw_cfg.addFile(acpi.LOADER_FILE, blobs.loader, null, null) catch unreachable;
+        _ = self.fw_cfg.addFile(acpi.TABLES_FILE, blobs.tables, null, null) catch unreachable;
+        _ = self.fw_cfg.addFile(acpi.RSDP_FILE, blobs.rsdp, null, null) catch unreachable;
+        self.acpi_blobs = blobs;
+        log.info("published ACPI tables: {} bytes", .{blobs.tables.len});
+    }
+
+    const RAMFB_CONFIG_SIZE = 28;
+    const RAMFB_TICK_NS: u64 = std.time.ns_per_s / 30;
+
+    /// Offer "etc/ramfb": EDK2's QemuRamfbDxe allocates a framebuffer in
+    /// reserved guest RAM and writes its geometry back through fw_cfg.
+    fn publishRamfb(self: *Machine) void {
+        _ = self.fw_cfg.addFile("etc/ramfb", &self.ramfb_config, ramfbConfigWritten, self) catch unreachable;
+    }
+
+    /// fw_cfg write callback: RAMFBCfg {addr u64, fourcc u32, flags u32,
+    /// width u32, height u32, stride u32}, all big-endian.
+    fn ramfbConfigWritten(userdata: ?*anyopaque, offset: u32, bytes: []const u8) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (offset + bytes.len < RAMFB_CONFIG_SIZE) return; // partial write, wait for the rest
+        const cfg = &self.ramfb_config;
+        const addr = std.mem.readInt(u64, cfg[0..8], .big);
+        const fourcc = std.mem.readInt(u32, cfg[8..12], .big);
+        const width = std.mem.readInt(u32, cfg[16..20], .big);
+        const height = std.mem.readInt(u32, cfg[20..24], .big);
+        var stride = std.mem.readInt(u32, cfg[24..28], .big);
+        if (stride == 0) stride = width *| 4;
+        const gpu_dev = self.gpu orelse return;
+
+        const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'XR24'
+        const ram_len: u64 = if (self.ram) |ram| ram.len else 0;
+        const fb_bytes = @as(u64, stride) * height;
+        const valid = addr == 0 or
+            (fourcc == DRM_FORMAT_XRGB8888 and width > 0 and height > 0 and
+                width <= virtio.Gpu.MAX_RESOURCE_DIM and height <= virtio.Gpu.MAX_RESOURCE_DIM and
+                stride >= width * 4 and stride % 4 == 0 and
+                addr >= MemoryLayout.RAM_BASE and addr - MemoryLayout.RAM_BASE + fb_bytes <= ram_len);
+        if (!valid) {
+            log.warn("ramfb: rejected config addr=0x{x} fourcc=0x{x} {}x{} stride={}", .{
+                addr, fourcc, width, height, stride,
+            });
+            return;
+        }
+        if (addr == 0) {
+            gpu_dev.setRamfb(null);
+            return;
+        }
+        log.info("ramfb: {}x{} stride={} at 0x{x}", .{ width, height, stride, addr });
+        gpu_dev.setRamfb(.{ .addr = addr, .width = width, .height = height, .stride = stride });
+        if (self.ramfb_ticker == null) {
+            self.ramfb_ticker = std.Thread.spawn(.{}, ramfbTickerMain, .{self}) catch null;
+        }
+    }
+
+    fn ramfbTickerMain(self: *Machine) void {
+        while (!self.ramfb_ticker_stop.load(.acquire)) {
+            std.Io.Clock.Duration.sleep(.{
+                .raw = .{ .nanoseconds = RAMFB_TICK_NS },
+                .clock = .awake,
+            }, global.io()) catch {};
+            if (self.gpu) |gpu_dev| gpu_dev.ramfbTick();
+        }
+    }
+
+    /// Firmware boots reach block and GPU devices over virtio-pci; hide
+    /// their virtio-mmio twins from the device tree so EDK2 does not drive
+    /// one device through two transports (its second instance never gets
+    /// a response and VirtioFlush() polls forever).
+    fn firmwareVirtioSkipMask(self: *const Machine) u16 {
+        if (!self.config.isFirmwareBoot()) return 0;
+        var mask: u16 = 0;
+        if (self.config.disk_path != null) mask |= 1 << 1;
+        if (self.config.disk2_path != null) mask |= 1 << 2;
+        if (self.config.enable_gpu) {
+            const gpu_slot: u4 = @intCast(1 + self.config.blockDeviceCount());
+            mask |= @as(u16, 1) << gpu_slot; // virtio-gpu
+            mask |= @as(u16, 1) << (gpu_slot + 1); // keyboard
+            mask |= @as(u16, 1) << (gpu_slot + 2); // tablet
+        }
+        if (self.config.enable_net and self.pciNetEnabled()) {
+            const net_slot: u4 = @intCast(1 + self.config.blockDeviceCount() +
+                (if (self.config.enable_gpu) @as(u8, 3) else 0));
+            mask |= @as(u16, 1) << net_slot;
+        }
+        return mask;
+    }
+
     fn generateDtb(self: *Machine) !void {
         var stack_allocator = std.heap.stackFallback(dtb.DtbBuilder.scratch_bytes, self.alloc);
         var builder = dtb.DtbBuilder.init(stack_allocator.get());
@@ -2630,6 +3167,7 @@ pub const Machine = struct {
             .initrd_start = self.initrd_start,
             .initrd_end = self.initrd_end,
             .virtio_count = virtio_count,
+            .virtio_skip_mask = self.firmwareVirtioSkipMask(),
             .virtio_base = MemoryLayout.VIRTIO_BASE,
             .virtio_size = MemoryLayout.VIRTIO_SIZE,
             .uart_base = MemoryLayout.UART_BASE,
@@ -2644,6 +3182,9 @@ pub const Machine = struct {
             .pcie_ecam_size = MemoryLayout.ECAM_SIZE,
             .pcie_mmio_base = MemoryLayout.PCI_MMIO_BASE,
             .pcie_mmio_size = MemoryLayout.PCI_MMIO_SIZE,
+            .pcie_io_base = MemoryLayout.PCI_IO_BASE,
+            .pcie_io_size = MemoryLayout.PCI_IO_SIZE,
+            .fw_cfg_base = MemoryLayout.FW_CFG_BASE,
         };
 
         const dtb_addr = self.dtbGuestAddress();
@@ -3044,9 +3585,311 @@ pub const Machine = struct {
             MemoryLayout.ECAM_BASE + MemoryLayout.ECAM_SIZE,
         });
 
-        if (self.block) |blk| try self.initPciBlock(blk);
-        if (self.block2) |blk| try self.initPciBlock2(blk);
-        if (self.gpu) |gpu_dev| try self.initPciGpu(gpu_dev);
+        if (self.config.storage_nvme) {
+            if (self.config.disk_path) |path| try self.initNvme(0, path, self.config.disk_read_only);
+            if (self.config.disk2_path) |path| try self.initNvme(1, path, self.config.disk2_read_only);
+        } else {
+            if (self.block) |blk| try self.initPciBlock(blk);
+            if (self.block2) |blk| try self.initPciBlock2(blk);
+        }
+        if (self.gpu) |gpu_dev| {
+            if (!self.config.enable_ramfb) try self.initPciGpu(gpu_dev);
+        }
+        // BOBRVM_NO_PCI_INPUT=1 leaves input on virtio-mmio only (bisecting aid).
+        const pci_input = std.c.getenv("BOBRVM_NO_PCI_INPUT") == null;
+        if (self.keyboard) |kbd| {
+            if (pci_input) self.pci_keyboard = try self.createPciInput(kbd, PCI_SLOT_KEYBOARD, pciKeyboardNotify, pciKeyboardIrq);
+        }
+        if (self.mouse) |mouse| {
+            // BOBRVM_NO_PCI_TABLET=1 keeps the absolute pointer off PCI (bisecting aid).
+            if (pci_input and std.c.getenv("BOBRVM_NO_PCI_TABLET") == null) {
+                self.pci_mouse = try self.createPciInput(mouse, PCI_SLOT_MOUSE, pciMouseNotify, pciMouseIrq);
+            }
+        }
+        if (self.net) |net| {
+            if (self.config.isFirmwareBoot() and self.pciNetEnabled()) self.pci_net = try self.createPciNet(net);
+        }
+    }
+
+    const PCI_SLOT_KEYBOARD: u5 = 3;
+    const PCI_SLOT_MOUSE: u5 = 4;
+    const PCI_SLOT_NET: u5 = 5;
+
+    /// virtio-net goes on PCI for guests without virtio-mmio drivers, which
+    /// the ramfb display selects today (Windows). Linux firmware boots keep
+    /// the virtio-mmio adapter. BOBRVM_NO_PCI_NET=1 disables it (bisecting aid).
+    fn pciNetEnabled(self: *const Machine) bool {
+        return self.config.enable_ramfb and std.c.getenv("BOBRVM_NO_PCI_NET") == null;
+    }
+
+    /// Expose the virtio-net device on PCI as well; the PCI transport's
+    /// queue setup is mirrored into the mmio transport on every kick, so the
+    /// existing NAT/shared-network plumbing keeps driving the same device.
+    fn createPciNet(self: *Machine, net: *virtio.Net) !*pci.VirtioPciDevice {
+        assert(self.ecam_host != null);
+        const device = try pci.VirtioPciDevice.init(
+            self.alloc,
+            1,
+            net.transport.device_features,
+            2,
+            @sizeOf(virtio.net.Config),
+        );
+        errdefer device.deinit();
+        device.bar0_addr = @truncate(
+            MemoryLayout.PCI_MMIO_BASE + @as(u64, PCI_SLOT_NET) * pci.virtio_pci.BAR0_SIZE,
+        );
+        for (device.transport.queues) |*queue| {
+            queue.size_max = virtio.Net.QUEUE_SIZE;
+            queue.size = virtio.Net.QUEUE_SIZE;
+        }
+        device.transport.setDeviceConfig(std.mem.asBytes(&net.config));
+        device.transport.setNotifyCallback(pciNetNotify, self);
+        net.setIrqCallback(virtio.mmio.Irq.initRaw(pciNetIrq, self));
+        // Class 02h/00h Ethernet controller.
+        device.config[0x09] = 0x00;
+        device.config[0x0A] = 0x00;
+        device.config[0x0B] = 0x02;
+        const ecam_device = pci.PciDevice{ .config = device.config, .present = true };
+        try self.ecam_host.?.addDevice(PCI_SLOT_NET, 0, ecam_device);
+        log.info("initialized virtio-pci-net at PCI 00:0{}.0, BAR0=0x{x}", .{ PCI_SLOT_NET, device.bar0_addr });
+        return device;
+    }
+
+    fn pciNetNotify(queue_idx: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        const device = self.pci_net orelse return;
+        const net = self.net orelse return;
+        if (queue_idx >= device.transport.queues.len or queue_idx >= net.transport.queues.len) return;
+        const source = device.transport.queues[queue_idx];
+        const target = &net.transport.queues[queue_idx];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        net.poll();
+    }
+
+    fn pciNetIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        if (self.pci_net) |device| {
+            if (self.net) |net| {
+                device.transport.isr_status.queue_interrupt = net.transport.interrupt_status.used_buffer;
+                device.transport.isr_status.config_change = net.transport.interrupt_status.config_change;
+            }
+        }
+        self.setPciIntx(PCI_SLOT_NET, level);
+    }
+
+    fn pciNetBarWrite(pci_net: *pci.VirtioPciDevice, net: *virtio.Net, offset: u32, size: u8, value: u32) void {
+        pci_net.writeBar0(offset, size, value);
+        // A device reset (status := 0) must also reset the mirrored device,
+        // or ring indices left by the firmware's driver poison the OS's.
+        if (offset == pci.virtio_pci.BAR_COMMON_CFG_OFFSET + @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status) and
+            (value & 0xFF) == 0)
+        {
+            net.reset();
+        }
+    }
+
+    fn pciNetBarRead(pci_net: *pci.VirtioPciDevice, net: *virtio.Net, offset: u32, size: u8) u32 {
+        const value = pci_net.readBar0(offset, size);
+        if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+            offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+        {
+            net.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), value);
+        }
+        return value;
+    }
+
+    /// Drive a PCI INTx line shared by every slot with the same (slot % 4):
+    /// the line stays asserted while any of them asserts it.
+    fn setPciIntx(self: *Machine, slot: u5, level: bool) void {
+        const line: u8 = slot % 4;
+        const bit: u8 = @as(u8, 1) << @intCast(slot / 4);
+        if (level) {
+            self.pci_intx_asserted[line] |= bit;
+        } else {
+            self.pci_intx_asserted[line] &= ~bit;
+        }
+        if (self.gic_device) |gic_dev| {
+            gic_dev.setSpiPending(80 + @as(u32, line), self.pci_intx_asserted[line] != 0);
+        }
+    }
+
+    fn createPciInput(
+        self: *Machine,
+        input: *virtio.Input,
+        slot: u5,
+        notify: *const fn (u32, ?*anyopaque) void,
+        irq: *const fn (bool, ?*anyopaque) void,
+    ) !*pci.VirtioPciDevice {
+        assert(self.ecam_host != null);
+        const device = try pci.VirtioPciDevice.init(
+            self.alloc,
+            18,
+            input.transport.device_features,
+            2,
+            @sizeOf(virtio.input.Config),
+        );
+        errdefer device.deinit();
+        device.bar0_addr = @truncate(
+            MemoryLayout.PCI_MMIO_BASE + @as(u64, slot) * pci.virtio_pci.BAR0_SIZE,
+        );
+        // The input device processes rings of at most its own queue size;
+        // the driver negotiates against size_max.
+        for (device.transport.queues) |*queue| {
+            queue.size_max = virtio.Input.QUEUE_SIZE;
+            queue.size = virtio.Input.QUEUE_SIZE;
+        }
+        device.transport.setDeviceConfig(std.mem.asBytes(&input.config));
+        device.transport.setNotifyCallback(notify, self);
+        input.transport.setIrqCallback(virtio.mmio.Irq.initRaw(irq, self));
+        // Class 09h/80h "input device, other" as QEMU's virtio-input-pci.
+        device.config[0x09] = 0x00;
+        device.config[0x0A] = 0x80;
+        device.config[0x0B] = 0x09;
+        const ecam_device = pci.PciDevice{ .config = device.config, .present = true };
+        try self.ecam_host.?.addDevice(slot, 0, ecam_device);
+        log.info("initialized virtio-pci-input at PCI 00:0{}.0, BAR0=0x{x}", .{ slot, device.bar0_addr });
+        return device;
+    }
+
+    /// Copy the PCI transport's queue setup into the input device's mmio
+    /// transport and let it process the kick.
+    fn syncPciInputQueue(pci_input: ?*pci.VirtioPciDevice, input: ?*virtio.Input, queue_idx: u32) void {
+        const device = pci_input orelse return;
+        const dev = input orelse return;
+        if (traceInput()) log.debug("input {s} notify queue {}", .{ dev.name, queue_idx });
+        if (queue_idx >= device.transport.queues.len or queue_idx >= dev.transport.queues.len) return;
+        const source = device.transport.queues[queue_idx];
+        const target = &dev.transport.queues[queue_idx];
+        target.num = source.size;
+        target.ready = source.enable;
+        target.desc_addr = source.desc_addr;
+        target.driver_addr = source.driver_addr;
+        target.device_addr = source.device_addr;
+        // The mirrored mmio transport never sees DRIVER_OK, so bypass its
+        // notify gate and service both rings directly.
+        dev.pollEvents();
+        if (traceInput()) {
+            const memory = GuestMemory.bindGlobal(getGuestMemoryWrapper);
+            const avail = virtio.ring.availIdxMemory(target.*, memory);
+            log.debug("input {s} queue {} after kick: ready={} num={} driver=0x{x} avail_idx={?} status_last_avail={} event_last_avail={}", .{
+                dev.name, queue_idx, target.ready, target.num, target.driver_addr, avail, dev.status_last_avail, dev.event_last_avail,
+            });
+        }
+    }
+
+    fn pciKeyboardNotify(queue_idx: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        syncPciInputQueue(self.pci_keyboard, self.keyboard, queue_idx);
+    }
+
+    fn pciMouseNotify(queue_idx: u32, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        syncPciInputQueue(self.pci_mouse, self.mouse, queue_idx);
+    }
+
+    fn setPciInputIrq(self: *Machine, pci_input: ?*pci.VirtioPciDevice, input: ?*virtio.Input, slot: u5, level: bool) void {
+        if (traceInput()) log.debug("input slot {} irq level={}", .{ slot, level });
+        if (pci_input) |device| {
+            if (input) |dev| {
+                device.transport.isr_status.queue_interrupt = dev.transport.interrupt_status.used_buffer;
+                device.transport.isr_status.config_change = dev.transport.interrupt_status.config_change;
+            }
+        }
+        self.setPciIntx(slot, level);
+    }
+
+    fn pciKeyboardIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        self.setPciInputIrq(self.pci_keyboard, self.keyboard, PCI_SLOT_KEYBOARD, level);
+    }
+
+    fn pciMouseIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        self.setPciInputIrq(self.pci_mouse, self.mouse, PCI_SLOT_MOUSE, level);
+    }
+
+    /// BOBRVM_TRACE_INPUT=1: log the guest's virtio-pci input traffic.
+    fn traceInput() bool {
+        const state = trace_input.load(.acquire);
+        if (state != 0) return state == 1;
+        const on = std.c.getenv("BOBRVM_TRACE_INPUT") != null;
+        trace_input.store(if (on) 1 else 2, .release);
+        return on;
+    }
+
+    /// virtio-input publishes its configuration through select/subsel
+    /// registers, so device-config accesses go through the input device.
+    fn pciInputBarRead(pci_input: *pci.VirtioPciDevice, input: *virtio.Input, offset: u32, size: u8) u32 {
+        if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+            const rel = offset - pci.virtio_pci.BAR_DEVICE_CFG_OFFSET;
+            _ = input.read(@intCast(@intFromEnum(virtio.mmio.Reg.config) + (rel & ~@as(u32, 3))));
+            pci_input.transport.setDeviceConfig(std.mem.asBytes(&input.config));
+        }
+        const value = pci_input.readBar0(offset, size);
+        if (offset >= pci.virtio_pci.BAR_ISR_OFFSET and
+            offset < pci.virtio_pci.BAR_ISR_OFFSET + pci.virtio_pci.BAR_ISR_SIZE)
+        {
+            input.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), value);
+        }
+        if (traceInput()) {
+            log.debug("input {s} bar read off=0x{x} size={} -> 0x{x} (select={} subsel={} cfgsize={})", .{
+                input.name, offset, size, value, input.config.select, input.config.subsel, input.config.size,
+            });
+        }
+        return value;
+    }
+
+    fn pciInputBarWrite(pci_input: *pci.VirtioPciDevice, input: *virtio.Input, offset: u32, size: u8, value: u32) void {
+        if (traceInput()) {
+            log.debug("input {s} bar write off=0x{x} size={} value=0x{x}", .{ input.name, offset, size, value });
+        }
+        pci_input.writeBar0(offset, size, value);
+        if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
+            const rel = offset - pci.virtio_pci.BAR_DEVICE_CFG_OFFSET;
+            var index: u32 = 0;
+            while (index < size and rel + index < 2) : (index += 1) {
+                const byte: u8 = @truncate(value >> @intCast(index * 8));
+                input.write(@intCast(@intFromEnum(virtio.mmio.Reg.config) + rel + index), byte);
+            }
+        }
+    }
+
+    fn initNvme(self: *Machine, slot: u5, path: []const u8, read_only: bool) !void {
+        assert(self.ecam_host != null);
+        assert(slot < self.nvme.len);
+        assert(self.nvme[slot] == null);
+        const serial = if (slot == 0) "BOBRVM000001" else "BOBRVM000002";
+        const device = try pci.Nvme.init(self.alloc, path, read_only, serial);
+        errdefer device.deinit();
+        device.setGuestMemory(GuestMemory.bindGlobal(getGuestMemoryWrapper));
+        device.setIrqCallback(.{
+            .callback = if (slot == 0) nvme0Irq else nvme1Irq,
+            .userdata = self,
+        });
+        const ecam_device = pci.PciDevice{ .config = device.config, .present = true };
+        try self.ecam_host.?.addDevice(slot, 0, ecam_device);
+        self.nvme[slot] = device;
+        log.info("initialized NVMe controller at PCI 00:0{}.0: {s}", .{ slot, path });
+    }
+
+    fn nvme0Irq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        self.setPciIntx(0, level);
+    }
+
+    fn nvme1Irq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        self.setPciIntx(1, level);
+    }
+
+    fn nvmeAt(self: *Machine, address: pci.EcamAddr) ?*pci.Nvme {
+        if (address.bus != 0 or address.function != 0) return null;
+        if (address.device >= self.nvme.len) return null;
+        return self.nvme[address.device];
     }
 
     fn initPciBlock(self: *Machine, blk: *virtio.Block) !void {
@@ -3309,6 +4152,21 @@ pub const Machine = struct {
                 return self.pciGpuBarRead(device, offset, size);
             }
         }
+        if (self.pci_keyboard) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                return pciInputBarRead(device, self.keyboard.?, offset, size);
+            }
+        }
+        if (self.pci_mouse) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                return pciInputBarRead(device, self.mouse.?, offset, size);
+            }
+        }
+        if (self.pci_net) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                return pciNetBarRead(device, self.net.?, offset, size);
+            }
+        }
         return null;
     }
 
@@ -3334,6 +4192,24 @@ pub const Machine = struct {
                 return true;
             }
         }
+        if (self.pci_keyboard) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                pciInputBarWrite(device, self.keyboard.?, offset, size, value);
+                return true;
+            }
+        }
+        if (self.pci_mouse) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                pciInputBarWrite(device, self.mouse.?, offset, size, value);
+                return true;
+            }
+        }
+        if (self.pci_net) |device| {
+            if (pciBarOffset(device, addr)) |offset| {
+                pciNetBarWrite(device, self.net.?, offset, size, value);
+                return true;
+            }
+        }
         return false;
     }
 
@@ -3356,6 +4232,9 @@ pub const Machine = struct {
             return result;
         }
 
+        if (self.nvmeAt(ecam_addr)) |device| {
+            return device.readConfig(ecam_addr.reg, size);
+        }
         if (self.pciDeviceAt(ecam_addr)) |entry| {
             return entry.device.readConfig(ecam_addr.reg, size);
         }
@@ -3386,6 +4265,11 @@ pub const Machine = struct {
             return;
         }
 
+        if (self.nvmeAt(ecam_addr)) |device| {
+            device.writeConfig(ecam_addr.reg, size, value);
+            if (self.ecam_host) |ecam| ecam.updateConfig(ecam_addr.device, 0, &device.config);
+            return;
+        }
         if (self.pciDeviceAt(ecam_addr)) |entry| {
             entry.device.writeConfig(ecam_addr.reg, size, value);
             if (self.ecam_host) |ecam| {
@@ -3412,6 +4296,9 @@ pub const Machine = struct {
             0 => if (self.pci_block) |device| .{ .device = device, .slot = 0 } else null,
             1 => if (self.pci_block2) |device| .{ .device = device, .slot = 1 } else null,
             2 => if (self.pci_gpu) |device| .{ .device = device, .slot = 2 } else null,
+            PCI_SLOT_KEYBOARD => if (self.pci_keyboard) |device| .{ .device = device, .slot = PCI_SLOT_KEYBOARD } else null,
+            PCI_SLOT_MOUSE => if (self.pci_mouse) |device| .{ .device = device, .slot = PCI_SLOT_MOUSE } else null,
+            PCI_SLOT_NET => if (self.pci_net) |device| .{ .device = device, .slot = PCI_SLOT_NET } else null,
             else => null,
         };
     }
@@ -3715,6 +4602,10 @@ test {
     _ = mininat;
     _ = dtb;
     _ = snapshot;
+    _ = Pflash;
+    _ = FwCfg;
+    _ = acpi;
+    _ = Pmu;
 }
 
 test "MemoryLayout constants" {
@@ -3818,6 +4709,10 @@ test "MachineConfig.blockDeviceCount" {
         .disk2_path = "/disk2",
     };
     try testing.expectEqual(@as(u8, 2), two_disks.blockDeviceCount());
+
+    // Disk 2 alone still occupies slot 2, so slot 1 stays reserved.
+    const iso_only = MachineConfig{ .disk2_path = "/install.iso" };
+    try testing.expectEqual(@as(u8, 2), iso_only.blockDeviceCount());
 }
 
 test "GUI forwarding publishes the configured slots after reserving manual ports" {
@@ -3863,8 +4758,12 @@ test "Machine and CPU states allocation profile" {
         counted.allocated_bytes,
     );
     try testing.expectEqual(@as(usize, config.vcpu_count), machine.cpu_states.len);
-    // Includes 16 bytes for eight atomically published forwarding ports.
-    try testing.expect(@sizeOf(Machine) <= 6256);
+    // Includes 16 bytes for eight atomically published forwarding ports and
+    // the embedded fw_cfg file directory (16 entries) for firmware boots.
+    if (@sizeOf(Machine) > 8832) {
+        std.debug.print("Machine is {} bytes\n", .{@sizeOf(Machine)});
+        return error.MachineTooLarge;
+    }
 }
 
 test "stop before synchronous thread entry cancels startup" {

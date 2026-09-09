@@ -27,6 +27,8 @@ initrd_path: ?[]const u8 = null,
 cmdline: []const u8 = "console=hvc0 earlycon=pl011,0x09000000",
 enable_gpu: bool = false,
 enable_virgl: bool = false,
+enable_ramfb: bool = false,
+enable_nvme: bool = false,
 kitty_display: bool = false,
 enable_net: bool = false,
 network_shared: bool = false,
@@ -150,6 +152,11 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--virgl")) {
             config.enable_gpu = true;
             config.enable_virgl = true;
+        } else if (std.mem.eql(u8, arg, "--ramfb")) {
+            config.enable_gpu = true;
+            config.enable_ramfb = true;
+        } else if (std.mem.eql(u8, arg, "--nvme")) {
+            config.enable_nvme = true;
         } else if (std.mem.eql(u8, arg, "--kitty-display")) {
             config.enable_gpu = true;
             config.kitty_display = true;
@@ -486,6 +493,8 @@ pub fn printOptions() void {
         \\  --cmdline <str>       Kernel command line
         \\  --gpu                 Attach a virtio-gpu display device
         \\  --virgl               Accelerated 3D graphics (implies --gpu)
+        \\  --ramfb               UEFI linear framebuffer for Windows guests (implies --gpu)
+        \\  --nvme                Expose disks as NVMe controllers (Windows guests)
         \\  --kitty-display       Stream GPU frames to Ghostty (implies --gpu)
         \\  --sound               Attach a virtio-snd playback device
         \\  --net                 Attach a virtio-net adapter (user-mode NAT)

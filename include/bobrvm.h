@@ -211,6 +211,14 @@ typedef struct {
     bool enable_snd;
     /** Export shared_dir without guest write access. */
     bool share_read_only;
+    /**
+     * Present a linear UEFI framebuffer (QEMU ramfb) instead of virtio-gpu on
+     * PCI. Required for Windows guests, whose boot manager draws into the
+     * GOP framebuffer directly.
+     */
+    bool enable_ramfb;
+    /** Expose disk_path/disk2_path as NVMe controllers instead of virtio-blk. */
+    bool storage_nvme;
 } bobrvm_vm_config_s;
 
 /** Actual listening port for a configured slot, or zero when unavailable. */

@@ -209,7 +209,11 @@ public final class VMManager: ObservableObject {
             diskPath: instance.config.diskPath,
             diskReadOnly: diskReadOnly ?? instance.config.diskReadOnly,
             isoPath: isoPath,
-            isoReadOnly: true
+            isoReadOnly: true,
+            // Windows has no virtio-gpu/virtio-blk drivers on Arm: give it a
+            // plain UEFI framebuffer and NVMe storage instead.
+            ramfbEnabled: instance.guestSystem == .windows,
+            nvmeStorage: instance.guestSystem == .windows
         )
 
         if let boot { newConfig = try boot.applying(to: newConfig) }
@@ -811,7 +815,9 @@ enum VMStorage {
                 diskPath: diskPath,
                 diskReadOnly: diskReadOnly,
                 isoPath: isoPath,
-                isoReadOnly: true
+                isoReadOnly: true,
+                ramfbEnabled: guestSystem == .windows,
+                nvmeStorage: guestSystem == .windows
             )
         }
 

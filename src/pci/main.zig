@@ -11,6 +11,7 @@ pub const PciDevice = ecam.PciDevice;
 pub const EcamAddr = ecam.EcamAddr;
 
 pub const VirtioPciDevice = virtio_pci.VirtioPciDevice;
+pub const Nvme = @import("nvme.zig");
 pub const VirtioPciTransport = virtio_pci.VirtioPciTransport;
 
 pub const ECAM_BASE = ecam.ECAM_BASE;
@@ -24,4 +25,5 @@ pub const ecamMmioWrite = ecam.ecamMmioWrite;
 test {
     _ = ecam;
     _ = virtio_pci;
+    _ = Nvme;
 }

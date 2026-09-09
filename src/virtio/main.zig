@@ -20,6 +20,7 @@ pub const Uart = @import("uart.zig").Uart;
 pub const uart = @import("uart.zig");
 pub const Rtc = @import("rtc.zig").Rtc;
 pub const rtc = @import("rtc.zig");
+pub const ring = @import("ring.zig");
 pub const Rng = @import("rng.zig").Rng;
 pub const rng = @import("rng.zig");
 pub const Balloon = @import("balloon.zig").Balloon;

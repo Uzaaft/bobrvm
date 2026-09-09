@@ -11,6 +11,7 @@ const KittyDisplay = @import("kitty_display.zig");
 const KittyInput = @import("kitty_input.zig");
 const config_mapping = @import("machine_config.zig");
 const machine = @import("../machine/main.zig");
+const virtio_gpu_scanout = @import("../virtio/gpu.zig");
 const mininat = @import("../net/mininat.zig");
 const os = @import("../os/main.zig");
 
@@ -28,8 +29,25 @@ fn sleepNs(ns: u64) void {
 }
 
 pub fn run(alloc: Allocator, config: *const Config) !void {
-    return runWithReadyMarker(alloc, config, null);
+    // A guest reboot (PSCI SYSTEM_RESET) tears the machine down and starts a
+    // fresh one from the same configuration, like power-cycling hardware.
+    var current = config.*;
+    while (true) {
+        try runWithReadyMarker(alloc, &current, null);
+        if (!last_run_requested_reset) return;
+        if (current.restore_path != null) return;
+        // Debug: BOBRVM_EJECT_DISK2_ON_RESET=1 drops the second disk at the
+        // first reboot, like pulling the install media out.
+        if (current.disk2_path != null and std.c.getenv("BOBRVM_EJECT_DISK2_ON_RESET") != null) {
+            log.info("ejecting --disk2 after reset", .{});
+            current.disk2_path = null;
+        }
+        log.info("guest requested a reset: rebooting", .{});
+    }
 }
+
+/// Whether the most recent `runWithReadyMarker` ended with a guest reset.
+var last_run_requested_reset: bool = false;
 
 /// Run a VM and optionally publish a host-only marker after restore. MCP uses
 /// the marker to keep commands out of the guest console until restore is done.
@@ -77,6 +95,8 @@ pub fn runWithReadyMarker(
     var machine_config = config_mapping.base(config);
     machine_config.enable_gpu = config.enable_gpu;
     machine_config.enable_virgl = config.enable_virgl;
+    machine_config.enable_ramfb = config.enable_ramfb;
+    machine_config.storage_nvme = config.enable_nvme;
     machine_config.isolate_host = config.isolate_host;
     machine_config.enable_snd = config.enable_snd;
     machine_config.forwards = forwards_buf[0..config.forward_count];
@@ -105,6 +125,7 @@ pub fn runWithReadyMarker(
         return err;
     };
     defer hw.deinit();
+    defer frame_machine = null;
 
     const stderr_logging_saved = global.state.logging.stderr;
     defer global.state.logging.stderr = stderr_logging_saved;
@@ -157,6 +178,34 @@ pub fn runWithReadyMarker(
             frame_machine = hw;
             hw.setFrameReadbackRequired(true);
             hw.setFrameCallback(frameDump, null);
+            // Also snapshot the latest scanout every two seconds so a
+            // screen that stops updating is still captured once.
+            if (!frame_dump_thread_spawned) {
+                const t = std.Thread.spawn(.{}, frameDumpLoop, .{}) catch null;
+                if (t) |thread| thread.detach();
+                frame_dump_thread_spawned = true;
+            }
+        }
+
+        // Debug: scripted key presses, "delay_s:keycode,..." with evdev
+        // codes (28 = Enter), each delay relative to the previous key. Lets
+        // a headless run drive a guest UI such as Windows Setup.
+        if (std.c.getenv("BOBRVM_KEY_SCRIPT")) |script| {
+            const t = std.Thread.spawn(.{}, keyScriptLoop, .{ hw, std.mem.span(script) }) catch null;
+            if (t) |thread| thread.detach();
+        }
+
+        // Debug: interactive input injection from a named pipe. Each line is
+        // a list of tokens: "28" taps Enter, "d56 15 u56" holds Alt around
+        // Tab, "w500" waits 500 ms, "m400:300 b272" clicks at (400,300),
+        // "g" dumps GIC state, "D<path>" dumps RAM. Survives guest reboots
+        // via input_target.
+        if (std.c.getenv("BOBRVM_KEY_FIFO")) |path| {
+            if (!key_fifo_thread_spawned) {
+                key_fifo_thread_spawned = true;
+                const t = std.Thread.spawn(.{}, keyFifoLoop, .{std.mem.span(path)}) catch null;
+                if (t) |thread| thread.detach();
+            }
         }
 
         // Debug: periodically inject synthetic key presses so guest-side
@@ -270,15 +319,24 @@ pub fn runWithReadyMarker(
     }
     defer restoreTermios();
 
-    const input_thread = std.Thread.spawn(
-        .{ .stack_size = input_stack_size_bytes },
-        inputLoop,
-        .{ hw, stdin_is_tty, config.kitty_display },
-    ) catch |err| blk: {
-        log.warn("failed to start console input thread: {}", .{err});
-        break :blk null;
-    };
-    if (input_thread) |t| t.detach();
+    // One stdin reader per process: a guest reboot re-creates the machine,
+    // and the reader picks the current one up through `input_target`.
+    input_target.store(hw, .release);
+    defer input_target.store(null, .release);
+    if (!input_thread_spawned) {
+        const input_thread = std.Thread.spawn(
+            .{ .stack_size = input_stack_size_bytes },
+            inputLoop,
+            .{ stdin_is_tty, config.kitty_display },
+        ) catch |err| blk: {
+            log.warn("failed to start console input thread: {}", .{err});
+            break :blk null;
+        };
+        if (input_thread) |t| {
+            t.detach();
+            input_thread_spawned = true;
+        }
+    }
 
     const ready_thread: ?std.Thread = if (ready_marker) |marker|
         try std.Thread.spawn(.{}, readyNotifier, .{ hw, marker })
@@ -315,6 +373,7 @@ pub fn runWithReadyMarker(
         return err;
     };
 
+    last_run_requested_reset = hw.resetRequested();
     log.info("VM stopped", .{});
 }
 
@@ -394,6 +453,137 @@ const AllocationCounter = struct {
 };
 
 /// Inject 'a' key presses every second (BOBRVM_TEST_KEYS debug hook).
+fn keyScriptLoop(hw: *machine.Machine, script: []const u8) void {
+    var entries = std.mem.splitScalar(u8, script, ',');
+    while (entries.next()) |entry| {
+        const sep = std.mem.indexOfScalar(u8, entry, ':') orelse continue;
+        const delay_s = std.fmt.parseInt(u64, entry[0..sep], 10) catch continue;
+        const keycode = std.fmt.parseInt(u16, entry[sep + 1 ..], 10) catch continue;
+        sleepNs(delay_s * std.time.ns_per_s);
+        log.info("key script: pressing keycode {}", .{keycode});
+        hw.injectKey(keycode, true);
+        sleepNs(60 * std.time.ns_per_ms);
+        hw.injectKey(keycode, false);
+    }
+}
+
+var key_fifo_thread_spawned: bool = false;
+
+/// Read key commands from the BOBRVM_KEY_FIFO pipe, reopening it whenever
+/// the writer closes.
+fn keyFifoLoop(path: []const u8) void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= path_buf.len) return;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+
+    var line: [512]u8 = undefined;
+    while (true) {
+        const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) {
+            sleepNs(std.time.ns_per_s);
+            continue;
+        }
+        defer _ = std.c.close(fd);
+        var len: usize = 0;
+        while (true) {
+            var byte: [1]u8 = undefined;
+            const n = std.c.read(fd, &byte, 1);
+            if (n <= 0) break;
+            if (byte[0] == '\n') {
+                runKeyLine(line[0..len]);
+                len = 0;
+                continue;
+            }
+            if (len < line.len) {
+                line[len] = byte[0];
+                len += 1;
+            }
+        }
+        if (len > 0) runKeyLine(line[0..len]);
+    }
+}
+
+fn runKeyLine(text: []const u8) void {
+    // "t <text>" types the rest of the line (US layout).
+    if (std.mem.startsWith(u8, text, "t ")) {
+        const hw = input_target.load(.acquire) orelse return;
+        typeText(hw, text[2..]);
+        return;
+    }
+    var tokens = std.mem.tokenizeAny(u8, text, " ,\t\r");
+    while (tokens.next()) |tok| {
+        const hw = input_target.load(.acquire) orelse return;
+        switch (tok[0]) {
+            'g' => hw.dumpGicState(),
+            'D' => hw.dumpRam(tok[1..]),
+            'm' => {
+                // m<x>:<y> moves the absolute pointer.
+                const sep = std.mem.indexOfScalar(u8, tok, ':') orelse continue;
+                const x = std.fmt.parseInt(i32, tok[1..sep], 10) catch continue;
+                const y = std.fmt.parseInt(i32, tok[sep + 1 ..], 10) catch continue;
+                hw.injectMousePosition(x, y);
+                sleepNs(60 * std.time.ns_per_ms);
+            },
+            'b' => {
+                // b<n> clicks evdev button n (272 = BTN_LEFT).
+                const button = std.fmt.parseInt(u16, tok[1..], 10) catch continue;
+                hw.injectMouseButton(button, true);
+                sleepNs(60 * std.time.ns_per_ms);
+                hw.injectMouseButton(button, false);
+                sleepNs(60 * std.time.ns_per_ms);
+            },
+            'w' => {
+                const ms = std.fmt.parseInt(u64, tok[1..], 10) catch continue;
+                sleepNs(ms * std.time.ns_per_ms);
+            },
+            'd', 'u' => {
+                const keycode = std.fmt.parseInt(u16, tok[1..], 10) catch continue;
+                log.info("key fifo: {s} keycode {}", .{ if (tok[0] == 'd') "press" else "release", keycode });
+                hw.injectKey(keycode, tok[0] == 'd');
+                sleepNs(60 * std.time.ns_per_ms);
+            },
+            else => {
+                const keycode = std.fmt.parseInt(u16, tok, 10) catch continue;
+                log.info("key fifo: tap keycode {}", .{keycode});
+                hw.injectKey(keycode, true);
+                sleepNs(60 * std.time.ns_per_ms);
+                hw.injectKey(keycode, false);
+                sleepNs(60 * std.time.ns_per_ms);
+            },
+        }
+    }
+}
+
+/// Type ASCII text with the US layout, holding Shift for capitals and
+/// shifted punctuation.
+fn typeText(hw: *machine.Machine, text: []const u8) void {
+    const shift: u16 = 42;
+    for (text) |char| {
+        var shifted = false;
+        var lower = char;
+        if (std.ascii.isUpper(char)) {
+            shifted = true;
+            lower = std.ascii.toLower(char);
+        } else if (std.mem.indexOfScalar(u8, "!@#$%^&*()", char)) |index| {
+            shifted = true;
+            lower = "1234567890"[index];
+        } else if (std.mem.indexOfScalar(u8, "_+:\"<>?{}|~", char)) |index| {
+            shifted = true;
+            lower = "-=;',./[]\\`"[index];
+        }
+        const keycode = asciiToEvdev(lower);
+        if (keycode == 0) continue;
+        if (shifted) hw.injectKey(shift, true);
+        hw.injectKey(keycode, true);
+        sleepNs(40 * std.time.ns_per_ms);
+        hw.injectKey(keycode, false);
+        if (shifted) hw.injectKey(shift, false);
+        sleepNs(40 * std.time.ns_per_ms);
+    }
+}
+
 fn testKeyLoop(hw: *machine.Machine) void {
     sleepNs(15 * std.time.ns_per_s);
     var i: u32 = 0;
@@ -510,16 +700,39 @@ fn testTypeLoop(hw: *machine.Machine, text: []const u8, delay_s: u64) void {
 }
 
 /// Dump selected scanout frames as raw BGRA for debugging.
+var frame_dump_generation: u64 = 0;
+var frame_dump_thread_spawned: bool = false;
+
+fn frameDumpLoop() void {
+    while (true) {
+        std.Io.Clock.Duration.sleep(.{
+            .raw = .{ .nanoseconds = 2 * std.time.ns_per_s },
+            .clock = .awake,
+        }, global.io()) catch {};
+        const hw = frame_machine orelse continue;
+        const gpu = hw.gpu orelse continue;
+        const scan = gpu.lockScanout() orelse continue;
+        defer gpu.unlockScanout();
+        if (scan.generation == frame_dump_generation) continue;
+        frame_dump_generation = scan.generation;
+        frame_count += 1;
+        writeFrameDump(scan);
+    }
+}
+
 fn frameDump(_: ?*anyopaque) void {
-    const dir = frame_dump_dir orelse return;
     const hw = frame_machine orelse return;
     const gpu = hw.gpu orelse return;
     const scan = gpu.scanout() orelse return;
 
     frame_count += 1;
-    // First frames and every 120th thereafter.
-    if (frame_count > 3 and frame_count % 120 != 0) return;
+    // First frames only; the periodic loop captures later changes.
+    if (frame_count > 3) return;
+    writeFrameDump(scan);
+}
 
+fn writeFrameDump(scan: virtio_gpu_scanout.Gpu.ScanoutView) void {
+    const dir = frame_dump_dir orelse return;
     var buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/frame-{d}-{d}x{d}.bgra", .{
         dir, frame_count, scan.width, scan.height,
@@ -552,7 +765,11 @@ fn restoreTermios() void {
 
 /// Reads host stdin and forwards it to the guest console. Runs detached;
 /// the process exits (and reaps it) when the VM stops.
-fn inputLoop(hw: *machine.Machine, is_tty: bool, kitty_mouse: bool) void {
+/// Machine currently receiving console input; null between reboots.
+var input_target = std.atomic.Value(?*machine.Machine).init(null);
+var input_thread_spawned: bool = false;
+
+fn inputLoop(is_tty: bool, kitty_mouse: bool) void {
     var buf: [1024]u8 = undefined;
     var decoder: KittyInput = .{};
     var host_input: HostInputState = .{};
@@ -563,12 +780,17 @@ fn inputLoop(hw: *machine.Machine, is_tty: bool, kitty_mouse: bool) void {
             !stdinReady(kitty_sequence_timeout_ms))
         {
             if (decoder.flushPending()) |bytes| {
+                const hw = input_target.load(.acquire) orelse continue;
                 if (!routeHostInput(hw, bytes, &host_input)) return;
             }
             continue;
         }
 
         const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch break;
+        const hw = input_target.load(.acquire) orelse {
+            if (n == 0) break;
+            continue;
+        };
         if (n == 0) {
             if (kitty_mouse) {
                 if (decoder.flushPending()) |bytes| {

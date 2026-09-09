@@ -238,6 +238,18 @@ pub const VM = struct {
     }
 
     /// Unmap memory from guest.
+    /// Change the guest access permissions of a mapped region. An empty
+    /// flag set makes every guest access trap while the host mapping stays.
+    pub fn protect(self: *VM, guest_addr: u64, size: usize, flags: MemoryFlags) Error!void {
+        assert(self.created);
+        assert(size > 0);
+        assert(guest_addr % PAGE_SIZE == 0);
+        assert(size % PAGE_SIZE == 0);
+
+        const ret = c.hv_vm_protect(guest_addr, size, flags.toRaw());
+        try c.check(ret);
+    }
+
     pub fn unmap(self: *VM, guest_addr: u64, size: usize) Error!void {
         // Pre-conditions
         assert(self.created);

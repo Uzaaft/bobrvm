@@ -31,6 +31,9 @@ const iosurface = @import("../gpu/iosurface.zig");
 
 pub const FrameReady = callback_binding.Binding0(void);
 
+/// Set by BOBRVM_TRACE_GPU=1 (0 = unchecked, 1 = on, 2 = off).
+var trace_commands = std.atomic.Value(u8).init(0);
+
 /// Venus (KosmicKrisp) GPU backend, opt-in via `-Dgpu-venus`. When disabled the
 /// import resolves to a stub so nothing links virglrenderer and the default
 /// build is unchanged; all venus code below sits behind `if (comptime gpu_venus)`.
@@ -622,6 +625,9 @@ pub const Gpu = struct {
 
     /// Guest memory accessor.
     guest_memory: ?GuestMemory,
+    /// Linear framebuffer in guest RAM configured through fw_cfg "etc/ramfb";
+    /// when set it replaces the virtio scanout as the presented image.
+    ramfb: ?Ramfb,
 
     /// Frame ready callback (scanout resource was flushed).
     frame_ready: ?FrameReady,
@@ -716,6 +722,9 @@ pub const Gpu = struct {
         enable_virgl: bool,
         memory_bytes_limit: u64,
     ) Error!*Gpu {
+        if (trace_commands.load(.acquire) == 0) {
+            trace_commands.store(if (std.c.getenv("BOBRVM_TRACE_GPU") != null) 1 else 2, .release);
+        }
         assert(memory_bytes_limit >= config_policy.gpu_memory_bytes_min);
         assert(memory_bytes_limit <= config_policy.gpu_memory_bytes_max);
         var gpu_device = if (comptime builtin.os.tag == .linux and gpu_virglrenderer)
@@ -760,6 +769,7 @@ pub const Gpu = struct {
             .display_width = 1280,
             .display_height = 800,
             .guest_memory = null,
+            .ramfb = null,
             .frame_ready = null,
             .virgl_enabled = virgl_active,
             .gpu_device = gpu_device,
@@ -1026,9 +1036,56 @@ pub const Gpu = struct {
         };
     }
 
+    /// QEMU ramfb geometry: XRGB8888 rows of `stride` bytes at guest
+    /// physical `addr`. Bounds are validated by the owner against RAM.
+    pub const Ramfb = struct {
+        addr: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+    };
+
+    /// Switch presentation to (or away from) a guest-RAM framebuffer.
+    pub fn setRamfb(self: *Gpu, config: ?Ramfb) void {
+        self.scanout_mutex.lockUncancelable(global.io());
+        self.ramfb = config;
+        self.frame_generation +%= 1;
+        self.scanout_mutex.unlock(global.io());
+        _ = self.presentation_generation.fetchAdd(1, .release);
+        if (self.frame_ready) |frame_ready| frame_ready.call();
+    }
+
+    /// A guest drawing into ramfb produces no events; the owner ticks this
+    /// at display rate so presenters re-read the framebuffer.
+    pub fn ramfbTick(self: *Gpu) void {
+        self.scanout_mutex.lockUncancelable(global.io());
+        const active = self.ramfb != null;
+        if (active) self.frame_generation +%= 1;
+        self.scanout_mutex.unlock(global.io());
+        if (!active) return;
+        _ = self.presentation_generation.fetchAdd(1, .release);
+        if (self.frame_ready) |frame_ready| frame_ready.call();
+    }
+
+    fn ramfbView(self: *Gpu, fb: Ramfb) ?ScanoutView {
+        const memory = self.guest_memory orelse return null;
+        const length = @as(usize, fb.stride) * fb.height;
+        const data = memory.get(fb.addr, length) orelse return null;
+        return .{
+            .data = data,
+            .width = fb.width,
+            .height = fb.height,
+            .full_width = fb.stride / 4,
+            .full_height = fb.height,
+            .generation = self.frame_generation,
+            .cursor = self.cursorView(),
+        };
+    }
+
     /// Current scanout pixels (BGRA/XRGB 4 bytes per pixel), or null.
     /// Caller must be on the vCPU thread (unsynchronized).
     pub fn scanout(self: *Gpu) ?ScanoutView {
+        if (self.ramfb) |fb| return self.ramfbView(fb);
         if (self.scanout_resource_id == 0) return null;
         // 2D scanout: served directly from the resource's host pixels,
         // honoring the scanout rect (fbdev re-modesets to a smaller mode by
@@ -1342,6 +1399,9 @@ pub const Gpu = struct {
                 log.warn("unhandled GPU command: 0x{x}", .{header.type});
                 resp_type = .resp_err_unspec;
             },
+        }
+        if (trace_commands.load(.acquire) == 1) {
+            log.debug("gpu cmd 0x{x} -> 0x{x}", .{ header.type, @intFromEnum(resp_type) });
         }
 
         // Write the response header (payload responses already wrote

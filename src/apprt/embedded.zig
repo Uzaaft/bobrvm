@@ -116,6 +116,10 @@ pub const VMConfig = extern struct {
     port_forward_count: u8 = 0,
     enable_snd: bool = false,
     share_read_only: bool = false,
+    /// UEFI linear framebuffer instead of a PCI virtio-gpu (Windows guests).
+    enable_ramfb: bool = false,
+    /// Disks as NVMe controllers instead of virtio-blk (Windows guests).
+    storage_nvme: bool = false,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
@@ -244,6 +248,8 @@ pub const VMConfig = extern struct {
             .port_forward_count = self.port_forward_count,
             .enable_snd = self.enable_snd,
             .share_read_only = self.share_read_only,
+            .enable_ramfb = self.enable_ramfb,
+            .storage_nvme = self.storage_nvme,
         };
     }
 };
@@ -278,6 +284,8 @@ pub const OwnedVMConfig = struct {
     port_forward_count: u8 = 0,
     enable_snd: bool = false,
     share_read_only: bool = false,
+    enable_ramfb: bool = false,
+    storage_nvme: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.string_storage.len > 0) alloc.free(self.string_storage);
@@ -602,6 +610,8 @@ pub const VM = struct {
                 .shared_dir = self.config.shared_dir,
                 .enable_snd = self.config.enable_snd,
                 .share_read_only = self.config.share_read_only,
+                .enable_ramfb = self.config.enable_ramfb,
+                .storage_nvme = self.config.storage_nvme,
                 .display_width = if (self.config.display_width != 0)
                     self.config.display_width
                 else
