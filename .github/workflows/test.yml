@@ -91,6 +91,7 @@ jobs:
           nix develop -c zig build \
             xcframework \
             ghostty-lib \
+            network-helper \
             -Demit-macos-app=false
 
       - name: Compile SwiftUI app
