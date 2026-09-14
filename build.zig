@@ -844,6 +844,10 @@ pub fn build(b: *std.Build) !void {
     if (target.result.os.tag == .macos and !is_nix_build) {
         const xcframework = XCFrameworkStep.create(b, lib);
         xcframework_step.dependOn(&xcframework.step);
+        // Xcode copies zig-out/bin/bobrvm-network-helper as an app resource.
+        // Keep it on the xcframework path so CI/frameworks builds produce it
+        // even when macos-app / install is skipped.
+        xcframework_step.dependOn(network_helper_install.?);
 
         const ghostty_steps = addGhosttySteps(b, optimize);
         ghostty_step.dependOn(ghostty_steps.install_root_step);
