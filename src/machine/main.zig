@@ -3688,11 +3688,7 @@ pub const Machine = struct {
         pci_net.writeBar0(offset, size, value);
         // A device reset (status := 0) must also reset the mirrored device,
         // or ring indices left by the firmware's driver poison the OS's.
-        if (offset == pci.virtio_pci.BAR_COMMON_CFG_OFFSET + @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status) and
-            (value & 0xFF) == 0)
-        {
-            net.reset();
-        }
+        if (pciDeviceResetWritten(offset, value)) net.reset();
     }
 
     fn pciNetBarRead(pci_net: *pci.VirtioPciDevice, net: *virtio.Net, offset: u32, size: u8) u32 {
@@ -4098,6 +4094,7 @@ pub const Machine = struct {
             pci_gpu.transport.setDeviceConfig(std.mem.asBytes(&gpu_dev.config));
         }
         pci_gpu.writeBar0(offset, size, value);
+        if (pciDeviceResetWritten(offset, value)) gpu_dev.reset();
         if (offset >= pci.virtio_pci.BAR_DEVICE_CFG_OFFSET) {
             const config_size = @sizeOf(virtio.gpu.Config);
             @memcpy(
@@ -4124,6 +4121,24 @@ pub const Machine = struct {
             block.transport.write(@intFromEnum(virtio.mmio.Reg.interrupt_ack), value);
         }
         return value;
+    }
+
+    fn pciBlockBarWrite(
+        device: *pci.VirtioPciDevice,
+        block: *virtio.Block,
+        offset: u32,
+        size: u8,
+        value: u32,
+    ) void {
+        device.writeBar0(offset, size, value);
+        // Firmware and the OS own different rings; reset the backend cursor too.
+        if (pciDeviceResetWritten(offset, value)) block.reset();
+    }
+
+    fn pciDeviceResetWritten(offset: u32, value: u32) bool {
+        const status_offset = pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+            @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status);
+        return offset == status_offset and (value & 0xFF) == 0;
     }
 
     fn pciBarOffset(device: *pci.VirtioPciDevice, addr: u64) ?u32 {
@@ -4179,13 +4194,13 @@ pub const Machine = struct {
 
         if (self.pci_block) |device| {
             if (pciBarOffset(device, addr)) |offset| {
-                device.writeBar0(offset, size, value);
+                pciBlockBarWrite(device, self.block.?, offset, size, value);
                 return true;
             }
         }
         if (self.pci_block2) |device| {
             if (pciBarOffset(device, addr)) |offset| {
-                device.writeBar0(offset, size, value);
+                pciBlockBarWrite(device, self.block2.?, offset, size, value);
                 return true;
             }
         }
@@ -4916,4 +4931,41 @@ test "CPU_ON rejects nonexistent affinity instead of aliasing a CPU" {
     for ([_]u64{ 16, 0x101, 0x10001, 0x100000001 }) |target| {
         try std.testing.expectEqual(Machine.PSCI_INVALID_PARAMETERS, machine.psciCpuOn(target, 0, 0));
     }
+}
+
+test "PCI block reset releases firmware queue ownership" {
+    const testing = std.testing;
+    const block = try virtio.Block.init(testing.allocator);
+    defer block.deinit();
+    const device = try pci.VirtioPciDevice.init(testing.allocator, 2, 0, 1, 64);
+    defer device.deinit();
+    const status_offset = pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+        @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status);
+
+    block.request_last_avail = 37;
+    Machine.pciBlockBarWrite(device, block, status_offset, 1, 0x0F);
+    try testing.expectEqual(@as(u16, 37), block.request_last_avail);
+    Machine.pciBlockBarWrite(device, block, status_offset, 1, 0);
+    try testing.expectEqual(@as(u16, 0), block.request_last_avail);
+    try testing.expectEqual(virtio.mmio.Status{}, block.transport.status);
+}
+
+test "PCI GPU reset releases firmware queue ownership" {
+    const testing = std.testing;
+    const machine = try Machine.init(testing.allocator, .{});
+    defer machine.deinit();
+    machine.gpu = try virtio.Gpu.init(testing.allocator, false);
+    const device = try pci.VirtioPciDevice.init(testing.allocator, 16, 0, 2, 64);
+    defer device.deinit();
+    const status_offset = pci.virtio_pci.BAR_COMMON_CFG_OFFSET +
+        @intFromEnum(pci.virtio_pci.CommonCfgReg.device_status);
+
+    machine.gpu.?.ctrl_last_avail = 17;
+    machine.gpu.?.cursor_last_avail = 9;
+    machine.pciGpuBarWrite(device, status_offset, 1, 0x0F);
+    try testing.expectEqual(@as(u16, 17), machine.gpu.?.ctrl_last_avail);
+    machine.pciGpuBarWrite(device, status_offset, 1, 0);
+    try testing.expectEqual(@as(u16, 0), machine.gpu.?.ctrl_last_avail);
+    try testing.expectEqual(@as(u16, 0), machine.gpu.?.cursor_last_avail);
+    try testing.expectEqual(virtio.mmio.Status{}, machine.gpu.?.transport.status);
 }
