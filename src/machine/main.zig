@@ -406,8 +406,7 @@ const VcpuRunState = struct {
     vtimer_unmask: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set by a restored secondary once its vCPU exists and its
-    /// registers are applied; the restore path serializes on this so
-    /// HVF's creation-index-derived MPIDR matches our CPU numbering.
+    /// registers are applied before the restore path proceeds.
     restore_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     entry_point: u64 = 0,
     context_id: u64 = 0,
@@ -608,6 +607,8 @@ pub const Machine = struct {
         std.Io.File.StatError ||
         std.Thread.SpawnError ||
         error{
+            InvalidVcpuCount,
+            InvalidVcpuIdentity,
             KernelTooLarge,
             InitrdTooLarge,
             FirmwareTooLarge,
@@ -618,6 +619,8 @@ pub const Machine = struct {
         };
 
     pub fn init(alloc: Allocator, config: MachineConfig) Error!*Machine {
+        if (config.vcpu_count == 0 or config.vcpu_count > config_policy.vcpu_count_max)
+            return error.InvalidVcpuCount;
         log.info("initializing machine: {}MB RAM, {} vCPUs", .{
             config.ram_size / (1024 * 1024),
             config.vcpu_count,
@@ -1683,8 +1686,7 @@ pub const Machine = struct {
     };
 
     /// Spawn one restored secondary vCPU and wait until its vCPU
-    /// exists with registers applied. The wait serializes creations so
-    /// HVF's creation-index-derived MPIDR matches our CPU numbering.
+    /// exists with registers applied before the restore path proceeds.
     fn spawnRestoredSecondary(self: *Machine, cpu_id: u8, data: []const u8) !void {
         const state = &self.cpu_states[cpu_id];
         assert(!state.started.load(.acquire));
@@ -1735,6 +1737,11 @@ pub const Machine = struct {
         };
         setupVcpuFeatures(vcpu) catch |err| {
             log.err("cpu {}: restored vCPU feature setup failed: {}", .{ cpu_id, err });
+            state.started.store(false, .release);
+            return;
+        };
+        setupVcpuIdentity(vcpu, cpu_id) catch |err| {
+            log.err("cpu {}: restored vCPU identity setup failed: {}", .{ cpu_id, err });
             state.started.store(false, .release);
             return;
         };
@@ -2510,7 +2517,7 @@ pub const Machine = struct {
             // PSCI_AFFINITY_INFO
             0x84000004, 0xC4000004 => blk: {
                 const target_mpidr = try vcpu.getReg(.x1);
-                const cpu_id = target_mpidr & 0xFF;
+                const cpu_id = target_mpidr;
                 if (cpu_id >= self.cpu_states.len) break :blk PSCI_INVALID_PARAMETERS;
                 break :blk if (self.cpu_states[cpu_id].started.load(.acquire)) 0 else 1;
             },
@@ -2551,7 +2558,7 @@ pub const Machine = struct {
 
     /// PSCI CPU_ON: bring a secondary vCPU online on its own thread.
     fn psciCpuOn(self: *Machine, target_mpidr: u64, entry_point: u64, context_id: u64) u64 {
-        const cpu_id = target_mpidr & 0xFF;
+        const cpu_id = target_mpidr;
         if (cpu_id == 0 or cpu_id >= self.cpu_states.len) return PSCI_INVALID_PARAMETERS;
 
         const state = &self.cpu_states[cpu_id];
@@ -2606,13 +2613,9 @@ pub const Machine = struct {
     ) !void {
         _ = self;
         try setupVcpuFeatures(vcpu);
+        try setupVcpuIdentity(vcpu, cpu_id);
         try vcpu.setSysReg(.vbar_el1, MemoryLayout.RAM_BASE);
         try vcpu.setSysReg(.sctlr_el1, 0);
-        // Best-effort: HVF may treat MPIDR as read-only (its default is
-        // the vCPU creation index, which matches our numbering).
-        vcpu.setSysReg(.mpidr_el1, @as(u64, cpu_id)) catch |err| {
-            log.warn("cpu {}: MPIDR not settable: {}", .{ cpu_id, err });
-        };
         try vcpu.setReg(.cpsr, 0x3c5);
         try vcpu.setPC(entry_point);
         try vcpu.setReg(.x0, context_id);
@@ -4317,6 +4320,7 @@ pub const Machine = struct {
     /// Only vCPU 0 gets the boot configuration; others wait for IPI.
     fn setupVcpuState(self: *Machine, vcpu: *hypervisor.Vcpu, id: u32) !void {
         try setupVcpuFeatures(vcpu);
+        try setupVcpuIdentity(vcpu, @intCast(id));
 
         // Set up SP_EL0 and SP_EL1 to valid addresses (per-vCPU)
         const stack_base = MemoryLayout.RAM_BASE + 0x10000 + @as(u64, id) * 0x20000;
@@ -4374,6 +4378,17 @@ pub const Machine = struct {
 
             log.debug("vCPU {}: secondary state at 0x{x} (waiting for PSCI CPU_ON)", .{ id, wfi_addr });
         }
+    }
+
+    /// Match DTB, ACPI and GICR_TYPER regardless of host vCPU creation order.
+    fn setupVcpuIdentity(
+        vcpu: *hypervisor.Vcpu,
+        cpu_id: u8,
+    ) (hypervisor.Vcpu.Error || error{InvalidVcpuIdentity})!void {
+        try vcpu.setSysReg(.mpidr_el1, (@as(u64, 1) << 31) | cpu_id);
+        const affinity_mask: u64 = 0xFF00FFFFFF;
+        if ((try vcpu.getSysReg(.mpidr_el1)) & affinity_mask != cpu_id)
+            return error.InvalidVcpuIdentity;
     }
 
     fn setupVcpuFeatures(vcpu: *hypervisor.Vcpu) !void {
@@ -4883,5 +4898,22 @@ test "snapshot section registry stays analyzable" {
             _ = &Section.capture;
             _ = &Section.restore;
         }
+    }
+}
+
+test "CPU configuration rejects unsupported counts before allocation" {
+    try std.testing.expectError(error.InvalidVcpuCount, Machine.init(std.testing.allocator, .{
+        .vcpu_count = 0,
+    }));
+    try std.testing.expectError(error.InvalidVcpuCount, Machine.init(std.testing.allocator, .{
+        .vcpu_count = 17,
+    }));
+}
+
+test "CPU_ON rejects nonexistent affinity instead of aliasing a CPU" {
+    const machine = try Machine.init(std.testing.allocator, .{ .vcpu_count = 16 });
+    defer machine.deinit();
+    for ([_]u64{ 16, 0x101, 0x10001, 0x100000001 }) |target| {
+        try std.testing.expectEqual(Machine.PSCI_INVALID_PARAMETERS, machine.psciCpuOn(target, 0, 0));
     }
 }

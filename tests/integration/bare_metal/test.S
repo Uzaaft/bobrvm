@@ -9,7 +9,7 @@
 //   UART: OK
 //   PSCI VERSION: 00010000
 //   PSCI FEATURES: OK
-//   PSCI CPU_ON + GICV3: OK
+//   PSCI CPU_ON + MPIDR + SGI: OK
 //   ALL TESTS PASSED
 
 .equ UART_BASE,     0x09000000
@@ -77,15 +77,30 @@ _start:
     adr     x0, msg_ok
     bl      uart_puts
 
-    // Bring CPU 1 online at secondary_start. The secondary verifies that
-    // its feature register and trapped ICC interface match CPU 0's.
+    // Discover the last redistributor, then start CPUs in reverse order.
+    // Host creation order must not determine the guest MPIDR.
+    mov     x22, #0x080A0000
+    mov     x21, #0
+find_last_cpu:
+    ldr     x9, [x22, #8]
+    tbnz    x9, #4, start_cpu
+    add     x22, x22, #0x20000
+    add     x21, x21, #1
+    cmp     x21, #16
+    b.eq    test_failed
+    b       find_last_cpu
+
+start_cpu:
+    mov     x9, #0x08000000
+    mov     w10, #2              // Enable Group 1 non-secure interrupts.
+    str     w10, [x9]
     adr     x19, secondary_status
     str     xzr, [x19]
     movz    w0, #PSCI_CPU_ON_HI, lsl #16
     movk    w0, #PSCI_CPU_ON_LO
-    mov     x1, #1
+    mov     x1, x21
     adr     x2, secondary_start
-    mov     x3, #0
+    mov     x3, x21              // Expected MPIDR affinity passed as context.
     hvc     #0
     cbnz    x0, test_failed
 
@@ -94,6 +109,20 @@ wait_for_secondary:
     cbz     x20, wait_for_secondary
     cmp     x20, #1
     b.ne    test_failed
+
+    // Send SGI 3 to this CPU, including Aff0 targets above seven.
+    mov     x9, #1
+    lsl     x9, x9, x21
+    orr     x9, x9, #0x03000000
+    msr     S3_0_C12_C11_5, x9   // ICC_SGI1R_EL1
+wait_for_sgi:
+    ldar    x20, [x19]
+    cmp     x20, #1
+    b.eq    wait_for_sgi
+    cmp     x20, #2
+    b.ne    test_failed
+    subs    x21, x21, #1
+    b.ne    start_cpu
 
     adr     x0, msg_smp_ok
     bl      uart_puts
@@ -119,6 +148,22 @@ test_failed:
 
 .balign 4
 secondary_start:
+    mrs     x9, MPIDR_EL1
+    mov     x10, #0xFFFFFF
+    movk    x10, #0xFF, lsl #32
+    and     x9, x9, x10
+    cmp     x9, x0
+    b.ne    secondary_failed
+    mov     x12, #0x080A0000
+    add     x12, x12, x0, lsl #17
+    ldr     x9, [x12, #8]       // GICR_TYPER affinity and Processor_Number.
+    lsr     x10, x9, #32
+    cmp     x10, x0
+    b.ne    secondary_failed
+    ubfx    x10, x9, #8, #16
+    cmp     x10, x0
+    b.ne    secondary_failed
+
     // ID_AA64PFR0_EL1.GIC == 1 advertises the GICv3 system-register
     // interface. This must be identical on every vCPU.
     mrs     x9, ID_AA64PFR0_EL1
@@ -135,11 +180,27 @@ secondary_start:
     cmp     x11, #0xA5
     b.ne    secondary_failed
 
+    add     x12, x12, #0x10000
+    mov     w10, #8
+    str     w10, [x12, #0x100]  // GICR_ISENABLER0: SGI 3.
+    mov     x10, #0xFF
+    msr     S3_0_C4_C6_0, x10   // ICC_PMR_EL1
     mov     x10, #1
+    msr     S3_0_C12_C12_7, x10 // ICC_IGRPEN1_EL1
+    adr     x11, secondary_status
+    stlr    x10, [x11]
+secondary_wait_sgi:
+    mrs     x9, S3_0_C12_C12_0 // ICC_IAR1_EL1
+    cmp     x9, #1023
+    b.eq    secondary_wait_sgi
+    cmp     x9, #3
+    b.ne    secondary_failed
+    msr     S3_0_C12_C12_1, x9 // ICC_EOIR1_EL1
+    mov     x10, #2
     b       secondary_complete
 
 secondary_failed:
-    mov     x10, #2
+    mov     x10, #3
 
 secondary_complete:
     adr     x11, secondary_status
@@ -207,7 +268,7 @@ msg_psci_feat:
 msg_ok:
     .asciz "OK\r\n"
 msg_smp_ok:
-    .asciz "PSCI CPU_ON + GICV3: OK\r\n"
+    .asciz "PSCI CPU_ON + MPIDR + SGI: OK\r\n"
 msg_passed:
     .asciz "ALL TESTS PASSED\r\n"
 msg_failed:

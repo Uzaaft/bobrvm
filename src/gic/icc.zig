@@ -195,6 +195,10 @@ pub const IccHandler = struct {
         const target_list: u16 = @truncate(value);
         const irm = (value >> 40) & 1; // Interrupt Routing Mode
 
+        // DTB, ACPI and MPIDR expose only Aff3:Aff2:Aff1 = 0 and Aff0 < 16.
+        // Do not alias another affinity group or range onto our CPUs.
+        const affinity_and_range_mask: u64 = 0x00FF_F0FF_00FF_0000;
+        if (irm == 0 and value & affinity_and_range_mask != 0) return;
         self.gic.sendSgi(source_cpu, intid, target_list, irm == 1);
     }
 };
@@ -335,13 +339,13 @@ test "ICC register state is isolated per CPU" {
 }
 
 test "ICC SGI targets only CPUs selected by the affinity bitmap" {
-    const gic = try Gic.init(std.testing.allocator, 3);
+    const gic = try Gic.init(std.testing.allocator, 16);
     defer gic.deinit();
-    const handler = try IccHandler.init(std.testing.allocator, gic, 3);
+    const handler = try IccHandler.init(std.testing.allocator, gic, 16);
     defer handler.deinit(std.testing.allocator);
 
     gic.distWrite(gic_module.GICD.CTLR, 4, gic_module.GICD.CTLR_ENABLE_G1NS);
-    for (1..3) |cpu_id| {
+    for (0..16) |cpu_id| {
         const redist_base = cpu_id * gic_module.GICR_FRAME_SIZE;
         const enable_addr = redist_base + gic_module.GICR.SGI_OFFSET +
             gic_module.GICR.ISENABLER0;
@@ -349,11 +353,22 @@ test "ICC SGI targets only CPUs selected by the affinity bitmap" {
         handler.write(@intCast(cpu_id), Reg.IGRPEN1, 1);
     }
 
-    handler.write(0, Reg.SGI1R, (@as(u64, 3) << 24) | (1 << 1) | (1 << 2));
-
-    try std.testing.expect(!gic.hasDeliverableIrq(0));
-    try std.testing.expect(gic.hasDeliverableIrq(1));
-    try std.testing.expect(gic.hasDeliverableIrq(2));
-    try std.testing.expectEqual(@as(u64, 3), handler.read(1, Reg.IAR1));
-    try std.testing.expectEqual(@as(u64, 3), handler.read(2, Reg.IAR1));
+    const targets = (1 << 1) | (1 << 8) | (1 << 11) | (1 << 15);
+    for ([_]u6{ 16, 32, 44, 48 }) |shift| {
+        handler.write(0, Reg.SGI1R, (@as(u64, 1) << shift) | (3 << 24) | targets);
+        for (0..16) |cpu_id| {
+            try std.testing.expect(!gic.hasDeliverableIrq(@intCast(cpu_id)));
+        }
+    }
+    handler.write(0, Reg.SGI1R, (3 << 24) | targets);
+    for (0..16) |cpu_id| {
+        const expected: u64 = if (targets & (@as(u16, 1) << @intCast(cpu_id)) != 0) 3 else 1023;
+        try std.testing.expectEqual(expected, handler.read(@intCast(cpu_id), Reg.IAR1));
+        handler.write(@intCast(cpu_id), Reg.EOIR1, 3);
+    }
+    handler.write(11, Reg.SGI1R, (@as(u64, 1) << 40) | (3 << 24));
+    for (0..16) |cpu_id| {
+        const expected: u64 = if (cpu_id == 11) 1023 else 3;
+        try std.testing.expectEqual(expected, handler.read(@intCast(cpu_id), Reg.IAR1));
+    }
 }

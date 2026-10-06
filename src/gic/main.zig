@@ -94,7 +94,7 @@ pub const MAX_SPI: u32 = 128; // Support 128 SPIs (32-159)
 pub const MAX_INTID: u32 = 32 + MAX_SPI;
 
 /// Number of vCPUs supported.
-pub const MAX_VCPUS: u8 = 8;
+pub const MAX_VCPUS: u8 = @import("../config.zig").vcpu_count_max;
 
 /// Redistributor frame size (2 x 64KB frames per CPU).
 pub const GICR_FRAME_SIZE: u32 = 0x20000; // 128KB per redistributor

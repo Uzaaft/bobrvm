@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const c = @import("c.zig");
+const global = @import("../global.zig");
 const Vcpu = @import("vcpu.zig").Vcpu;
 
 /// Memory permission flags for guest mappings.
@@ -62,6 +63,7 @@ pub const VM = struct {
     created: bool,
     regions: std.ArrayListUnmanaged(MemoryRegion),
     vcpus: std.ArrayListUnmanaged(*Vcpu),
+    vcpu_lock: std.Io.Mutex = .init,
 
     pub const Error = c.Error || Allocator.Error || std.posix.MMapError;
 
@@ -294,6 +296,9 @@ pub const VM = struct {
         const vcpu = try Vcpu.create(self.alloc);
         errdefer vcpu.destroy();
 
+        // CPU_ON requests can create secondary vCPUs concurrently.
+        self.vcpu_lock.lockUncancelable(global.io());
+        defer self.vcpu_lock.unlock(global.io());
         try self.vcpus.append(self.alloc, vcpu);
 
         // Post-condition: vCPU is tracked
