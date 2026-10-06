@@ -3618,11 +3618,11 @@ pub const Machine = struct {
     const PCI_SLOT_MOUSE: u5 = 4;
     const PCI_SLOT_NET: u5 = 5;
 
-    /// virtio-net goes on PCI for guests without virtio-mmio drivers, which
-    /// the ramfb display selects today (Windows). Linux firmware boots keep
-    /// the virtio-mmio adapter. BOBRVM_NO_PCI_NET=1 disables it (bisecting aid).
+    /// Firmware guests can use ACPI, which does not describe virtio-mmio
+    /// devices. Expose the NIC on PCI regardless of the display backend.
+    /// BOBRVM_NO_PCI_NET=1 disables it (bisecting aid).
     fn pciNetEnabled(self: *const Machine) bool {
-        return self.config.enable_ramfb and std.c.getenv("BOBRVM_NO_PCI_NET") == null;
+        return self.config.isFirmwareBoot() and std.c.getenv("BOBRVM_NO_PCI_NET") == null;
     }
 
     /// Expose the virtio-net device on PCI as well; the PCI transport's
@@ -3972,7 +3972,7 @@ pub const Machine = struct {
 
     fn pciBlockBackendIrq(level: bool, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        self.setPciBlockIrq(self.pci_block, self.block, 80, level);
+        self.setPciBlockIrq(self.pci_block, self.block, 0, level);
     }
 
     fn pciBlock2Notify(queue_idx: u32, userdata: ?*anyopaque) void {
@@ -3982,7 +3982,7 @@ pub const Machine = struct {
 
     fn pciBlock2BackendIrq(level: bool, userdata: ?*anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(userdata));
-        self.setPciBlockIrq(self.pci_block2, self.block2, 81, level);
+        self.setPciBlockIrq(self.pci_block2, self.block2, 1, level);
     }
 
     fn syncPciBlockQueue(
@@ -4010,10 +4010,10 @@ pub const Machine = struct {
         self: *Machine,
         pci_block: ?*pci.VirtioPciDevice,
         block: ?*virtio.Block,
-        intid: u32,
+        slot: u5,
         level: bool,
     ) void {
-        assert(intid == 80 or intid == 81);
+        assert(slot < 2);
         if (pci_block) |device| {
             if (block) |blk| {
                 device.transport.isr_status.queue_interrupt =
@@ -4022,7 +4022,7 @@ pub const Machine = struct {
                     blk.transport.interrupt_status.config_change;
             }
         }
-        if (self.gic_device) |gic_dev| gic_dev.setSpiPending(intid, level);
+        self.setPciIntx(slot, level);
     }
 
     fn pciGpuNotify(queue_idx: u32, userdata: ?*anyopaque) void {
@@ -4968,4 +4968,27 @@ test "PCI GPU reset releases firmware queue ownership" {
     try testing.expectEqual(@as(u16, 0), machine.gpu.?.ctrl_last_avail);
     try testing.expectEqual(@as(u16, 0), machine.gpu.?.cursor_last_avail);
     try testing.expectEqual(virtio.mmio.Status{}, machine.gpu.?.transport.status);
+}
+
+test "PCI disk and network acknowledgements preserve shared interrupts" {
+    const testing = std.testing;
+    const machine = try Machine.init(testing.allocator, .{});
+    defer machine.deinit();
+    machine.gic_device = try gic.Gic.init(testing.allocator, 1);
+    const pending = gic.GICD.ISPENDR + 8;
+    const mask: u64 = 1 << (81 - 64);
+
+    machine.setPciBlockIrq(null, null, 1, true);
+    machine.setPciIntx(Machine.PCI_SLOT_NET, true);
+    machine.setPciIntx(Machine.PCI_SLOT_NET, false);
+    try testing.expectEqual(mask, machine.gic_device.?.distRead(pending, 4) & mask);
+    machine.setPciBlockIrq(null, null, 1, false);
+    try testing.expectEqual(@as(u64, 0), machine.gic_device.?.distRead(pending, 4) & mask);
+
+    machine.setPciIntx(Machine.PCI_SLOT_NET, true);
+    machine.setPciBlockIrq(null, null, 1, true);
+    machine.setPciBlockIrq(null, null, 1, false);
+    try testing.expectEqual(mask, machine.gic_device.?.distRead(pending, 4) & mask);
+    machine.setPciIntx(Machine.PCI_SLOT_NET, false);
+    try testing.expectEqual(@as(u64, 0), machine.gic_device.?.distRead(pending, 4) & mask);
 }
