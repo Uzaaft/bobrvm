@@ -908,18 +908,11 @@ pub const Machine = struct {
         self.kickCpu(0);
     }
 
-    /// Inject an absolute pointer position. Thread-safe.
+    /// Inject an absolute pointer position in the range 0..32767. Thread-safe.
     pub fn injectMousePosition(self: *Machine, x: i32, y: i32) void {
         if (self.xhci) |usb| {
             self.machine_lock.lockUncancelable(global.io());
-            const width = std.mem.readInt(u32, self.ramfb_config[16..20], .big);
-            const height = std.mem.readInt(u32, self.ramfb_config[20..24], .big);
-            usb.devices[1].pointer(
-                x,
-                y,
-                if (width > 0) width else self.config.display_width,
-                if (height > 0) height else self.config.display_height,
-            );
+            usb.devices[1].pointer(x, y);
             self.machine_lock.unlock(global.io());
             self.kickCpu(0);
             return;

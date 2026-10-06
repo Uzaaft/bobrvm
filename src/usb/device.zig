@@ -264,17 +264,11 @@ pub fn key(self: *Device, evdev: u16, pressed: bool) void {
     self.enqueue();
 }
 
-pub fn pointer(self: *Device, x: i32, y: i32, width: u32, height: u32) void {
-    const px = pointerAxis(x, width);
-    const py = pointerAxis(y, height);
-    std.mem.writeInt(u16, self.report[1..3], @min(px, 32767), .little);
-    std.mem.writeInt(u16, self.report[3..5], @min(py, 32767), .little);
+/// Coordinates use the same 0..32767 absolute range as virtio-input.
+pub fn pointer(self: *Device, x: i32, y: i32) void {
+    std.mem.writeInt(u16, self.report[1..3], @intCast(std.math.clamp(x, 0, 32767)), .little);
+    std.mem.writeInt(u16, self.report[3..5], @intCast(std.math.clamp(y, 0, 32767)), .little);
     self.enqueue();
-}
-
-fn pointerAxis(position: i32, extent: u32) u16 {
-    const scaled = @divTrunc(@as(i64, @max(0, position)) * 32767, @max(1, extent -| 1));
-    return @intCast(@min(32767, scaled));
 }
 
 pub fn button(self: *Device, code: u16, pressed: bool) void {
@@ -336,6 +330,20 @@ test "USB HID preserves press and release reports while transfer is pending" {
     try std.testing.expectEqual(0x28, report[2]);
     _ = try keyboard.transfer(1, true, &report);
     try std.testing.expectEqual(0, report[2]);
+}
+
+test "USB tablet preserves normalized coordinates and buttons" {
+    var tablet: Device = .{ .kind = .tablet, .configuration = 1 };
+    var report: [6]u8 = undefined;
+    tablet.pointer(16383, 8191);
+    tablet.button(272, true);
+    try std.testing.expectEqual(6, (try tablet.transfer(1, true, &report)).?);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0xff, 0x3f, 0xff, 0x1f, 0 }, &report);
+    _ = try tablet.transfer(1, true, &report);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0xff, 0x3f, 0xff, 0x1f, 0 }, &report);
+    tablet.pointer(std.math.minInt(i32), std.math.maxInt(i32));
+    _ = try tablet.transfer(1, true, &report);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0xff, 0x7f, 0 }, &report);
 }
 
 test {
