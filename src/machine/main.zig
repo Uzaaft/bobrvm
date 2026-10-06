@@ -213,6 +213,10 @@ pub const MachineConfig = struct {
     /// Expose the disks as NVMe controllers on PCI instead of virtio-blk.
     /// Windows and EDK2 carry NVMe drivers; neither has virtio-blk for Arm.
     storage_nvme: bool = false,
+    /// PCI xHCI with USB HID keyboard/tablet for firmware guests.
+    enable_usb: bool = false,
+    /// Expose disk2 as read-only USB optical media with 2048-byte sectors.
+    disk2_optical: bool = false,
 
     /// Present a QEMU ramfb (linear framebuffer in guest RAM) through fw_cfg
     /// instead of a virtio-gpu PCI device. Windows' boot manager draws into
@@ -546,6 +550,8 @@ pub const Machine = struct {
 
     /// Virtio PCI GPU device (UEFI does not discover virtio-mmio displays).
     pci_gpu: ?*pci.VirtioPciDevice = null,
+    /// USB HID input and optional installation media at PCI 00:06.0.
+    xhci: ?*pci.Xhci = null,
     /// NVMe controllers for disk 1 and disk 2 at PCI 00:00.0 / 00:01.0.
     nvme: [2]?*pci.Nvme = .{ null, null },
     /// virtio-input over PCI for guests without virtio-mmio drivers
@@ -609,6 +615,8 @@ pub const Machine = struct {
         error{
             InvalidVcpuCount,
             InvalidVcpuIdentity,
+            InvalidOpticalImage,
+            InvalidUsbConfiguration,
             KernelTooLarge,
             InitrdTooLarge,
             FirmwareTooLarge,
@@ -619,6 +627,9 @@ pub const Machine = struct {
         };
 
     pub fn init(alloc: Allocator, config: MachineConfig) Error!*Machine {
+        if ((config.disk2_optical and !config.enable_usb) or
+            (config.enable_usb and !config.isFirmwareBoot())) return error.InvalidUsbConfiguration;
+        if (config.enable_usb and config.restore_path != null) return error.Unsupported;
         if (config.vcpu_count == 0 or config.vcpu_count > config_policy.vcpu_count_max)
             return error.InvalidVcpuCount;
         log.info("initializing machine: {}MB RAM, {} vCPUs", .{
@@ -780,6 +791,10 @@ pub const Machine = struct {
             pci_gpu.deinit();
             self.pci_gpu = null;
         }
+        if (self.xhci) |device| {
+            device.deinit();
+            self.xhci = null;
+        }
         for (&self.nvme) |*slot| {
             if (slot.*) |device| device.deinit();
             slot.* = null;
@@ -867,6 +882,13 @@ pub const Machine = struct {
 
     /// Inject a keyboard event with an explicit evdev action. Thread-safe.
     pub fn injectKeyAction(self: *Machine, keycode: u16, action: KeyAction) void {
+        if (self.xhci) |usb| {
+            self.machine_lock.lockUncancelable(global.io());
+            if (action != .repeat) usb.devices[0].key(keycode, action == .press);
+            self.machine_lock.unlock(global.io());
+            self.kickCpu(0);
+            return;
+        }
         const kbd = self.keyboard orelse return;
         kbd.injectKeyAction(keycode, action) catch {};
         self.kickCpu(0);
@@ -874,6 +896,13 @@ pub const Machine = struct {
 
     /// Inject a mouse button event (evdev BTN_*). Thread-safe.
     pub fn injectMouseButton(self: *Machine, button: u16, pressed: bool) void {
+        if (self.xhci) |usb| {
+            self.machine_lock.lockUncancelable(global.io());
+            usb.devices[1].button(button, pressed);
+            self.machine_lock.unlock(global.io());
+            self.kickCpu(0);
+            return;
+        }
         const mouse = self.mouse orelse return;
         mouse.injectButton(button, pressed) catch {};
         self.kickCpu(0);
@@ -881,6 +910,20 @@ pub const Machine = struct {
 
     /// Inject an absolute pointer position. Thread-safe.
     pub fn injectMousePosition(self: *Machine, x: i32, y: i32) void {
+        if (self.xhci) |usb| {
+            self.machine_lock.lockUncancelable(global.io());
+            const width = std.mem.readInt(u32, self.ramfb_config[16..20], .big);
+            const height = std.mem.readInt(u32, self.ramfb_config[20..24], .big);
+            usb.devices[1].pointer(
+                x,
+                y,
+                if (width > 0) width else self.config.display_width,
+                if (height > 0) height else self.config.display_height,
+            );
+            self.machine_lock.unlock(global.io());
+            self.kickCpu(0);
+            return;
+        }
         const mouse = self.mouse orelse return;
         mouse.injectAbsolute(x, y) catch {};
         self.kickCpu(0);
@@ -888,6 +931,13 @@ pub const Machine = struct {
 
     /// Inject scroll wheel motion. Thread-safe.
     pub fn injectScroll(self: *Machine, dx: i32, dy: i32) void {
+        if (self.xhci) |usb| {
+            self.machine_lock.lockUncancelable(global.io());
+            usb.devices[1].scroll(dy);
+            self.machine_lock.unlock(global.io());
+            self.kickCpu(0);
+            return;
+        }
         const mouse = self.mouse orelse return;
         mouse.injectScroll(dx, dy) catch {};
         self.kickCpu(0);
@@ -1313,6 +1363,9 @@ pub const Machine = struct {
     /// Serialize all machine state except guest RAM. The machine must be
     /// paused. Caller owns the returned bytes.
     pub fn captureState(self: *Machine, alloc: Allocator) ![]u8 {
+        // The snapshot format has no xHCI rings or USB transport state yet.
+        // Reject the operation before writing a suspend image that cannot resume.
+        if (self.xhci != null) return error.Unsupported;
         if (!self.paused.load(.acquire)) return error.NotPaused;
 
         var builder = try snapshot.Builder.init(alloc);
@@ -1921,6 +1974,8 @@ pub const Machine = struct {
         if (self.config.isFirmwareBoot()) {
             try self.publishAcpiTables();
             if (self.config.enable_ramfb) self.publishRamfb();
+            if (self.config.disk2_optical and self.config.disk2_path != null)
+                self.publishOpticalBootOrder();
         }
         if (std.c.getenv("BOBRVM_DUMP_RAM_AFTER")) |seconds_z| {
             const seconds = std.fmt.parseInt(u64, std.mem.span(seconds_z), 10) catch 0;
@@ -2070,6 +2125,7 @@ pub const Machine = struct {
                 }
                 if (self.keyboard) |kbd| kbd.pollEvents();
                 if (self.mouse) |mouse| mouse.pollEvents();
+                if (self.xhci) |usb| usb.poll();
                 if (self.net) |net| net.poll();
                 self.machine_lock.unlock(global.io());
             }
@@ -2116,6 +2172,7 @@ pub const Machine = struct {
                                 }
                                 if (self.keyboard) |kbd| kbd.pollEvents();
                                 if (self.mouse) |mouse| mouse.pollEvents();
+                                if (self.xhci) |usb| usb.poll();
                                 self.machine_lock.unlock(global.io());
                             }
                             try vcpu.advancePC(exit_info);
@@ -2390,6 +2447,19 @@ pub const Machine = struct {
             }
             try vcpu.advancePC(info);
             return;
+        }
+
+        if (self.xhci) |usb| {
+            if (usb.barOffset(addr)) |offset| {
+                if (is_write) {
+                    const value = if (srt == 31) 0 else try vcpu.getReg(@enumFromInt(srt));
+                    usb.writeBar(offset, size, value);
+                } else if (srt != 31) {
+                    try vcpu.setReg(@enumFromInt(srt), usb.readBar(offset, size));
+                }
+                try vcpu.advancePC(info);
+                return;
+            }
         }
 
         // PCI MMIO region (BAR space) - NVMe controllers (64-bit registers)
@@ -3070,6 +3140,19 @@ pub const Machine = struct {
     const RAMFB_CONFIG_SIZE = 28;
     const RAMFB_TICK_NS: u64 = std.time.ns_per_s / 30;
 
+    /// EDK2 otherwise appends a newly introduced USB DVD behind saved PXE
+    /// entries. Prefer attached installation media, then the system disk.
+    /// QemuBootOrderLib translates these OpenFirmware paths to UEFI prefixes:
+    /// https://github.com/tianocore/edk2/blob/master/OvmfPkg/Library/QemuBootOrderLib/QemuBootOrderLib.c
+    fn publishOpticalBootOrder(self: *Machine) void {
+        const order = std.fmt.comptimePrint(
+            "/pci@i0cf8/usb@{x}/storage@3/channel@0/disk@0,0\n" ++
+                "/pci@i0cf8/storage@0\n\x00",
+            .{PCI_SLOT_USB},
+        );
+        _ = self.fw_cfg.addFile("bootorder", @constCast(order), null, null) catch unreachable;
+    }
+
     /// Offer "etc/ramfb": EDK2's QemuRamfbDxe allocates a framebuffer in
     /// reserved guest RAM and writes its geometry back through fw_cfg.
     fn publishRamfb(self: *Machine) void {
@@ -3340,7 +3423,7 @@ pub const Machine = struct {
         }
 
         // Initialize secondary block device (slot 2) if disk2_path is set (typically ISO)
-        if (self.config.disk2_path) |disk2_path| {
+        if (!self.config.disk2_optical) if (self.config.disk2_path) |disk2_path| {
             log.debug("attaching disk2: {s} (len={})", .{ disk2_path, disk2_path.len });
             self.block2 = try virtio.Block.init(self.alloc);
             self.block2.?.attachDisk(disk2_path, self.config.disk2_read_only) catch |err| {
@@ -3353,7 +3436,7 @@ pub const Machine = struct {
                 disk2_path,
                 self.config.disk2_read_only,
             });
-        }
+        };
 
         // Initialize GPU (slot after the block devices) if enabled
         if (self.config.enable_gpu) {
@@ -3590,7 +3673,9 @@ pub const Machine = struct {
 
         if (self.config.storage_nvme) {
             if (self.config.disk_path) |path| try self.initNvme(0, path, self.config.disk_read_only);
-            if (self.config.disk2_path) |path| try self.initNvme(1, path, self.config.disk2_read_only);
+            if (!self.config.disk2_optical) {
+                if (self.config.disk2_path) |path| try self.initNvme(1, path, self.config.disk2_read_only);
+            }
         } else {
             if (self.block) |blk| try self.initPciBlock(blk);
             if (self.block2) |blk| try self.initPciBlock2(blk);
@@ -3599,7 +3684,8 @@ pub const Machine = struct {
             if (!self.config.enable_ramfb) try self.initPciGpu(gpu_dev);
         }
         // BOBRVM_NO_PCI_INPUT=1 leaves input on virtio-mmio only (bisecting aid).
-        const pci_input = std.c.getenv("BOBRVM_NO_PCI_INPUT") == null;
+        if (self.config.enable_usb) try self.initUsb();
+        const pci_input = !self.config.enable_usb and std.c.getenv("BOBRVM_NO_PCI_INPUT") == null;
         if (self.keyboard) |kbd| {
             if (pci_input) self.pci_keyboard = try self.createPciInput(kbd, PCI_SLOT_KEYBOARD, pciKeyboardNotify, pciKeyboardIrq);
         }
@@ -3617,6 +3703,7 @@ pub const Machine = struct {
     const PCI_SLOT_KEYBOARD: u5 = 3;
     const PCI_SLOT_MOUSE: u5 = 4;
     const PCI_SLOT_NET: u5 = 5;
+    const PCI_SLOT_USB: u5 = 6;
 
     /// Firmware guests can use ACPI, which does not describe virtio-mmio
     /// devices. Expose the NIC on PCI regardless of the display backend.
@@ -3855,6 +3942,20 @@ pub const Machine = struct {
                 input.write(@intCast(@intFromEnum(virtio.mmio.Reg.config) + rel + index), byte);
             }
         }
+    }
+
+    fn initUsb(self: *Machine) !void {
+        const optical = if (self.config.disk2_optical) self.config.disk2_path else null;
+        const device = try pci.Xhci.init(self.alloc, GuestMemory.bindGlobal(getGuestMemoryWrapper), optical);
+        errdefer device.deinit();
+        device.irq = .{ .callback = usbIrq, .userdata = self };
+        try self.ecam_host.?.addDevice(PCI_SLOT_USB, 0, .{ .config = device.config, .present = true });
+        self.xhci = device;
+    }
+
+    fn usbIrq(level: bool, userdata: ?*anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(userdata));
+        self.setPciIntx(PCI_SLOT_USB, level);
     }
 
     fn initNvme(self: *Machine, slot: u5, path: []const u8, read_only: bool) !void {
@@ -4250,6 +4351,9 @@ pub const Machine = struct {
             return result;
         }
 
+        if (ecam_addr.bus == 0 and ecam_addr.device == PCI_SLOT_USB and ecam_addr.function == 0) {
+            if (self.xhci) |usb| return usb.readConfig(ecam_addr.reg, size);
+        }
         if (self.nvmeAt(ecam_addr)) |device| {
             return device.readConfig(ecam_addr.reg, size);
         }
@@ -4283,6 +4387,13 @@ pub const Machine = struct {
             return;
         }
 
+        if (ecam_addr.bus == 0 and ecam_addr.device == PCI_SLOT_USB and ecam_addr.function == 0) {
+            if (self.xhci) |usb| {
+                usb.writeConfig(ecam_addr.reg, size, value);
+                if (self.ecam_host) |ecam| ecam.updateConfig(PCI_SLOT_USB, 0, &usb.config);
+                return;
+            }
+        }
         if (self.nvmeAt(ecam_addr)) |device| {
             device.writeConfig(ecam_addr.reg, size, value);
             if (self.ecam_host) |ecam| ecam.updateConfig(ecam_addr.device, 0, &device.config);

@@ -213,7 +213,9 @@ public final class VMManager: ObservableObject {
             // Windows has no virtio-gpu/virtio-blk drivers on Arm: give it a
             // plain UEFI framebuffer and NVMe storage instead.
             ramfbEnabled: instance.guestSystem == .windows,
-            nvmeStorage: instance.guestSystem == .windows
+            nvmeStorage: instance.guestSystem == .windows,
+            usbEnabled: instance.guestSystem == .windows,
+            opticalMedia: instance.guestSystem == .windows
         )
 
         if let boot { newConfig = try boot.applying(to: newConfig) }
@@ -817,7 +819,9 @@ enum VMStorage {
                 isoPath: isoPath,
                 isoReadOnly: true,
                 ramfbEnabled: guestSystem == .windows,
-                nvmeStorage: guestSystem == .windows
+                nvmeStorage: guestSystem == .windows,
+                usbEnabled: guestSystem == .windows,
+                opticalMedia: guestSystem == .windows
             )
         }
 

@@ -353,6 +353,21 @@ final class BobrvmKitTests: XCTestCase {
         }
     }
 
+    func testWindowsUsbConfigurationCrossesCBridge() throws {
+        let config = VMConfig(
+            firmwarePath: "/tmp/firmware.fd",
+            isoPath: "/tmp/windows.iso",
+            nvmeStorage: true,
+            usbEnabled: true,
+            opticalMedia: true
+        )
+        try config.withCConfig { pointer in
+            XCTAssertTrue(pointer.pointee.storage_nvme)
+            XCTAssertTrue(pointer.pointee.enable_usb)
+            XCTAssertTrue(pointer.pointee.disk2_optical)
+        }
+    }
+
     func testVMConfigKeepsAbsentStringsNull() throws {
         let config = VMConfig()
 

@@ -97,6 +97,8 @@ pub fn runWithReadyMarker(
     machine_config.enable_virgl = config.enable_virgl;
     machine_config.enable_ramfb = config.enable_ramfb;
     machine_config.storage_nvme = config.enable_nvme;
+    machine_config.enable_usb = config.enable_usb;
+    machine_config.disk2_optical = config.disk2_optical;
     machine_config.isolate_host = config.isolate_host;
     machine_config.enable_snd = config.enable_snd;
     machine_config.forwards = forwards_buf[0..config.forward_count];

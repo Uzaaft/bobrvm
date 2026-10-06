@@ -219,6 +219,10 @@ typedef struct {
     bool enable_ramfb;
     /** Expose disk_path/disk2_path as NVMe controllers instead of virtio-blk. */
     bool storage_nvme;
+    /** PCI xHCI controller with USB HID keyboard and tablet. */
+    bool enable_usb;
+    /** Expose disk2_path as read-only USB optical media; requires enable_usb. */
+    bool disk2_optical;
 } bobrvm_vm_config_s;
 
 /** Actual listening port for a configured slot, or zero when unavailable. */
