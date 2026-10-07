@@ -169,6 +169,12 @@ public struct VMConfig {
     public var isoPath: String?
     /// Whether ISO is read-only (default: true).
     public var isoReadOnly: Bool
+    /// UEFI linear framebuffer (ramfb) instead of virtio-gpu; Windows guests.
+    public var ramfbEnabled: Bool
+    /// Disks as NVMe controllers instead of virtio-blk; Windows guests.
+    public var nvmeStorage: Bool
+    public var usbEnabled: Bool
+    public var opticalMedia: Bool
 
     public init(
         memoryBytes: UInt64? = nil,
@@ -193,7 +199,11 @@ public struct VMConfig {
         diskPath: String? = nil,
         diskReadOnly: Bool = false,
         isoPath: String? = nil,
-        isoReadOnly: Bool = true
+        isoReadOnly: Bool = true,
+        ramfbEnabled: Bool = false,
+        nvmeStorage: Bool = false,
+        usbEnabled: Bool = false,
+        opticalMedia: Bool = false
     ) {
         let defaults = bobrvm_vm_config_defaults()
         self.memoryBytes = memoryBytes ?? defaults.memory_bytes
@@ -226,6 +236,10 @@ public struct VMConfig {
         self.diskReadOnly = diskReadOnly
         self.isoPath = isoPath
         self.isoReadOnly = isoReadOnly
+        self.ramfbEnabled = ramfbEnabled
+        self.nvmeStorage = nvmeStorage
+        self.usbEnabled = usbEnabled
+        self.opticalMedia = opticalMedia
     }
 
     public func validate() throws {
@@ -254,6 +268,10 @@ public struct VMConfig {
         config.enable_touch_id = touchIDEnabled
         config.disk_read_only = diskReadOnly
         config.disk2_read_only = isoReadOnly
+        config.enable_ramfb = ramfbEnabled
+        config.storage_nvme = nvmeStorage
+        config.enable_usb = usbEnabled
+        config.disk2_optical = opticalMedia
         try withUnsafeMutableBytes(of: &config.port_forwards) { bytes in
             let slots = bytes.bindMemory(to: bobrvm_port_forward_s.self)
             guard portForwards.count <= slots.count else { throw BobrvmError.invalidArgument }

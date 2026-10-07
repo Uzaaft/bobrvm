@@ -116,9 +116,18 @@ pub const VMConfig = extern struct {
     port_forward_count: u8 = 0,
     enable_snd: bool = false,
     share_read_only: bool = false,
+    /// UEFI linear framebuffer instead of a PCI virtio-gpu (Windows guests).
+    enable_ramfb: bool = false,
+    /// Disks as NVMe controllers instead of virtio-blk (Windows guests).
+    storage_nvme: bool = false,
+    enable_usb: bool = false,
+    disk2_optical: bool = false,
 
     /// Validate configuration for sanity.
     pub fn validate(self: VMConfig) bool {
+        if (self.disk2_optical and !self.enable_usb) return false;
+        if (self.enable_usb and (optionalString(self.firmware_path) == null or
+            optionalString(self.kernel_path) != null)) return false;
         assert(config_policy.memory_bytes_default > 0);
         assert(config_policy.vcpu_count_default > 0);
         config_policy.validate(.{
@@ -244,6 +253,10 @@ pub const VMConfig = extern struct {
             .port_forward_count = self.port_forward_count,
             .enable_snd = self.enable_snd,
             .share_read_only = self.share_read_only,
+            .enable_ramfb = self.enable_ramfb,
+            .storage_nvme = self.storage_nvme,
+            .enable_usb = self.enable_usb,
+            .disk2_optical = self.disk2_optical,
         };
     }
 };
@@ -278,6 +291,10 @@ pub const OwnedVMConfig = struct {
     port_forward_count: u8 = 0,
     enable_snd: bool = false,
     share_read_only: bool = false,
+    enable_ramfb: bool = false,
+    storage_nvme: bool = false,
+    enable_usb: bool = false,
+    disk2_optical: bool = false,
 
     pub fn deinit(self: *OwnedVMConfig, alloc: Allocator) void {
         if (self.string_storage.len > 0) alloc.free(self.string_storage);
@@ -602,6 +619,10 @@ pub const VM = struct {
                 .shared_dir = self.config.shared_dir,
                 .enable_snd = self.config.enable_snd,
                 .share_read_only = self.config.share_read_only,
+                .enable_ramfb = self.config.enable_ramfb,
+                .storage_nvme = self.config.storage_nvme,
+                .enable_usb = self.config.enable_usb,
+                .disk2_optical = self.config.disk2_optical,
                 .display_width = if (self.config.display_width != 0)
                     self.config.display_width
                 else
@@ -1495,4 +1516,18 @@ test "VM surface registry unlinks arbitrary entries" {
 
 test {
     _ = @import("../machine/snapshot_directory.zig");
+}
+
+test "USB configuration validates firmware and survives ownership transfer" {
+    const testing = std.testing;
+    var config: VMConfig = .{ .disk2_optical = true };
+    try testing.expect(!config.validate());
+    config.enable_usb = true;
+    try testing.expect(!config.validate());
+    config.firmware_path = "/tmp/firmware.fd";
+    try testing.expect(config.validate());
+    var owned = try config.dupe(testing.allocator);
+    defer owned.deinit(testing.allocator);
+    try testing.expect(owned.enable_usb);
+    try testing.expect(owned.disk2_optical);
 }

@@ -86,6 +86,8 @@ pub const Net = struct {
     /// Shadow avail-ring cursors.
     rx_last_avail: u16,
     tx_last_avail: u16,
+    /// Set once an impossible avail jump has been logged; cleared by reset.
+    avail_jump_warned: bool = false,
 
     /// Frames waiting for guest RX buffers. Guarded by rx_mutex: backend
     /// threads append, the vCPU thread drains via pollRx.
@@ -190,6 +192,7 @@ pub const Net = struct {
         self.transport.reset();
         self.rx_last_avail = 0;
         self.tx_last_avail = 0;
+        self.avail_jump_warned = false;
     }
 
     /// Queue a frame for delivery to the guest. Thread-safe; the frame
@@ -333,7 +336,10 @@ pub const Net = struct {
         const avail_idx = ring.availIdxMemory(qc, get_mem) orelse return;
         const pending = avail_idx -% self.tx_last_avail;
         if (pending > qc.num) {
-            log.warn("rejecting TX avail jump {} larger than queue {}", .{ pending, qc.num });
+            if (!self.avail_jump_warned) {
+                self.avail_jump_warned = true;
+                log.warn("rejecting TX avail jump {} larger than queue {}", .{ pending, qc.num });
+            }
             return;
         }
         var processed: u32 = 0;
@@ -429,7 +435,10 @@ pub const Net = struct {
         const avail_idx = ring.availIdxMemory(qc, get_mem) orelse return;
         const pending = avail_idx -% self.rx_last_avail;
         if (pending > qc.num) {
-            log.warn("rejecting RX avail jump {} larger than queue {}", .{ pending, qc.num });
+            if (!self.avail_jump_warned) {
+                self.avail_jump_warned = true;
+                log.warn("rejecting RX avail jump {} larger than queue {}", .{ pending, qc.num });
+            }
             return;
         }
         var last_avail = self.rx_last_avail;

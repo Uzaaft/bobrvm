@@ -141,6 +141,11 @@ const FPunchhole = extern struct {
 const PUNCH_ALIGN: u64 = 4096;
 
 /// Block device.
+const log = std.log.scoped(.virtio_blk);
+
+/// Set by BOBRVM_TRACE_BLK=1 (0 = unchecked, 1 = on, 2 = off).
+var trace_reads = std.atomic.Value(u8).init(0);
+
 pub const Block = struct {
     alloc: Allocator,
     transport: mmio.Transport,
@@ -167,6 +172,9 @@ pub const Block = struct {
     pub const SECTOR_SIZE: u64 = 512;
 
     pub fn init(alloc: Allocator) Error!*Block {
+        if (trace_reads.load(.acquire) == 0) {
+            trace_reads.store(if (std.c.getenv("BOBRVM_TRACE_BLK") != null) 1 else 2, .release);
+        }
         // VIRTIO_F_VERSION_1 (bit 32) is required for modern virtio-mmio
         const virtio_version_1: u64 = 1 << 32;
         const features = Features.SIZE_MAX | Features.SEG_MAX | Features.BLK_SIZE |
@@ -509,6 +517,9 @@ pub const Block = struct {
         const offset = std.math.mul(u64, sector, SECTOR_SIZE) catch return .io_err;
         const end = std.math.add(u64, offset, total) catch return .io_err;
         if (end > self.capacity_bytes) return .io_err;
+        if (trace_reads.load(.acquire) == 1) {
+            log.debug("blk read cap={} sector={} bytes={}", .{ self.capacity_bytes, sector, total });
+        }
 
         var active = buffers[0..count];
         var completed: usize = 0;

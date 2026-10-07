@@ -220,6 +220,12 @@ pub extern "Hypervisor" fn hv_vm_unmap(
     size: usize,
 ) callconv(.c) hv_return_t;
 
+pub extern "Hypervisor" fn hv_vm_protect(
+    ipa: hv_ipa_t,
+    size: usize,
+    flags: hv_memory_flags_t,
+) callconv(.c) hv_return_t;
+
 // =============================================================================
 // vCPU Functions
 // =============================================================================

@@ -8,6 +8,8 @@ const assert = @import("quirks.zig").inlineAssert;
 
 pub const memory_bytes_default: u64 = 512 * 1024 * 1024;
 pub const vcpu_count_default: u8 = 2;
+/// One affinity group with Aff0 0..15, addressable by ICC_SGI1R.TargetList.
+pub const vcpu_count_max: u8 = 16;
 pub const display_width_default: u32 = 1280;
 pub const display_height_default: u32 = 800;
 pub const display_dimension_min: u32 = 320;
@@ -41,7 +43,7 @@ pub fn validate(values: Values) ValidationError!void {
     assert(gpu_memory_bytes_max >= gpu_memory_bytes_min);
 
     if (values.memory_bytes == 0) return error.InvalidMemory;
-    if (values.vcpu_count == 0) return error.InvalidVcpuCount;
+    if (values.vcpu_count == 0 or values.vcpu_count > vcpu_count_max) return error.InvalidVcpuCount;
     const display_enabled = values.display_width > 0 and values.display_height > 0;
     if ((values.display_width == 0) != (values.display_height == 0) or
         display_enabled and (values.display_width < display_dimension_min or
@@ -162,4 +164,10 @@ test "filename sanitization needs no allocation" {
     const result = try sanitizeFilename("NixOS VM:1", &output);
     try std.testing.expectEqualStrings("NixOS_VM-1", result);
     try std.testing.expectError(error.BufferTooSmall, sanitizeFilename("large", output[0..4]));
+}
+
+test "CPU count stays within the emulated affinity group" {
+    try validate(.{ .vcpu_count = 12 });
+    try validate(.{ .vcpu_count = 16 });
+    try std.testing.expectError(error.InvalidVcpuCount, validate(.{ .vcpu_count = 17 }));
 }

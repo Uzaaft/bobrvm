@@ -18,11 +18,23 @@ pub fn writeType0(
     size: u8,
     value: u64,
 ) WriteEffect {
+    return writeType0Masked(config, offset, size, value, bar0_mask);
+}
+
+/// Like `writeType0` with the BAR0 size mask of the device (a mask of
+/// 0xFFFF_C000 is a 16 KiB BAR).
+pub fn writeType0Masked(
+    config: *[space_size]u8,
+    offset: u12,
+    size: u8,
+    value: u64,
+    mask: u32,
+) WriteEffect {
     if (@as(usize, offset) + size > config.len) return .none;
     if (offset == bar0_offset and size == 4 and @as(u32, @truncate(value)) ==
         std.math.maxInt(u32))
     {
-        writeU32(config, bar0_offset, bar0_mask);
+        writeU32(config, bar0_offset, mask);
         return .bar0_probe;
     }
 
@@ -42,7 +54,7 @@ pub fn writeType0(
     }
 
     if (!bar0_touched) return .none;
-    const assigned = readU32(config, bar0_offset) & bar0_mask;
+    const assigned = readU32(config, bar0_offset) & mask;
     writeU32(config, bar0_offset, assigned);
     return .{ .bar0_assigned = assigned };
 }

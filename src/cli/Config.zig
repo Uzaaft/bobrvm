@@ -27,6 +27,10 @@ initrd_path: ?[]const u8 = null,
 cmdline: []const u8 = "console=hvc0 earlycon=pl011,0x09000000",
 enable_gpu: bool = false,
 enable_virgl: bool = false,
+enable_ramfb: bool = false,
+enable_nvme: bool = false,
+enable_usb: bool = false,
+disk2_optical: bool = false,
 kitty_display: bool = false,
 enable_net: bool = false,
 network_shared: bool = false,
@@ -150,6 +154,16 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
         } else if (std.mem.eql(u8, arg, "--virgl")) {
             config.enable_gpu = true;
             config.enable_virgl = true;
+        } else if (std.mem.eql(u8, arg, "--ramfb")) {
+            config.enable_gpu = true;
+            config.enable_ramfb = true;
+        } else if (std.mem.eql(u8, arg, "--usb")) {
+            config.enable_usb = true;
+        } else if (std.mem.eql(u8, arg, "--optical")) {
+            config.enable_usb = true;
+            config.disk2_optical = true;
+        } else if (std.mem.eql(u8, arg, "--nvme")) {
+            config.enable_nvme = true;
         } else if (std.mem.eql(u8, arg, "--kitty-display")) {
             config.enable_gpu = true;
             config.kitty_display = true;
@@ -243,6 +257,9 @@ pub fn parseArgs(args: *std.process.Args.Iterator) (Allocator.Error || ParseErro
 }
 
 pub fn validate(self: *const Config) ParseError!void {
+    if (self.disk2_optical and !self.enable_usb) return ParseError.InvalidArgument;
+    if (self.enable_usb and (self.firmware_path == null or self.kernel_path != null))
+        return ParseError.InvalidArgument;
     if (self.network_shared and (self.forward_count != 0 or self.docker_enabled or
         self.network_mac[0] & 3 != 2 or @import("builtin").os.tag != .macos))
     {
@@ -486,6 +503,10 @@ pub fn printOptions() void {
         \\  --cmdline <str>       Kernel command line
         \\  --gpu                 Attach a virtio-gpu display device
         \\  --virgl               Accelerated 3D graphics (implies --gpu)
+        \\  --ramfb               UEFI linear framebuffer for Windows guests (implies --gpu)
+        \\  --usb                 PCI xHCI with USB keyboard and tablet
+        \\  --optical             Expose disk2 as read-only USB optical media (implies --usb)
+        \\  --nvme                Expose disks as NVMe controllers (Windows guests)
         \\  --kitty-display       Stream GPU frames to Ghostty (implies --gpu)
         \\  --sound               Attach a virtio-snd playback device
         \\  --net                 Attach a virtio-net adapter (user-mode NAT)

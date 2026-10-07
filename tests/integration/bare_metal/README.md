@@ -2,7 +2,9 @@
 
 This minimal arm64 program tests PL011 output, the PSCI `VERSION`,
 `FEATURES`, `CPU_ON`, and `SYSTEM_OFF` calls, and the GICv3 system-register
-interface on a secondary vCPU without booting Linux.
+interface without booting Linux. It runs with 2, 12, and 16 vCPUs, starts
+secondaries in reverse order, checks MPIDR against GICR_TYPER, and delivers
+a directed SGI to each secondary.
 
 ```sh
 zig build test-bare-metal
@@ -15,7 +17,7 @@ BOBRVM TEST START
 UART: OK
 PSCI VERSION: 00010000
 PSCI FEATURES: OK
-PSCI CPU_ON + GICV3: OK
+PSCI CPU_ON + MPIDR + SGI: OK
 ALL TESTS PASSED
 ```
 

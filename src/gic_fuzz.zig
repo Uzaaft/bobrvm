@@ -30,7 +30,7 @@ const Model = struct {
     fn init(num_cpus: u8) Model {
         var model = Model{
             .num_cpus = num_cpus,
-            .ctlr = GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS,
+            .ctlr = GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS | GICD.CTLR_DS,
             .spis = @splat(.{}),
             .redists = @splat(@splat(.{})),
             .wakers = @splat(GICR.WAKER_CHILDREN_ASLEEP),
@@ -338,8 +338,9 @@ fn applyOperation(actual: *Gic, model: *Model, smith: *testing.Smith) !void {
         0 => {
             const value = smith.value(u32);
             actual.distWrite(GICD.CTLR, 4, value);
-            model.ctlr = value & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS |
-                GICD.CTLR_ENABLE_G1S | GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS | GICD.CTLR_DS);
+            // ARE and DS are RAO/WI (single security state, affinity routing).
+            model.ctlr = (value & (GICD.CTLR_ENABLE_G0 | GICD.CTLR_ENABLE_G1NS | GICD.CTLR_ENABLE_G1S)) |
+                GICD.CTLR_ARE_S | GICD.CTLR_ARE_NS | GICD.CTLR_DS;
         },
         1...7 => applyDistBitmap(actual, model, smith, operation - 1),
         8 => applyDistWords(actual, model, smith, false),
